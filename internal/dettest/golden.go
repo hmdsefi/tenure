@@ -4,6 +4,7 @@
 package dettest
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/json"
 	"errors"
@@ -239,10 +240,17 @@ type Result struct {
 	Hash   uint64
 }
 
-// resultJSON holds the fields of a results line that ParseResults reads. A nil pointer is a
-// field the line lacks; faultline omits events and trace_hash on lines without a run.
+// resultVersion holds the faultline_result field of a results line, undecoded, so that a line of
+// another format version gets the version error and not a type error from one of its other fields.
+type resultVersion struct {
+	Version json.RawMessage `json:"faultline_result"`
+}
+
+// resultJSON holds the other fields of a results line that ParseResults reads. A nil pointer is
+// a field the line lacks; faultline omits events and trace_hash on lines without a run. Like
+// encoding/json everywhere, the decode matches keys case-insensitively and takes the last of
+// duplicate keys; faultline writes neither.
 type resultJSON struct {
-	Version   *int    `json:"faultline_result"`
 	Test      string  `json:"test"`
 	Seed      *string `json:"seed"`
 	Status    string  `json:"status"`
@@ -253,8 +261,8 @@ type resultJSON struct {
 // ParseResults parses a faultline results file (the file FAULTLINE_RESULTS names).
 func ParseResults(data []byte) ([]Result, error) {
 	var results []Result
-	for i, line := range strings.Split(string(data), "\n") {
-		if line == "" {
+	for i, line := range bytes.Split(data, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		r, err := parseResult(line)
@@ -266,17 +274,22 @@ func ParseResults(data []byte) ([]Result, error) {
 	return results, nil
 }
 
-// parseResult parses one non-empty results line (DET-530). Its errors lack the line prefix.
-func parseResult(line string) (Result, error) {
-	var j resultJSON
-	if err := json.Unmarshal([]byte(line), &j); err != nil {
+// parseResult parses one non-blank results line (DET-530). Its errors lack the line prefix.
+func parseResult(line []byte) (Result, error) {
+	var v resultVersion
+	if err := json.Unmarshal(line, &v); err != nil {
 		return Result{}, err
 	}
-	switch {
-	case j.Version == nil:
+	switch string(v.Version) {
+	case "", "null":
 		return Result{}, errors.New("missing faultline_result")
-	case *j.Version != 1:
-		return Result{}, fmt.Errorf("faultline_result %d, want 1", *j.Version)
+	case "1":
+	default:
+		return Result{}, fmt.Errorf("faultline_result %s, want 1", v.Version)
+	}
+	var j resultJSON
+	if err := json.Unmarshal(line, &j); err != nil {
+		return Result{}, err
 	}
 	pass := j.Status == "pass"
 	r := Result{Test: j.Test, Status: j.Status}

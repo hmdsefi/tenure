@@ -271,7 +271,7 @@ func TestATDET11Digest(t *testing.T) {
 // Results lines in faultline v0.2.0's encoding: the fields and their order are those of its
 // resultLine, as json.Marshal writes them.
 const (
-	resultRun   = `{"faultline_result":1,"package":"github.com/hmdsefi/tenure/simtest","test":"TestScenario","seed":"0x00000000000000ff","index":0,"status":"pass","events":12,"trace_hash":"0x00000000000000aa","wall_ns":1500}`
+	resultRun   = `{"faultline_result":1,"package":"github.com/hmdsefi/tenure/simtest","test":"TestScenario","seed":"0x00000000000000ff","index":0,"status":"pass","events":12,"trace_hash":"0x00000000000000aa","wall_ns":1500,"determinism_level":"exact"}`
 	resultSetup = `{"faultline_result":1,"package":"github.com/hmdsefi/tenure/simtest","test":"TestScenario","seed":"","index":-1,"status":"fail","kind":"setup","signature":"setup:","message":"faultline: no seeds","wall_ns":0}`
 )
 
@@ -296,6 +296,9 @@ func TestATDET15Results(t *testing.T) {
 			"dettest: results line 1: missing trace_hash"},
 		{"version 2", strings.Replace(resultRun, `"faultline_result":1`, `"faultline_result":2`, 1),
 			"dettest: results line 1: faultline_result 2, want 1"},
+		{"version 2, numeric seed", strings.Replace(strings.Replace(resultRun, `"faultline_result":1`, `"faultline_result":2`, 1),
+			`"seed":"0x00000000000000ff"`, `"seed":255`, 1),
+			"dettest: results line 1: faultline_result 2, want 1"},
 		{"bad trace_hash", strings.Replace(resultRun, `"trace_hash":"0x00000000000000aa"`, `"trace_hash":"zz"`, 1),
 			`dettest: results line 1: invalid trace_hash "zz"`},
 	} {
@@ -309,17 +312,21 @@ func TestATDET15Results(t *testing.T) {
 	}
 }
 
-// TestParseResultsLines checks DET-530's other cases: line numbers count every line, blank lines
-// are skipped, an empty seed is missing on a pass line, and fields missing from a skip line are 0.
+// TestParseResultsLines checks DET-530's other cases: line numbers count every line, blank and
+// whitespace-only lines (CRLF ones too) are skipped, fields missing from a skip line or a line of
+// another status are 0, an empty seed is missing on a pass line, a line without faultline_result
+// is reported, and an empty trace_hash is invalid on any line.
 func TestParseResultsLines(t *testing.T) {
 	skip := `{"faultline_result":1,"package":"p","test":"TestSkip","seed":"0x0000000000000003","index":0,"status":"skip","wall_ns":7}`
-	got, err := ParseResults([]byte("\n" + resultRun + "\n\n" + skip))
+	other := `{"faultline_result":1,"test":"TestOther","seed":"0x0000000000000004","status":"PASS"}`
+	got, err := ParseResults([]byte("\n" + resultRun + "\r\n\r\n \t\n" + skip + "\n" + other + "\r\n"))
 	if err != nil {
 		t.Fatalf("ParseResults: %v", err)
 	}
 	want := []Result{
 		{Test: "TestScenario", Seed: 0xff, Status: "pass", Events: 12, Hash: 0xaa},
 		{Test: "TestSkip", Seed: 3, Status: "skip"},
+		{Test: "TestOther", Seed: 4, Status: "PASS"},
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("ParseResults = %+v, want %+v", got, want)
@@ -339,6 +346,14 @@ func TestParseResultsLines(t *testing.T) {
 			"dettest: results line 2: missing events"},
 		{"bad seed", strings.Replace(resultSetup, `"seed":""`, `"seed":"0xff"`, 1),
 			`dettest: results line 1: invalid seed "0xff"`},
+		{"no faultline_result", strings.Replace(resultRun, `"faultline_result":1,`, "", 1),
+			"dettest: results line 1: missing faultline_result"},
+		{"null faultline_result", strings.Replace(resultRun, `"faultline_result":1`, `"faultline_result":null`, 1),
+			"dettest: results line 1: missing faultline_result"},
+		{"string faultline_result", strings.Replace(resultRun, `"faultline_result":1`, `"faultline_result":"1"`, 1),
+			`dettest: results line 1: faultline_result "1", want 1`},
+		{"empty trace_hash on fail", strings.Replace(resultSetup, `"seed":""`, `"seed":"","trace_hash":""`, 1),
+			`dettest: results line 1: invalid trace_hash ""`},
 	} {
 		if _, err := ParseResults([]byte(tc.data)); err == nil || err.Error() != tc.want {
 			t.Errorf("%s: ParseResults error = %v, want %q", tc.name, err, tc.want)
