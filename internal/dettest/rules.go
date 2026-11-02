@@ -1121,21 +1121,19 @@ func pVerbs(format string) int {
 }
 
 // printInterfaces returns the interfaces error and fmt.Stringer, against which the fmt walk tests
-// argument types, and the interface of the methods fmt calls that a time type can provide,
-// Error, String and GoString.
-func printInterfaces() (errorT, stringer, printed *types.Interface) {
+// argument types.
+func printInterfaces() (errorT, stringer *types.Interface) {
 	method := func(name string) *types.Func {
 		result := types.NewTuple(types.NewVar(token.NoPos, nil, "", types.Typ[types.String]))
 		return types.NewFunc(token.NoPos, nil, name, types.NewSignatureType(nil, nil, nil, nil, result, false))
 	}
 	errorT = types.NewInterfaceType([]*types.Func{method("Error")}, nil).Complete()
 	stringer = types.NewInterfaceType([]*types.Func{method("String")}, nil).Complete()
-	printed = types.NewInterfaceType([]*types.Func{method("Error"), method("String"), method("GoString")}, nil).Complete()
-	return errorT, stringer, printed
+	return errorT, stringer
 }
 
-// errorType, stringerType and printedType are the interfaces of printInterfaces.
-var errorType, stringerType, printedType = printInterfaces()
+// errorType and stringerType are the interfaces of printInterfaces.
+var errorType, stringerType = printInterfaces()
 
 // fmtWalk walks the type of a value argument of fmt (DET-150 item 1).
 type fmtWalk struct {
@@ -1152,9 +1150,7 @@ func (w fmtWalk) rule(t types.Type) Rule {
 		}
 		w.seen[t] = true
 	}
-	// A type with forbidden time methods formats a time when fmt calls one of them; a Duration's
-	// String is allowed, so a Duration falls through to the Stringer test.
-	if forbiddenTime(t) && !allowedVia(t, printedType) {
+	if forbiddenTime(t) {
 		return RuleClock
 	}
 	if types.Implements(t, errorType) || types.Implements(t, stringerType) {
@@ -1166,6 +1162,9 @@ func (w fmtWalk) rule(t types.Type) Rule {
 			return RulePointer
 		}
 		for _, term := range terms {
+			if b, ok := term.Underlying().(*types.Basic); ok && b.Kind() == types.Uintptr {
+				continue // core cannot name uintptr (DET-150 item 4), and cmp.Ordered lists it
+			}
 			if r := w.rule(term); r != "" {
 				return r
 			}

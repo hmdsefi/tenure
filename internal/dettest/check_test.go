@@ -1046,3 +1046,48 @@ func writes(src []int) {
 		t.Errorf("findings:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
 	}
 }
+
+// TestValueRuleEdges checks the fmt cases that sit between DT003 and DT006: an fmt function
+// used as a value in a package-level declaration, type parameters whose terms are all safe
+// (cmp.Ordered's uintptr term included), explicit conversions to interfaces in parentheses and
+// nested, a format given by a multi-valued call, and a Duration behind any.
+func TestValueRuleEdges(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"a.go": `package p
+
+import (
+	"cmp"
+	"fmt"
+	"time"
+)
+
+var sp = fmt.Sprint
+
+func pair() (string, int) { return "%d", 1 }
+
+func safe[T ~int | ~string](v T) string { return fmt.Sprint(v) }
+
+func key[T cmp.Ordered](v T) string { return fmt.Sprint(v) }
+
+func f(t time.Time, d time.Duration) {
+	_ = fmt.Sprint((any(t)))
+	_ = fmt.Sprint(any(fmt.Stringer(t)))
+	_ = fmt.Sprintf(pair())
+	_ = fmt.Sprint(any(d))
+}
+`})
+	fs, err := CheckDir(dir, "example.com/p", fixtureCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const local = " formats a time.Time in the local time zone; pass t.UnixMilli() or a Duration"
+	want := []string{
+		"a.go:9:14: DT006: fmt.Sprint used as a value: call it directly so its arguments can be checked",
+		"a.go:18:22: DT003: argument of type time.Time to fmt.Sprint" + local,
+		"a.go:19:34: DT003: argument of type time.Time to fmt.Sprint" + local,
+		"a.go:20:18: DT006: non-constant format to fmt.Sprintf may hold %p; use a constant format",
+	}
+	if got := strings.Split(findingLines(fs), "\n"); !slices.Equal(got, want) {
+		t.Errorf("findings:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
