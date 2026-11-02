@@ -3,7 +3,10 @@
 
 package fixture
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 func f(t, u time.Time, d time.Duration) {
 	_ = time.Now()       // want DT003
@@ -12,6 +15,7 @@ func f(t, u time.Time, d time.Duration) {
 	_ = time.NewTimer(d) // want DT003
 	_ = time.Local       // want DT003
 	_ = t.Year()         // want DT003
+	_ = fmt.Sprint(t)    // want DT003
 	_ = t.Add(d)
 	_ = t.Before(u)
 	_ = t.UnixMilli()

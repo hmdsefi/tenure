@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/build"
 	"go/build/constraint"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"io/fs"
@@ -182,8 +183,8 @@ func (r *pkgRun) hostRules(host []*ast.File, info *types.Info) {
 }
 
 // nodes reports the findings of the rules that read the syntax and the type information of the
-// host file f: DT002 (DET-110), DT003 (DET-120), DT004 (DET-130), DT005 (DET-140) and DT008
-// (DET-170).
+// host file f: DT002 (DET-110), DT003 (DET-120), DT004 (DET-130), DT005 (DET-140), DT007's math
+// functions (DET-160) and DT008 (DET-170), then those of valueRules.
 func (r *pkgRun) nodes(f *ast.File, info *types.Info) {
 	add := r.addAt
 	var stack []ast.Node           // n and the nodes that enclose it
@@ -231,11 +232,12 @@ func (r *pkgRun) nodes(f *ast.File, info *types.Info) {
 		}
 		return true
 	})
+	r.valueRules(f, info)
 }
 
 // packageUse returns the rule and message of a use of obj when obj is a package-level object of
-// time, fmt, sort or slices that core may not use, or the builtin print or println (DET-120,
-// DET-130, DET-170).
+// time, fmt, math, sort or slices that core may not use, or the builtin print or println (DET-120,
+// DET-130, DET-160, DET-170).
 func packageUse(obj types.Object) (Rule, string, bool) {
 	if b, ok := obj.(*types.Builtin); ok && (b.Name() == "print" || b.Name() == "println") {
 		return RuleIO, b.Name() + ioTail, true
@@ -249,6 +251,8 @@ func packageUse(obj types.Object) (Rule, string, bool) {
 		return RuleClock, "time." + name + clockTail, true
 	case path == "fmt" && !slices.Contains(fmtNames, name):
 		return RuleIO, "fmt." + name + ioTail, true
+	case path == "math" && isFunc(obj) && !slices.Contains(mathExact, name):
+		return RuleFloat, "math." + name + " may round differently on other platforms; core uses only math's exactly rounded functions", true
 	case (path == "sort" || path == "slices") && slices.Contains(unstableSorts, path+"."+name):
 		return RuleSort, sortMsg(path + "." + name), true
 	}
@@ -726,5 +730,422 @@ func coreType(t types.Type) types.Type {
 		return core
 	default:
 		return u
+	}
+}
+
+// isFunc reports whether obj is a function.
+func isFunc(obj types.Object) bool {
+	_, ok := obj.(*types.Func)
+	return ok
+}
+
+// mathExact are the functions of package math that are exactly rounded on every platform
+// (DET-160).
+var mathExact = []string{"Abs", "Ceil", "Copysign", "FMA", "Float32bits", "Float32frombits", "Float64bits",
+	"Float64frombits", "Floor", "Frexp", "Inf", "IsInf", "IsNaN", "Ldexp", "Max", "Min", "Mod", "Modf", "NaN",
+	"Nextafter", "Nextafter32", "Remainder", "Round", "RoundToEven", "Signbit", "Sqrt", "Trunc"}
+
+// fmtPrints are the functions of package fmt whose value arguments are walked (DET-150 item 1).
+var fmtPrints = []string{"Append", "Appendf", "Appendln", "Errorf", "Sprint", "Sprintf", "Sprintln"}
+
+// fmtFormats are the functions of fmtPrints whose format argument is scanned for %p (DET-150
+// item 2).
+var fmtFormats = []string{"Appendf", "Errorf", "Sprintf"}
+
+// floatMulMsg is the DT007 message about a floating-point product (DET-160 items 2 and 3).
+const floatMulMsg = "floating-point multiplication may be fused with an addition on some platforms; " +
+	"convert the product explicitly, for example float64(a*b)"
+
+// valueRules reports the findings of the host file f about values whose behavior depends on memory
+// addresses (DT006, DET-150, and DT003 for a formatted time.Time), on the platform's
+// floating-point code (DT007, DET-160), and on writes to package-level variables (DT009,
+// DET-180).
+func (r *pkgRun) valueRules(f *ast.File, info *types.Info) {
+	add := r.addAt
+	write := func(pos token.Pos, e ast.Expr) {
+		if v := packageVar(e, info); v != nil {
+			add(pos, RuleGlobal, fmt.Sprintf("write to package-level variable %s.%s: core keeps no mutable package state",
+				v.Pkg().Name(), v.Name()))
+		}
+	}
+	complexLines := map[int]bool{} // lines that have a complex-type finding
+	ast.PreorderStack(f, nil, func(n ast.Node, stack []ast.Node) bool {
+		if e, ok := n.(ast.Expr); ok {
+			// Preorder visits a line's expressions in source order, so the first one is leftmost.
+			if t := info.TypeOf(e); t != nil && isBasic(t, types.IsComplex) {
+				if line := r.c.fset.PositionFor(e.Pos(), false).Line; !complexLines[line] {
+					complexLines[line] = true
+					add(e.Pos(), RuleFloat, "complex type "+typeString(t)+" in core")
+				}
+			}
+		}
+		inFunc := slices.ContainsFunc(stack, func(n ast.Node) bool {
+			switch n.(type) {
+			case *ast.FuncDecl, *ast.FuncLit:
+				return true
+			}
+			return false
+		})
+		switch n := n.(type) {
+		case *ast.CallExpr:
+			r.fmtCall(n, info, add)
+			if sel, ok := ast.Unparen(n.Fun).(*ast.SelectorExpr); ok && inFunc && takesAddress(info.Selections[sel]) {
+				write(n.Pos(), sel.X)
+			}
+		case *ast.SelectorExpr:
+			if inFunc && takesAddress(info.Selections[n]) && !calledFun(n, stack) { // a method value
+				write(n.Pos(), n.X)
+			}
+		case *ast.BinaryExpr:
+			switch {
+			case n.Op == token.EQL || n.Op == token.NEQ:
+				for _, x := range []ast.Expr{n.X, n.Y} {
+					if t := info.TypeOf(x); t != nil && containsTime(t) {
+						add(n.Pos(), RulePointer, timeEqualMsg(t))
+						break
+					}
+				}
+			case n.Op == token.MUL && isFloatProduct(info.Types[n]) && !floatConversionArg(n, stack, info):
+				add(n.Pos(), RuleFloat, floatMulMsg)
+			}
+		case *ast.SwitchStmt:
+			if n.Tag != nil {
+				if t := info.TypeOf(n.Tag); t != nil && containsTime(t) {
+					add(n.Tag.Pos(), RulePointer, timeEqualMsg(t))
+				}
+			}
+		case *ast.MapType:
+			if t := info.TypeOf(n.Key); t != nil && containsTime(t) {
+				add(n.Pos(), RulePointer, fmt.Sprintf("map key type %s contains time.Time, whose == compares time zone pointers; "+
+					"key by an integer such as UnixNano", typeString(t)))
+			}
+		case *ast.Ident:
+			if info.Uses[n] == types.Universe.Lookup("uintptr") {
+				add(n.Pos(), RulePointer, "uintptr in core: no value may depend on a memory address")
+			}
+		case *ast.AssignStmt:
+			if n.Tok == token.MUL_ASSIGN && isBasic(info.TypeOf(n.Lhs[0]), types.IsFloat) {
+				add(n.Pos(), RuleFloat, floatMulMsg)
+			}
+			if inFunc && n.Tok != token.DEFINE {
+				for _, lhs := range n.Lhs {
+					write(n.Pos(), lhs)
+				}
+			}
+		case *ast.RangeStmt:
+			if inFunc && n.Tok == token.ASSIGN {
+				for _, lhs := range []ast.Expr{n.Key, n.Value} {
+					if lhs != nil {
+						write(n.Pos(), lhs)
+					}
+				}
+			}
+		case *ast.IncDecStmt:
+			if inFunc {
+				write(n.Pos(), n.X)
+			}
+		case *ast.UnaryExpr:
+			if inFunc && n.Op == token.AND {
+				write(n.Pos(), n.X)
+			}
+		}
+		return true
+	})
+}
+
+// isBasic reports whether t is a typed type whose underlying type is a basic type with the
+// property flag (types.IsFloat: float32 or float64; types.IsComplex: complex64 or complex128).
+func isBasic(t types.Type, flag types.BasicInfo) bool {
+	if t == nil {
+		return false
+	}
+	b, ok := t.Underlying().(*types.Basic)
+	return ok && b.Info()&flag != 0 && b.Info()&types.IsUntyped == 0
+}
+
+// isFloatProduct reports whether a product with the type and value tv is computed at run time
+// in float32 or float64 (DET-160 item 2). go/types records an untyped constant product such as
+// math.Pi * 2 with the type it is converted to, so constants are left out by their value: the
+// compiler computes them exactly.
+func isFloatProduct(tv types.TypeAndValue) bool {
+	return tv.Value == nil && isBasic(tv.Type, types.IsFloat)
+}
+
+// floatConversionArg reports whether the expression n, whose ancestors are stack, is, after
+// skipping parentheses, the single argument of a conversion to a type whose underlying type is
+// float32 or float64 (DET-160 item 2).
+func floatConversionArg(n ast.Node, stack []ast.Node, info *types.Info) bool {
+	child := n
+	i := len(stack) - 1
+	for ; i >= 0; i-- {
+		p, ok := stack[i].(*ast.ParenExpr)
+		if !ok {
+			break
+		}
+		child = p
+	}
+	if i < 0 {
+		return false
+	}
+	call, ok := stack[i].(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 || call.Args[0] != child {
+		return false
+	}
+	tv := info.Types[call.Fun]
+	return tv.IsType() && isBasic(tv.Type, types.IsFloat)
+}
+
+// isTime reports whether t is time.Time.
+func isTime(t types.Type) bool {
+	n, ok := types.Unalias(t).(*types.Named)
+	return ok && n.Obj().Pkg() != nil && n.Obj().Pkg().Path() == "time" && n.Obj().Name() == "Time"
+}
+
+// containsTime reports whether t contains time.Time: it is time.Time, or a struct with a field,
+// or an array with an element, whose type contains it (DET-150 item 3). A value cannot contain
+// itself, so the walk ends.
+func containsTime(t types.Type) bool {
+	if isTime(t) {
+		return true
+	}
+	switch u := t.Underlying().(type) {
+	case *types.Struct:
+		for i := range u.NumFields() {
+			if containsTime(u.Field(i).Type()) {
+				return true
+			}
+		}
+	case *types.Array:
+		return containsTime(u.Elem())
+	}
+	return false
+}
+
+// timeEqualMsg is the DT006 message about comparing values of type t, which contains time.Time,
+// with == (DET-150 item 3).
+func timeEqualMsg(t types.Type) string {
+	return fmt.Sprintf("comparing %s with == compares time zone pointers and monotonic readings; "+
+		"use Time.Equal or Time.Compare", typeString(t))
+}
+
+// fmtCall reports, for a call of a function of fmtPrints, a %p verb in its constant format
+// (DET-150 item 2) and each value argument that may print a memory address (DT006) or formats a
+// time.Time (DT003) (DET-150 item 1).
+func (r *pkgRun) fmtCall(call *ast.CallExpr, info *types.Info, add func(token.Pos, Rule, string)) {
+	var id *ast.Ident
+	switch fun := ast.Unparen(call.Fun).(type) {
+	case *ast.Ident:
+		id = fun
+	case *ast.SelectorExpr:
+		id = fun.Sel
+	default:
+		return
+	}
+	fn, ok := info.Uses[id].(*types.Func)
+	if !ok || fn.Pkg() == nil || fn.Pkg().Path() != "fmt" || fn.Parent() != fn.Pkg().Scope() ||
+		!slices.Contains(fmtPrints, fn.Name()) {
+		return
+	}
+	first := fn.Signature().Params().Len() - 1 // index of the variadic parameter
+	type value struct {
+		at ast.Expr
+		t  types.Type
+	}
+	var vals []value
+	if len(call.Args) == 0 {
+		return
+	}
+	if tuple, ok := info.TypeOf(call.Args[0]).(*types.Tuple); ok { // f(g()) with a multi-valued g
+		for i := first; i < tuple.Len(); i++ {
+			vals = append(vals, value{call.Args[0], tuple.At(i).Type()})
+		}
+	} else {
+		if slices.Contains(fmtFormats, fn.Name()) {
+			format := call.Args[first-1]
+			if tv := info.Types[format]; tv.Value != nil && tv.Value.Kind() == constant.String {
+				for range pVerbs(constant.StringVal(tv.Value)) {
+					add(format.Pos(), RulePointer, "%p prints a memory address")
+				}
+			}
+		}
+		if !call.Ellipsis.IsValid() {
+			for _, a := range call.Args[first:] {
+				vals = append(vals, value{a, info.TypeOf(a)})
+			}
+		}
+	}
+	errorT, ok := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
+	if !ok {
+		return
+	}
+	stringer, ok := fn.Pkg().Scope().Lookup("Stringer").Type().Underlying().(*types.Interface)
+	if !ok {
+		return
+	}
+	w := fmtWalk{seen: map[*types.Named]bool{}, errorT: errorT, stringer: stringer}
+	for _, v := range vals {
+		clear(w.seen)
+		switch w.rule(v.t) {
+		case RuleClock:
+			add(v.at.Pos(), RuleClock, fmt.Sprintf("argument of type %s to fmt.%s formats a time.Time in the local time zone; "+
+				"pass t.UnixMilli() or a Duration", typeString(v.t), fn.Name()))
+		case RulePointer:
+			add(v.at.Pos(), RulePointer, fmt.Sprintf("argument of type %s to fmt.%s may print a memory address",
+				typeString(v.t), fn.Name()))
+		}
+	}
+}
+
+// pVerbs returns the number of %p verbs in the fmt format string format (DET-150 item 2).
+func pVerbs(format string) int {
+	n := 0
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			continue
+		}
+		i++
+		if i < len(format) && format[i] == '%' {
+			continue
+		}
+		for i < len(format) && strings.IndexByte("+-# 0123456789.*[]", format[i]) >= 0 {
+			i++
+		}
+		if i < len(format) && format[i] == 'p' {
+			n++
+		}
+	}
+	return n
+}
+
+// fmtWalk walks the type of a value argument of fmt (DET-150 item 1).
+type fmtWalk struct {
+	seen     map[*types.Named]bool // named types visited
+	errorT   *types.Interface
+	stringer *types.Interface // fmt.Stringer
+}
+
+// rule returns RuleClock if formatting a value of type t formats a time.Time, RulePointer if
+// it may print a memory address, and "" if it does neither. It stops at the first such type.
+func (w fmtWalk) rule(t types.Type) Rule {
+	if n, ok := types.Unalias(t).(*types.Named); ok {
+		if w.seen[n] {
+			return ""
+		}
+		w.seen[n] = true
+	}
+	if isTime(t) {
+		return RuleClock
+	}
+	if types.Implements(t, w.errorT) || types.Implements(t, w.stringer) {
+		return ""
+	}
+	switch u := t.Underlying().(type) {
+	case *types.Pointer, *types.Chan, *types.Signature:
+		return RulePointer
+	case *types.Basic:
+		if u.Kind() == types.Uintptr || u.Kind() == types.UnsafePointer {
+			return RulePointer
+		}
+	case *types.Struct:
+		for i := range u.NumFields() {
+			if r := w.rule(u.Field(i).Type()); r != "" {
+				return r
+			}
+		}
+	case *types.Array:
+		return w.rule(u.Elem())
+	case *types.Slice:
+		return w.rule(u.Elem())
+	case *types.Map:
+		if r := w.rule(u.Key()); r != "" {
+			return r
+		}
+		return w.rule(u.Elem())
+	}
+	return ""
+}
+
+// takesAddress reports whether calling the method that sel selects, or taking it as a method
+// value, takes the address of its operand x: the method has a pointer receiver, and neither x nor
+// an embedded field on the path to the method is a pointer (DET-180 item 4).
+func takesAddress(sel *types.Selection) bool {
+	if sel == nil || sel.Kind() != types.MethodVal {
+		return false
+	}
+	fn, ok := sel.Obj().(*types.Func)
+	if !ok {
+		return false
+	}
+	recv := fn.Signature().Recv()
+	if recv == nil || !isPointer(recv.Type()) {
+		return false
+	}
+	t := sel.Recv()
+	idx := sel.Index()
+	for _, i := range idx[:len(idx)-1] {
+		if isPointer(t) {
+			return false
+		}
+		s, ok := t.Underlying().(*types.Struct)
+		if !ok {
+			return false
+		}
+		t = s.Field(i).Type()
+	}
+	return !isPointer(t)
+}
+
+// calledFun reports whether the expression n, whose ancestors are stack, is, after skipping
+// parentheses, the function of a call.
+func calledFun(n ast.Expr, stack []ast.Node) bool {
+	i := len(stack) - 1
+	for i >= 0 {
+		if _, ok := stack[i].(*ast.ParenExpr); !ok {
+			break
+		}
+		i--
+	}
+	if i < 0 {
+		return false
+	}
+	call, ok := stack[i].(*ast.CallExpr)
+	return ok && ast.Unparen(call.Fun) == n
+}
+
+// isPointer reports whether t's underlying type is a pointer.
+func isPointer(t types.Type) bool {
+	_, ok := t.Underlying().(*types.Pointer)
+	return ok
+}
+
+// packageVar returns the package-level variable at the root of e, or nil if there is none. The
+// root is found by stripping parentheses, field and method selections, index and slice
+// expressions and dereferences; the root of a qualified identifier pkg.V is V (DET-180).
+func packageVar(e ast.Expr, info *types.Info) *types.Var {
+	for {
+		switch x := e.(type) {
+		case *ast.ParenExpr:
+			e = x.X
+		case *ast.SelectorExpr:
+			if info.Selections[x] == nil {
+				e = x.Sel // a qualified identifier
+			} else {
+				e = x.X
+			}
+		case *ast.IndexExpr:
+			e = x.X
+		case *ast.SliceExpr:
+			e = x.X
+		case *ast.StarExpr:
+			e = x.X
+		case *ast.Ident:
+			v, ok := info.Uses[x].(*types.Var)
+			if !ok || v.Name() == "_" || v.Pkg() == nil || v.Parent() != v.Pkg().Scope() {
+				return nil
+			}
+			return v
+		default:
+			return nil
+		}
 	}
 }

@@ -468,9 +468,9 @@ func TestATDET02Messages(t *testing.T) {
 	const clockTail = " is not allowed in core: core reads no clock and uses time only for Time and Duration values and their arithmetic"
 	dt003 := strings.Split(findingLines(fixtureFindings(t, "dt003")), "\n")
 	for _, want := range []string{
-		"a.go:9:11: DT003: time.Now" + clockTail,
-		"a.go:14:8: DT003: time.Time.Year" + clockTail,
-		"a.go:22:11: DT003: time.Unix" + clockTail, // the function; the method t.Unix() on line 23 is allowed
+		"a.go:12:11: DT003: time.Now" + clockTail,
+		"a.go:17:8: DT003: time.Time.Year" + clockTail,
+		"a.go:26:11: DT003: time.Unix" + clockTail, // the function; the method t.Unix() on line 27 is allowed
 	} {
 		if !slices.Contains(dt003, want) {
 			t.Errorf("dt003: no finding %q in:\n%s", want, strings.Join(dt003, "\n"))
@@ -759,6 +759,135 @@ func TestRuleBypasses(t *testing.T) {
 		"a.go:90:9: DT003: time.Time used as any" + convTail,
 		"a.go:115:41: DT008: slices.Sort" + sortTail,
 		"b.go:5:12: DT004: fmt.Println is not allowed in core: core performs no I/O; return values and errors instead",
+	}
+	if got := strings.Split(findingLines(fs), "\n"); !slices.Equal(got, want) {
+		t.Errorf("findings:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
+// TestValueRules checks the messages of DT006, DT007 and DT009 and the cases the fixtures do not
+// show: the fmt argument walk through nested and recursive types, spread and multi-valued
+// arguments, %p after flags and an index, conversions around a product, one complex finding per
+// line, constant products, writes through qualified identifiers, dereferences, range clauses and
+// embedded fields, and method values; and the fixture dt006's messages.
+func TestValueRules(t *testing.T) {
+	dt006 := strings.Split(findingLines(fixtureFindings(t, "dt006")), "\n")
+	for _, want := range []string{
+		"a.go:21:7: DT006: map key type fixture.stamp contains time.Time, whose == compares time zone pointers; key by an integer such as UnixNano",
+		"a.go:27:17: DT006: argument of type fixture.holder to fmt.Sprint may print a memory address",
+		"a.go:30:9: DT006: comparing time.Time with == compares time zone pointers and monotonic readings; use Time.Equal or Time.Compare",
+		"a.go:32:8: DT006: uintptr in core: no value may depend on a memory address",
+	} {
+		if !slices.Contains(dt006, want) {
+			t.Errorf("dt006: no finding %q in:\n%s", want, strings.Join(dt006, "\n"))
+		}
+	}
+
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"a.go": `package p
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"time"
+)
+
+type name struct{ s string }
+
+func (n name) String() string { return n.s }
+
+type event struct{ at time.Time }
+
+type tree struct{ kids []tree }
+
+type ppm float64
+
+func two() (int, *int) { return 0, nil }
+
+func fmts(xs []any, ev event, n name, tr tree, m map[*int]bool, ch chan int, fn func(), err error) {
+	_ = fmt.Sprint()
+	_ = fmt.Sprint(xs...)
+	_ = fmt.Sprint(two())
+	_ = fmt.Errorf("%%p %-[1]p %d", xs, 1)
+	_ = fmt.Sprintln(ev, n, tr, err, nil)
+	_ = fmt.Append(nil, m, ch, fn)
+	_ = ev == event{}
+}
+
+func floats(a, b float64) {
+	_ = float64((a * b))
+	_ = ppm(a * b)
+	_ = (a * b)
+	_ = math.Pi * 2
+	_ = math.Log(a)
+	_, _ = complex(a, b), complex(b, a)
+}
+
+type counter struct{ n int }
+
+func (c *counter) Inc() { c.n++ }
+
+type byValue struct{ counter }
+
+type byPointer struct{ *counter }
+
+var (
+	total int
+	ptr   *int
+	bv    byValue
+	bp    byPointer
+	addr  = &total
+)
+
+var _ = func() int { total = 1; return 0 }()
+
+func writes(xs []int) {
+	errors.ErrUnsupported = nil
+	*ptr = 1
+	for total = range xs {
+	}
+	bv.Inc()
+	bp.Inc()
+	_ = addr
+	inc := bv.Inc
+	_ = (bv.Inc)
+	(bv.Inc)()
+	_ = bp.Inc
+	inc()
+}
+
+var _ = bv.Inc
+`})
+	fs, err := CheckDir(dir, "example.com/p", fixtureCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		fused = "floating-point multiplication may be fused with an addition on some platforms; " +
+			"convert the product explicitly, for example float64(a*b)"
+		mutable = ": core keeps no mutable package state"
+	)
+	want := []string{
+		"a.go:22:68: DT002: channel type: core uses no channels",
+		"a.go:25:17: DT006: argument of type *int to fmt.Sprint may print a memory address",
+		"a.go:26:17: DT006: %p prints a memory address",
+		"a.go:27:19: DT003: argument of type p.event to fmt.Sprintln formats a time.Time in the local time zone; pass t.UnixMilli() or a Duration",
+		"a.go:28:22: DT006: argument of type map[*int]bool to fmt.Append may print a memory address",
+		"a.go:28:25: DT006: argument of type chan int to fmt.Append may print a memory address",
+		"a.go:28:29: DT006: argument of type func() to fmt.Append may print a memory address",
+		"a.go:29:6: DT006: comparing p.event with == compares time zone pointers and monotonic readings; use Time.Equal or Time.Compare",
+		"a.go:35:7: DT007: " + fused,
+		"a.go:37:11: DT007: math.Log may round differently on other platforms; core uses only math's exactly rounded functions",
+		"a.go:38:9: DT007: complex type complex128 in core",
+		"a.go:57:22: DT009: write to package-level variable p.total" + mutable,
+		"a.go:60:2: DT009: write to package-level variable errors.ErrUnsupported" + mutable,
+		"a.go:61:2: DT009: write to package-level variable p.ptr" + mutable,
+		"a.go:62:2: DT009: write to package-level variable p.total" + mutable,
+		"a.go:64:2: DT009: write to package-level variable p.bv" + mutable,
+		"a.go:67:9: DT009: write to package-level variable p.bv" + mutable,
+		"a.go:68:7: DT009: write to package-level variable p.bv" + mutable,
+		"a.go:69:2: DT009: write to package-level variable p.bv" + mutable,
 	}
 	if got := strings.Split(findingLines(fs), "\n"); !slices.Equal(got, want) {
 		t.Errorf("findings:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
