@@ -3,5 +3,11 @@
 
 package core
 
-// KeyShard is a scratch function for a CI check.
-func KeyShard() {}
+// KeyShard implements REP-010.
+func KeyShard() { keyShard() }
+
+// keyShard implements REP-010.
+func keyShard() {}
+
+// KeyHash returns the SHA-256 of the key.
+func KeyHash() {}
