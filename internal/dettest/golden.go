@@ -4,7 +4,10 @@
 package dettest
 
 import (
+	"bytes"
 	"cmp"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -226,4 +229,92 @@ func (d *Digest) Add(line string) {
 // Entry returns the golden entry of the digest under name, with Seed 0.
 func (d *Digest) Entry(name string) Entry {
 	return Entry{Name: name, Seed: 0, Hash: d.sum(), Count: d.count}
+}
+
+// Result is one line of a faultline results file, reduced to what golden tests read.
+type Result struct {
+	Test   string
+	Seed   uint64
+	Status string // "pass", "fail" or "skip"
+	Events uint64
+	Hash   uint64
+}
+
+// resultVersion holds the faultline_result field of a results line, undecoded, so that a line of
+// another format version gets the version error and not a type error from one of its other fields.
+type resultVersion struct {
+	Version json.RawMessage `json:"faultline_result"`
+}
+
+// resultJSON holds the other fields of a results line that ParseResults reads. A nil pointer is
+// a field the line lacks; faultline omits events and trace_hash on lines without a run. Like
+// encoding/json everywhere, the decode matches keys case-insensitively and takes the last of
+// duplicate keys; faultline writes neither.
+type resultJSON struct {
+	Test      string  `json:"test"`
+	Seed      *string `json:"seed"`
+	Status    string  `json:"status"`
+	Events    *uint64 `json:"events"`
+	TraceHash *string `json:"trace_hash"`
+}
+
+// ParseResults parses a faultline results file (the file FAULTLINE_RESULTS names).
+func ParseResults(data []byte) ([]Result, error) {
+	var results []Result
+	for i, line := range bytes.Split(data, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		r, err := parseResult(line)
+		if err != nil {
+			return nil, fmt.Errorf("dettest: results line %d: %w", i+1, err)
+		}
+		results = append(results, r)
+	}
+	return results, nil
+}
+
+// parseResult parses one non-blank results line (DET-530). Its errors lack the line prefix.
+func parseResult(line []byte) (Result, error) {
+	var v resultVersion
+	if err := json.Unmarshal(line, &v); err != nil {
+		return Result{}, err
+	}
+	switch string(v.Version) {
+	case "", "null":
+		return Result{}, errors.New("missing faultline_result")
+	case "1":
+	default:
+		return Result{}, fmt.Errorf("faultline_result %s, want 1", v.Version)
+	}
+	var j resultJSON
+	if err := json.Unmarshal(line, &j); err != nil {
+		return Result{}, err
+	}
+	pass := j.Status == "pass"
+	r := Result{Test: j.Test, Status: j.Status}
+	if j.Seed != nil && *j.Seed != "" {
+		v, ok := parseHex64(*j.Seed)
+		if !ok {
+			return Result{}, fmt.Errorf("invalid seed %q", *j.Seed)
+		}
+		r.Seed = v
+	} else if pass {
+		return Result{}, errors.New("missing seed")
+	}
+	if j.Events != nil {
+		r.Events = *j.Events
+	} else if pass {
+		return Result{}, errors.New("missing events")
+	}
+	if j.TraceHash != nil {
+		v, ok := parseHex64(*j.TraceHash)
+		if !ok {
+			return Result{}, fmt.Errorf("invalid trace_hash %q", *j.TraceHash)
+		}
+		r.Hash = v
+	} else if pass {
+		return Result{}, errors.New("missing trace_hash")
+	}
+	return r, nil
 }
