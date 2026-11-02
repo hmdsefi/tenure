@@ -1,0 +1,5 @@
+package tenure // import "github.com/hmdsefi/tenure"
+
+Package tenure shards single-writer services: each shard of a space has one
+owner at a time, and every ownership carries a term that a downstream fence can
+check.

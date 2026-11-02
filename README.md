@@ -1,4 +1,4 @@
-[![license](https://img.shields.io/badge/license-MPL--2.0-blue)](LICENSE)
+[![license](https://img.shields.io/badge/license-MPL--2.0-blue)](LICENSE) [![coverage](https://img.shields.io/github/issues/detail/title/hmdsefi/tenure/235?label=coverage&color=brightgreen)](https://github.com/hmdsefi/tenure/actions/workflows/build.yml?query=branch%3Amain)
 
 # tenure
 
@@ -71,6 +71,11 @@ published benchmarks back them.
 Besides lockstep, the plan includes running [Temporal](https://github.com/temporalio/temporal) on
 tenure instead of Ringpop: first a fresh cluster, then a live cluster migrated step by step, with
 benchmarks against Ringpop, losses included.
+
+## Contributing
+
+Bug reports, fixes and tests are welcome. The [contributor guide](.github/CONTRIBUTING.md)
+explains how to build and test tenure, the determinism rules of `core`, and the commit conventions.
 
 ## License
 
