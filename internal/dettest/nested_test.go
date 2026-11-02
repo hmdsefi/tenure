@@ -139,6 +139,16 @@ func TestATREP02NestedModuleTable(t *testing.T) {
 			want:  []string{"k8s/go.mod: module github.com/hmdsefi/tenure/kubernetes, want github.com/hmdsefi/tenure/k8s"},
 		},
 		{
+			name:  "replace with an old version",
+			files: k8s("replace github.com/hmdsefi/tenure =>", "replace github.com/hmdsefi/tenure "+placeholder+" =>"),
+			want:  []string{"k8s/go.mod: replace github.com/hmdsefi/tenure " + placeholder + " => .., want .."},
+		},
+		{
+			name:  "replace with a new version",
+			files: k8s("=> ..", "=> example.com/fork v1.0.0"),
+			want:  []string{"k8s/go.mod: replace github.com/hmdsefi/tenure => example.com/fork v1.0.0, want .."},
+		},
+		{
 			name:  "replace of something else",
 			files: map[string]string{"k8s/go.mod": k8sGoMod + "\nreplace example.com/third => ../third\n"},
 			want:  []string{"k8s/go.mod: replace example.com/third: only in-repo requirements are replaced"},
@@ -146,10 +156,10 @@ func TestATREP02NestedModuleTable(t *testing.T) {
 		{
 			name: "every violation in order",
 			files: map[string]string{
-				"k8s/go.mod": "module example.com/k8s\n\ngo 1.25\n\ntoolchain go1.27.1\n\n" +
+				"simtest/go.mod": "module example.com/simtest\n\ngo 1.25\n\ntoolchain go1.27.1\n\n" +
 					"godebug default=go1.21\n\n" +
-					"require (\n\tgithub.com/hmdsefi/tenure/simtest " + placeholder +
-					"\n\tgithub.com/hmdsefi/tenure v0.1.0-rc.1\n\texample.com/third v1.2.3\n)\n\n" +
+					"require (\n\tgithub.com/hmdsefi/tenure v0.1.0-rc.1\n\tgithub.com/hmdsefi/tenure/k8s " + placeholder +
+					"\n\tgithub.com/hmdsefi/tenure/bench " + placeholder + "\n\texample.com/third v1.2.3\n)\n\n" +
 					"exclude example.com/third v1.2.2\n\nretract v0.0.1\n\ntool example.com/third/cmd/x\n\n" +
 					"ignore ./node_modules\n\n" +
 					"replace (\n\texample.com/third => ../third\n\tgithub.com/hmdsefi/tenure => ./root\n)\n",
@@ -157,18 +167,19 @@ func TestATREP02NestedModuleTable(t *testing.T) {
 				"zz/go.mod":       "module example.com/zz\n",
 			},
 			want: []string{
-				"k8s/go.mod: module example.com/k8s, want github.com/hmdsefi/tenure/k8s",
-				"k8s/go.mod: go 1.25, want 1.26.0",
-				"k8s/go.mod: unexpected Toolchain directive",
-				"k8s/go.mod: unexpected Exclude directive",
-				"k8s/go.mod: unexpected Retract directive",
-				"k8s/go.mod: unexpected Tool directive",
-				"k8s/go.mod: unexpected GoDebug directive",
-				"k8s/go.mod: unexpected Ignore directive",
-				"k8s/go.mod: requires github.com/hmdsefi/tenure/simtest, which k8s may not require",
-				strings.Replace(versionLine, "%s", "v0.1.0-rc.1", 1),
-				"k8s/go.mod: replace github.com/hmdsefi/tenure => ./root, want ..",
-				"k8s/go.mod: replace example.com/third: only in-repo requirements are replaced",
+				"simtest/go.mod: module example.com/simtest, want github.com/hmdsefi/tenure/simtest",
+				"simtest/go.mod: go 1.25, want 1.26.0",
+				"simtest/go.mod: unexpected Toolchain directive",
+				"simtest/go.mod: unexpected Exclude directive",
+				"simtest/go.mod: unexpected Retract directive",
+				"simtest/go.mod: unexpected Tool directive",
+				"simtest/go.mod: unexpected GoDebug directive",
+				"simtest/go.mod: unexpected Ignore directive",
+				"simtest/go.mod: requires github.com/hmdsefi/tenure v0.1.0-rc.1; want the placeholder " + placeholder + " or a tag version vX.Y.Z",
+				"simtest/go.mod: replace github.com/hmdsefi/tenure => ./root, want ..",
+				"simtest/go.mod: requires github.com/hmdsefi/tenure/k8s without replace github.com/hmdsefi/tenure/k8s => ../k8s",
+				"simtest/go.mod: requires github.com/hmdsefi/tenure/bench, which simtest may not require",
+				"simtest/go.mod: replace example.com/third: only in-repo requirements are replaced",
 				"testdata/go.mod: go.mod under testdata",
 				"zz/go.mod: zz is not a nested module of the repository layout",
 			},
@@ -203,6 +214,34 @@ func TestATREP03CmdTenure(t *testing.T) {
 			name:  "placeholder",
 			gomod: strings.Replace(cmdTenureGoMod, "tenure v0.3.0", "tenure "+placeholder, 1),
 			want:  []string{"cmd/tenure/go.mod: requires github.com/hmdsefi/tenure at the placeholder version; cmd/tenure requires tags only"},
+		},
+		{
+			name: "placeholder and replace",
+			gomod: strings.Replace(cmdTenureGoMod, "tenure v0.3.0", "tenure "+placeholder, 1) +
+				"\nreplace github.com/hmdsefi/tenure => ../..\n",
+			want: []string{
+				"cmd/tenure/go.mod: replace github.com/hmdsefi/tenure: cmd/tenure has no replace directives, go install rejects them",
+				"cmd/tenure/go.mod: requires github.com/hmdsefi/tenure at the placeholder version; cmd/tenure requires tags only",
+			},
+		},
+		{
+			name: "pseudo-version and placeholder",
+			gomod: strings.NewReplacer("tenure v0.3.0", "tenure v0.0.0-20261101000000-0123456789ab",
+				"k8s v0.3.0", "k8s "+placeholder).Replace(cmdTenureGoMod),
+			want: []string{
+				"cmd/tenure/go.mod: requires github.com/hmdsefi/tenure v0.0.0-20261101000000-0123456789ab; want the placeholder " +
+					placeholder + " or a tag version vX.Y.Z",
+				"cmd/tenure/go.mod: requires github.com/hmdsefi/tenure/k8s at the placeholder version; cmd/tenure requires tags only",
+			},
+		},
+		{
+			name: "replace of a requirement not allowed",
+			gomod: cmdTenureGoMod + "\nrequire github.com/hmdsefi/tenure/simtest v0.3.0\n\n" +
+				"replace github.com/hmdsefi/tenure/simtest => ../../simtest\n",
+			want: []string{
+				"cmd/tenure/go.mod: requires github.com/hmdsefi/tenure/simtest, which cmd/tenure may not require",
+				"cmd/tenure/go.mod: replace github.com/hmdsefi/tenure/simtest: cmd/tenure has no replace directives, go install rejects them",
+			},
 		},
 		{
 			name:  "replace of something else",
@@ -285,7 +324,8 @@ func TestNestedGoModNullKeys(t *testing.T) {
 	"Tool": null,
 	"Ignore": null
 }`
-	got, err := checkNestedGoMod("k8s", []byte(valid))
+	k8sRow := nestedModules[slices.IndexFunc(nestedModules, func(m nestedModule) bool { return m.dir == "k8s" })]
+	got, err := checkNestedGoMod(k8sRow, []byte(valid))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +335,7 @@ func TestNestedGoModNullKeys(t *testing.T) {
 
 	const nulls = `{"Module": {"Path": "github.com/hmdsefi/tenure/k8s"}, "Go": "1.26.0",
 	"Require": null, "Exclude": null, "Replace": null, "Retract": null, "Tool": null, "Ignore": null}`
-	got, err = checkNestedGoMod("k8s", []byte(nulls))
+	got, err = checkNestedGoMod(k8sRow, []byte(nulls))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +345,7 @@ func TestNestedGoModNullKeys(t *testing.T) {
 
 	const set = `{"Module": {"Path": "github.com/hmdsefi/tenure/k8s"}, "Go": "1.26.0",
 	"Ignore": [{"Path": "./x"}], "Exclude": [], "Tool": null}`
-	got, err = checkNestedGoMod("k8s", []byte(set))
+	got, err = checkNestedGoMod(k8sRow, []byte(set))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -375,7 +415,7 @@ var tagVersion = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
 // starts with "." or "_". A directory with a go.mod that is not in REP-030's table gets one line,
 // and neither its go.mod nor its files are checked further.
 func checkNestedModules(root string) ([]string, error) {
-	root, err := filepath.EvalSymlinks(root)
+	root, err := resolveRoot(root)
 	if err != nil {
 		return nil, err
 	}
@@ -419,7 +459,8 @@ func checkNestedModules(root string) ([]string, error) {
 				lines = append(lines, rel+"/go.mod: go.mod under testdata")
 				return nil
 			}
-			if !slices.ContainsFunc(nestedModules, func(m nestedModule) bool { return m.dir == rel }) {
+			i := slices.IndexFunc(nestedModules, func(m nestedModule) bool { return m.dir == rel })
+			if i < 0 {
 				lines = append(lines, fmt.Sprintf("%s/go.mod: %s is not a nested module of the repository layout", rel, rel))
 				stack = append(stack, module{dir: rel})
 				return nil
@@ -428,7 +469,7 @@ func checkNestedModules(root string) ([]string, error) {
 			if err != nil {
 				return err
 			}
-			found, err := checkNestedGoMod(rel, out)
+			found, err := checkNestedGoMod(nestedModules[i], out)
 			if err != nil {
 				return err
 			}
@@ -457,7 +498,7 @@ func checkNestedModules(root string) ([]string, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("nested modules: walk %s: %w", root, err)
 	}
 	return lines, nil
 }
@@ -478,15 +519,11 @@ type goModReplace struct {
 	Old, New struct{ Path, Version string }
 }
 
-// checkNestedGoMod returns one line per way in which the go.mod of the nested module in dir (a
-// row of REP-030, slash-separated and relative to the root) breaks REP-040, in REP-060's order.
-// data is the output of go mod edit -json on it; a key whose value is null counts as absent.
-func checkNestedGoMod(dir string, data []byte) ([]string, error) {
-	i := slices.IndexFunc(nestedModules, func(m nestedModule) bool { return m.dir == dir })
-	if i < 0 {
-		return nil, fmt.Errorf("%s/go.mod: %s is not a nested module of the repository layout", dir, dir)
-	}
-	row := nestedModules[i]
+// checkNestedGoMod returns one line per way in which the go.mod of the nested module of row
+// breaks REP-040, in REP-060's order. data is the output of go mod edit -json on it; a key whose
+// value is null counts as absent.
+func checkNestedGoMod(row nestedModule, data []byte) ([]string, error) {
+	dir := row.dir
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(data, &keys); err != nil {
 		return nil, fmt.Errorf("go mod edit -json %s/go.mod: %w", dir, err)
@@ -523,22 +560,25 @@ func checkNestedGoMod(dir string, data []byte) ([]string, error) {
 			continue
 		}
 		inRepo[req.Path] = true
-		if !slices.Contains(row.requires, reqDir) {
+		allowed := slices.Contains(row.requires, reqDir)
+		if !allowed {
 			add("requires %s, which %s may not require", req.Path, dir)
-			continue
-		}
-		if req.Version != placeholder && !tagVersion.MatchString(req.Version) {
+		} else if req.Version != placeholder && !tagVersion.MatchString(req.Version) {
 			add("requires %s %s; want the placeholder %s or a tag version vX.Y.Z", req.Path, req.Version, placeholder)
 		}
 		if row.tagsOnly {
-			if req.Version == placeholder {
-				add("requires %s at the placeholder version; cmd/tenure requires tags only", req.Path)
-			}
+			// Every replace is reported in cmd/tenure, a not-allowed requirement's too.
 			for _, r := range mf.Replace {
 				if r.Old.Path == req.Path {
 					add("replace %s: cmd/tenure has no replace directives, go install rejects them", r.Old.Path)
 				}
 			}
+			if allowed && req.Version == placeholder {
+				add("requires %s at the placeholder version; cmd/tenure requires tags only", req.Path)
+			}
+			continue
+		}
+		if !allowed {
 			continue
 		}
 		rel, err := filepath.Rel(filepath.FromSlash(dir), filepath.FromSlash(cmp.Or(reqDir, ".")))
