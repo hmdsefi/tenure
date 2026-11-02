@@ -69,6 +69,54 @@ func TestATDET08GoldenFormat(t *testing.T) {
 			t.Errorf("FormatGolden(name %q) panicked: %s", name, msg)
 		}
 	}
+
+	// Two entries with one (Name, Seed) would give a file ParseGolden rejects.
+	dup := []Entry{{"b", 1, 0x1, 1}, {"ask", 3, 0x1, 1}, {"b", 2, 0x2, 2}, {"ask", 3, 0x2, 2}}
+	msg := panicValue(func() { FormatGolden(dup) })
+	if want := "dettest: duplicate golden entry ask 0x0000000000000003"; msg != want {
+		t.Errorf("FormatGolden with a duplicate (Name, Seed) panic = %q, want %q", msg, want)
+	}
+	sameName := []Entry{{"ask", 3, 0x1, 1}, {"ask", 4, 0x1, 1}, {"fanin", 3, 0x1, 1}}
+	if msg := panicValue(func() { FormatGolden(sameName) }); msg != "" {
+		t.Errorf("FormatGolden of distinct (Name, Seed) pairs panicked: %s", msg)
+	}
+
+	// The largest values round-trip in every numeric field.
+	const maxU64 = ^uint64(0)
+	big := []Entry{{Name: "max", Seed: maxU64, Hash: maxU64, Count: maxU64}}
+	data := FormatGolden(big)
+	if want := goldenHeader + "max 0xffffffffffffffff 0xffffffffffffffff 18446744073709551615\n"; string(data) != want {
+		t.Errorf("FormatGolden(MaxUint64 fields) = %q, want %q", data, want)
+	}
+	if got, err := ParseGolden("x.txt", data); err != nil || !slices.Equal(got, big) {
+		t.Errorf("ParseGolden(MaxUint64 fields) = %v, %v; want %v", got, err, big)
+	}
+}
+
+// TestGoldenParseAccepts pins the inputs ParseGolden accepts although FormatGolden never writes
+// them (DET-410 checks line 1 only and skips later # lines).
+func TestGoldenParseAccepts(t *testing.T) {
+	ask := Entry{Name: "ask", Seed: 3, Hash: 0xc, Count: 1}
+	tests := []struct {
+		name, data string
+		want       []Entry
+	}{
+		{"no final newline", goldenHeader + "ask 0x0000000000000003 0x000000000000000c 1", []Entry{ask}},
+		{"header without final newline", "# tenure golden v1", nil},
+		{"no line 2", "# tenure golden v1\nask 0x0000000000000003 0x000000000000000c 1\n", []Entry{ask}},
+		{"other line 2", "# tenure golden v1\n# columns\nask 0x0000000000000003 0x000000000000000c 1\n", []Entry{ask}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseGolden("x.txt", []byte(tt.data))
+			if err != nil {
+				t.Fatalf("ParseGolden: %v", err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("ParseGolden = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
 
 // TestATDET09GoldenParseErrors checks DET-410 (AT-DET-09).

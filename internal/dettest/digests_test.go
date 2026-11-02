@@ -52,23 +52,93 @@ func TestCoreDigests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join("testdata", "core-digests.txt")
-	if *update {
-		if err := os.WriteFile(path, FormatGolden(entries), 0o644); err != nil { //nolint:gosec // the golden file is committed and readable by everyone
-			t.Fatal(err)
-		}
-		return
+	failure, err := checkCoreDigests(entries, filepath.Join("testdata", "core-digests.txt"), *update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failure != "" {
+		t.Error(failure)
+	}
+}
+
+// checkCoreDigests runs DET-440 items 2 and 3 for entries against the golden file at path,
+// whose base name ParseGolden reports. With update it rewrites the file. It returns the
+// failure message (the CompareGolden lines followed by the update hint), or "" when the test
+// passes; err is a read, parse or write error, for t.Fatal.
+func checkCoreDigests(entries []Entry, path string, update bool) (failure string, err error) {
+	if update {
+		return "", os.WriteFile(path, FormatGolden(entries), 0o644) //nolint:gosec // the golden file is committed and readable by everyone
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	want, err := ParseGolden(filepath.Base(path), data)
+	if err != nil {
+		return "", err
+	}
+	if lines := CompareGolden(entries, want); lines != nil {
+		return strings.Join(lines, "\n") + "\n" + coreDigestsHint, nil
+	}
+	return "", nil
+}
+
+// TestCheckCoreDigests checks TestCoreDigests' compare and update paths (DET-440, AT-DET-12).
+func TestCheckCoreDigests(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "core-digests.txt")
+	entries := []Entry{
+		{Name: "keyshard", Hash: 0x1, Count: 60042},
+		{Name: "score", Hash: 0x2, Count: 6180},
+	}
+
+	if failure, err := checkCoreDigests(entries, path, false); err == nil {
+		t.Errorf("checkCoreDigests without a golden file = %q, nil; want a read error", failure)
+	}
+
+	if failure, err := checkCoreDigests(entries, path, true); err != nil || failure != "" {
+		t.Fatalf("checkCoreDigests(update) = %q, %v; want a pass", failure, err)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := ParseGolden("core-digests.txt", data)
-	if err != nil {
+	if want := FormatGolden(entries); string(data) != string(want) {
+		t.Errorf("update wrote\n%s\nwant\n%s", data, want)
+	}
+	if failure, err := checkCoreDigests(entries, path, false); err != nil || failure != "" {
+		t.Errorf("checkCoreDigests after update = %q, %v; want a pass", failure, err)
+	}
+
+	golden := goldenHeader +
+		"keyshard 0x0000000000000000 0x0000000000000001 60036\n" +
+		"machine 0x0000000000000000 0x0000000000000003 7\n" +
+		"score 0x0000000000000000 0x0000000000000002 6180\n"
+	if err := os.WriteFile(path, []byte(golden), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if lines := CompareGolden(entries, want); lines != nil {
-		t.Errorf("%s\n%s", strings.Join(lines, "\n"), coreDigestsHint)
+	failure, err := checkCoreDigests(entries, path, false)
+	if err != nil {
+		t.Fatalf("checkCoreDigests: %v", err)
+	}
+	want := "golden: keyshard seed 0x0000000000000000: got hash 0x0000000000000001 count 60042, want hash 0x0000000000000001 count 60036\n" +
+		"golden: machine seed 0x0000000000000000: in the golden file but not produced\n" +
+		`core digests changed: if intended, run "GOWORK=off go test ./internal/dettest -run TestCoreDigests -update" and add a "Golden-Update: <reason>" line to the commit message`
+	if failure != want {
+		t.Errorf("checkCoreDigests failure =\n%s\nwant\n%s", failure, want)
+	}
+	if failure, _ := checkCoreDigests(entries[:1], path, false); !strings.Contains(failure, "golden: score seed 0x0000000000000000: in the golden file but not produced") {
+		t.Errorf("checkCoreDigests with a case missing from the list = %q, want a not-produced line", failure)
+	}
+	if failure, _ := checkCoreDigests(append(slices.Clone(entries), Entry{Name: "tree", Count: 1}), path, false); !strings.Contains(failure, "golden: tree seed 0x0000000000000000: missing from the golden file") {
+		t.Errorf("checkCoreDigests with a new case = %q, want a missing line", failure)
+	}
+
+	if err := os.WriteFile(path, []byte("# tenure golden v1\nbad\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkCoreDigests(entries, path, false); err == nil || err.Error() != "core-digests.txt:2: malformed entry" {
+		t.Errorf("checkCoreDigests of a malformed file: error %v, want %q", err, "core-digests.txt:2: malformed entry")
 	}
 }
 

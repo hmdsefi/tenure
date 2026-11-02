@@ -139,9 +139,13 @@ func sortedEntries(entries []Entry) []Entry {
 func FormatGolden(entries []Entry) []byte {
 	b := make([]byte, 0, len(goldenMagic)+len(goldenColumns)+2+len(entries)*64)
 	b = append(b, goldenMagic+"\n"+goldenColumns+"\n"...)
-	for _, e := range sortedEntries(entries) {
+	sorted := sortedEntries(entries)
+	for i, e := range sorted {
 		if !validGoldenName(e.Name) {
 			panic(fmt.Sprintf("dettest: invalid golden name %q", e.Name))
+		}
+		if i > 0 && compareEntries(sorted[i-1], e) == 0 {
+			panic(fmt.Sprintf("dettest: duplicate golden entry %s 0x%016x", e.Name, e.Seed))
 		}
 		b = fmt.Appendf(b, "%s 0x%016x 0x%016x %d\n", e.Name, e.Seed, e.Hash, e.Count)
 	}
