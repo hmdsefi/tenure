@@ -5,6 +5,8 @@ package dettest
 
 import (
 	"cmp"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -226,4 +228,80 @@ func (d *Digest) Add(line string) {
 // Entry returns the golden entry of the digest under name, with Seed 0.
 func (d *Digest) Entry(name string) Entry {
 	return Entry{Name: name, Seed: 0, Hash: d.sum(), Count: d.count}
+}
+
+// Result is one line of a faultline results file, reduced to what golden tests read.
+type Result struct {
+	Test   string
+	Seed   uint64
+	Status string // "pass", "fail" or "skip"
+	Events uint64
+	Hash   uint64
+}
+
+// resultJSON holds the fields of a results line that ParseResults reads. A nil pointer is a
+// field the line lacks; faultline omits events and trace_hash on lines without a run.
+type resultJSON struct {
+	Version   *int    `json:"faultline_result"`
+	Test      string  `json:"test"`
+	Seed      *string `json:"seed"`
+	Status    string  `json:"status"`
+	Events    *uint64 `json:"events"`
+	TraceHash *string `json:"trace_hash"`
+}
+
+// ParseResults parses a faultline results file (the file FAULTLINE_RESULTS names).
+func ParseResults(data []byte) ([]Result, error) {
+	var results []Result
+	for i, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		r, err := parseResult(line)
+		if err != nil {
+			return nil, fmt.Errorf("dettest: results line %d: %w", i+1, err)
+		}
+		results = append(results, r)
+	}
+	return results, nil
+}
+
+// parseResult parses one non-empty results line (DET-530). Its errors lack the line prefix.
+func parseResult(line string) (Result, error) {
+	var j resultJSON
+	if err := json.Unmarshal([]byte(line), &j); err != nil {
+		return Result{}, err
+	}
+	switch {
+	case j.Version == nil:
+		return Result{}, errors.New("missing faultline_result")
+	case *j.Version != 1:
+		return Result{}, fmt.Errorf("faultline_result %d, want 1", *j.Version)
+	}
+	pass := j.Status == "pass"
+	r := Result{Test: j.Test, Status: j.Status}
+	if j.Seed != nil && *j.Seed != "" {
+		v, ok := parseHex64(*j.Seed)
+		if !ok {
+			return Result{}, fmt.Errorf("invalid seed %q", *j.Seed)
+		}
+		r.Seed = v
+	} else if pass {
+		return Result{}, errors.New("missing seed")
+	}
+	if j.Events != nil {
+		r.Events = *j.Events
+	} else if pass {
+		return Result{}, errors.New("missing events")
+	}
+	if j.TraceHash != nil {
+		v, ok := parseHex64(*j.TraceHash)
+		if !ok {
+			return Result{}, fmt.Errorf("invalid trace_hash %q", *j.TraceHash)
+		}
+		r.Hash = v
+	} else if pass {
+		return Result{}, errors.New("missing trace_hash")
+	}
+	return r, nil
 }
