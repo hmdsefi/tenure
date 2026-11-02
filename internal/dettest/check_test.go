@@ -61,8 +61,22 @@ func TestCoreImports(t *testing.T) {
 	}
 }
 
-// wantComment matches a fixture expectation "// want DT001 [DT005 …]" (DET-320).
-var wantComment = regexp.MustCompile(`^// want((?:[ \t]+DT[0-9]{3})+)[ \t]*$`)
+// TestCoreDeterminism checks every core package against the rules other than the import
+// allow-list (DET-310).
+func TestCoreDeterminism(t *testing.T) {
+	fs, err := Check(repoRoot(t), tenureModule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fs = keepRule(fs, RuleImport, false); len(fs) > 0 {
+		t.Errorf("core determinism rules: %d finding(s):\n%s", len(fs), findingLines(fs))
+	}
+}
+
+// wantComment matches a fixture expectation "// want DT001 [DT005 …]" (DET-320), or the same
+// text as a block comment "/* want DT000 */", which a line holding a directive needs: a directive
+// is a line comment that runs to the end of its line.
+var wantComment = regexp.MustCompile(`^(?:// want((?:[ \t]+DT[0-9]{3})+)[ \t]*|/\* want((?:[ \t]+DT[0-9]{3})+)[ \t]*\*/)$`)
 
 // fixtureWants returns the sorted "<file>:<line> <rule>" expectations of the .go files in dir.
 func fixtureWants(t *testing.T, dir string) []string {
@@ -88,7 +102,7 @@ func fixtureWants(t *testing.T, dir string) []string {
 					continue
 				}
 				line := fset.Position(c.Pos()).Line
-				for _, r := range strings.Fields(m[1]) {
+				for _, r := range strings.Fields(m[1] + m[2]) {
 					wants = append(wants, fmt.Sprintf("%s:%d %s", e.Name(), line, r))
 				}
 			}
@@ -435,5 +449,318 @@ func TestSortFindings(t *testing.T) {
 	sortFindings(got)
 	if !slices.Equal(got, want) {
 		t.Errorf("sortFindings:\n%s\nwant:\n%s", findingLines(got), findingLines(want))
+	}
+}
+
+// fixtureFindings returns the findings of CheckDir on the fixture testdata/src/<name>.
+func fixtureFindings(t *testing.T, name string) []Finding {
+	t.Helper()
+	fs, err := CheckDir(filepath.Join("testdata", "src", name), "fixture/"+name, fixtureCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fs
+}
+
+// TestATDET02Messages checks the exact text of the clock findings of fixture dt003 and of the
+// directive findings of fixture directives (AT-DET-02).
+func TestATDET02Messages(t *testing.T) {
+	const clockTail = " is not allowed in core: core reads no clock and uses time only for Time and Duration values and their arithmetic"
+	dt003 := strings.Split(findingLines(fixtureFindings(t, "dt003")), "\n")
+	for _, want := range []string{
+		"a.go:9:11: DT003: time.Now" + clockTail,
+		"a.go:14:8: DT003: time.Time.Year" + clockTail,
+		"a.go:22:11: DT003: time.Unix" + clockTail, // the function; the method t.Unix() on line 23 is allowed
+	} {
+		if !slices.Contains(dt003, want) {
+			t.Errorf("dt003: no finding %q in:\n%s", want, strings.Join(dt003, "\n"))
+		}
+	}
+	for _, line := range dt003 {
+		if strings.HasPrefix(line, "a.go:23:") {
+			t.Errorf("dt003: t.Unix() is allowed, got %s", line)
+		}
+	}
+
+	meta := keepRule(fixtureFindings(t, "directives"), RuleMeta, true)
+	want := []string{
+		"a.go:16:19: DT000: //tenure:maporder needs a reason",
+		"a.go:19:28: DT000: unknown directive //tenure:sortorder",
+		"a.go:22:19: DT000: //tenure:maporder suppresses no finding",
+		"a.go:25:19: DT000: //tenure:totalorder suppresses no finding",
+	}
+	if got := strings.Split(findingLines(meta), "\n"); !slices.Equal(got, want) {
+		t.Errorf("directives: DT000 findings:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
+// TestRuleTypes checks the type-dependent cases of DT003 and DT005 that the fixtures do not
+// show: methods promoted from an embedded time.Time, fields of time's struct types, methods of
+// Duration, ranges over named map types and over type parameters whose core type is a map.
+func TestRuleTypes(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"a.go": `package p
+
+import "time"
+
+type stamp struct{ time.Time }
+
+type set map[string]bool
+
+func f[M ~map[string]int, S ~[]int](s stamp, e *time.ParseError, d time.Duration, m M, xs S, k set) {
+	_ = s.Format("")
+	_ = s.UnixMilli()
+	_ = e.Layout
+	_ = d.Hours()
+	for range m {
+	}
+	for range xs {
+	}
+	for range k {
+	}
+}
+`})
+	fs, err := CheckDir(dir, "example.com/p", fixtureCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clockTail = " is not allowed in core: core reads no clock and uses time only for Time and Duration values and their arithmetic"
+	const rangeTail = ": iteration order is random; range over sorted keys or annotate //tenure:maporder <reason>"
+	want := []string{
+		"a.go:9:54: DT003: time.ParseError" + clockTail,
+		"a.go:10:8: DT003: time.Time.Format" + clockTail,
+		"a.go:12:8: DT003: time.ParseError.Layout" + clockTail,
+		"a.go:13:8: DT003: time.Duration.Hours" + clockTail,
+		"a.go:14:2: DT005: range over map M" + rangeTail,
+		"a.go:18:2: DT005: range over map p.set" + rangeTail,
+	}
+	if got := strings.Split(findingLines(fs), "\n"); !slices.Equal(got, want) {
+		t.Errorf("findings:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
+// TestRuleMessages checks the exact text and position of the DT002, DT004 and DT008 findings of
+// their fixtures (DET-110, DET-130, DET-170).
+func TestRuleMessages(t *testing.T) {
+	const ioTail = " is not allowed in core: core performs no I/O; return values and errors instead"
+	const sortTail = " is not stable: elements that compare equal may come out in any order, and the order can change " +
+		"between Go releases; make the comparison a total order and annotate //tenure:totalorder <reason>, or use a stable sort"
+	for _, tc := range []struct {
+		name string
+		want []string
+	}{
+		{"dt002", []string{
+			"a.go:8:11: DT002: channel type: core uses no channels",
+			"a.go:9:2: DT002: go statement: core starts no goroutines",
+			"a.go:10:2: DT002: channel send: core uses no channels",
+			"a.go:11:6: DT002: channel receive: core uses no channels",
+			"a.go:15:2: DT002: select statement: core uses no channels",
+		}},
+		{"dt004", []string{
+			"a.go:11:6: DT004: fmt.Println" + ioTail,
+			"a.go:12:6: DT004: fmt.Fprint" + ioTail,
+			"a.go:15:2: DT004: println" + ioTail,
+			"a.go:16:2: DT004: print" + ioTail,
+		}},
+		{"dt008", []string{
+			"a.go:22:7: DT008: sort.Slice" + sortTail,
+			"a.go:23:7: DT008: sort.Sort" + sortTail,
+			"a.go:24:9: DT008: slices.SortFunc" + sortTail,
+			"a.go:28:7: DT008: sort.Float64s" + sortTail,
+			"a.go:29:24: DT008: sort.Float64Slice.Sort" + sortTail,
+			"a.go:30:9: DT008: slices.Sort" + sortTail,
+			"a.go:31:13: DT008: slices.Sorted" + sortTail,
+			"a.go:32:16: DT008: slices.BinarySearch" + sortTail,
+		}},
+	} {
+		if got := strings.Split(findingLines(fixtureFindings(t, tc.name)), "\n"); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: findings:\n  %s\nwant:\n  %s", tc.name, strings.Join(got, "\n  "), strings.Join(tc.want, "\n  "))
+		}
+	}
+}
+
+// indirectSource is a package that reaches forbidden names in the ways the type information
+// resolves: method expressions and values, a renamed import, an explicit instantiation in a
+// variable, ranges over a call result and an alias of a map type, conversions of a time.Time to
+// interfaces at each kind of site, type arguments, directives on a node's end line and after a
+// //line comment, and a float type parameter sorted. It also holds the allowed cases: Durations
+// and structs with a Time field as interfaces, Times passed and returned as time.Time, fmt
+// arguments (DET-150 walks them), any-constrained slices functions and an allowed constraint.
+// b.go adds a dot import; c.go uses errors.Is.
+const indirectSource = `package p
+
+import (
+	"fmt"
+	"slices"
+	"time"
+	tm "time"
+)
+
+type yearer interface{ Year() int }
+
+type box struct{ v any }
+
+type am = map[string]int
+
+func mk() map[string]int { return nil }
+
+func takes(any) {}
+
+func va(int, ...any) {}
+
+func ret(t time.Time) any { return t }
+
+func send(ch chan any, t time.Time) { ch <- t }
+
+func eqer[X interface{ Equal(time.Time) bool }](X) {}
+
+func f(t time.Time, d time.Duration, ts []time.Time, xs []any, m map[string]int, a am) {
+	_ = time.Time.Year
+	_ = t.Location
+	_ = tm.Now()
+	sf := slices.SortFunc[[]int, int]
+	_ = sf
+	for range mk() {
+	}
+	for range a {
+	}
+	_ = fmt.Stringer(t).String()
+	_ = slices.Contains(ts, t)
+	var y yearer
+	y = t
+	_ = y
+	takes(t)
+	va(1, t)
+	va(1, xs...)
+	_ = []any{t}
+	_ = map[any]any{t: t}
+	_ = box{v: t}
+	_ = box{t}
+	var _ fmt.Stringer = d
+	_ = any(d)
+	_ = fmt.Sprint(d)
+	eqer(t)
+	for range m {
+	} //tenure:maporder applies to this line
+	for range m {
+	}
+//line other.go:100
+	for range m { //tenure:maporder order unused
+	}
+	_ = tm.Since(t)
+	var yv yearer
+	for _, yv = range ts {
+	}
+	_ = yv
+	ma := map[any]int{}
+	_ = ma[t]
+	var x any
+	switch x {
+	case t:
+	}
+	_ = eq(t, t)
+	st := stamp{}
+	_ = fmt.Sprint(any(st))
+	_ = fmt.Sprintf("%v", yearer(st))
+	slices.SortStableFunc(ts, func(a, b time.Time) int { return a.Compare(b) })
+	_ = slices.Clone(ts)
+	keep(t)
+	_ = retT(t)
+	r := rec{At: t}
+	r.At = t
+	var _ any = r
+	var _ any = d
+	var _ Set[time.Time]
+	var _ Eqs[time.Time]
+	_ = [1]any{t}
+	var v any
+	v, _ = tuple()
+	tmap := map[string]time.Time{}
+	v, _ = tmap["k"]
+	_ = v
+}
+
+type stamp struct{ time.Time }
+
+type rec struct{ At time.Time }
+
+type Set[T any] struct{}
+
+type Eqs[T interface{ Equal(time.Time) bool }] struct{}
+
+func keep(time.Time) {}
+
+func retT(t time.Time) time.Time { return t }
+
+func tuple() (time.Time, error) { return time.Time{}, nil }
+
+func eq[T interface {
+	comparable
+	Equal(time.Time) bool
+}](a, b T) bool {
+	return a == b
+}
+
+func fsort[F ~float64](xs []F) { slices.Sort(xs) }
+`
+
+// TestRuleBypasses checks that renamed and dot imports, method values and expressions,
+// instantiations, aliases, conversions to interfaces and //line comments do not hide findings,
+// and that a directive on the line where a node ends applies to that line (DET-120, DET-130,
+// DET-140, DET-170, DET-200).
+func TestRuleBypasses(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"a.go": indirectSource,
+		"b.go": "package p\n\nimport . \"fmt\"\n\nfunc g() { Println() }\n",
+		"c.go": "package p\n\nimport \"errors\"\n\nvar errX = errors.New(\"x\")\n\nfunc h(err error) bool { return errors.Is(err, errX) }\n",
+	})
+	fs, err := CheckDir(dir, "example.com/p", fixtureCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clockTail = " is not allowed in core: core reads no clock and uses time only for Time and Duration values and their arithmetic"
+	const convTail = " can reach time methods that read the zone or the clock; pass t.UnixMilli() or a Duration"
+	const rangeTail = ": iteration order is random; range over sorted keys or annotate //tenure:maporder <reason>"
+	const sortTail = " is not stable: elements that compare equal may come out in any order, and the order can change " +
+		"between Go releases; make the comparison a total order and annotate //tenure:totalorder <reason>, or use a stable sort"
+	want := []string{
+		"a.go:22:36: DT003: time.Time used as any" + convTail,
+		"a.go:24:14: DT002: channel type: core uses no channels",
+		"a.go:24:39: DT002: channel send: core uses no channels",
+		"a.go:24:45: DT003: time.Time used as any" + convTail,
+		"a.go:29:16: DT003: time.Time.Year" + clockTail,
+		"a.go:30:8: DT003: time.Time.Location" + clockTail,
+		"a.go:31:9: DT003: time.Now" + clockTail,
+		"a.go:32:15: DT008: slices.SortFunc" + sortTail,
+		"a.go:34:2: DT005: range over map map[string]int" + rangeTail,
+		"a.go:36:2: DT005: range over map p.am" + rangeTail,
+		"a.go:38:19: DT003: time.Time used as fmt.Stringer" + convTail,
+		"a.go:39:13: DT003: time.Time used as comparable" + convTail,
+		"a.go:41:6: DT003: time.Time used as p.yearer" + convTail,
+		"a.go:43:8: DT003: time.Time used as any" + convTail,
+		"a.go:44:8: DT003: time.Time used as any" + convTail,
+		"a.go:46:12: DT003: time.Time used as any" + convTail,
+		"a.go:47:18: DT003: time.Time used as any" + convTail,
+		"a.go:47:21: DT003: time.Time used as any" + convTail,
+		"a.go:48:13: DT003: time.Time used as any" + convTail,
+		"a.go:49:10: DT003: time.Time used as any" + convTail,
+		"a.go:54:2: DT005: range over map map[string]int" + rangeTail,
+		"a.go:55:4: DT000: //tenure:maporder suppresses no finding",
+		"a.go:56:2: DT005: range over map map[string]int" + rangeTail,
+		"a.go:61:9: DT003: time.Since" + clockTail,
+		"a.go:63:9: DT003: time.Time used as p.yearer" + convTail,
+		"a.go:67:9: DT003: time.Time used as any" + convTail,
+		"a.go:70:7: DT003: time.Time used as any" + convTail,
+		"a.go:72:6: DT003: time.Time used as interface{Equal(time.Time) bool; comparable}" + convTail,
+		"a.go:84:8: DT003: time.Time used as any" + convTail,
+		"a.go:86:13: DT003: time.Time used as any" + convTail,
+		"a.go:88:9: DT003: time.Time used as any" + convTail,
+		"a.go:90:9: DT003: time.Time used as any" + convTail,
+		"a.go:115:41: DT008: slices.Sort" + sortTail,
+		"b.go:5:12: DT004: fmt.Println is not allowed in core: core performs no I/O; return values and errors instead",
+	}
+	if got := strings.Split(findingLines(fs), "\n"); !slices.Equal(got, want) {
+		t.Errorf("findings:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
 	}
 }
