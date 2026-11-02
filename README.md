@@ -2,6 +2,13 @@
 
 # tenure
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/readme-dark.svg">
+    <img alt="tenure: shard stateful Go services. The Go gopher slides the last shard into a space of six." src=".github/assets/readme-light.svg" width="640">
+  </picture>
+</p>
+
 **Shard stateful Go services: every shard has one owner at a time, and a stale owner's writes can be
 rejected.**
 
@@ -80,3 +87,7 @@ explains how to build and test tenure, the determinism rules of `core`, and the 
 ## License
 
 [MPL-2.0](LICENSE).
+
+The Go gopher was designed by Renée French. The gopher in the banner is line art made from Takuya
+Ueda's [gopher vector](https://github.com/golang-samples/gopher-vector), licensed under
+[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
