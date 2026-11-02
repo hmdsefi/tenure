@@ -7,8 +7,7 @@ the [Mozilla Public License 2.0](../LICENSE), the same license as the project.
 ## Development setup
 
 You need Go 1.26 or newer and, for linting, [golangci-lint](https://golangci-lint.run/) v2.14.
-Run these commands from the repository root before every commit; CI runs the same checks on Linux
-and macOS with Go 1.26 and the newest stable Go.
+Run these commands from the repository root before every commit:
 
 ```shell
 gofmt -l $(git ls-files '*.go')                       # prints nothing
@@ -19,6 +18,14 @@ GOWORK=off go mod tidy -diff                          # prints nothing
 golangci-lint run ./...
 go test -count=1 ./internal/dettest/... ./core/...    # go.mod, imports, headers, determinism, golden digests
 ```
+
+CI runs the same checks on every pull request, on Linux unless stated otherwise:
+
+- golangci-lint with Go 1.26.0;
+- `gofmt`, `go mod tidy -diff`, `go vet` and `go build` with the newest stable Go;
+- `go test -race ./...` with Go 1.26 and with the newest stable Go;
+- the tests of `internal/dettest` and `core` on Linux and macOS with Go 1.26 and the newest stable
+  Go, and the `core` tests and `TestCoreDigests` once more as 32-bit Linux (`GOARCH=386`).
 
 The root module, `github.com/hmdsefi/tenure`, depends only on the standard library: its `go.mod`
 has no `require` line and the repository has no root `go.sum`. Code that needs another dependency
@@ -47,12 +54,13 @@ GOWORK=off go -C <dir> test -race ./...               # simtest: add -short (ful
 Each nested module requires the root module, and any other module of this repository it uses,
 through a `replace` directive that points at that module's directory in your checkout. That is
 why `GOWORK=off` works: a nested module builds against your local changes without a `go.work`
-file. A local `go.work` is only useful to work against a faultline or lockstep checkout next to
-this one; never commit it.
+file. A local `go.work` is useful to work against a faultline or lockstep checkout next to this
+one; it is gitignored, so it is never committed.
 
 `cmd/tenure` is the exception: `go install` rejects a module with `replace` directives, so it
-has none. Run its `vet`, `test` and lint commands in a workspace instead, for example in a scratch
-copy of the repository after `go work init && go work use -r .`.
+has none. Run its `vet`, `test` and lint commands in a workspace instead of with `GOWORK=off`:
+either a local `go.work` that uses every module of the checkout, or a scratch copy of the
+repository after `go work init && go work use -r .`.
 
 ## Tests against real servers
 
@@ -67,28 +75,38 @@ finds its server through one environment variable and skips when the variable is
 | `TENURE_TEST_EXTERNAL` | `1` makes a missing server variable fail the test instead of skipping it; empty or `0` skips | every test that needs a server |
 
 CI sets `TENURE_TEST_EXTERNAL=1`, so a misspelled variable fails the job instead of skipping the
-tests. These commands start the same servers CI starts.
+tests. These commands start the same servers CI starts, wait until each one is ready, run the
+tests and remove the server.
 
 Kubernetes, on a [kind](https://kind.sigs.k8s.io/) v0.33.0 cluster:
 
 ```shell
-kind create cluster --name tenure --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5 --kubeconfig "$PWD/kubeconfig"
-TENURE_TEST_EXTERNAL=1 TENURE_TEST_KUBECONFIG="$PWD/kubeconfig" GOWORK=off go -C k8s test -race -count=1 ./...
-kind delete cluster --name tenure
+kind create cluster --name tenure --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5 --kubeconfig "$HOME/.kube/tenure-kind"
+TENURE_TEST_EXTERNAL=1 TENURE_TEST_KUBECONFIG="$HOME/.kube/tenure-kind" GOWORK=off go -C k8s test -race -count=1 ./...
+kind delete cluster --name tenure --kubeconfig "$HOME/.kube/tenure-kind"
 ```
+
+The kubeconfig stays outside the checkout, so it cannot be committed by mistake.
 
 PostgreSQL, in a container (CI tests versions 14.24 and 18.6):
 
 ```shell
 docker run -d --name postgres -p 5432:5432 -e POSTGRES_PASSWORD=tenure -e POSTGRES_DB=tenure postgres:18.6
+until docker exec postgres pg_isready -h 127.0.0.1 -U postgres -d tenure; do sleep 1; done
 TENURE_TEST_EXTERNAL=1 TENURE_TEST_POSTGRES='postgres://postgres:tenure@127.0.0.1:5432/tenure?sslmode=disable' GOWORK=off go -C postgres test -race -count=1 ./...
+docker rm -f postgres
 ```
+
+`pg_isready -h 127.0.0.1` succeeds only after the image's first-start initialization, because the
+temporary server it runs meanwhile listens on a Unix socket only.
 
 etcd, in a container (CI tests versions v3.5.35 and v3.6.16):
 
 ```shell
 docker run -d --name etcd -p 2379:2379 quay.io/coreos/etcd:v3.6.16 /usr/local/bin/etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://127.0.0.1:2379
+until curl -fsS http://127.0.0.1:2379/health; do sleep 1; done
 TENURE_TEST_EXTERNAL=1 TENURE_TEST_ETCD=http://127.0.0.1:2379 GOWORK=off go -C etcd test -race -count=1 ./...
+docker rm -f etcd
 ```
 
 ## Determinism rules for core
@@ -113,8 +131,8 @@ failing check prints:
 - [DT008] No `sort.Sort`, `sort.Slice` or `slices.SortFunc` unless the comparison is a total
   order; otherwise use a stable sort, `slices.Sort`, `sort.Ints` or `sort.Strings`.
 - [DT009] No writes to package-level variables after their declarations.
-- [DT010] No build constraints, no file names that only some platforms compile, and no
-  non-Go files.
+- [DT010] No build constraints, no file names that only some platforms compile, and no assembly, C
+  or other non-Go source files.
 
 Two rules can be suppressed on one line, with a comment that says why the line is safe. The
 comment goes at the end of the line or alone on the line above it:
