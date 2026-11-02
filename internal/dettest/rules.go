@@ -186,14 +186,15 @@ func (r *pkgRun) hostRules(host []*ast.File, info *types.Info) {
 // (DET-170).
 func (r *pkgRun) nodes(f *ast.File, info *types.Info) {
 	add := r.addAt
-	var stack []ast.Node // n and the nodes that enclose it
+	var stack []ast.Node           // n and the nodes that enclose it
+	fmtArgs := map[ast.Expr]bool{} // arguments of the fmt calls DET-150 walks
 	ast.Inspect(f, func(n ast.Node) bool {
 		if n == nil {
 			stack = stack[:len(stack)-1]
 			return true
 		}
 		stack = append(stack, n)
-		r.conversions(n, stack, info)
+		r.conversions(n, stack, fmtArgs, info)
 		switch n := n.(type) {
 		case *ast.GoStmt:
 			add(n.Pos(), RuleConcurrency, "go statement: core starts no goroutines")
@@ -301,18 +302,48 @@ func (r *pkgRun) instance(id *ast.Ident, inst types.Instance, obj types.Object) 
 		if tparams != nil && i < tparams.Len() {
 			constraint = tparams.At(i).Constraint()
 		}
-		if !allowedVia(arg, constraint) {
+		if stdContainer(obj) && types.Identical(constraint, types.Universe.Lookup("any").Type()) {
+			continue // slices and maps never convert an any-constrained element to an interface
+		}
+		if u, ok := constraint.Underlying().(*types.Interface); ok && u.IsComparable() || !allowedVia(arg, constraint) {
 			r.addAt(id.Pos(), RuleClock, conversionMsg(arg, constraint))
 		}
 	}
 }
 
-// floatArg reports whether one of the type arguments args has float32 or float64 as its
-// underlying type.
+// stdContainer reports whether obj is a generic function of package slices or maps.
+func stdContainer(obj types.Object) bool {
+	fn, ok := obj.(*types.Func)
+	return ok && fn.Pkg() != nil && (fn.Pkg().Path() == "slices" || fn.Pkg().Path() == "maps")
+}
+
+// floatArg reports whether one of the type arguments args is a floating-point type (floatTerm).
 func floatArg(args *types.TypeList) bool {
 	for i := range args.Len() {
-		if b, ok := args.At(i).Underlying().(*types.Basic); ok && (b.Kind() == types.Float32 || b.Kind() == types.Float64) {
+		if floatTerm(args.At(i)) {
 			return true
+		}
+	}
+	return false
+}
+
+// floatTerm reports whether t has float32 or float64 as its underlying type or, for a type
+// parameter, whether a term of its type set has (DET-170).
+func floatTerm(t types.Type) bool {
+	switch u := t.Underlying().(type) {
+	case *types.Basic:
+		return u.Kind() == types.Float32 || u.Kind() == types.Float64
+	case *types.Interface:
+		for i := range u.NumEmbeddeds() {
+			if floatTerm(u.EmbeddedType(i)) {
+				return true
+			}
+		}
+	case *types.Union:
+		for i := range u.Len() {
+			if floatTerm(u.Term(i).Type()) {
+				return true
+			}
 		}
 	}
 	return false
@@ -320,17 +351,21 @@ func floatArg(args *types.TypeList) bool {
 
 // conversions reports DT003 for the conversions of values with forbidden time methods to
 // interface types that the node n makes, explicitly or implicitly; stack holds n and the nodes
-// that enclose it (DET-120).
-func (r *pkgRun) conversions(n ast.Node, stack []ast.Node, info *types.Info) {
+// that enclose it, and fmtArgs the arguments of the fmt calls seen so far whose operands DET-150
+// walks (DET-120).
+func (r *pkgRun) conversions(n ast.Node, stack []ast.Node, fmtArgs map[ast.Expr]bool, info *types.Info) {
 	switch n := n.(type) {
 	case *ast.CallExpr:
 		if tv, ok := info.Types[n.Fun]; ok && tv.IsType() {
-			if len(n.Args) == 1 {
+			if len(n.Args) == 1 && !fmtArgs[n] {
 				r.convert(n.Args[0], info.TypeOf(n.Args[0]), info.TypeOf(n))
 			}
 			return
 		}
 		if fmtWalkedCall(n, info) {
+			for _, arg := range n.Args {
+				fmtArgs[ast.Unparen(arg)] = true
+			}
 			return
 		}
 		sig, ok := typeOf(info, n.Fun).Underlying().(*types.Signature)
@@ -378,7 +413,71 @@ func (r *pkgRun) conversions(n ast.Node, stack []ast.Node, info *types.Info) {
 		if ch, ok := typeOf(info, n.Chan).Underlying().(*types.Chan); ok {
 			r.convert(n.Value, info.TypeOf(n.Value), ch.Elem())
 		}
+	case *ast.RangeStmt:
+		if n.Tok == token.ASSIGN {
+			key, val := rangeTypes(typeOf(info, n.X))
+			if n.Key != nil {
+				r.convert(n.Key, key, info.TypeOf(n.Key))
+			}
+			if n.Value != nil {
+				r.convert(n.Value, val, info.TypeOf(n.Value))
+			}
+		}
+	case *ast.IndexExpr:
+		if m, ok := coreType(typeOf(info, n.X)).(*types.Map); ok {
+			r.convert(n.Index, info.TypeOf(n.Index), m.Key())
+		}
+	case *ast.SwitchStmt:
+		if n.Tag == nil {
+			return
+		}
+		tag := info.TypeOf(n.Tag)
+		for _, stmt := range n.Body.List {
+			if clause, ok := stmt.(*ast.CaseClause); ok {
+				for _, e := range clause.List {
+					r.convert(e, info.TypeOf(e), tag)
+				}
+			}
+		}
 	}
+}
+
+// rangeTypes returns the types of the iteration values a range over a value of type t gives, nil
+// for one that it does not give.
+func rangeTypes(t types.Type) (key, val types.Type) {
+	switch u := coreType(t).(type) {
+	case *types.Basic:
+		if u.Info()&types.IsString != 0 {
+			return types.Typ[types.Int], types.Universe.Lookup("rune").Type()
+		}
+		return t, nil
+	case *types.Array:
+		return types.Typ[types.Int], u.Elem()
+	case *types.Pointer:
+		if a, ok := u.Elem().Underlying().(*types.Array); ok {
+			return types.Typ[types.Int], a.Elem()
+		}
+	case *types.Slice:
+		return types.Typ[types.Int], u.Elem()
+	case *types.Map:
+		return u.Key(), u.Elem()
+	case *types.Chan:
+		return u.Elem(), nil
+	case *types.Signature: // range over func(yield func(K, V) bool)
+		if u.Params().Len() == 1 {
+			if yield, ok := u.Params().At(0).Type().Underlying().(*types.Signature); ok {
+				ps := yield.Params()
+				if ps.Len() > 0 {
+					key = ps.At(0).Type()
+				}
+				if ps.Len() > 1 {
+					val = ps.At(1).Type()
+				}
+				return key, val
+			}
+		}
+	}
+	return nil, nil
 }
 
 // compositeConversions reports the conversions of the elements, keys and values of the composite
@@ -520,7 +619,7 @@ func isInterface(t types.Type) bool {
 }
 
 // forbiddenTime reports whether t has forbidden time methods: the method set of t or of *t holds
-// a method of package time that DET-120 does not allow. Interfaces and type parameters have none.
+// a method of time.Time that DET-120 does not allow. Interfaces and type parameters have none.
 func forbiddenTime(t types.Type) bool {
 	if types.IsInterface(t) {
 		return false
@@ -555,10 +654,11 @@ func allowedVia(t, iface types.Type) bool {
 	return true
 }
 
-// forbiddenTimeMethod reports whether fn is a method of package time that DET-120 does not allow.
+// forbiddenTimeMethod reports whether fn is a method of time.Time that DET-120 does not allow.
+// The other methods of Duration read no zone or clock, so they do not count.
 func forbiddenTimeMethod(fn *types.Func) bool {
 	return fn.Pkg() != nil && fn.Pkg().Path() == "time" && fn.Signature().Recv() != nil &&
-		!slices.Contains(clockMethods, recvName(fn)+"."+fn.Name())
+		recvName(fn) == "Time" && !slices.Contains(clockMethods, "Time."+fn.Name())
 }
 
 // recvName returns the name of the type that declares the method fn.

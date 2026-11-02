@@ -583,7 +583,10 @@ func TestRuleMessages(t *testing.T) {
 // resolves: method expressions and values, a renamed import, an explicit instantiation in a
 // variable, ranges over a call result and an alias of a map type, conversions of a time.Time to
 // interfaces at each kind of site, type arguments, directives on a node's end line and after a
-// //line comment. b.go adds a dot import.
+// //line comment, and a float type parameter sorted. It also holds the allowed cases: Durations
+// and structs with a Time field as interfaces, Times passed and returned as time.Time, fmt
+// arguments (DET-150 walks them), any-constrained slices functions and an allowed constraint.
+// b.go adds a dot import; c.go uses errors.Is.
 const indirectSource = `package p
 
 import (
@@ -645,7 +648,60 @@ func f(t time.Time, d time.Duration, ts []time.Time, xs []any, m map[string]int,
 	for range m { //tenure:maporder order unused
 	}
 	_ = tm.Since(t)
+	var yv yearer
+	for _, yv = range ts {
+	}
+	_ = yv
+	ma := map[any]int{}
+	_ = ma[t]
+	var x any
+	switch x {
+	case t:
+	}
+	_ = eq(t, t)
+	st := stamp{}
+	_ = fmt.Sprint(any(st))
+	_ = fmt.Sprintf("%v", yearer(st))
+	slices.SortStableFunc(ts, func(a, b time.Time) int { return a.Compare(b) })
+	_ = slices.Clone(ts)
+	keep(t)
+	_ = retT(t)
+	r := rec{At: t}
+	r.At = t
+	var _ any = r
+	var _ any = d
+	var _ Set[time.Time]
+	var _ Eqs[time.Time]
+	_ = [1]any{t}
+	var v any
+	v, _ = tuple()
+	tmap := map[string]time.Time{}
+	v, _ = tmap["k"]
+	_ = v
 }
+
+type stamp struct{ time.Time }
+
+type rec struct{ At time.Time }
+
+type Set[T any] struct{}
+
+type Eqs[T interface{ Equal(time.Time) bool }] struct{}
+
+func keep(time.Time) {}
+
+func retT(t time.Time) time.Time { return t }
+
+func tuple() (time.Time, error) { return time.Time{}, nil }
+
+func eq[T interface {
+	comparable
+	Equal(time.Time) bool
+}](a, b T) bool {
+	return a == b
+}
+
+func fsort[F ~float64](xs []F) { slices.Sort(xs) }
 `
 
 // TestRuleBypasses checks that renamed and dot imports, method values and expressions,
@@ -657,6 +713,7 @@ func TestRuleBypasses(t *testing.T) {
 	writeFiles(t, dir, map[string]string{
 		"a.go": indirectSource,
 		"b.go": "package p\n\nimport . \"fmt\"\n\nfunc g() { Println() }\n",
+		"c.go": "package p\n\nimport \"errors\"\n\nvar errX = errors.New(\"x\")\n\nfunc h(err error) bool { return errors.Is(err, errX) }\n",
 	})
 	fs, err := CheckDir(dir, "example.com/p", fixtureCore)
 	if err != nil {
@@ -688,11 +745,19 @@ func TestRuleBypasses(t *testing.T) {
 		"a.go:47:21: DT003: time.Time used as any" + convTail,
 		"a.go:48:13: DT003: time.Time used as any" + convTail,
 		"a.go:49:10: DT003: time.Time used as any" + convTail,
-		"a.go:51:10: DT003: time.Duration used as any" + convTail,
 		"a.go:54:2: DT005: range over map map[string]int" + rangeTail,
 		"a.go:55:4: DT000: //tenure:maporder suppresses no finding",
 		"a.go:56:2: DT005: range over map map[string]int" + rangeTail,
 		"a.go:61:9: DT003: time.Since" + clockTail,
+		"a.go:63:9: DT003: time.Time used as p.yearer" + convTail,
+		"a.go:67:9: DT003: time.Time used as any" + convTail,
+		"a.go:70:7: DT003: time.Time used as any" + convTail,
+		"a.go:72:6: DT003: time.Time used as interface{Equal(time.Time) bool; comparable}" + convTail,
+		"a.go:84:8: DT003: time.Time used as any" + convTail,
+		"a.go:86:13: DT003: time.Time used as any" + convTail,
+		"a.go:88:9: DT003: time.Time used as any" + convTail,
+		"a.go:90:9: DT003: time.Time used as any" + convTail,
+		"a.go:115:41: DT008: slices.Sort" + sortTail,
 		"b.go:5:12: DT004: fmt.Println is not allowed in core: core performs no I/O; return values and errors instead",
 	}
 	if got := strings.Split(findingLines(fs), "\n"); !slices.Equal(got, want) {
