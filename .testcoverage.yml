@@ -1,0 +1,7 @@
+# Settings for go-test-coverage, used by the coverage job of .github/workflows/build.yml.
+# See https://github.com/vladopajic/go-test-coverage for all options.
+profile: cover.out
+
+# tenure v0.x reports coverage without thresholds.
+threshold:
+  total: 0

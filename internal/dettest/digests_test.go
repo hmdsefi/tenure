@@ -1,0 +1,183 @@
+// Copyright 2026 Hamed Yousefi
+// SPDX-License-Identifier: MPL-2.0
+
+package dettest
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+)
+
+var update = flag.Bool("update", false, "rewrite golden files")
+
+// digestCase is one case of TestCoreDigests (DET-440): lines calls add once per text line, in a
+// fixed order.
+type digestCase struct {
+	name  string
+	lines func(add func(line string))
+}
+
+// digestCases lists the digest cases of DET-450 and DET-460. Each is added by the change that
+// adds the core function it calls.
+var digestCases []digestCase
+
+// digestEntries computes one golden entry per case, in list order, each from a fresh Digest.
+func digestEntries(cases []digestCase) ([]Entry, error) {
+	entries := make([]Entry, 0, len(cases))
+	seen := make(map[string]bool, len(cases))
+	for _, c := range cases {
+		if seen[c.name] {
+			return nil, fmt.Errorf("duplicate digest case %s", c.name)
+		}
+		seen[c.name] = true
+		var d Digest
+		c.lines(d.Add)
+		entries = append(entries, d.Entry(c.name))
+	}
+	return entries, nil
+}
+
+// coreDigestsHint follows the differences TestCoreDigests reports (DET-440).
+const coreDigestsHint = `core digests changed: if intended, run "GOWORK=off go test ./internal/dettest -run TestCoreDigests -update" and add a "Golden-Update: <reason>" line to the commit message`
+
+// TestCoreDigests pins the digests of core's pure functions in testdata/core-digests.txt
+// (DET-440).
+func TestCoreDigests(t *testing.T) {
+	entries, err := digestEntries(digestCases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure, err := checkCoreDigests(entries, filepath.Join("testdata", "core-digests.txt"), *update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failure != "" {
+		t.Error(failure)
+	}
+}
+
+// checkCoreDigests runs DET-440 items 2 and 3 for entries against the golden file at path,
+// whose base name ParseGolden reports. With update it rewrites the file. It returns the
+// failure message (the CompareGolden lines followed by the update hint), or "" when the test
+// passes; err is a read, parse or write error, for t.Fatal.
+func checkCoreDigests(entries []Entry, path string, update bool) (failure string, err error) {
+	if update {
+		return "", os.WriteFile(path, FormatGolden(entries), 0o644) //nolint:gosec // the golden file is committed and readable by everyone
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	want, err := ParseGolden(filepath.Base(path), data)
+	if err != nil {
+		return "", err
+	}
+	if lines := CompareGolden(entries, want); lines != nil {
+		return strings.Join(lines, "\n") + "\n" + coreDigestsHint, nil
+	}
+	return "", nil
+}
+
+// TestCheckCoreDigests checks TestCoreDigests' compare and update paths (DET-440, AT-DET-12).
+func TestCheckCoreDigests(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "core-digests.txt")
+	entries := []Entry{
+		{Name: "keyshard", Hash: 0x1, Count: 60042},
+		{Name: "score", Hash: 0x2, Count: 6180},
+	}
+
+	if failure, err := checkCoreDigests(entries, path, false); err == nil {
+		t.Errorf("checkCoreDigests without a golden file = %q, nil; want a read error", failure)
+	}
+
+	if failure, err := checkCoreDigests(entries, path, true); err != nil || failure != "" {
+		t.Fatalf("checkCoreDigests(update) = %q, %v; want a pass", failure, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := FormatGolden(entries); string(data) != string(want) {
+		t.Errorf("update wrote\n%s\nwant\n%s", data, want)
+	}
+	if failure, err := checkCoreDigests(entries, path, false); err != nil || failure != "" {
+		t.Errorf("checkCoreDigests after update = %q, %v; want a pass", failure, err)
+	}
+
+	golden := goldenHeader +
+		"keyshard 0x0000000000000000 0x0000000000000001 60036\n" +
+		"machine 0x0000000000000000 0x0000000000000003 7\n" +
+		"score 0x0000000000000000 0x0000000000000002 6180\n"
+	if err := os.WriteFile(path, []byte(golden), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	failure, err := checkCoreDigests(entries, path, false)
+	if err != nil {
+		t.Fatalf("checkCoreDigests: %v", err)
+	}
+	want := "golden: keyshard seed 0x0000000000000000: got hash 0x0000000000000001 count 60042, want hash 0x0000000000000001 count 60036\n" +
+		"golden: machine seed 0x0000000000000000: in the golden file but not produced\n" +
+		`core digests changed: if intended, run "GOWORK=off go test ./internal/dettest -run TestCoreDigests -update" and add a "Golden-Update: <reason>" line to the commit message`
+	if failure != want {
+		t.Errorf("checkCoreDigests failure =\n%s\nwant\n%s", failure, want)
+	}
+	if failure, _ := checkCoreDigests(entries[:1], path, false); !strings.Contains(failure, "golden: score seed 0x0000000000000000: in the golden file but not produced") {
+		t.Errorf("checkCoreDigests with a case missing from the list = %q, want a not-produced line", failure)
+	}
+	if failure, _ := checkCoreDigests(append(slices.Clone(entries), Entry{Name: "tree", Count: 1}), path, false); !strings.Contains(failure, "golden: tree seed 0x0000000000000000: missing from the golden file") {
+		t.Errorf("checkCoreDigests with a new case = %q, want a missing line", failure)
+	}
+
+	if err := os.WriteFile(path, []byte("# tenure golden v1\nbad\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkCoreDigests(entries, path, false); err == nil || err.Error() != "core-digests.txt:2: malformed entry" {
+		t.Errorf("checkCoreDigests of a malformed file: error %v, want %q", err, "core-digests.txt:2: malformed entry")
+	}
+}
+
+// TestATDET12DigestWorkflow checks the case list rules of DET-440 (AT-DET-12, AT-DET-13).
+func TestATDET12DigestWorkflow(t *testing.T) {
+	if entries, err := digestEntries(nil); err != nil || len(entries) != 0 {
+		t.Errorf("digestEntries(nil) = %v, %v; want no entries and no error", entries, err)
+	}
+
+	lines := func(ls ...string) func(add func(string)) {
+		return func(add func(string)) {
+			for _, l := range ls {
+				add(l)
+			}
+		}
+	}
+	entries, err := digestEntries([]digestCase{
+		{name: "second", lines: lines("a")},
+		{name: "first", lines: lines("a", "b")},
+		{name: "empty", lines: lines()},
+	})
+	if err != nil {
+		t.Fatalf("digestEntries: %v", err)
+	}
+	want := []Entry{
+		{Name: "second", Hash: 0x089bdc07b544e7b2, Count: 1},
+		{Name: "first", Hash: 0x78ed6781f136a14e, Count: 2},
+		{Name: "empty", Hash: 0xcbf29ce484222325, Count: 0},
+	}
+	if !slices.Equal(entries, want) {
+		t.Errorf("digestEntries = %+v, want %+v", entries, want)
+	}
+
+	_, err = digestEntries([]digestCase{
+		{name: "score", lines: lines("a")},
+		{name: "keyshard", lines: lines("b")},
+		{name: "score", lines: lines("c")},
+	})
+	if want := "duplicate digest case score"; err == nil || err.Error() != want {
+		t.Errorf("digestEntries with two cases named score: error %v, want %q", err, want)
+	}
+}
