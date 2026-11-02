@@ -1,0 +1,258 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+
+  build:
+    name: Go build
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable # the test job covers the minimum version in go.mod
+      - name: gofmt
+        run: |
+          out=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$out" ]; then
+            echo "these files are not gofmt-formatted:"
+            echo "$out"
+            exit 1
+          fi
+      - name: go mod tidy
+        run: go mod tidy -diff
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build -v ./...
+      - name: private files are not committed
+        run: |
+          files=$( { git ls-files | grep -E '^(\.helper/|AGENTS\.md$)|(^|/)go\.work(\.sum)?$|^\.[^/]+' | grep -vE '^(\.github/|\.gitignore$|\.golangci\.yml$|\.testcoverage\.yml$)'; git ls-files | grep -E '^[^/]+\.md$' | grep -vx 'README.md'; } || true)
+          if [ -n "$files" ]; then
+            echo "these files are private and must not be committed:"
+            echo "$files"
+            exit 1
+          fi
+
+  test:
+    name: Go test (go ${{ matrix.go }})
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.26.x', 'stable']
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+      - name: test
+        run: go test -race -count=1 ./...
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: 'off'
+    outputs:
+      total: ${{ steps.coverage.outputs.total-coverage }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: test with coverage
+        run: go test -race -count=1 -covermode=atomic -coverprofile=cover.out ./...
+      - name: check coverage
+        id: coverage
+        uses: vladopajic/go-test-coverage@249eda999ac7e91238727277beec9b32b28a19b0 # v2.21.0
+        with:
+          config: ./.testcoverage.yml
+      - name: coverage summary
+        if: ${{ !cancelled() && steps.coverage.outputs.report != '' }}
+        env:
+          REPORT: ${{ fromJSON(steps.coverage.outputs.report) }}
+        run: |
+          {
+            echo '```'
+            echo "$REPORT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  coverage-badge:
+    name: coverage badge
+    needs: coverage
+    if: github.event_name == 'push' && github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write # the README coverage badge shows the title of issue #235
+    steps:
+      - name: update the coverage badge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COVERAGE: ${{ needs.coverage.outputs.total }}
+        run: |
+          test -n "$COVERAGE"
+          title="$COVERAGE%"
+          current=$(gh issue view 235 --repo "$GITHUB_REPOSITORY" --json title --jq .title)
+          if [ "$current" != "$title" ]; then
+            gh issue edit 235 --repo "$GITHUB_REPOSITORY" --title "$title"
+          fi
+
+  determinism:
+    name: determinism (${{ matrix.os }}, go ${{ matrix.go }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ['1.26.x', 'stable']
+    runs-on: ${{ matrix.os }}
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+      - name: core import allow-list, determinism rules, golden digests
+        run: go test -count=1 ./internal/dettest/... ./core/...
+      - name: core on 32-bit (linux/386)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          GOARCH: '386'
+        run: |
+          go test -count=1 ./core/...
+          go test -count=1 -run '^TestCoreDigests$' ./internal/dettest
+
+  api:
+    name: API snapshot
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.0' # go doc output is pinned to the go line of go.mod
+      - name: api/tenure.txt and api/core.txt match go doc -all
+        run: |
+          go doc -all github.com/hmdsefi/tenure > api/tenure.txt
+          go doc -all github.com/hmdsefi/tenure/core > api/core.txt
+          git diff --exit-code -- api/
+      - name: public docs cite no spec IDs
+        run: |
+          set -e
+          out="$RUNNER_TEMP/docs.txt"
+          : > "$out"
+          for p in $(go list ./... | grep -v -E '/internal(/|$)'); do go doc -all "$p" >> "$out"; done
+          for mod in $(git ls-files '*/go.mod' | xargs -r -n 1 dirname | sort); do
+            for p in $(go -C "$mod" list ./... | grep -v -E '/internal(/|$)'); do go -C "$mod" doc -all "$p" >> "$out"; done
+          done
+          if grep -nwE '(AT-)?(REP|DET|COR|ASG|MCH|PTR|RUN|STO|MEM|K8S|OBS|SIM|EXM|PGS|ETC|GSP|RCP|TMP|BEN|WLD|SPL|CLI|MET)-[0-9]{2,3}' "$out"; then
+            echo "public doc comments cite spec IDs; the specs are private, so describe the behavior instead"
+            exit 1
+          fi
+
+  nested:
+    name: nested modules (go ${{ matrix.go }})
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.26.x', 'stable']
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+      - name: workspace with the root and all nested modules
+        run: |
+          go work init
+          go work use -r .
+      - name: tidy, vet and test each nested module
+        run: |
+          set -e
+          for mod in $(git ls-files '*/go.mod' | xargs -r -n 1 dirname | sort); do
+            echo "::group::$mod"
+            if [ "$mod" != cmd/tenure ]; then
+              GOWORK=off go -C "$mod" mod tidy -diff
+            fi
+            go -C "$mod" vet ./...
+            if [ "$mod" != simtest ]; then
+              go -C "$mod" test -race -count=1 ./...
+            fi
+            echo "::endgroup::"
+          done
+
+  golden-trailer:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: golden changes need an explanation
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          base="$BASE_SHA"
+          if git diff --name-only "$base"...HEAD | grep -qx -e 'internal/dettest/testdata/core-digests.txt' -e 'simtest/testdata/hashes.txt'; then
+            if ! git log --format=%B "$base"..HEAD | grep -Eq '^Golden-Update: .+'; then
+              echo "a golden file changed: add a 'Golden-Update: <reason>' line to a commit message"
+              exit 1
+            fi
+          fi
+
+  commits:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Conventional Commits, no AI attribution
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          base="$BASE_SHA"
+          bad=0
+          for c in $(git rev-list --no-merges "$base"..HEAD); do
+            subject=$(git log -1 --format=%s "$c")
+            if ! printf '%s\n' "$subject" | grep -Eq '^(feat|fix|docs|test|refactor|perf|build|ci|chore|revert)(\([a-z0-9./_-]+\))?!?: .+'; then
+              echo "$c: subject is not a Conventional Commit: $subject"
+              bad=1
+            fi
+            if git log -1 --format=%B "$c" | grep -Eiq '^co-authored-by:|^[^[:alnum:]]*generated (with|by) '; then
+              echo "$c: commit message carries an attribution line"
+              bad=1
+            fi
+          done
+          exit $bad

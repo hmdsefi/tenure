@@ -1,0 +1,4 @@
+package core // import "github.com/hmdsefi/tenure/core"
+
+Package core holds every decision tenure makes as pure, deterministic code: key
+hashing, assignment, ranking, the ownership machine, timing and partition trees.
