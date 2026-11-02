@@ -12,4 +12,6 @@ func f(err error) {
 	fmt.Fprint(nil)  // want DT004
 	_ = fmt.Errorf("e: %w", err)
 	_ = fmt.Sprintf("%d", 1)
+	println("x") // want DT004
+	print("x")   // want DT004
 }

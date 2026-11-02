@@ -19,4 +19,18 @@ func f(t, u time.Time, d time.Duration) {
 	_ = time.Second
 	var x time.Duration
 	_ = x
+	_ = time.Unix(0, 0) // want DT003
+	_ = t.Unix()
+	var y yearer = t // want DT003
+	_ = y
+	var s stringer = d
+	_ = s
+	_ = any(t) // want DT003
+	_ = gm(t)  // want DT003
 }
+
+type yearer interface{ Year() int }
+
+type stringer interface{ String() string }
+
+func gm[X interface{ Year() int }](x X) int { return x.Year() }

@@ -6,22 +6,9 @@ package dettest
 import (
 	"fmt"
 	"go/ast"
-	"go/types"
-	"path/filepath"
 	"regexp"
 	"strings"
 )
-
-// hostRules runs the rules that need type information on the host files of the package, then
-// applies their directives (DET-020, DET-200).
-func (r *pkgRun) hostRules(host []*ast.File, info *types.Info) {
-	var dirs []*directive
-	for _, f := range host {
-		r.nodes(f, info)
-		dirs = append(dirs, r.directives(f)...)
-	}
-	r.applyDirectives(dirs)
-}
 
 // directiveRE matches the text after "//" of a directive comment (DET-200).
 var directiveRE = regexp.MustCompile(`^tenure:([a-z]+)(?:[ \t]+(.*\S))?[ \t]*$`)
@@ -74,13 +61,11 @@ func (r *pkgRun) directives(f *ast.File) []*directive {
 				continue
 			}
 			pos := r.c.fset.PositionFor(c.Pos(), false)
-			file, _ := filepath.Rel(r.base, pos.Filename) // both absolute, file below base: no error
-			file = filepath.ToSlash(file)
 			target := pos.Line + 1
 			if code[pos.Line] {
 				target = pos.Line
 			}
-			out = append(out, &directive{file: file, line: pos.Line, col: pos.Column, target: target, name: m[1], reason: m[2]})
+			out = append(out, &directive{file: r.rel(pos.Filename), line: pos.Line, col: pos.Column, target: target, name: m[1], reason: m[2]})
 		}
 	}
 	return out
@@ -95,7 +80,7 @@ func (r *pkgRun) applyDirectives(dirs []*directive) {
 		problems = append(problems, Finding{File: d.file, Line: d.line, Col: d.col, Rule: RuleMeta, Msg: msg})
 	}
 	used := make([]bool, len(dirs))
-	kept := r.out[:0:0]
+	kept := make([]Finding, 0, len(r.out))
 	for _, f := range r.out {
 		suppressed := false
 		for i, d := range dirs {

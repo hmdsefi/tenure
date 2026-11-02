@@ -358,10 +358,16 @@ type pkgRun struct {
 	out      []Finding
 }
 
+// rel returns the slash path of the absolute path file, which is below base, relative to base:
+// the File of findings and the key directives match them by.
+func (r *pkgRun) rel(file string) string {
+	rel, _ := filepath.Rel(r.base, file) // both absolute, file below base: no error
+	return filepath.ToSlash(rel)
+}
+
 // add appends a finding about the file at the absolute path file, which is below base.
 func (r *pkgRun) add(file string, line, col int, rule Rule, msg string) {
-	rel, _ := filepath.Rel(r.base, file) // both absolute, file below base: no error
-	r.out = append(r.out, Finding{File: filepath.ToSlash(rel), Line: line, Col: col, Rule: rule, Msg: msg})
+	r.out = append(r.out, Finding{File: r.rel(file), Line: line, Col: col, Rule: rule, Msg: msg})
 }
 
 // addAt appends a finding at pos. //line directives are not applied: the finding names the
@@ -411,8 +417,10 @@ func (c *checker) checkPackage(base, dir, importPath, corePath string) ([]Findin
 	if len(host) > 0 {
 		info := &types.Info{
 			Types:      map[ast.Expr]types.TypeAndValue{},
+			Defs:       map[*ast.Ident]types.Object{},
 			Uses:       map[*ast.Ident]types.Object{},
 			Selections: map[*ast.SelectorExpr]*types.Selection{},
+			Instances:  map[*ast.Ident]types.Instance{},
 		}
 		pkg, err := c.typesConfig().Check(importPath, c.fset, host, info)
 		if err != nil {
