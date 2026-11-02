@@ -1,2 +1,3 @@
 # tenure golden v1
 # name seed hash count
+# note: scratch change
