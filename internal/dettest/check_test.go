@@ -210,6 +210,53 @@ func TestATDET06WalkAndImportPaths(t *testing.T) {
 	}
 }
 
+// TestCheckSymlinkedRoot checks that Check and CheckDir walk a root reached through a symbolic
+// link, and that their other errors start with "dettest: ".
+func TestCheckSymlinkedRoot(t *testing.T) {
+	tmp := t.TempDir()
+	real := filepath.Join(tmp, "real")
+	writeFiles(t, real, atDET06Module())
+	link := filepath.Join(tmp, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("no symbolic links: %v", err)
+	}
+	fs, err := Check(link, "example.com/m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := findingKeys(fs); !slices.Equal(got, []string{"core/x/x.go:3 DT001"}) {
+		t.Errorf("Check through a link:\n%s\nwant the DT001 finding of core/x/x.go", findingLines(fs))
+	}
+
+	fixture, err := filepath.Abs(filepath.Join("testdata", "src", "dt001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := CheckDir(fixture, "fixture/dt001", fixtureCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureLink := filepath.Join(tmp, "dt001")
+	if err := os.Symlink(fixture, fixtureLink); err != nil {
+		t.Fatal(err)
+	}
+	got, err := CheckDir(fixtureLink, "fixture/dt001", fixtureCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want) == 0 || !slices.Equal(got, want) {
+		t.Errorf("CheckDir through a link:\n%s\nwant:\n%s", findingLines(got), findingLines(want))
+	}
+
+	missing := filepath.Join(tmp, "missing")
+	if _, err := Check(missing, "example.com/m"); err == nil || !strings.HasPrefix(err.Error(), "dettest: ") {
+		t.Errorf("Check(%s): error %v, want one starting \"dettest: \"", missing, err)
+	}
+	if _, err := CheckDir(missing, "fixture/missing", fixtureCore); err == nil || !strings.HasPrefix(err.Error(), "dettest: ") {
+		t.Errorf("CheckDir(%s): error %v, want one starting \"dettest: \"", missing, err)
+	}
+}
+
 // TestATDET07TypeErrors checks that a type error is returned without findings (AT-DET-07).
 func TestATDET07TypeErrors(t *testing.T) {
 	root := t.TempDir()

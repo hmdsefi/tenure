@@ -103,7 +103,38 @@ func goModModule(gomod string) string {
 // Check runs every rule on each package directory at or below <root>/core of the module
 // modulePath and returns the findings sorted by (File, Line, Col, Rule, Msg).
 func Check(root, modulePath string) ([]Finding, error) {
-	abs, err := filepath.Abs(root)
+	out, err := check(root, modulePath)
+	return out, dettestError(err)
+}
+
+// CheckDir runs every rule on the single package in dir, whose import path is importPath.
+// Imports of corePath and of packages below it are allowed. File paths in findings are
+// relative to dir.
+func CheckDir(dir, importPath, corePath string) ([]Finding, error) {
+	out, err := checkDir(dir, importPath, corePath)
+	return out, dettestError(err)
+}
+
+// dettestError returns err with the prefix "dettest: " unless it has it already.
+func dettestError(err error) error {
+	if err == nil || strings.HasPrefix(err.Error(), "dettest: ") {
+		return err
+	}
+	return fmt.Errorf("dettest: %w", err)
+}
+
+// resolveDir returns the absolute path of dir with symbolic links resolved, so that a walk
+// through a linked directory sees its entries as directories and files.
+func resolveDir(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
+}
+
+func check(root, modulePath string) ([]Finding, error) {
+	abs, err := resolveDir(root)
 	if err != nil {
 		return nil, err
 	}
@@ -135,11 +166,8 @@ func Check(root, modulePath string) ([]Finding, error) {
 	return out, nil
 }
 
-// CheckDir runs every rule on the single package in dir, whose import path is importPath.
-// Imports of corePath and of packages below it are allowed. File paths in findings are
-// relative to dir.
-func CheckDir(dir, importPath, corePath string) ([]Finding, error) {
-	abs, err := filepath.Abs(dir)
+func checkDir(dir, importPath, corePath string) ([]Finding, error) {
+	abs, err := resolveDir(dir)
 	if err != nil {
 		return nil, err
 	}
