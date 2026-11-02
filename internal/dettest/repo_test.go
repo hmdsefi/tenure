@@ -127,9 +127,13 @@ func TestLicenseHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(paths) == 0 {
-		return
+	if len(paths) > 0 {
+		t.Error(licenseHeaderReport(paths))
 	}
+}
+
+// licenseHeaderReport is TestLicenseHeaders' failure message for paths (REP-110).
+func licenseHeaderReport(paths []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d file(s) do not start with the license header:\n", len(paths))
 	for _, p := range paths {
@@ -138,7 +142,7 @@ func TestLicenseHeaders(t *testing.T) {
 	b.WriteString("start each one with these two lines and a blank line:\n" +
 		"  // Copyright 2026 Hamed Yousefi\n" +
 		"  // SPDX-License-Identifier: MPL-2.0")
-	t.Error(b.String())
+	return b.String()
 }
 
 // TestATREP05Headers runs the header check on a temp tree (AT-REP-05).
@@ -152,6 +156,8 @@ func TestATREP05Headers(t *testing.T) {
 		"d.go":          "// Copyright 2026 Someone Else\n// SPDX-License-Identifier: MPL-2.0\n\n" + body,
 		"e.go":          strings.TrimSuffix(licenseHeader, "\n") + body,
 		"f.go":          "// Copyright 2025 Hamed Yousefi\n// SPDX-License-Identifier: MPL-2.0\n\n" + body,
+		"g.go":          strings.Replace(licenseHeader, "\n", "\r\n", 1) + body,
+		"h.go":          "\ufeff" + licenseHeader + body,
 		"notes.txt":     "no header\n",
 		"testdata/x.go": body,
 		".hidden/y.go":  body,
@@ -159,13 +165,32 @@ func TestATREP05Headers(t *testing.T) {
 		"k8s/go.mod":    "module github.com/hmdsefi/tenure/k8s\n\ngo 1.26.0\n",
 		"k8s/w.go":      body,
 	})
+	// A symlink is not a regular file: the walk skips it instead of failing to read it.
+	if err := os.Symlink("missing.go", filepath.Join(root, "dangling.go")); err != nil {
+		t.Fatal(err)
+	}
 	got, err := checkLicenseHeaders(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"b.go", "c.go", "d.go", "e.go", "k8s/w.go"}
+	want := []string{"b.go", "c.go", "d.go", "e.go", "g.go", "h.go", "k8s/w.go"}
 	if !slices.Equal(got, want) {
 		t.Errorf("checkLicenseHeaders = %q, want %q", got, want)
+	}
+
+	const wantReport = `7 file(s) do not start with the license header:
+  b.go
+  c.go
+  d.go
+  e.go
+  g.go
+  h.go
+  k8s/w.go
+start each one with these two lines and a blank line:
+  // Copyright 2026 Hamed Yousefi
+  // SPDX-License-Identifier: MPL-2.0`
+	if r := licenseHeaderReport(got); r != wantReport {
+		t.Errorf("licenseHeaderReport:\n%s\nwant:\n%s", r, wantReport)
 	}
 }
 
@@ -188,7 +213,7 @@ func TestATREP06RootImports(t *testing.T) {
 		"x.go": "package tenure\n\nimport (\n\t\"fmt\"\n\t\"github.com/hmdsefi/tenure/memstore\"\n" +
 			"\t\"github.com/hmdsefi/tenure/core\"\n)\n",
 		"x_test.go":             "package tenure\n\nimport (\n\t\"testing\"\n\t\"github.com/hmdsefi/tenure/extra\"\n\t\"example.com/x\"\n)\n",
-		"memstore/m.go":         "package memstore\n\nimport (\n\t\"testing\"\n\t\"github.com/hmdsefi/tenure\"\n)\n",
+		"memstore/m.go":         "package memstore\n\nimport (\n\t\"testing\"\n\t\"github.com/hmdsefi/tenure\"\n\t\"example.com/a\"\n)\n",
 		"storetest/s.go":        "package storetest\n\nimport (\n\t\"testing\"\n\t\"testing/synctest\"\n\t\"github.com/hmdsefi/tenure\"\n)\n",
 		"extra/e.go":            "package extra\n",
 		"core/c.go":             "package core\n\nimport \"os\"\n",
@@ -207,11 +232,74 @@ func TestATREP06RootImports(t *testing.T) {
 	want := []string{
 		"extra: package github.com/hmdsefi/tenure/extra has no import rule; add a row to internal/dettest",
 		`internal/dettest/d.go: import "C" is not allowed in package github.com/hmdsefi/tenure/internal/dettest`,
+		`memstore/m.go: import "example.com/a" is not allowed in package github.com/hmdsefi/tenure/memstore`,
 		`memstore/m.go: import "testing" is not allowed in package github.com/hmdsefi/tenure/memstore`,
 		`x.go: import "github.com/hmdsefi/tenure/memstore" is not allowed in package github.com/hmdsefi/tenure`,
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("checkRootImports:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
+// TestRepoChecksThroughSymlinkedRoot runs the walks on a root reached through a symlink, as a
+// checkout under a symlinked directory is: they must check the files behind the link.
+func TestRepoChecksThroughSymlinkedRoot(t *testing.T) {
+	tmp := t.TempDir()
+	target := filepath.Join(tmp, "target")
+	writeFiles(t, target, map[string]string{
+		"go.mod": rootGoMod,
+		"bad.go": "package tenure\n\nimport \"example.com/x\"\n",
+	})
+	link := filepath.Join(tmp, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	headers, err := checkLicenseHeaders(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"bad.go"}; !slices.Equal(headers, want) {
+		t.Errorf("checkLicenseHeaders = %q, want %q", headers, want)
+	}
+	imports, err := checkRootImports(link, tenureModule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{`bad.go: import "example.com/x" is not allowed in package github.com/hmdsefi/tenure`}
+	if !slices.Equal(imports, want) {
+		t.Errorf("checkRootImports = %q, want %q", imports, want)
+	}
+}
+
+// TestRootGoModNullKeys checks that a key printed as null counts as absent: Go 1.26's go mod
+// edit -json prints the lists a go.mod does not have that way.
+func TestRootGoModNullKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+		want []string
+	}{
+		{
+			name: "null keys",
+			out:  `{"Module":{"Path":"github.com/hmdsefi/tenure"},"Go":"1.26.0","Require":null,"Exclude":null,"Replace":null,"Retract":null,"Tool":null,"Ignore":null}`,
+		},
+		{
+			name: "non-null key",
+			out:  `{"Module":{"Path":"github.com/hmdsefi/tenure"},"Go":"1.26.0","Require":[{"Path":"golang.org/x/tools","Version":"v0.30.0"}],"Tool":null}`,
+			want: []string{"go.mod: unexpected Require; the root module has no requirements, replacements, exclusions, retractions, tools, toolchain or godebug lines"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := rootGoModLines([]byte(tc.out))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("rootGoModLines = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -226,8 +314,8 @@ func goModEditJSON(dir string, args ...string) ([]byte, error) {
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("go mod edit -json %s in %s: %w: %s",
-			strings.Join(args, " "), dir, err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("go %s in %s: %w: %s",
+			strings.Join(cmd.Args[1:], " "), dir, err, strings.TrimSpace(stderr.String()))
 	}
 	return out, nil
 }
@@ -235,29 +323,49 @@ func goModEditJSON(dir string, args ...string) ([]byte, error) {
 // checkRootGoMod returns one line per way in which the go.mod and go.sum in dir break REP-010,
 // in REP-015's order.
 func checkRootGoMod(dir string) ([]string, error) {
-	out, err := goModEditJSON(dir)
+	out, err := goModEditJSON(dir, "go.mod")
 	if err != nil {
 		return nil, err
 	}
+	lines, err := rootGoModLines(out)
+	if err != nil {
+		return nil, fmt.Errorf("go mod edit -json in %s: %w", dir, err)
+	}
+	switch _, err := os.Stat(filepath.Join(dir, "go.sum")); {
+	case err == nil:
+		lines = append(lines, "go.sum: the root module has no requirements, so it has no go.sum")
+	case !errors.Is(err, fs.ErrNotExist):
+		return nil, err
+	}
+	return lines, nil
+}
+
+// rootGoModLines returns REP-015's go.mod lines (items 1 to 3) for out, the output of go mod
+// edit -json.
+func rootGoModLines(out []byte) ([]string, error) {
 	// Walk the top-level object as a token stream to keep its keys in printed order.
 	dec := json.NewDecoder(bytes.NewReader(out))
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return nil, fmt.Errorf("go mod edit -json in %s: output is not a JSON object", dir)
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if tok != json.Delim('{') {
+		return nil, errors.New("output is not a JSON object")
 	}
 	var keys []string
 	values := map[string]json.RawMessage{}
 	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
-			return nil, fmt.Errorf("go mod edit -json in %s: %w", dir, err)
+			return nil, err
 		}
 		key, ok := tok.(string)
 		if !ok {
-			return nil, fmt.Errorf("go mod edit -json in %s: key %v is not a string", dir, tok)
+			return nil, fmt.Errorf("key %v is not a string", tok)
 		}
 		var v json.RawMessage
 		if err := dec.Decode(&v); err != nil {
-			return nil, fmt.Errorf("go mod edit -json in %s: %s: %w", dir, key, err)
+			return nil, fmt.Errorf("%s: %w", key, err)
 		}
 		// Go 1.26 prints a directive the file does not have as a null key ("Require": null);
 		// Go 1.27 omits it. Either way the file has no such line.
@@ -278,7 +386,7 @@ func checkRootGoMod(dir string) ([]string, error) {
 	var mod struct{ Path string }
 	if v, ok := values["Module"]; ok {
 		if err := json.Unmarshal(v, &mod); err != nil {
-			return nil, fmt.Errorf("go mod edit -json in %s: Module: %w", dir, err)
+			return nil, fmt.Errorf("Module: %w", err)
 		}
 	}
 	if mod.Path != tenureModule {
@@ -287,19 +395,23 @@ func checkRootGoMod(dir string) ([]string, error) {
 	var goVersion string
 	if v, ok := values["Go"]; ok {
 		if err := json.Unmarshal(v, &goVersion); err != nil {
-			return nil, fmt.Errorf("go mod edit -json in %s: Go: %w", dir, err)
+			return nil, fmt.Errorf("Go: %w", err)
 		}
 	}
 	if goVersion != "1.26.0" {
 		lines = append(lines, fmt.Sprintf("go.mod: go %s, want 1.26.0", goVersion))
 	}
-	switch _, err := os.Stat(filepath.Join(dir, "go.sum")); {
-	case err == nil:
-		lines = append(lines, "go.sum: the root module has no requirements, so it has no go.sum")
-	case !errors.Is(err, fs.ErrNotExist):
-		return nil, err
-	}
 	return lines, nil
+}
+
+// resolveRoot returns root with its symlinks resolved. filepath.WalkDir does not descend into
+// a root that is a symlink, so a walk from an unresolved root would check nothing.
+func resolveRoot(root string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve root %s: %w", root, err)
+	}
+	return resolved, nil
 }
 
 // skipDir reports whether a walk skips the directory named name below its root: testdata
@@ -315,8 +427,12 @@ var copyrightLine = regexp.MustCompile(`^// Copyright 20[0-9]{2} Hamed Yousefi$`
 // the .go files below root that do not start with the license header and a blank line (REP-110).
 // Nested modules are walked too.
 func checkLicenseHeaders(root string) ([]string, error) {
+	root, err := resolveRoot(root)
+	if err != nil {
+		return nil, err
+	}
 	var bad []string
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -326,7 +442,9 @@ func checkLicenseHeaders(root string) ([]string, error) {
 			}
 			return nil
 		}
-		if !strings.HasSuffix(d.Name(), ".go") {
+		// Symlinks and other non-regular entries are skipped: a link's target is checked where
+		// it lives, and a dangling link has no content to check.
+		if !d.Type().IsRegular() || !strings.HasSuffix(d.Name(), ".go") {
 			return nil
 		}
 		data, err := os.ReadFile(path) //nolint:gosec // G304: the walk reads the files it finds below root
@@ -394,9 +512,13 @@ func (r importRule) allows(path, modulePath string) bool {
 // directories with their own go.mod, and core and the directories below it.
 func checkRootImports(root, modulePath string) ([]string, error) {
 	type violation struct{ file, path, line string }
+	root, err := resolveRoot(root)
+	if err != nil {
+		return nil, err
+	}
 	var found []violation
 	fset := token.NewFileSet()
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}

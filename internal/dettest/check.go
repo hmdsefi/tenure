@@ -17,7 +17,7 @@ import (
 func FindRoot(dir, modulePath string) (string, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("dettest: find root of %s: %w", dir, err)
 	}
 	for d := abs; ; d = filepath.Dir(d) {
 		data, err := os.ReadFile(filepath.Join(d, "go.mod")) //nolint:gosec // G304: reading go.mod files above dir is the point
@@ -27,7 +27,7 @@ func FindRoot(dir, modulePath string) (string, error) {
 				return d, nil
 			}
 		case !errors.Is(err, fs.ErrNotExist):
-			return "", err
+			return "", fmt.Errorf("dettest: find root of %s: %w", abs, err)
 		}
 		if filepath.Dir(d) == d {
 			return "", fmt.Errorf("dettest: no go.mod for module %s above %s", modulePath, abs)

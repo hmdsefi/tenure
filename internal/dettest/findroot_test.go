@@ -6,6 +6,7 @@ package dettest
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -63,6 +64,17 @@ func TestFindRoot(t *testing.T) {
 		want := "dettest: no go.mod for module github.com/hmdsefi/tenure above " + dir
 		if err == nil || err.Error() != want {
 			t.Fatalf("FindRoot error = %v, want %s", err, want)
+		}
+	})
+
+	t.Run("read error", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFiles(t, dir, map[string]string{"x.go": "package x\n"})
+		file := filepath.Join(dir, "x.go")
+		_, err := FindRoot(file, "github.com/hmdsefi/tenure")
+		want := "dettest: find root of " + file + ": "
+		if err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("FindRoot error = %v, want prefix %q", err, want)
 		}
 	})
 }
