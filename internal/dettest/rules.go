@@ -8,6 +8,8 @@ import (
 	"go/ast"
 	"go/build"
 	"go/build/constraint"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -18,23 +20,48 @@ import (
 var CoreImports = []string{"cmp", "errors", "fmt", "hash/fnv", "math", "math/bits", "slices", "sort", "strconv", "strings", "time"}
 
 // imports reports DT001 for every import of f whose path is neither in CoreImports nor
-// corePath nor below it, at the import path literal (DET-100).
-func (r *pkgRun) imports(f *ast.File) error {
+// corePath nor below it, and for every import below corePath whose directory the walk does not
+// enter, at the import path literal (DET-100).
+func (r *pkgRun) imports(f *ast.File) {
 	for _, spec := range f.Imports {
-		p, err := strconv.Unquote(spec.Path.Value)
-		if err != nil {
-			return err
-		}
-		if slices.Contains(CoreImports, p) || p == r.corePath || strings.HasPrefix(p, r.corePath+"/") {
+		p, _ := strconv.Unquote(spec.Path.Value) // the parser accepts only valid string literals
+		if slices.Contains(CoreImports, p) || p == r.corePath || (strings.HasPrefix(p, r.corePath+"/") && !r.unwalked(p)) {
 			continue
 		}
-		msg := fmt.Sprintf("import %q is not allowed in core; core imports only %s and packages of %s",
-			p, strings.Join(CoreImports, ", "), r.corePath)
-		if err := r.addAt(spec.Path.Pos(), RuleImport, msg); err != nil {
-			return err
+		r.addAt(spec.Path.Pos(), RuleImport, fmt.Sprintf("import %q is not allowed in core; core imports only %s and packages of %s",
+			p, strings.Join(CoreImports, ", "), r.corePath))
+	}
+}
+
+// unwalked reports whether the walk does not enter the directory of the package path below
+// corePath: a path element it skips, or, in a Check run, a directory on the way that is a
+// symbolic link or holds its own go.mod.
+func (r *pkgRun) unwalked(path string) bool {
+	dir := ""
+	if r.c.root != "" {
+		dir = filepath.Join(r.c.root, "core")
+	}
+	for elem := range strings.SplitSeq(strings.TrimPrefix(path, r.corePath+"/"), "/") {
+		if skippedDir(elem) {
+			return true
+		}
+		if dir == "" {
+			continue
+		}
+		dir = filepath.Join(dir, elem)
+		st, err := os.Lstat(dir)
+		if err != nil {
+			dir = "" // missing: type-checking reports it
+			continue
+		}
+		if st.Mode()&fs.ModeSymlink != 0 {
+			return true
+		}
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 // platformMsg ends the DT010 messages about .go files.
@@ -63,8 +90,9 @@ func (r *pkgRun) platformFile(dir, name string, f *ast.File) error {
 		}
 		for _, c := range g.List {
 			if constraint.IsGoBuild(c.Text) || constraint.IsPlusBuild(c.Text) {
-				line := r.c.fset.Position(c.Pos()).Line
-				return r.add(filepath.Join(dir, name), line, 1, RulePlatform, "build constraint in core: "+platformMsg)
+				line := r.c.fset.PositionFor(c.Pos(), false).Line
+				r.add(filepath.Join(dir, name), line, 1, RulePlatform, "build constraint in core: "+platformMsg)
+				return nil
 			}
 		}
 	}
@@ -74,8 +102,8 @@ func (r *pkgRun) platformFile(dir, name string, f *ast.File) error {
 			return err
 		}
 		if !ok {
-			return r.add(filepath.Join(dir, name), 0, 0, RulePlatform,
-				fmt.Sprintf("platform-specific file %s: %s", name, platformMsg))
+			r.add(filepath.Join(dir, name), 0, 0, RulePlatform, fmt.Sprintf("platform-specific file %s: %s", name, platformMsg))
+			return nil
 		}
 	}
 	return nil
@@ -87,9 +115,8 @@ var nonGoExts = []string{".s", ".S", ".sx", ".c", ".cc", ".cpp", ".cxx", ".h", "
 
 // nonGoFile reports DT010 for the file at the absolute path path if it is a non-Go source file
 // (DET-190 item 3).
-func (r *pkgRun) nonGoFile(path string) error {
-	if !slices.Contains(nonGoExts, filepath.Ext(path)) {
-		return nil
+func (r *pkgRun) nonGoFile(path string) {
+	if slices.Contains(nonGoExts, filepath.Ext(path)) {
+		r.add(path, 0, 0, RulePlatform, fmt.Sprintf("non-Go source file %s: core is plain Go", filepath.Base(path)))
 	}
-	return r.add(path, 0, 0, RulePlatform, fmt.Sprintf("non-Go source file %s: core is plain Go", filepath.Base(path)))
 }
