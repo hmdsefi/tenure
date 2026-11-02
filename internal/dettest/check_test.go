@@ -61,8 +61,22 @@ func TestCoreImports(t *testing.T) {
 	}
 }
 
-// wantComment matches a fixture expectation "// want DT001 [DT005 …]" (DET-320).
-var wantComment = regexp.MustCompile(`^// want((?:[ \t]+DT[0-9]{3})+)[ \t]*$`)
+// TestCoreDeterminism checks every core package against the rules other than the import
+// allow-list (DET-310).
+func TestCoreDeterminism(t *testing.T) {
+	fs, err := Check(repoRoot(t), tenureModule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fs = keepRule(fs, RuleImport, false); len(fs) > 0 {
+		t.Errorf("core determinism rules: %d finding(s):\n%s", len(fs), findingLines(fs))
+	}
+}
+
+// wantComment matches a fixture expectation "// want DT001 [DT005 …]" (DET-320), or the same
+// text as a block comment "/* want DT000 */", which a line holding a directive needs: a directive
+// is a line comment that runs to the end of its line.
+var wantComment = regexp.MustCompile(`^(?:// want((?:[ \t]+DT[0-9]{3})+)[ \t]*|/\* want((?:[ \t]+DT[0-9]{3})+)[ \t]*\*/)$`)
 
 // fixtureWants returns the sorted "<file>:<line> <rule>" expectations of the .go files in dir.
 func fixtureWants(t *testing.T, dir string) []string {
@@ -88,7 +102,7 @@ func fixtureWants(t *testing.T, dir string) []string {
 					continue
 				}
 				line := fset.Position(c.Pos()).Line
-				for _, r := range strings.Fields(m[1]) {
+				for _, r := range strings.Fields(m[1] + m[2]) {
 					wants = append(wants, fmt.Sprintf("%s:%d %s", e.Name(), line, r))
 				}
 			}
@@ -435,5 +449,86 @@ func TestSortFindings(t *testing.T) {
 	sortFindings(got)
 	if !slices.Equal(got, want) {
 		t.Errorf("sortFindings:\n%s\nwant:\n%s", findingLines(got), findingLines(want))
+	}
+}
+
+// fixtureFindings returns the findings of CheckDir on the fixture testdata/src/<name>.
+func fixtureFindings(t *testing.T, name string) []Finding {
+	t.Helper()
+	fs, err := CheckDir(filepath.Join("testdata", "src", name), "fixture/"+name, fixtureCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fs
+}
+
+// TestATDET02Messages checks the exact text of the clock findings of fixture dt003 and of the
+// directive findings of fixture directives (AT-DET-02).
+func TestATDET02Messages(t *testing.T) {
+	const clockTail = " is not allowed in core: core reads no clock and uses time only for Time and Duration values and their arithmetic"
+	dt003 := strings.Split(findingLines(fixtureFindings(t, "dt003")), "\n")
+	for _, want := range []string{
+		"a.go:9:11: DT003: time.Now" + clockTail,
+		"a.go:14:8: DT003: time.Time.Year" + clockTail,
+	} {
+		if !slices.Contains(dt003, want) {
+			t.Errorf("dt003: no finding %q in:\n%s", want, strings.Join(dt003, "\n"))
+		}
+	}
+
+	meta := keepRule(fixtureFindings(t, "directives"), RuleMeta, true)
+	want := []string{
+		"a.go:16:19: DT000: //tenure:maporder needs a reason",
+		"a.go:19:28: DT000: unknown directive //tenure:sortorder",
+		"a.go:22:19: DT000: //tenure:maporder suppresses no finding",
+		"a.go:25:19: DT000: //tenure:totalorder suppresses no finding",
+	}
+	if got := strings.Split(findingLines(meta), "\n"); !slices.Equal(got, want) {
+		t.Errorf("directives: DT000 findings:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
+// TestRuleTypes checks the type-dependent cases of DT003 and DT005 that the fixtures do not
+// show: methods promoted from an embedded time.Time, fields of time's struct types, methods of
+// Duration, ranges over named map types and over type parameters whose core type is a map.
+func TestRuleTypes(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"a.go": `package p
+
+import "time"
+
+type stamp struct{ time.Time }
+
+type set map[string]bool
+
+func f[M ~map[string]int, S ~[]int](s stamp, e *time.ParseError, d time.Duration, m M, xs S, k set) {
+	_ = s.Format("")
+	_ = s.UnixMilli()
+	_ = e.Layout
+	_ = d.Hours()
+	for range m {
+	}
+	for range xs {
+	}
+	for range k {
+	}
+}
+`})
+	fs, err := CheckDir(dir, "example.com/p", fixtureCore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clockTail = " is not allowed in core: core reads no clock and uses time only for Time and Duration values and their arithmetic"
+	const rangeTail = ": iteration order is random; range over sorted keys or annotate //tenure:maporder <reason>"
+	want := []string{
+		"a.go:9:54: DT003: time.ParseError" + clockTail,
+		"a.go:10:8: DT003: time.Time.Format" + clockTail,
+		"a.go:12:8: DT003: time.ParseError.Layout" + clockTail,
+		"a.go:13:8: DT003: time.Duration.Hours" + clockTail,
+		"a.go:14:2: DT005: range over map M" + rangeTail,
+		"a.go:18:2: DT005: range over map p.set" + rangeTail,
+	}
+	if got := strings.Split(findingLines(fs), "\n"); !slices.Equal(got, want) {
+		t.Errorf("findings:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
 	}
 }

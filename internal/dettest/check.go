@@ -409,7 +409,12 @@ func (c *checker) checkPackage(base, dir, importPath, corePath string) ([]Findin
 		}
 	}
 	if len(host) > 0 {
-		pkg, err := c.typesConfig().Check(importPath, c.fset, host, nil)
+		info := &types.Info{
+			Types:      map[ast.Expr]types.TypeAndValue{},
+			Uses:       map[*ast.Ident]types.Object{},
+			Selections: map[*ast.SelectorExpr]*types.Selection{},
+		}
+		pkg, err := c.typesConfig().Check(importPath, c.fset, host, info)
 		if err != nil {
 			if c.loadErr != nil {
 				return nil, c.loadErr
@@ -421,6 +426,7 @@ func (c *checker) checkPackage(base, dir, importPath, corePath string) ([]Findin
 				c.pkgs[importPath] = pkg // packages below reuse it
 			}
 		}
+		r.hostRules(host, info)
 	}
 	return r.out, nil
 }
