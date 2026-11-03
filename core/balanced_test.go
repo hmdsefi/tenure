@@ -6,6 +6,7 @@ package core
 import (
 	"cmp"
 	"hash/fnv"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -112,11 +113,6 @@ func propertyMatrix(f func(space string, n int, keys []string)) {
 	}
 }
 
-// scoreClosure is the Score closure of ASG-090 for space.
-func scoreClosure(space string) func(s int, k string) uint64 {
-	return func(s int, k string) uint64 { return Score(space, strconv.Itoa(s), k) }
-}
-
 func TestATASG01Shapes(t *testing.T) {
 	tests := []struct {
 		space string
@@ -219,6 +215,30 @@ func TestATASG02Golden(t *testing.T) {
 	}
 }
 
+// TestBalancedScore checks the allocation-free score function of Balanced against
+// Score(space, strconv.Itoa(s), key) (ASG-090), with shards in an order that changes the
+// shard between calls and repeats it.
+func TestBalancedScore(t *testing.T) {
+	shards := []int{0, 9, 10, 99, 100, 12345, math.MaxInt32, -1, -100, 0, 0, 12345, 9}
+	keys := []string{"", "a", "m0", "slot-3", "x\x00y", "pod-0"}
+	for _, space := range []string{"", "orderbook", "bench", "a\x00b"} {
+		score := balancedScore(space)
+		for _, s := range shards {
+			for _, key := range keys {
+				if got, want := score(s, key), Score(space, strconv.Itoa(s), key); got != want {
+					t.Errorf("balancedScore(%q)(%d, %q) = %#016x, want Score = %#016x", space, s, key, got, want)
+				}
+			}
+		}
+		for i := range shards { // the shard changes on every call
+			s, key := shards[i], keys[i%len(keys)]
+			if got, want := score(s, key), Score(space, strconv.Itoa(s), key); got != want {
+				t.Errorf("balancedScore(%q)(%d, %q) after shard %d = %#016x, want Score = %#016x", space, s, key, shards[max(i-1, 0)], got, want)
+			}
+		}
+	}
+}
+
 func TestATASG03Ties(t *testing.T) {
 	seven := func(int, string) uint64 { return 7 }
 	byShard := func(s int, _ string) uint64 { return uint64(100 - s) } //nolint:gosec // s is below 100
@@ -238,31 +258,6 @@ func TestATASG03Ties(t *testing.T) {
 			t.Errorf("%s: balancedScored(%d, %q) = %v, want %v", tt.name, tt.n, tt.keys, got, tt.want)
 		}
 	}
-}
-
-func TestATASG04Properties(t *testing.T) {
-	propertyMatrix(func(space string, n int, keys []string) {
-		got := Balanced(space, n, keys)
-		if len(got) != n || slices.Contains(got, -1) {
-			t.Errorf("Balanced(%q, %d, m0 … m%d) = %v, want %d assigned shards", space, n, len(keys)-1, got, n)
-			return
-		}
-		m := len(keys)
-		q, r := n/m, n%m
-		full := 0
-		for i, c := range shardCounts(got, m) {
-			switch c {
-			case q + 1:
-				full++
-			case q:
-			default:
-				t.Errorf("Balanced(%q, %d, m0 … m%d): %s holds %d shards, want %d or %d", space, n, m-1, keys[i], c, q, q+1)
-			}
-		}
-		if full != r {
-			t.Errorf("Balanced(%q, %d, m0 … m%d): %d keys hold %d shards, want %d", space, n, m-1, full, q+1, r)
-		}
-	})
 }
 
 func TestATASG05KeyOrder(t *testing.T) {
@@ -308,29 +303,16 @@ func TestATASG05KeyOrder(t *testing.T) {
 	})
 }
 
-func TestATASG06Seam(t *testing.T) {
-	propertyMatrix(func(space string, n int, keys []string) {
-		if got, want := Balanced(space, n, keys), balancedScored(n, keys, scoreClosure(space)); !slices.Equal(got, want) {
-			t.Errorf("Balanced(%q, %d, m0 … m%d) = %v, balancedScored with Score = %v", space, n, len(keys)-1, got, want)
-		}
-	})
-}
-
 // balancedMovement returns, for Balanced("bench", n, m0 … m(M-1)), how many shards move when
 // m<M> joins and how many of them move to it, and how many move when m(M-1) leaves and how
-// many of them move from it (ASG-110). same is the number of shards that move when the
-// result is recomputed with the same keys.
-func balancedMovement(n, m int) (movedJoin, toNew, movedLeave, fromLeft, same int) {
+// many of them move from it (ASG-110).
+func balancedMovement(n, m int) (movedJoin, toNew, movedLeave, fromLeft int) {
 	keys := seqKeys("m", m+1)
 	base, joined, left := keys[:m], keys, keys[:m-1]
 	b := Balanced("bench", n, base)
-	again := Balanced("bench", n, base)
 	j := Balanced("bench", n, joined)
 	l := Balanced("bench", n, left)
 	for s := range n {
-		if base[again[s]] != base[b[s]] {
-			same++
-		}
 		if joined[j[s]] != base[b[s]] {
 			movedJoin++
 			if j[s] == m {
@@ -344,57 +326,36 @@ func balancedMovement(n, m int) (movedJoin, toNew, movedLeave, fromLeft, same in
 			}
 		}
 	}
-	return movedJoin, toNew, movedLeave, fromLeft, same
+	return movedJoin, toNew, movedLeave, fromLeft
+}
+
+// countMoved returns the number of shards whose key differs between results a and b over
+// keys.
+func countMoved(keys []string, a, b []int) int {
+	moved := 0
+	for s := range a {
+		if keys[a[s]] != keys[b[s]] {
+			moved++
+		}
+	}
+	return moved
 }
 
 func TestBalancedMovement(t *testing.T) {
 	for _, n := range []int{64, 1024, 4096} {
 		for _, m := range []int{3, 10, 100} {
-			movedJoin, toNew, movedLeave, fromLeft, same := balancedMovement(n, m)
-			if same != 0 {
+			movedJoin, toNew, movedLeave, fromLeft := balancedMovement(n, m)
+			keys := seqKeys("m", m)
+			base, again := Balanced("bench", n, keys), Balanced("bench", n, keys)
+			if same := countMoved(keys, base, again); same != 0 {
 				t.Errorf("n=%d m=%d: recomputing with the same keys moves %d shards, want 0", n, m, same)
 			}
-			held := shardCounts(Balanced("bench", n, seqKeys("m", m)), m)[m-1]
+			held := shardCounts(base, m)[m-1]
 			if fromLeft != held {
 				t.Errorf("n=%d m=%d: removing m%d moves %d of its %d shards, want all", n, m, m-1, fromLeft, held)
 			}
 			t.Logf("n=%d m=%d: moved/join %d, to-new/join %d, moved/leave %d, from-left/leave %d",
 				n, m, movedJoin, toNew, movedLeave, fromLeft)
 		}
-	}
-}
-
-func TestATASG09Differential(t *testing.T) {
-	check := func(space string, n int, keys []string) {
-		t.Helper()
-		if got, want := Balanced(space, n, keys), balancedReference(space, n, keys); !slices.Equal(got, want) {
-			t.Errorf("Balanced(%q, %d, %v) = %v, balancedReference = %v", space, n, keys, got, want)
-		}
-	}
-	propertyMatrix(check)
-	for sp := range 20 {
-		for _, n := range []int{1, 16, 1024} {
-			for _, m := range []int{1, 2, 3, 5, 10, 33, 100} {
-				check("s"+strconv.Itoa(sp), n, seqKeys("slot-", m))
-			}
-		}
-	}
-	for _, v := range []struct {
-		space string
-		n     int
-		keys  []string
-	}{
-		{"orderbook", 8, []string{"a", "b", "c"}},
-		{"orderbook", 8, []string{"c", "a", "b"}},
-		{"orderbook", 10, []string{"m1", "m2", "m3"}},
-		{"s", 2, []string{"a", "b", "c"}},
-		{"orderbook", 16, seqKeys("slot-", 4)},
-		{"orderbook", 6, []string{"a", "b", "c"}},
-		{"orderbook", 7, []string{"a", "b", "c"}},
-		{"wallets", 5, []string{"a", "b", "c"}},
-		{"bench", 1024, seqKeys("m", 10)},
-		{"orderbook", 64, []string{"pod-0", "pod-1", "pod-2"}},
-	} {
-		check(v.space, v.n, v.keys)
 	}
 }

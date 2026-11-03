@@ -34,7 +34,7 @@ func BenchmarkBalancedMovement(b *testing.B) {
 				b.ReportAllocs()
 				var movedJoin, toNew, movedLeave, fromLeft int
 				for b.Loop() {
-					movedJoin, toNew, movedLeave, fromLeft, _ = balancedMovement(n, m)
+					movedJoin, toNew, movedLeave, fromLeft = balancedMovement(n, m)
 				}
 				b.ReportMetric(float64(movedJoin), "moved/join")
 				b.ReportMetric(float64(toNew), "to-new/join")

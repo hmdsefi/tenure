@@ -6,6 +6,7 @@
 package core
 
 import (
+	"runtime/debug"
 	"strconv"
 	"testing"
 )
@@ -107,6 +108,9 @@ func TestATPTR11AllocsPicks(t *testing.T) {
 }
 
 func TestATASG07Allocs(t *testing.T) {
+	// A collection during a run can add an allocation; keep the collector off so the counts
+	// compare exactly.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 	var sink int
 	calls := []struct {
 		name  string
@@ -121,6 +125,9 @@ func TestATASG07Allocs(t *testing.T) {
 	var first float64
 	for i, c := range calls {
 		got := testing.AllocsPerRun(10, func() { sink += len(Balanced(c.space, c.n, c.keys)) })
+		if got > 4 {
+			t.Errorf("%s allocates %v times, want at most 4", c.name, got)
+		}
 		if i == 0 {
 			first = got
 			t.Logf("%s allocates %v times", c.name, got)

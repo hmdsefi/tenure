@@ -31,12 +31,7 @@ func Balanced(space string, n int, keys []string) []int {
 	if dup, ok := smallestDuplicate(keys); ok {
 		panic(fmt.Errorf("core: Balanced: duplicate key %q", dup))
 	}
-	return balancedScored(n, keys, func(shard int, key string) uint64 {
-		// strconv.Itoa allocates for shard >= 100; AppendInt into a local array does not, so
-		// the number of allocations does not depend on n (ASG-100).
-		var digits [20]byte
-		return scoreDigits(space, strconv.AppendInt(digits[:0], int64(shard), 10), key)
-	})
+	return balancedScored(n, keys, balancedScore(space))
 }
 
 // smallestDuplicate returns the smallest key, in byte-wise order, that keys holds more than
@@ -52,23 +47,31 @@ func smallestDuplicate(keys []string) (string, bool) {
 	return "", false
 }
 
-// scoreDigits returns Score(namespace, string(key), memberID) without converting key to a
-// string (COR-110).
-func scoreDigits(namespace string, key []byte, memberID string) uint64 {
-	h := fnvString(fnvOffset64, namespace)
-	h = fnvZero(h)
-	for _, c := range key {
-		h ^= uint64(c)
-		h *= fnvPrime64
+// balancedScore returns the score function Balanced passes to balancedScored: it equals
+// Score(space, strconv.Itoa(shard), key) (ASG-090) without allocating. It hashes space, the
+// shard's digits and the zero bytes once per shard and reuses that state while consecutive
+// calls name the same shard, as balancedScored's calls do (ASG §11). strconv.Itoa allocates
+// for shard >= 100; the digits go into an array local to the call instead, so the number of
+// allocations does not depend on n (ASG-100).
+func balancedScore(space string) func(shard int, key string) uint64 {
+	var (
+		last   int
+		prefix uint64
+		cached bool
+	)
+	return func(shard int, key string) uint64 {
+		if !cached || shard != last {
+			var digits [20]byte
+			prefix = scorePrefix(space, strconv.AppendInt(digits[:0], int64(shard), 10))
+			last, cached = shard, true
+		}
+		return scoreFrom(prefix, key)
 	}
-	h = fnvZero(h)
-	h = fnvString(h, memberID)
-	return fmix64(h)
 }
 
 // balancedPair is one (shard, key) pair of the greedy pass: its score, the key's rank in
-// byte-wise key order and the shard. Indices fit int32 inside ASG-100's measured envelope
-// of n·M <= 2^24 pairs.
+// byte-wise key order and the shard. The indices fit int32 for any n and M up to 2^31-1
+// (ASG §11).
 type balancedPair struct {
 	score uint64
 	key   int32
@@ -106,8 +109,8 @@ func balancedScored(n int, keys []string, score func(shard int, key string) uint
 		for j, i := range order {
 			pairs = append(pairs, balancedPair{
 				score: score(s, keys[i]),
-				key:   int32(j), //nolint:gosec // j < len(keys), inside the measured envelope
-				shard: int32(s), //nolint:gosec // s < n, inside the measured envelope
+				key:   int32(j), //nolint:gosec // j < len(keys); wraps only past 2^31-1 keys
+				shard: int32(s), //nolint:gosec // s < n; wraps only past 2^31-1 shards
 			})
 		}
 	}
