@@ -1,2 +1,4 @@
 # tenure golden v1
 # name seed hash count
+keyshard 0x0000000000000000 0x0dd91dee1b7fedf9 60036
+score 0x0000000000000000 0x88689fb8f3d7910d 6180
