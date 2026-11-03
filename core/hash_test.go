@@ -76,6 +76,10 @@ func TestATCOR08KeyShard(t *testing.T) {
 			func() {
 				defer func() {
 					r := recover()
+					if r == nil {
+						t.Errorf("KeyShard(%q, %d) did not panic, want %q", "a", tt.n, tt.want)
+						return
+					}
 					err, ok := r.(error)
 					if !ok {
 						t.Errorf("KeyShard(%q, %d) panicked with %v (%T), want an error", "a", tt.n, r, r)

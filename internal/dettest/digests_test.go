@@ -247,7 +247,7 @@ func TestATDET12DigestWorkflow(t *testing.T) {
 func TestDigestCaseKeyshard(t *testing.T) {
 	lines := caseLines(t, "keyshard")
 	if len(lines) != 60036 {
-		t.Errorf("keyshard has %d lines, want 60036", len(lines))
+		t.Fatalf("keyshard has %d lines, want 60036", len(lines))
 	}
 	if lines[0] != `"" 1 0` {
 		t.Errorf("first keyshard line = %q, want %q", lines[0], `"" 1 0`)
