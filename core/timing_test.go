@@ -66,6 +66,20 @@ func TestATCOR06TimingValidate(t *testing.T) {
 			"core: invalid timing: SlotGrace 14s must be at least LeaseDuration 15s"},
 		{"grace 15s", with(func(t *Timing) { t.SlotGrace = 15 * time.Second }), ""},
 
+		// Check order (COR-070): the first failing check wins.
+		{"checks 2 and 3 fail", Timing{LeaseDuration: 11 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 10 * time.Second, SlotGrace: 60 * time.Second},
+			"core: invalid timing: RenewDeadline 10s must be greater than 1.2 times RetryPeriod 10s"},
+		{"checks 3 and 4 fail", Timing{LeaseDuration: 11 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 2 * time.Second, SlotGrace: 5 * time.Second},
+			"core: invalid timing: LeaseDuration 11s must be at least 21/19 times RenewDeadline 10s"},
+		{"checks 2 and 4 fail", Timing{LeaseDuration: 15 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 10 * time.Second, SlotGrace: 5 * time.Second},
+			"core: invalid timing: RenewDeadline 10s must be greater than 1.2 times RetryPeriod 10s"},
+		{"checks 2, 3 and 4 fail", Timing{LeaseDuration: 11 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 10 * time.Second, SlotGrace: 5 * time.Second},
+			"core: invalid timing: RenewDeadline 10s must be greater than 1.2 times RetryPeriod 10s"},
+		{"check 1 before check 3", Timing{LeaseDuration: 11 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 2 * time.Second, SlotGrace: 0},
+			"core: invalid timing: SlotGrace 0s " + rangeErr},
+		{"check 1 before check 2", Timing{LeaseDuration: 15 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 0, SlotGrace: 60 * time.Second},
+			"core: invalid timing: RetryPeriod 0s " + rangeErr},
+
 		{"largest values", Timing{LeaseDuration: 24 * time.Hour, RenewDeadline: 20 * time.Hour, RetryPeriod: time.Hour, SlotGrace: 24 * time.Hour}, ""},
 	}
 	for _, tt := range tests {
