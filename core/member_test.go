@@ -106,6 +106,11 @@ func TestATCOR02ViewValidate(t *testing.T) {
 		{"slot vacant", slotted(1, -1), "core: invalid view: Members[0]: Slot 1 is vacant"},
 		{"slot shared", slotted(0, 0), "core: invalid view: Members[1]: Slot 0 already held by \"a\""},
 		{"opaque holders", View{Slots: 1, SlotHolders: []string{"zz/9"}, Members: []Member{{ID: "a", Slot: -1}}}, ""},
+		{"check 1 before 2", View{Members: members("x/y", "a")}, "core: invalid view: Members[0]: ID \"x/y\" contains '/'"},
+		{"check 1 before 3", View{Slots: -1, Members: []Member{{ID: "a", Slot: -2}}}, "core: invalid view: Members[0]: Slot -2 is below -1"},
+		{"check 2 before 3", View{Slots: -1, Members: members("b", "a")}, "core: invalid view: Members[1]: ID \"a\" does not sort after \"b\""},
+		{"check 3 before 4", View{Slots: -1, SlotHolders: []string{"h"}}, "core: invalid view: Slots -1 is negative"},
+		{"check 4 before 5", View{Slots: 2, SlotHolders: []string{"h"}, Members: []Member{{ID: "a", Slot: 5}}}, "core: invalid view: 1 SlotHolders for 2 slots"},
 		{"slots ignored without slots", View{Members: []Member{{ID: "a", Slot: 5}, {ID: "b", Slot: 5}}}, ""},
 	}
 	for _, tt := range tests {
