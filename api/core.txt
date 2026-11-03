@@ -2,3 +2,83 @@ package core // import "github.com/hmdsefi/tenure/core"
 
 Package core holds every decision tenure makes as pure, deterministic code: key
 hashing, assignment, ranking, the ownership machine, timing and partition trees.
+
+VARIABLES
+
+var (
+	ErrInvalidMember = errors.New("core: invalid member")
+	ErrInvalidView   = errors.New("core: invalid view")
+	ErrInvalidTiming = errors.New("core: invalid timing")
+)
+    Errors wrapped by the Validate methods. The text of each returned error
+    starts with the text of the error it wraps.
+
+
+TYPES
+
+type Member struct {
+	// ID identifies the member across restarts, for example its pod name. It is non-empty
+	// and contains neither '/' nor a zero byte.
+	ID string
+
+	// Addr is where callers reach the member, for example "10.0.0.7:8080". core does not
+	// interpret it.
+	Addr string
+
+	// Meta holds string labels. core does not interpret or modify it; a Member copied by a
+	// core function shares the map.
+	Meta map[string]string
+
+	// Draining reports that the member is handing its work over before it leaves.
+	Draining bool
+
+	// Slot is the slot the member holds in a view with slots, or -1 for none. In a view
+	// without slots it has no meaning. The runtime sets it when it merges slot data into a
+	// view.
+	Slot int
+
+	// JoinAt and LeaveAt bound, in wall-clock time, when the member takes part in
+	// placement: from JoinAt, inclusive, to LeaveAt, exclusive. A zero time is no bound.
+	JoinAt  time.Time
+	LeaveAt time.Time
+}
+    Member is one process taking part in a group.
+
+    Write Member values with keyed fields: later versions add fields.
+
+func Eligible(v View, at time.Time) []Member
+    Eligible returns the members of v that may be given shards or keys at the
+    wall-clock time at: members that are not draining, whose [JoinAt, LeaveAt)
+    window contains at (a zero bound is open), and that are not standbys
+    (members without a slot in a view with slots). The result is a new slice in
+    ID order, nil when no member is eligible.
+
+func (m Member) Validate() error
+    Validate reports whether m can take part in a group: ID is non-empty and
+    contains neither '/' nor a zero byte, Slot is -1 or greater, and LeaveAt is
+    after JoinAt when both are set. The error wraps ErrInvalidMember.
+
+type View struct {
+	// Version increases with every new snapshot on the same member. core functions other
+	// than the ownership machine ignore it.
+	Version uint64
+
+	// Members holds the members sorted by ID, with distinct IDs. Callers must not modify
+	// it.
+	Members []Member
+
+	// Slots is the group's slot count; 0 means the group has no slots.
+	Slots int
+
+	// SlotHolders has one entry per slot: the holder string of the slot's holder, or ""
+	// when the slot is vacant.
+	SlotHolders []string
+}
+    View is a membership snapshot as one member sees it.
+
+func (v View) Validate() error
+    Validate reports whether v is well formed: every member is valid, members
+    are sorted by ID with distinct IDs, Slots is not negative, SlotHolders has
+    Slots entries, and in a view with slots every member's Slot is -1 or a held
+    slot that no other member claims. The error wraps ErrInvalidView.
+
