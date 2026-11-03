@@ -399,6 +399,9 @@ func TestATPTR07Pick(t *testing.T) {
 	if got, want := treePanicText(t, func() { Tree{Read: 0}.PickRead(1) }), "core: Tree.PickRead: Read 0 is below 1"; got != want {
 		t.Errorf("PickRead panic = %q, want %q", got, want)
 	}
+	if got, want := treePanicText(t, func() { Tree{Read: -1}.PickRead(1) }), "core: Tree.PickRead: Read -1 is below 1"; got != want {
+		t.Errorf("PickRead panic = %q, want %q", got, want)
+	}
 	// Pick reads only Write, and PickRead only Read.
 	if got := (Tree{Write: 2}).Pick(3); got != 1 {
 		t.Errorf("Tree{Write: 2}.Pick(3) = %d, want 1", got)
@@ -451,6 +454,7 @@ func TestATPTR09ValidateChange(t *testing.T) {
 		{"next invalid", tq, Tree{Name: "tq", Read: 8, Write: 9, Degree: 3}, `core: invalid tree "tq": Read 8 is below Write 9`},
 		{"receiver invalid", Tree{Name: "tq", Read: 0, Write: 0, Degree: 3}, tq, `core: invalid tree "tq": Write 0 is below 1`},
 		{"both invalid, receiver first", Tree{Name: "tq", Read: 0, Write: 0, Degree: 3}, Tree{}, `core: invalid tree "tq": Write 0 is below 1`},
+		{"name change beats a Read below the previous Write", tq, Tree{Name: "other", Read: 4, Write: 4, Degree: 3}, `core: invalid tree change: Name "tq" to "other"`},
 		{"invalid next beats a name change", tq, Tree{Name: "x/1", Read: 8, Write: 8, Degree: 3}, `core: invalid tree: Name "x/1" ends in partition suffix "/1"`},
 		{"scale up, step one", Tree{Name: "tq", Read: 4, Write: 4, Degree: 3}, Tree{Name: "tq", Read: 8, Write: 4, Degree: 3}, ""},
 		{"scale up, step two", Tree{Name: "tq", Read: 8, Write: 4, Degree: 3}, Tree{Name: "tq", Read: 8, Write: 8, Degree: 3}, ""},
@@ -476,6 +480,11 @@ func TestATPTR09ValidateChange(t *testing.T) {
 			if !errors.Is(err, ErrInvalidTree) {
 				t.Errorf("ValidateChange error %q does not wrap ErrInvalidTree", err)
 			}
+			// The receiver's and next's own Validate errors come back unchanged, not
+			// wrapped again, so one Unwrap reaches ErrInvalidTree.
+			if got := errors.Unwrap(err); got != ErrInvalidTree {
+				t.Errorf("errors.Unwrap(%q) = %v, want ErrInvalidTree itself", err, got)
+			}
 		})
 	}
 }
@@ -498,7 +507,7 @@ func TestATPTR10ScaleDown(t *testing.T) {
 	// forwards into 0..2.
 	polled := make(map[int]bool)
 	for r := range uint64(1000) {
-		if p := s1.Pick(r); p < 0 || p > 2 {
+		if p := s1.Pick(r); p > 2 {
 			t.Fatalf("s1.Pick(%d) = %d, want 0..2", r, p)
 		}
 		polled[s1.PickRead(r)] = true
@@ -508,13 +517,20 @@ func TestATPTR10ScaleDown(t *testing.T) {
 			t.Errorf("s1.PickRead never returned %d", p)
 		}
 	}
+	// Each draining partition's chain decreases and lands in 0..2; the first partition
+	// of the chain inside 0..2 is the one its backlog drains into.
+	landing := map[int]int{3: 1, 4: 1, 5: 2, 6: 2, 7: 1}
 	for p := 3; p <= 7; p++ {
 		at := p
 		for at > 2 {
-			at = s1.Parent(at)
+			parent := s1.Parent(at)
+			if parent < 0 || parent >= at {
+				t.Fatalf("Parent(%d) = %d, want 0 <= parent < %d", at, parent, at)
+			}
+			at = parent
 		}
-		if at < 0 || at > 2 {
-			t.Errorf("partition %d does not reach 0..2", p)
+		if at != landing[p] {
+			t.Errorf("partition %d drains into %d, want %d", p, at, landing[p])
 		}
 	}
 	if got := s1.Parent(7); got != 3 || s1.Parent(3) != 1 {
