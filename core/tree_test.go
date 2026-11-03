@@ -354,3 +354,193 @@ func TestTreeChildrenMatchParent(t *testing.T) {
 		}
 	}
 }
+
+func TestATPTR07Pick(t *testing.T) {
+	tree := Tree{Name: "tq", Read: 8, Write: 4, Degree: 3}
+	for _, tc := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"Pick(0)", tree.Pick(0), 0},
+		{"Pick(5)", tree.Pick(5), 1},
+		{"Pick(MaxUint64)", tree.Pick(math.MaxUint64), 3},
+		{"PickRead(13)", tree.PickRead(13), 5},
+		{"PickRead(MaxUint64)", tree.PickRead(math.MaxUint64), 7},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d", tc.name, tc.got, tc.want)
+		}
+	}
+
+	var writes [4]int
+	var reads [8]int
+	for r := range uint64(8000) {
+		writes[tree.Pick(r)]++
+		reads[tree.PickRead(r)]++
+	}
+	for p, n := range writes {
+		if n != 2000 {
+			t.Errorf("write partition %d picked %d times, want 2000", p, n)
+		}
+	}
+	for p, n := range reads {
+		if n != 1000 {
+			t.Errorf("read partition %d picked %d times, want 1000", p, n)
+		}
+	}
+
+	if got, want := treePanicText(t, func() { Tree{Write: 0}.Pick(1) }), "core: Tree.Pick: Write 0 is below 1"; got != want {
+		t.Errorf("Pick panic = %q, want %q", got, want)
+	}
+	if got, want := treePanicText(t, func() { Tree{Write: -3}.Pick(1) }), "core: Tree.Pick: Write -3 is below 1"; got != want {
+		t.Errorf("Pick panic = %q, want %q", got, want)
+	}
+	if got, want := treePanicText(t, func() { Tree{Read: 0}.PickRead(1) }), "core: Tree.PickRead: Read 0 is below 1"; got != want {
+		t.Errorf("PickRead panic = %q, want %q", got, want)
+	}
+	if got, want := treePanicText(t, func() { Tree{Read: -1}.PickRead(1) }), "core: Tree.PickRead: Read -1 is below 1"; got != want {
+		t.Errorf("PickRead panic = %q, want %q", got, want)
+	}
+	// Pick reads only Write, and PickRead only Read.
+	if got := (Tree{Write: 2}).Pick(3); got != 1 {
+		t.Errorf("Tree{Write: 2}.Pick(3) = %d, want 1", got)
+	}
+	if got := (Tree{Read: 2}).PickRead(3); got != 1 {
+		t.Errorf("Tree{Read: 2}.PickRead(3) = %d, want 1", got)
+	}
+}
+
+func TestATPTR08Unpartitioned(t *testing.T) {
+	for _, degree := range []int{20, 1} {
+		u := Tree{Name: "orders/eu", Read: 1, Write: 1, Degree: degree}
+		if got := u.Key(0); got != "orders/eu" {
+			t.Errorf("Degree %d: Key(0) = %q, want %q", degree, got, "orders/eu")
+		}
+		want := KeyShard("orders/eu", 64)
+		for _, r := range []uint64{0, 1, 12345, math.MaxUint64} {
+			if got := u.Pick(r); got != 0 {
+				t.Errorf("Degree %d: Pick(%d) = %d, want 0", degree, r, got)
+			}
+			if got := u.PickRead(r); got != 0 {
+				t.Errorf("Degree %d: PickRead(%d) = %d, want 0", degree, r, got)
+			}
+			if got := KeyShard(u.Key(u.Pick(r)), 64); got != want {
+				t.Errorf("Degree %d: KeyShard of the picked key = %d, want %d", degree, got, want)
+			}
+		}
+		if !u.IsRoot(0) {
+			t.Errorf("Degree %d: IsRoot(0) = false, want true", degree)
+		}
+		if got := u.Children(0); got != nil {
+			t.Errorf("Degree %d: Children(0) = %v, want nil", degree, got)
+		}
+	}
+}
+
+func TestATPTR09ValidateChange(t *testing.T) {
+	tq := treeTQ
+	tests := []struct {
+		name string
+		from Tree
+		to   Tree
+		want string // empty: valid
+	}{
+		{"lower Write", tq, Tree{Name: "tq", Read: 8, Write: 4, Degree: 3}, ""},
+		{"then lower Read", Tree{Name: "tq", Read: 8, Write: 4, Degree: 3}, Tree{Name: "tq", Read: 4, Write: 4, Degree: 3}, ""},
+		{"lower both at once", tq, Tree{Name: "tq", Read: 4, Write: 4, Degree: 3}, `core: invalid tree change "tq": Read 4 is below the previous Write 8`},
+		{"Degree change", tq, Tree{Name: "tq", Read: 8, Write: 8, Degree: 5}, ""},
+		{"name change", tq, Tree{Name: "other", Read: 8, Write: 8, Degree: 3}, `core: invalid tree change: Name "tq" to "other"`},
+		{"next invalid", tq, Tree{Name: "tq", Read: 8, Write: 9, Degree: 3}, `core: invalid tree "tq": Read 8 is below Write 9`},
+		{"receiver invalid", Tree{Name: "tq", Read: 0, Write: 0, Degree: 3}, tq, `core: invalid tree "tq": Write 0 is below 1`},
+		{"both invalid, receiver first", Tree{Name: "tq", Read: 0, Write: 0, Degree: 3}, Tree{}, `core: invalid tree "tq": Write 0 is below 1`},
+		{"name change beats a Read below the previous Write", tq, Tree{Name: "other", Read: 4, Write: 4, Degree: 3}, `core: invalid tree change: Name "tq" to "other"`},
+		{"invalid next beats a name change", tq, Tree{Name: "x/1", Read: 8, Write: 8, Degree: 3}, `core: invalid tree: Name "x/1" ends in partition suffix "/1"`},
+		{"scale up, step one", Tree{Name: "tq", Read: 4, Write: 4, Degree: 3}, Tree{Name: "tq", Read: 8, Write: 4, Degree: 3}, ""},
+		{"scale up, step two", Tree{Name: "tq", Read: 8, Write: 4, Degree: 3}, Tree{Name: "tq", Read: 8, Write: 8, Degree: 3}, ""},
+		{"scale up in one step", Tree{Name: "tq", Read: 4, Write: 4, Degree: 3}, Tree{Name: "tq", Read: 8, Write: 8, Degree: 3}, ""},
+		{"no change", tq, tq, ""},
+		{"Read equals previous Write", Tree{Name: "tq", Read: 8, Write: 4, Degree: 3}, Tree{Name: "tq", Read: 4, Write: 2, Degree: 3}, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.from.ValidateChange(tc.to)
+			if tc.want == "" {
+				if err != nil {
+					t.Errorf("ValidateChange = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ValidateChange = nil, want %q", tc.want)
+			}
+			if err.Error() != tc.want {
+				t.Errorf("ValidateChange = %q, want %q", err.Error(), tc.want)
+			}
+			if !errors.Is(err, ErrInvalidTree) {
+				t.Errorf("ValidateChange error %q does not wrap ErrInvalidTree", err)
+			}
+			// The receiver's and next's own Validate errors come back unchanged, not
+			// wrapped again, so one Unwrap reaches ErrInvalidTree.
+			if got := errors.Unwrap(err); got != ErrInvalidTree {
+				t.Errorf("errors.Unwrap(%q) = %v, want ErrInvalidTree itself", err, got)
+			}
+		})
+	}
+}
+
+func TestATPTR10ScaleDown(t *testing.T) {
+	s0 := Tree{Name: "tq", Read: 8, Write: 8, Degree: 2}
+	s1 := Tree{Name: "tq", Read: 8, Write: 3, Degree: 2}
+	s2 := Tree{Name: "tq", Read: 3, Write: 3, Degree: 2}
+	if err := s0.ValidateChange(s1); err != nil {
+		t.Errorf("s0 to s1: %v, want nil", err)
+	}
+	if err := s1.ValidateChange(s2); err != nil {
+		t.Errorf("s1 to s2: %v, want nil", err)
+	}
+	if err := s0.ValidateChange(s2); !errors.Is(err, ErrInvalidTree) {
+		t.Errorf("s0 to s2: %v, want an error wrapping ErrInvalidTree", err)
+	}
+
+	// Under s1 writers stay in 0..2, readers poll 0..7, and every draining partition
+	// forwards into 0..2.
+	polled := make(map[int]bool)
+	for r := range uint64(1000) {
+		if p := s1.Pick(r); p > 2 {
+			t.Fatalf("s1.Pick(%d) = %d, want 0..2", r, p)
+		}
+		polled[s1.PickRead(r)] = true
+	}
+	for p := range 8 {
+		if !polled[p] {
+			t.Errorf("s1.PickRead never returned %d", p)
+		}
+	}
+	// Each draining partition's chain decreases and lands in 0..2; the first partition
+	// of the chain inside 0..2 is the one its backlog drains into.
+	landing := map[int]int{3: 1, 4: 1, 5: 2, 6: 2, 7: 1}
+	for p := 3; p <= 7; p++ {
+		at := p
+		for at > 2 {
+			parent := s1.Parent(at)
+			if parent < 0 || parent >= at {
+				t.Fatalf("Parent(%d) = %d, want 0 <= parent < %d", at, parent, at)
+			}
+			at = parent
+		}
+		if at != landing[p] {
+			t.Errorf("partition %d drains into %d, want %d", p, at, landing[p])
+		}
+	}
+	if got := s1.Parent(7); got != 3 || s1.Parent(3) != 1 {
+		t.Errorf("chain from 7 = 7, %d, %d, want 7, 3, 1", got, s1.Parent(3))
+	}
+
+	if got := s2.Children(1); got != nil {
+		t.Errorf("s2.Children(1) = %v, want nil", got)
+	}
+	if got, want := s2.Children(0), []int{1, 2}; !slices.Equal(got, want) {
+		t.Errorf("s2.Children(0) = %v, want %v", got, want)
+	}
+}

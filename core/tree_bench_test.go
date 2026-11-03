@@ -8,6 +8,7 @@ import "testing"
 var (
 	benchTreeStr  string
 	benchTreeInts []int
+	benchTreeInt  int
 )
 
 func BenchmarkTreeKey(b *testing.B) {
@@ -30,5 +31,15 @@ func BenchmarkTreeChildren(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		benchTreeInts = tree.Children(0)
+	}
+}
+
+func BenchmarkTreePick(b *testing.B) {
+	tree := Tree{Name: "tq", Read: 4096, Write: 1000, Degree: 20}
+	b.ReportAllocs()
+	var r uint64
+	for b.Loop() {
+		r += 0x9e3779b97f4a7c15
+		benchTreeInt = tree.Pick(r)
 	}
 }

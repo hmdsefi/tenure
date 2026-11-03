@@ -203,10 +203,26 @@ func (t Tree) Parent(i int) int
     contains the parent of each of its partitions. Parent panics if i < 1 or
     Degree < 1.
 
+func (t Tree) Pick(r uint64) int
+    Pick returns the write partition for the random number r: r modulo Write.
+    Callers pass a uniformly random r. Pick panics if Write < 1.
+
+func (t Tree) PickRead(r uint64) int
+    PickRead returns the read partition to poll for the random number r:
+    r modulo Read. PickRead panics if Read < 1.
+
 func (t Tree) Validate() error
     Validate reports whether t is usable: Name is non-empty and does not end
     in "/" followed by a decimal number without leading zeros, Write >= 1,
     Read >= Write and Degree >= 1. The error wraps ErrInvalidTree.
+
+func (t Tree) ValidateChange(next Tree) error
+    ValidateChange reports whether members may move from t to next:
+    both are valid, the names are equal, and next.Read is at least t.Write,
+    so no partition stops being polled while a member that has not yet applied
+    next may still write to it. Partitions dropped from the read set must be
+    empty before the change; ValidateChange cannot check that. The error wraps
+    ErrInvalidTree.
 
 type View struct {
 	// Version increases with every new snapshot on the same member. core functions other
