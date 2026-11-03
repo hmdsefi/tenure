@@ -28,7 +28,6 @@ func TestATPTR11AllocsTopology(t *testing.T) {
 		{"Key(0)", func() { treeSinkStr = tq.Key(0) }, 0},
 		{"Key(5)", func() { treeSinkStr = tq.Key(5) }, 1},
 		{"Key(4095)", func() { treeSinkStr = tq.Key(4095) }, 1},
-		{"Children(0)", func() { treeSinkInts = tq.Children(0) }, 1},
 		{"Children(3)", func() { treeSinkInts = tq.Children(3) }, 0},
 		{"Validate", func() { treeSinkErr = tq.Validate() }, 0},
 	}

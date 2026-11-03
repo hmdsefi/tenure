@@ -225,9 +225,8 @@ func TestATPTR04Topology(t *testing.T) {
 			{"parent partition first", func() { Tree{Degree: 0}.Parent(0) }, "core: Tree.Parent: partition 0 has no parent"},
 			{"children negative", func() { treeTQ.Children(-1) }, "core: Tree.Children: partition -1 is negative"},
 			{"children degree", func() { Tree{Name: "tq", Read: 8, Degree: 0}.Children(0) }, "core: Tree.Children: Degree 0 is below 1"},
-			// AT-PTR-04 lists {Read: 1}.Children(0) -> nil, but that tree has Degree 0, which
-			// PTR-070 and the panic table in PTR section 7 make a panic; the nil case above
-			// uses Degree 1.
+			// AT-PTR-04: {Read: 1, Degree: 1}.Children(0) is nil (a case above), but with
+			// Degree 0 PTR-070 makes Children panic, before the Read <= 1 shortcut.
 			{"children read 1 degree 0", func() { Tree{Name: "tq", Read: 1}.Children(0) }, "core: Tree.Children: Degree 0 is below 1"},
 			{"children partition first", func() { Tree{Read: 8, Degree: 0}.Children(-1) }, "core: Tree.Children: partition -1 is negative"},
 		}
