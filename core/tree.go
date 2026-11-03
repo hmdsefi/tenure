@@ -81,6 +81,27 @@ func partitionSuffix(name string) string {
 	return name[slash:]
 }
 
+// ValidateChange reports whether members may move from t to next: both are valid, the
+// names are equal, and next.Read is at least t.Write, so no partition stops being polled
+// while a member that has not yet applied next may still write to it. Partitions dropped
+// from the read set must be empty before the change; ValidateChange cannot check that. The
+// error wraps ErrInvalidTree.
+func (t Tree) ValidateChange(next Tree) error {
+	if err := t.Validate(); err != nil {
+		return err
+	}
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	if next.Name != t.Name {
+		return fmt.Errorf("%w change: Name %q to %q", ErrInvalidTree, t.Name, next.Name)
+	}
+	if next.Read < t.Write {
+		return fmt.Errorf("%w change %q: Read %d is below the previous Write %d", ErrInvalidTree, t.Name, next.Read, t.Write)
+	}
+	return nil
+}
+
 // Key returns partition i's key: Name for the root and Name + "/" + i otherwise. It does
 // not check i against Read, so a member with an older Tree value can still name a
 // partition. Key panics if i < 0.
@@ -148,4 +169,22 @@ func (t Tree) Children(i int) []int {
 		children[k] = first + k
 	}
 	return children
+}
+
+// Pick returns the write partition for the random number r: r modulo Write. Callers pass a
+// uniformly random r. Pick panics if Write < 1.
+func (t Tree) Pick(r uint64) int {
+	if t.Write < 1 {
+		panic(fmt.Errorf("core: Tree.Pick: Write %d is below 1", t.Write))
+	}
+	return int(r % uint64(t.Write)) //nolint:gosec // the remainder is below Write, which is an int
+}
+
+// PickRead returns the read partition to poll for the random number r: r modulo Read.
+// PickRead panics if Read < 1.
+func (t Tree) PickRead(r uint64) int {
+	if t.Read < 1 {
+		panic(fmt.Errorf("core: Tree.PickRead: Read %d is below 1", t.Read))
+	}
+	return int(r % uint64(t.Read)) //nolint:gosec // the remainder is below Read, which is an int
 }

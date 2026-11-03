@@ -32,6 +32,7 @@ var digestCases = []digestCase{
 	{name: "keyshard", lines: func(add func(line string)) { keyshardLines(add, keyshardKeys()) }},
 	{name: "score", lines: scoreLines},
 	{name: "rank", lines: rankLines},
+	{name: "tree", lines: treeLines},
 }
 
 // keyshardKeys returns the keys of the keyshard case: six fixed keys, then k0 … k9999.
@@ -91,6 +92,34 @@ func rankLines(add func(line string)) {
 			}
 			add(strconv.Itoa(n) + " " + key + " " + strings.Join(ids, ","))
 		}
+	}
+}
+
+// treeLines adds the tree case's lines (PTR-150): for each Degree, each partition's key,
+// parent and children, then picks of 1000 multiples of the golden-ratio constant.
+func treeLines(add func(line string)) {
+	for _, d := range []int{1, 2, 3, 20} {
+		t := core.Tree{Name: "tq", Read: 100, Write: 50, Degree: d}
+		for i := range 100 {
+			parent := "-"
+			if i > 0 {
+				parent = strconv.Itoa(t.Parent(i))
+			}
+			children := "-"
+			if cs := t.Children(i); cs != nil {
+				strs := make([]string, len(cs))
+				for k, c := range cs {
+					strs[k] = strconv.Itoa(c)
+				}
+				children = strings.Join(strs, ",")
+			}
+			add(strconv.Itoa(d) + " " + strconv.Itoa(i) + " " + t.Key(i) + " " + parent + " " + children)
+		}
+	}
+	u := core.Tree{Name: "tq", Read: 7, Write: 3, Degree: 2}
+	for j := range 1000 {
+		r := uint64(j) * 0x9e3779b97f4a7c15 // wraps
+		add("pick " + strconv.FormatUint(r, 10) + " " + strconv.Itoa(u.Pick(r)) + " " + strconv.Itoa(u.PickRead(r)))
 	}
 }
 
@@ -343,5 +372,30 @@ func TestATDET12KeyshardDrift(t *testing.T) {
 	re := regexp.MustCompile(`^golden: keyshard seed 0x0000000000000000: got hash 0x[0-9a-f]{16} count 60042, want hash 0x[0-9a-f]{16} count 60036$`)
 	if !re.MatchString(lines[0]) {
 		t.Errorf("CompareGolden line = %q, want a match of %s", lines[0], re)
+	}
+}
+
+// TestATPTR12TreeDigest checks the tree case's count and lines (AT-PTR-12).
+func TestATPTR12TreeDigest(t *testing.T) {
+	lines := caseLines(t, "tree")
+	if len(lines) != 1400 {
+		t.Fatalf("tree has %d lines, want 1400", len(lines))
+	}
+	for _, c := range []struct {
+		n    int // 1-based line number
+		want string
+	}{
+		{1, "1 0 tq - 1"},
+		{100, "1 99 tq/99 98 -"},
+		{401, "pick 0 0 0"},
+		{402, "pick 11400714819323198485 1 4"},
+	} {
+		if lines[c.n-1] != c.want {
+			t.Errorf("tree line %d = %q, want %q", c.n, lines[c.n-1], c.want)
+		}
+	}
+	const want = "3 1 tq/1 0 4,5,6"
+	if !slices.Contains(lines, want) {
+		t.Errorf("tree has no line %q", want)
 	}
 }

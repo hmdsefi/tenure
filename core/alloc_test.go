@@ -88,3 +88,20 @@ func TestATPTR11AllocsTopology(t *testing.T) {
 		t.Errorf("Children(0): %v allocations per run, want exactly 1", got)
 	}
 }
+
+func TestATPTR11AllocsPicks(t *testing.T) {
+	tq := Tree{Name: "tq", Read: 8, Write: 8, Degree: 3}
+	tests := []struct {
+		name string
+		f    func()
+	}{
+		{"Pick", func() { treeSinkInt = tq.Pick(5) }},
+		{"PickRead", func() { treeSinkInt = tq.PickRead(5) }},
+		{"ValidateChange", func() { treeSinkErr = tq.ValidateChange(tq) }},
+	}
+	for _, tc := range tests {
+		if got := testing.AllocsPerRun(100, tc.f); got != 0 {
+			t.Errorf("%s: %v allocations per run, want 0", tc.name, got)
+		}
+	}
+}
