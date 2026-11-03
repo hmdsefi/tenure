@@ -31,6 +31,7 @@ type digestCase struct {
 var digestCases = []digestCase{
 	{name: "keyshard", lines: func(add func(line string)) { keyshardLines(add, keyshardKeys()) }},
 	{name: "score", lines: scoreLines},
+	{name: "rank", lines: rankLines},
 }
 
 // keyshardKeys returns the keys of the keyshard case: six fixed keys, then k0 … k9999.
@@ -69,6 +70,26 @@ func scoreLines(add func(line string)) {
 				add(strconv.Quote(ns) + " " + strconv.Quote(key) + " " + strconv.Quote(id) + " " +
 					fmt.Sprintf("0x%016x", core.Score(ns, key, id)))
 			}
+		}
+	}
+}
+
+// rankLines adds the rank case's lines (DET-450): over members m7 … m0 (descending IDs), for
+// each n and key, n, key and the IDs of core.Rank("account", key, members, n) joined by ",".
+func rankLines(add func(line string)) {
+	members := make([]core.Member, 8)
+	for i := range members {
+		members[i] = core.Member{ID: "m" + strconv.Itoa(7-i), Slot: -1}
+	}
+	for _, n := range []int{1, 3, 8} {
+		for i := range 200 {
+			key := "k" + strconv.Itoa(i)
+			ranked := core.Rank("account", key, members, n)
+			ids := make([]string, len(ranked))
+			for j, m := range ranked {
+				ids[j] = m.ID
+			}
+			add(strconv.Itoa(n) + " " + key + " " + strings.Join(ids, ","))
 		}
 	}
 }
@@ -263,6 +284,32 @@ func TestDigestCaseScore(t *testing.T) {
 	const want = `"account" "alice" "n1" 0x15f291e4c62474b8`
 	if !slices.Contains(lines, want) {
 		t.Errorf("score has no line %q", want)
+	}
+}
+
+// TestDigestCaseRank checks the rank case's count and that every line with n = 8 lists all
+// eight IDs (AT-DET-13).
+func TestDigestCaseRank(t *testing.T) {
+	lines := caseLines(t, "rank")
+	if len(lines) != 600 {
+		t.Errorf("rank has %d lines, want 600", len(lines))
+	}
+	all := []string{"m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"}
+	eights := 0
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) != 3 || fields[0] != "8" {
+			continue
+		}
+		eights++
+		got := strings.Split(fields[2], ",")
+		slices.Sort(got)
+		if !slices.Equal(got, all) {
+			t.Errorf("rank line %q does not list all eight IDs", line)
+		}
+	}
+	if eights != 200 {
+		t.Errorf("rank has %d lines with n = 8, want 200", eights)
 	}
 }
 

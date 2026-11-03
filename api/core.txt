@@ -82,10 +82,35 @@ func Eligible(v View, at time.Time) []Member
     (members without a slot in a view with slots). The result is a new slice in
     ID order, nil when no member is eligible.
 
+func Rank(namespace, key string, members []Member, n int) []Member
+    Rank returns the first n members of members for key in namespace,
+    best first: by Score descending, then by ID ascending, then by position
+    in members. It ranks every member it is given, whatever its other fields;
+    callers filter first. The result is a new slice of min(n, len(members))
+    copies, nil when n <= 0 or members is empty. Rank does not modify members.
+
 func (m Member) Validate() error
     Validate reports whether m can take part in a group: ID is non-empty and
     contains neither '/' nor a zero byte, Slot is -1 or greater, and LeaveAt is
     after JoinAt when both are set. The error wraps ErrInvalidMember.
+
+type Placement interface {
+	// Rank returns the first min(n, p) members for key in namespace, best first, as a new
+	// slice, where p is the number of members the placement places (an implementation that
+	// gives several members one place documents it); nil when n <= 0 or p is 0. For a <= b,
+	// Rank(namespace, key, a) is a prefix of Rank(namespace, key, b), so the first choice
+	// never depends on n.
+	Rank(namespace, key string, n int) []Member
+}
+    Placement places keys on one fixed list of members. Build one per member
+    list, for example once per view, and reuse it for every lookup. A Placement
+    is immutable and safe for concurrent use.
+
+func NewRendezvous(members []Member) Placement
+    NewRendezvous returns the Placement over members that ranks with Rank:
+    its Rank method returns Rank(namespace, key, members, n). It copies members,
+    so later changes to the slice do not affect it. NewRendezvous panics if two
+    members share an ID.
 
 type Term uint64
     Term numbers one acquisition of a shard. A store grants a new, larger term

@@ -5,7 +5,10 @@
 
 package core
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 func TestATCOR10Allocs(t *testing.T) {
 	var score uint64
@@ -17,6 +20,37 @@ func TestATCOR10Allocs(t *testing.T) {
 		t.Errorf(`KeyShard("market-42", 64) allocates %v times, want 0`, got)
 	}
 	_, _ = score, shard
+}
+
+func TestATCOR10AllocsRank(t *testing.T) {
+	ms := make([]Member, 1000)
+	for i := range ms {
+		ms[i] = Member{ID: "n" + strconv.Itoa(i)}
+	}
+	small := members("n1", "n2", "n3")
+	p := NewRendezvous(ms)
+	pSmall := NewRendezvous(small)
+	var sink int
+	tests := []struct {
+		name string
+		f    func()
+	}{
+		{`Rank("account", "k1", n0 … n999, 3)`, func() { sink += len(Rank("account", "k1", ms, 3)) }},
+		{`Rank("account", "k1", n0 … n999, 1)`, func() { sink += len(Rank("account", "k1", ms, 1)) }},
+		{`Rank("account", "k1", n1 … n3, 1)`, func() { sink += len(Rank("account", "k1", small, 1)) }},
+		{`Rank("account", "k1", n1 … n3, 3)`, func() { sink += len(Rank("account", "k1", small, 3)) }},
+		{`Rank("account", "k1", n1 … n3, 10)`, func() { sink += len(Rank("account", "k1", small, 10)) }},
+		{`NewRendezvous(n0 … n999).Rank("account", "k1", 1)`, func() { sink += len(p.Rank("account", "k1", 1)) }},
+		{`NewRendezvous(n0 … n999).Rank("account", "k1", 3)`, func() { sink += len(p.Rank("account", "k1", 3)) }},
+		{`NewRendezvous(n1 … n3).Rank("account", "k1", 1)`, func() { sink += len(pSmall.Rank("account", "k1", 1)) }},
+		{`NewRendezvous(n1 … n3).Rank("account", "k1", 10)`, func() { sink += len(pSmall.Rank("account", "k1", 10)) }},
+	}
+	for _, tt := range tests {
+		if got := testing.AllocsPerRun(100, tt.f); got > 2 {
+			t.Errorf("%s allocates %v times, want at most 2", tt.name, got)
+		}
+	}
+	_ = sink
 }
 
 // Results go to package-level sinks so the compiler cannot drop the calls.
