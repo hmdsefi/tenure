@@ -6,11 +6,14 @@ package core
 import (
 	"cmp"
 	"hash/fnv"
+	"maps"
 	"math"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // balancedReference is the sort-based algorithm of ASG-020 to ASG-040, kept verbatim and never
@@ -357,5 +360,209 @@ func TestBalancedMovement(t *testing.T) {
 			t.Logf("n=%d m=%d: moved/join %d, to-new/join %d, moved/leave %d, from-left/leave %d",
 				n, m, movedJoin, toNew, movedLeave, fromLeft)
 		}
+	}
+}
+
+// copyView returns a deep copy of v, Meta maps included, so a test can check that a call left
+// it unchanged.
+func copyView(v View) View {
+	c := v
+	c.Members = slices.Clone(v.Members)
+	for i := range c.Members {
+		c.Members[i].Meta = maps.Clone(v.Members[i].Meta)
+	}
+	c.SlotHolders = slices.Clone(v.SlotHolders)
+	return c
+}
+
+// placementKeys calls PlacementKeys and fails the test if it changes v or expired.
+func placementKeys(t *testing.T, v View, at time.Time, expired []bool) (keys []string, slots []int) {
+	t.Helper()
+	vCopy, expiredCopy := copyView(v), slices.Clone(expired)
+	keys, slots = PlacementKeys(v, at, expired)
+	if !reflect.DeepEqual(v, vCopy) {
+		t.Errorf("PlacementKeys modified v: now %+v, was %+v", v, vCopy)
+	}
+	if !slices.Equal(expired, expiredCopy) || (expired == nil) != (expiredCopy == nil) {
+		t.Errorf("PlacementKeys modified expired: now %v, was %v", expired, expiredCopy)
+	}
+	return keys, slots
+}
+
+func TestATASG10PlacementKeysNoSlots(t *testing.T) {
+	v := View{Members: []Member{
+		{ID: "a", Draining: true},
+		{ID: "b", Meta: map[string]string{"zone": "x"}},
+		{ID: "c", LeaveAt: t0},
+		{ID: "d"},
+	}}
+	tests := []struct {
+		name     string
+		at       time.Time
+		expired  []bool
+		wantKeys []string
+	}{
+		{"nil expired", t0, nil, []string{"b", "d"}},
+		{"empty expired", t0, []bool{}, []string{"b", "d"}},
+		{"before leave", t0.Add(-time.Second), nil, []string{"b", "c", "d"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			keys, slots := placementKeys(t, v, tt.at, tt.expired)
+			if !slices.Equal(keys, tt.wantKeys) {
+				t.Errorf("keys = %q, want %q", keys, tt.wantKeys)
+			}
+			if slots != nil {
+				t.Errorf("slots = %v, want nil", slots)
+			}
+		})
+	}
+
+	t.Run("every member draining", func(t *testing.T) {
+		all := View{Members: []Member{{ID: "a", Draining: true}, {ID: "b", Draining: true}}}
+		keys, slots := placementKeys(t, all, t0, nil)
+		if keys != nil || slots != nil {
+			t.Errorf("keys, slots = %#v, %#v, want nil, nil", keys, slots)
+		}
+		if got, want := Balanced("x", 3, keys), []int{-1, -1, -1}; !slices.Equal(got, want) {
+			t.Errorf("Balanced(x, 3, nil) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("no members", func(t *testing.T) {
+		keys, slots := placementKeys(t, View{}, t0, nil)
+		if keys != nil || slots != nil {
+			t.Errorf("keys, slots = %#v, %#v, want nil, nil", keys, slots)
+		}
+	})
+
+	t.Run("expired of length 1", func(t *testing.T) {
+		vCopy := copyView(v)
+		got := treePanicText(t, func() { PlacementKeys(v, t0, []bool{true}) })
+		if want := "core: PlacementKeys: len(expired) is 1, want 0"; got != want {
+			t.Errorf("panic = %q, want %q", got, want)
+		}
+		if !reflect.DeepEqual(v, vCopy) {
+			t.Errorf("PlacementKeys modified v while panicking")
+		}
+	})
+}
+
+func TestATASG11PlacementKeysSlots(t *testing.T) {
+	v := View{
+		Slots:       4,
+		SlotHolders: []string{"p/1", "", "q/2", ""},
+		Members: []Member{
+			{ID: "p", Slot: 0, Draining: true},
+			{ID: "q", Slot: 2, Meta: map[string]string{"zone": "y"}},
+			{ID: "r", Slot: -1},
+		},
+	}
+	tests := []struct {
+		name      string
+		expired   []bool
+		wantKeys  []string
+		wantSlots []int
+	}{
+		{"nil expired", nil, []string{"slot-0", "slot-1", "slot-2", "slot-3"}, []int{0, 1, 2, 3}},
+		{"none expired", []bool{false, false, false, false}, []string{"slot-0", "slot-1", "slot-2", "slot-3"}, []int{0, 1, 2, 3}},
+		{"one vacant expired", []bool{false, true, false, false}, []string{"slot-0", "slot-2", "slot-3"}, []int{0, 2, 3}},
+		{"all expired, held stay", []bool{true, true, true, true}, []string{"slot-0", "slot-2"}, []int{0, 2}},
+	}
+	for _, tt := range tests {
+		for _, at := range []time.Time{t0, {}} {
+			t.Run(tt.name+"/zero at="+strconv.FormatBool(at.IsZero()), func(t *testing.T) {
+				keys, slots := placementKeys(t, v, at, tt.expired)
+				if !slices.Equal(keys, tt.wantKeys) {
+					t.Errorf("at %v: keys = %q, want %q", at, keys, tt.wantKeys)
+				}
+				if !slices.Equal(slots, tt.wantSlots) {
+					t.Errorf("at %v: slots = %v, want %v", at, slots, tt.wantSlots)
+				}
+			})
+		}
+	}
+
+	t.Run("Balanced over the slot keys", func(t *testing.T) {
+		keys, _ := placementKeys(t, v, t0, nil)
+		want := []int{2, 3, 3, 1, 1, 3, 0, 2, 3, 2, 0, 2, 1, 0, 1, 0}
+		if got := Balanced("orderbook", 16, keys); !slices.Equal(got, want) {
+			t.Errorf("Balanced(orderbook, 16, keys) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a draining holder keeps its slot, a member's window is not read", func(t *testing.T) {
+		w := View{
+			Slots:       2,
+			SlotHolders: []string{"p/1", "q/2"},
+			Members: []Member{
+				{ID: "p", Slot: 0, Draining: true, LeaveAt: t0.Add(-time.Hour)},
+				{ID: "q", Slot: 1, JoinAt: t0.Add(time.Hour)},
+			},
+		}
+		keys, slots := placementKeys(t, w, t0, []bool{true, true})
+		if want := []string{"slot-0", "slot-1"}; !slices.Equal(keys, want) {
+			t.Errorf("keys = %q, want %q", keys, want)
+		}
+		if want := []int{0, 1}; !slices.Equal(slots, want) {
+			t.Errorf("slots = %v, want %v", slots, want)
+		}
+	})
+
+	t.Run("twelve vacant slots", func(t *testing.T) {
+		w := View{Slots: 12, SlotHolders: make([]string, 12)}
+		keys, slots := placementKeys(t, w, t0, nil)
+		if len(keys) != 12 || keys[0] != "slot-0" || keys[11] != "slot-11" {
+			t.Errorf("keys = %q, want slot-0 … slot-11", keys)
+		}
+		for i, s := range slots {
+			if s != i {
+				t.Errorf("slots = %v, want 0 … 11", slots)
+				break
+			}
+		}
+		if len(slots) != 12 {
+			t.Errorf("len(slots) = %d, want 12", len(slots))
+		}
+	})
+
+	t.Run("every slot expired", func(t *testing.T) {
+		w := View{Slots: 2, SlotHolders: []string{"", ""}}
+		keys, slots := placementKeys(t, w, t0, []bool{true, true})
+		if keys != nil || slots != nil {
+			t.Errorf("keys, slots = %#v, %#v, want nil, nil", keys, slots)
+		}
+		if got, want := Balanced("x", 3, keys), []int{-1, -1, -1}; !slices.Equal(got, want) {
+			t.Errorf("Balanced(x, 3, nil) = %v, want %v", got, want)
+		}
+	})
+
+	panics := []struct {
+		name    string
+		v       View
+		expired []bool
+		want    string
+	}{
+		{"short SlotHolders", View{Slots: 2, SlotHolders: []string{"p/1"}}, nil,
+			"core: PlacementKeys: 1 SlotHolders for 2 slots"},
+		{"SlotHolders checked first", View{Slots: 2, SlotHolders: []string{"p/1"}}, []bool{false, false, false},
+			"core: PlacementKeys: 1 SlotHolders for 2 slots"},
+		{"SlotHolders without slots", View{SlotHolders: []string{""}}, nil,
+			"core: PlacementKeys: 1 SlotHolders for 0 slots"},
+		{"short expired", View{Slots: 2, SlotHolders: []string{"", ""}}, []bool{true},
+			"core: PlacementKeys: len(expired) is 1, want 2"},
+		{"empty non-nil expired", View{Slots: 2, SlotHolders: []string{"", ""}}, []bool{},
+			"core: PlacementKeys: len(expired) is 0, want 2"},
+	}
+	for _, tt := range panics {
+		t.Run(tt.name, func(t *testing.T) {
+			vCopy, expiredCopy := copyView(tt.v), slices.Clone(tt.expired)
+			if got := treePanicText(t, func() { PlacementKeys(tt.v, t0, tt.expired) }); got != tt.want {
+				t.Errorf("panic = %q, want %q", got, tt.want)
+			}
+			if !reflect.DeepEqual(tt.v, vCopy) || !slices.Equal(tt.expired, expiredCopy) {
+				t.Errorf("PlacementKeys modified its arguments while panicking")
+			}
+		})
 	}
 }
