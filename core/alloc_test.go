@@ -7,6 +7,18 @@ package core
 
 import "testing"
 
+func TestATCOR10Allocs(t *testing.T) {
+	var score uint64
+	var shard int
+	if got := testing.AllocsPerRun(100, func() { score += Score("account", "alice", "n1") }); got != 0 {
+		t.Errorf(`Score("account", "alice", "n1") allocates %v times, want 0`, got)
+	}
+	if got := testing.AllocsPerRun(100, func() { shard += KeyShard("market-42", 64) }); got != 0 {
+		t.Errorf(`KeyShard("market-42", 64) allocates %v times, want 0`, got)
+	}
+	_, _ = score, shard
+}
+
 // Results go to package-level sinks so the compiler cannot drop the calls.
 var (
 	treeSinkBool bool

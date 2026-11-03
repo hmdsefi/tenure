@@ -8,9 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/hmdsefi/tenure/core"
 )
 
 var update = flag.Bool("update", false, "rewrite golden files")
@@ -24,7 +28,64 @@ type digestCase struct {
 
 // digestCases lists the digest cases of DET-450 and DET-460. Each is added by the change that
 // adds the core function it calls.
-var digestCases []digestCase
+var digestCases = []digestCase{
+	{name: "keyshard", lines: func(add func(line string)) { keyshardLines(add, keyshardKeys()) }},
+	{name: "score", lines: scoreLines},
+}
+
+// keyshardKeys returns the keys of the keyshard case: six fixed keys, then k0 … k9999.
+func keyshardKeys() []string {
+	keys := []string{"", "a", "é", "\x00", "orderbook/42", strings.Repeat("x", 1000)}
+	for i := range 10000 {
+		keys = append(keys, "k"+strconv.Itoa(i))
+	}
+	return keys
+}
+
+// keyshardLines adds the keyshard case's lines for keys: for each n, for each key,
+// Quote(key) n core.KeyShard(key, n) (DET-450).
+func keyshardLines(add func(line string), keys []string) {
+	for _, n := range []int{1, 2, 7, 64, 1000, 65536} {
+		for _, key := range keys {
+			add(strconv.Quote(key) + " " + strconv.Itoa(n) + " " + strconv.Itoa(core.KeyShard(key, n)))
+		}
+	}
+}
+
+// scoreLines adds the score case's lines (DET-450): for each namespace, key and member ID,
+// the three quoted strings and core.Score as 0x%016x.
+func scoreLines(add func(line string)) {
+	keys := []string{"", "alice", "bob"}
+	for i := range 100 {
+		keys = append(keys, "k"+strconv.Itoa(i))
+	}
+	ids := []string{"", "n1", "n2", "n3"}
+	for i := range 16 {
+		ids = append(ids, "m"+strconv.Itoa(i))
+	}
+	for _, ns := range []string{"", "account", "orderbook"} {
+		for _, key := range keys {
+			for _, id := range ids {
+				add(strconv.Quote(ns) + " " + strconv.Quote(key) + " " + strconv.Quote(id) + " " +
+					fmt.Sprintf("0x%016x", core.Score(ns, key, id)))
+			}
+		}
+	}
+}
+
+// caseLines collects the lines of the digest case called name.
+func caseLines(t *testing.T, name string) []string {
+	t.Helper()
+	for _, c := range digestCases {
+		if c.name == name {
+			var lines []string
+			c.lines(func(line string) { lines = append(lines, line) })
+			return lines
+		}
+	}
+	t.Fatalf("no digest case %q", name)
+	return nil
+}
 
 // digestEntries computes one golden entry per case, in list order, each from a fresh Digest.
 func digestEntries(cases []digestCase) ([]Entry, error) {
@@ -179,5 +240,61 @@ func TestATDET12DigestWorkflow(t *testing.T) {
 	})
 	if want := "duplicate digest case score"; err == nil || err.Error() != want {
 		t.Errorf("digestEntries with two cases named score: error %v, want %q", err, want)
+	}
+}
+
+// TestDigestCaseKeyshard checks the keyshard case's count and first line (AT-DET-13).
+func TestDigestCaseKeyshard(t *testing.T) {
+	lines := caseLines(t, "keyshard")
+	if len(lines) != 60036 {
+		t.Errorf("keyshard has %d lines, want 60036", len(lines))
+	}
+	if lines[0] != `"" 1 0` {
+		t.Errorf("first keyshard line = %q, want %q", lines[0], `"" 1 0`)
+	}
+}
+
+// TestDigestCaseScore checks the score case's count and lockstep's vector (AT-DET-13).
+func TestDigestCaseScore(t *testing.T) {
+	lines := caseLines(t, "score")
+	if len(lines) != 6180 {
+		t.Errorf("score has %d lines, want 6180", len(lines))
+	}
+	const want = `"account" "alice" "n1" 0x15f291e4c62474b8`
+	if !slices.Contains(lines, want) {
+		t.Errorf("score has no line %q", want)
+	}
+}
+
+// TestATDET12KeyshardDrift checks that one more keyshard key changes exactly the keyshard
+// entry of the committed file (AT-DET-12).
+func TestATDET12KeyshardDrift(t *testing.T) {
+	keys := append(keyshardKeys(), "k10000")
+	var d Digest
+	keyshardLines(d.Add, keys)
+	got := []Entry{d.Entry("keyshard")}
+
+	data, err := os.ReadFile(filepath.Join("testdata", "core-digests.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := ParseGolden("core-digests.txt", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []Entry
+	for _, e := range all {
+		if e.Name == "keyshard" {
+			want = append(want, e)
+		}
+	}
+
+	lines := CompareGolden(got, want)
+	if len(lines) != 1 {
+		t.Fatalf("CompareGolden = %q, want one line", lines)
+	}
+	re := regexp.MustCompile(`^golden: keyshard seed 0x0000000000000000: got hash 0x[0-9a-f]{16} count 60042, want hash 0x[0-9a-f]{16} count 60036$`)
+	if !re.MatchString(lines[0]) {
+		t.Errorf("CompareGolden line = %q, want a match of %s", lines[0], re)
 	}
 }

@@ -28,6 +28,21 @@ var ErrInvalidTree = errors.New("core: invalid tree")
     Tree.ValidateChange return.
 
 
+FUNCTIONS
+
+func KeyShard(key string, n int) int
+    KeyShard returns the shard in 0…n-1 that key belongs to: the 64-bit FNV-1a
+    hash of key, passed through MurmurHash3's 64-bit finalizer, modulo n.
+    Doubling n splits shard s into s and s+n. KeyShard panics if n < 1.
+
+func Score(namespace, key, memberID string) uint64
+    Score returns the rendezvous score of memberID for key in namespace:
+    MurmurHash3's 64-bit finalizer applied to the 64-bit FNV-1a hash of
+    namespace, a zero byte, key, a zero byte and memberID. It is the score
+    lockstep's virtual actors use, with namespace as the actor kind. Score does
+    not allocate.
+
+
 TYPES
 
 type Member struct {
