@@ -44,3 +44,37 @@ func BenchmarkBalancedMovement(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkPlacementKeys(b *testing.B) {
+	const m = 1000
+	b.Run("m=1000", func(b *testing.B) {
+		v := View{Members: make([]Member, m)}
+		for i := range v.Members {
+			// Zero-padded IDs keep the members sorted by ID.
+			v.Members[i] = Member{ID: "pod-" + strconv.Itoa(10000+i), Slot: -1, Draining: i%4 == 1}
+		}
+		b.ReportAllocs()
+		for b.Loop() {
+			if keys, _ := PlacementKeys(v, t0, nil); len(keys) == 0 {
+				b.Fatal("no placement keys")
+			}
+		}
+	})
+	b.Run("slots=1000", func(b *testing.B) {
+		v := View{Slots: m, SlotHolders: make([]string, m)}
+		expired := make([]bool, m)
+		for i := range v.SlotHolders {
+			if i%2 == 0 {
+				v.SlotHolders[i] = "pod-" + strconv.Itoa(10000+i) + "/1"
+			} else {
+				expired[i] = i%4 == 1
+			}
+		}
+		b.ReportAllocs()
+		for b.Loop() {
+			if keys, _ := PlacementKeys(v, t0, expired); len(keys) == 0 {
+				b.Fatal("no placement keys")
+			}
+		}
+	})
+}

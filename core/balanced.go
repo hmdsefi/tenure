@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Balanced assigns the n shards of space to placement keys and returns, for each shard
@@ -32,6 +33,61 @@ func Balanced(space string, n int, keys []string) []int {
 		panic(fmt.Errorf("core: Balanced: duplicate key %q", dup))
 	}
 	return balancedScored(n, keys, balancedScore(space))
+}
+
+// PlacementKeys returns the placement keys Balanced takes for the view v and, in a view
+// with slots, the slot each key names.
+//
+// Without slots, keys are the IDs of Eligible(v, at) in ID order and slots is nil. With
+// slots, keys are "slot-0" … "slot-<k-1>" in slot order, including vacant slots and slots
+// whose holder is draining, except vacant slots whose entry in expired is true; slots[i] is
+// the slot keys[i] names. expired is the caller's observation of which slots have been
+// vacant for at least Timing.SlotGrace; nil means none. at is used only without slots.
+//
+// PlacementKeys panics if expired is not nil and its length differs from v.Slots, or if
+// len(v.SlotHolders) differs from v.Slots.
+func PlacementKeys(v View, at time.Time, expired []bool) (keys []string, slots []int) {
+	if len(v.SlotHolders) != v.Slots {
+		panic(fmt.Errorf("core: PlacementKeys: %d SlotHolders for %d slots", len(v.SlotHolders), v.Slots))
+	}
+	if expired != nil && len(expired) != v.Slots {
+		panic(fmt.Errorf("core: PlacementKeys: len(expired) is %d, want %d", len(expired), v.Slots))
+	}
+	if v.Slots == 0 {
+		eligible := Eligible(v, at)
+		if len(eligible) == 0 {
+			return nil, nil
+		}
+		keys = make([]string, len(eligible))
+		for i := range eligible {
+			keys[i] = eligible[i].ID
+		}
+		return keys, nil
+	}
+	kept := 0
+	for s := range v.Slots {
+		if keepSlot(v.SlotHolders[s], expired, s) {
+			kept++
+		}
+	}
+	if kept == 0 {
+		return nil, nil
+	}
+	keys = make([]string, 0, kept)
+	slots = make([]int, 0, kept)
+	for s := range v.Slots {
+		if keepSlot(v.SlotHolders[s], expired, s) {
+			keys = append(keys, "slot-"+strconv.Itoa(s))
+			slots = append(slots, s)
+		}
+	}
+	return keys, slots
+}
+
+// keepSlot reports whether slot s, held by holder, is a placement key: it is unless it is
+// vacant and expired (ASG-140).
+func keepSlot(holder string, expired []bool, s int) bool {
+	return holder != "" || expired == nil || !expired[s]
 }
 
 // smallestDuplicate returns the smallest key, in byte-wise order, that keys holds more than

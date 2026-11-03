@@ -52,6 +52,20 @@ func KeyShard(key string, n int) int
     hash of key, passed through MurmurHash3's 64-bit finalizer, modulo n.
     Doubling n splits shard s into s and s+n. KeyShard panics if n < 1.
 
+func PlacementKeys(v View, at time.Time, expired []bool) (keys []string, slots []int)
+    PlacementKeys returns the placement keys Balanced takes for the view v and,
+    in a view with slots, the slot each key names.
+
+    Without slots, keys are the IDs of Eligible(v, at) in ID order and slots
+    is nil. With slots, keys are "slot-0" … "slot-<k-1>" in slot order,
+    including vacant slots and slots whose holder is draining, except vacant
+    slots whose entry in expired is true; slots[i] is the slot keys[i] names.
+    expired is the caller's observation of which slots have been vacant for at
+    least Timing.SlotGrace; nil means none. at is used only without slots.
+
+    PlacementKeys panics if expired is not nil and its length differs from
+    v.Slots, or if len(v.SlotHolders) differs from v.Slots.
+
 func Score(namespace, key, memberID string) uint64
     Score returns the rendezvous score of memberID for key in namespace:
     MurmurHash3's 64-bit finalizer applied to the 64-bit FNV-1a hash of
