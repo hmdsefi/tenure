@@ -112,19 +112,24 @@ func TestATASG07Allocs(t *testing.T) {
 	// compare exactly.
 	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 	var sink int
+	allocs := func(space string, n int, keys []string) float64 {
+		return testing.AllocsPerRun(10, func() { sink += len(Balanced(space, n, keys)) })
+	}
+	// With at least eight keys every scratch slice is over the compiler's 32-byte stack
+	// limit, on 32-bit platforms too, so the count is the same.
 	calls := []struct {
 		name  string
 		space string
 		n     int
 		keys  []string
 	}{
-		{"Balanced(s, 64, m0 … m2)", "s", 64, seqKeys("m", 3)},
+		{"Balanced(s, 64, m0 … m15)", "s", 64, seqKeys("m", 16)},
 		{"Balanced(s, 4096, m0 … m99)", "s", 4096, seqKeys("m", 100)},
 		{"Balanced(t, 1000, m0 … m9)", "t", 1000, seqKeys("m", 10)},
 	}
 	var first float64
 	for i, c := range calls {
-		got := testing.AllocsPerRun(10, func() { sink += len(Balanced(c.space, c.n, c.keys)) })
+		got := allocs(c.space, c.n, c.keys)
 		if got > 4 {
 			t.Errorf("%s allocates %v times, want at most 4", c.name, got)
 		}
@@ -134,6 +139,12 @@ func TestATASG07Allocs(t *testing.T) {
 		} else if got != first {
 			t.Errorf("%s allocates %v times, want %v like %s", c.name, got, first, calls[0].name)
 		}
+	}
+	// Fewer keys may keep scratch slices on the stack: never more allocations.
+	if got := allocs("s", 64, seqKeys("m", 3)); got > first {
+		t.Errorf("Balanced(s, 64, m0 … m2) allocates %v times, want at most %v", got, first)
+	} else {
+		t.Logf("Balanced(s, 64, m0 … m2) allocates %v times", got)
 	}
 	_ = sink
 }

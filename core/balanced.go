@@ -81,9 +81,9 @@ type balancedPair struct {
 // balancedScored is Balanced with score in place of Score and without its panics (ASG-090):
 // it sorts the pairs in pair order (ASG-030) and takes them greedily under the caps
 // (ASG-040). It allocates the result and, with keys, one slice for the key order and
-// counts and one for the pairs (ASG-100). The key order and counts share a slice so that it
-// is at least 48 bytes from three keys on: the compiler keeps a slice of at most 32 bytes
-// that does not escape on the stack, so tiny inputs may allocate less, never more.
+// counts and one for the pairs (ASG-100). The compiler keeps a slice of at most 32 bytes
+// that does not escape on the stack, so inputs with few keys (up to two on 64-bit
+// platforms, four on 32-bit ones) may allocate less, never more.
 func balancedScored(n int, keys []string, score func(shard int, key string) uint64) []int {
 	out := make([]int, n)
 	for s := range out {
