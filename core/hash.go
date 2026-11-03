@@ -17,7 +17,7 @@ func fnv1a64(s string) uint64 {
 }
 
 // fnvString folds the bytes of s into the FNV-1a state h.
-func fnvString(h uint64, s string) uint64 {
+func fnvString[S string | []byte](h uint64, s S) uint64 {
 	for i := 0; i < len(s); i++ {
 		h ^= uint64(s[i])
 		h *= fnvPrime64
@@ -55,10 +55,20 @@ func KeyShard(key string, n int) int {
 // and memberID. It is the score lockstep's virtual actors use, with namespace as the actor
 // kind. Score does not allocate.
 func Score(namespace, key, memberID string) uint64 {
+	return scoreFrom(scorePrefix(namespace, key), memberID)
+}
+
+// scorePrefix returns the FNV-1a state of Score's input up to the member ID: namespace, a
+// zero byte, key and a zero byte (COR-110). Balanced computes it once per shard.
+func scorePrefix[K string | []byte](namespace string, key K) uint64 {
 	h := fnvString(fnvOffset64, namespace)
 	h = fnvZero(h)
 	h = fnvString(h, key)
-	h = fnvZero(h)
-	h = fnvString(h, memberID)
-	return fmix64(h)
+	return fnvZero(h)
+}
+
+// scoreFrom finishes Score from the state scorePrefix returned: it folds in memberID and
+// applies fmix64.
+func scoreFrom(prefix uint64, memberID string) uint64 {
+	return fmix64(fnvString(prefix, memberID))
 }
