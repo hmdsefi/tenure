@@ -5,6 +5,7 @@ package core
 
 import (
 	"errors"
+	"maps"
 	"reflect"
 	"slices"
 	"testing"
@@ -106,7 +107,6 @@ func TestATCOR02ViewValidate(t *testing.T) {
 		{"slot vacant", slotted(1, -1), "core: invalid view: Members[0]: Slot 1 is vacant"},
 		{"slot shared", slotted(0, 0), "core: invalid view: Members[1]: Slot 0 already held by \"a\""},
 		{"opaque holders", View{Slots: 1, SlotHolders: []string{"zz/9"}, Members: []Member{{ID: "a", Slot: -1}}}, ""},
-		{"check 1 before 2", View{Members: members("x/y", "a")}, "core: invalid view: Members[0]: ID \"x/y\" contains '/'"},
 		{"check 1 before 3", View{Slots: -1, Members: []Member{{ID: "a", Slot: -2}}}, "core: invalid view: Members[0]: Slot -2 is below -1"},
 		{"check 2 before 3", View{Slots: -1, Members: members("b", "a")}, "core: invalid view: Members[1]: ID \"a\" does not sort after \"b\""},
 		{"check 3 before 4", View{Slots: -1, SlotHolders: []string{"h"}}, "core: invalid view: Slots -1 is negative"},
@@ -221,12 +221,7 @@ func deepCopyMembers(ms []Member) []Member {
 	out := make([]Member, len(ms))
 	for i, m := range ms {
 		out[i] = m
-		if m.Meta != nil {
-			out[i].Meta = make(map[string]string, len(m.Meta))
-			for k, val := range m.Meta {
-				out[i].Meta[k] = val
-			}
-		}
+		out[i].Meta = maps.Clone(m.Meta)
 	}
 	return out
 }

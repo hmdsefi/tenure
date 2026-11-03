@@ -19,11 +19,9 @@ func BenchmarkScore(b *testing.B) {
 		key := benchKey(size)
 		b.Run("len="+strconv.Itoa(size), func(b *testing.B) {
 			b.ReportAllocs()
-			var sink uint64
 			for b.Loop() {
-				sink += Score("account", key, "n1")
+				Score("account", key, "n1")
 			}
-			_ = sink
 		})
 	}
 }
@@ -33,11 +31,9 @@ func BenchmarkKeyShard(b *testing.B) {
 		key := benchKey(size)
 		b.Run("len="+strconv.Itoa(size), func(b *testing.B) {
 			b.ReportAllocs()
-			var sink int
 			for b.Loop() {
-				sink += KeyShard(key, 64)
+				KeyShard(key, 64)
 			}
-			_ = sink
 		})
 	}
 }

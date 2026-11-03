@@ -7,7 +7,6 @@ import (
 	"cmp"
 	"reflect"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -26,15 +25,6 @@ func permutations(ms []Member) [][]Member {
 		}
 	}
 	return out
-}
-
-// testKeys returns k0 … k(n-1).
-func testKeys(n int) []string {
-	keys := make([]string, n)
-	for i := range keys {
-		keys[i] = "k" + strconv.Itoa(i)
-	}
-	return keys
 }
 
 func TestATCOR11Ordering(t *testing.T) {
@@ -84,7 +74,7 @@ func TestATCOR12Prefixes(t *testing.T) {
 		t.Errorf("Rank(empty members) = %v, want nil", ids(got))
 	}
 
-	for _, key := range testKeys(100) {
+	for _, key := range seqKeys("k", 100) {
 		for b := 0; b <= 5; b++ {
 			full := Rank("account", key, ms, b)
 			for a := 0; a <= b; a++ {
@@ -221,7 +211,7 @@ func TestATCOR15LockstepCompat(t *testing.T) {
 	for _, kind := range []string{"account", "counter"} {
 		for _, nodes := range sets {
 			ms := members(nodes...)
-			for _, key := range testKeys(10000) {
+			for _, key := range seqKeys("k", 10000) {
 				want := []string{vacOwner(kind, key, nodes), vacRunnerUp(kind, key, nodes)}
 				if got := ids(Rank(kind, key, ms, 2)); !slices.Equal(got, want) {
 					t.Fatalf("Rank(%q, %q, %v, 2) = %v, want %v", kind, key, nodes, got, want)
@@ -251,7 +241,7 @@ func firstChoices(ns string, keys []string, ms []Member) []string {
 }
 
 func TestATCOR16Movement(t *testing.T) {
-	keys := testKeys(10000)
+	keys := seqKeys("k", 10000)
 	three := firstChoices("account", keys, members("n1", "n2", "n3"))
 	counts := map[string]int{}
 	for _, id := range three {
@@ -291,7 +281,7 @@ func TestATCOR16Movement(t *testing.T) {
 }
 
 func TestATCOR17Rendezvous(t *testing.T) {
-	keys := testKeys(1000)
+	keys := seqKeys("k", 1000)
 	perms := permutations(members("n1", "n2", "n3", "n4"))
 	base := NewRendezvous(perms[0])
 	for _, ms := range perms {
@@ -364,29 +354,13 @@ func TestATCOR17Rendezvous(t *testing.T) {
 }
 
 func TestATCOR18RendezvousDuplicates(t *testing.T) {
-	func() {
-		defer func() {
-			r := recover()
-			err, ok := r.(error)
-			if !ok {
-				t.Fatalf("NewRendezvous with a duplicate ID panicked with %#v, want an error", r)
-			}
-			if want := `core: NewRendezvous: duplicate member ID "b"`; err.Error() != want {
-				t.Errorf("panic = %q, want %q", err, want)
-			}
-		}()
-		NewRendezvous([]Member{{ID: "b"}, {ID: "a"}, {ID: "b"}})
-	}()
+	if got, want := panicText(t, func() { NewRendezvous([]Member{{ID: "b"}, {ID: "a"}, {ID: "b"}}) }), `core: NewRendezvous: duplicate member ID "b"`; got != want {
+		t.Errorf("panic = %q, want %q", got, want)
+	}
 
-	func() {
-		defer func() {
-			err, _ := recover().(error)
-			if want := `core: NewRendezvous: duplicate member ID "a"`; err == nil || err.Error() != want {
-				t.Errorf("panic = %v, want %q (the first duplicate in ID order)", err, want)
-			}
-		}()
-		NewRendezvous(members("c", "c", "a", "b", "a"))
-	}()
+	if got, want := panicText(t, func() { NewRendezvous(members("c", "c", "a", "b", "a")) }), `core: NewRendezvous: duplicate member ID "a"`; got != want {
+		t.Errorf("panic = %q, want %q (the first duplicate in ID order)", got, want)
+	}
 
 	p := NewRendezvous([]Member{{ID: "bad/id"}, {ID: ""}})
 	got := ids(p.Rank("x", "y", 2))

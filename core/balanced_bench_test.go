@@ -30,12 +30,14 @@ func BenchmarkBalanced(b *testing.B) {
 func BenchmarkBalancedMovement(b *testing.B) {
 	for _, n := range []int{64, 1024, 4096} {
 		for _, m := range []int{3, 10, 100} {
+			keys := seqKeys("m", m+1)
 			b.Run("n="+strconv.Itoa(n)+"/m="+strconv.Itoa(m), func(b *testing.B) {
 				b.ReportAllocs()
-				var movedJoin, toNew, movedLeave, fromLeft int
+				var base, joined, left []int
 				for b.Loop() {
-					movedJoin, toNew, movedLeave, fromLeft = balancedMovement(n, m)
+					base, joined, left = balancedMovementRuns(n, m, keys)
 				}
+				movedJoin, toNew, movedLeave, fromLeft := balancedMovement(m, keys, base, joined, left)
 				b.ReportMetric(float64(movedJoin), "moved/join")
 				b.ReportMetric(float64(toNew), "to-new/join")
 				b.ReportMetric(float64(movedLeave), "moved/leave")
