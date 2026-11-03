@@ -33,6 +33,7 @@ var digestCases = []digestCase{
 	{name: "score", lines: scoreLines},
 	{name: "rank", lines: rankLines},
 	{name: "tree", lines: treeLines},
+	{name: "balanced", lines: balancedLines},
 }
 
 // keyshardKeys returns the keys of the keyshard case: six fixed keys, then k0 … k9999.
@@ -121,6 +122,40 @@ func treeLines(add func(line string)) {
 		r := uint64(j) * 0x9e3779b97f4a7c15 // wraps
 		add("pick " + strconv.FormatUint(r, 10) + " " + strconv.Itoa(u.Pick(r)) + " " + strconv.Itoa(u.PickRead(r)))
 	}
+}
+
+// balancedLines adds the balanced case's lines (DET-450): for each space, n and key list
+// (m0 … m(M-1), then slot-0 … slot-(k-1)), the space, n, the keys joined by "," and
+// core.Balanced(space, n, keys) as decimals joined by ",".
+func balancedLines(add func(line string)) {
+	var lists [][]string
+	for _, m := range []int{1, 2, 3, 5, 16} {
+		lists = append(lists, seqStrings("m", m))
+	}
+	for _, k := range []int{1, 3, 4} {
+		lists = append(lists, seqStrings("slot-", k))
+	}
+	for _, space := range []string{"orderbook", "accounts"} {
+		for _, n := range []int{1, 2, 7, 64, 256, 1000} {
+			for _, keys := range lists {
+				got := core.Balanced(space, n, keys)
+				shards := make([]string, len(got))
+				for i, v := range got {
+					shards[i] = strconv.Itoa(v)
+				}
+				add(space + " " + strconv.Itoa(n) + " " + strings.Join(keys, ",") + " " + strings.Join(shards, ","))
+			}
+		}
+	}
+}
+
+// seqStrings returns prefix0 … prefix(n-1).
+func seqStrings(prefix string, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = prefix + strconv.Itoa(i)
+	}
+	return out
 }
 
 // caseLines collects the lines of the digest case called name.
@@ -339,6 +374,17 @@ func TestDigestCaseRank(t *testing.T) {
 	}
 	if eights != 200 {
 		t.Errorf("rank has %d lines with n = 8, want 200", eights)
+	}
+}
+
+// TestDigestCaseBalanced checks the balanced case's count and first line (AT-DET-13).
+func TestDigestCaseBalanced(t *testing.T) {
+	lines := caseLines(t, "balanced")
+	if len(lines) != 96 {
+		t.Fatalf("balanced has %d lines, want 96", len(lines))
+	}
+	if lines[0] != "orderbook 1 m0 0" {
+		t.Errorf("first balanced line = %q, want %q", lines[0], "orderbook 1 m0 0")
 	}
 }
 

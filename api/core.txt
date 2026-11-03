@@ -30,6 +30,23 @@ var ErrInvalidTree = errors.New("core: invalid tree")
 
 FUNCTIONS
 
+func Balanced(space string, n int, keys []string) []int
+    Balanced assigns the n shards of space to placement keys and returns, for
+    each shard 0…n-1, the index in keys of its key; every entry is -1 when keys
+    is empty. Every key gets ⌊n/m⌋ or ⌈n/m⌉ shards for m keys, and the result
+    depends only on space, n and the set of keys: reordering keys only relabels
+    the indices.
+
+    Each (shard, key) pair is scored with Score(space, strconv.Itoa(shard),
+    key). Pairs are taken greedily by descending score (ties: key ascending,
+    then shard ascending) when the shard is still unassigned and the key is
+    under its cap: ⌈n/m⌉ while fewer than n mod m keys have reached ⌈n/m⌉,
+    and ⌊n/m⌋ after that.
+
+    Balanced takes time O(n·m·log(n·m)) and memory O(n·m); compute it once per
+    view change, not per lookup. It does not modify keys. Balanced panics if n <
+    1 or keys contains a duplicate.
+
 func KeyShard(key string, n int) int
     KeyShard returns the shard in 0…n-1 that key belongs to: the 64-bit FNV-1a
     hash of key, passed through MurmurHash3's 64-bit finalizer, modulo n.

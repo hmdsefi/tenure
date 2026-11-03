@@ -105,3 +105,28 @@ func TestATPTR11AllocsPicks(t *testing.T) {
 		}
 	}
 }
+
+func TestATASG07Allocs(t *testing.T) {
+	var sink int
+	calls := []struct {
+		name  string
+		space string
+		n     int
+		keys  []string
+	}{
+		{"Balanced(s, 64, m0 … m2)", "s", 64, seqKeys("m", 3)},
+		{"Balanced(s, 4096, m0 … m99)", "s", 4096, seqKeys("m", 100)},
+		{"Balanced(t, 1000, m0 … m9)", "t", 1000, seqKeys("m", 10)},
+	}
+	var first float64
+	for i, c := range calls {
+		got := testing.AllocsPerRun(10, func() { sink += len(Balanced(c.space, c.n, c.keys)) })
+		if i == 0 {
+			first = got
+			t.Logf("%s allocates %v times", c.name, got)
+		} else if got != first {
+			t.Errorf("%s allocates %v times, want %v like %s", c.name, got, first, calls[0].name)
+		}
+	}
+	_ = sink
+}
