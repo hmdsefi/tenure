@@ -6,7 +6,6 @@ package core
 import (
 	"cmp"
 	"hash/fnv"
-	"maps"
 	"math"
 	"reflect"
 	"slices"
@@ -138,7 +137,7 @@ func TestATASG01Shapes(t *testing.T) {
 		name := "Balanced(" + strconv.Quote(tt.space) + ", " + strconv.Itoa(tt.n) + ", " + strings.Join(tt.keys, ",") + ")"
 		before := slices.Clone(tt.keys)
 		if tt.panic != "" {
-			if got := treePanicText(t, func() { Balanced(tt.space, tt.n, tt.keys) }); got != tt.panic {
+			if got := panicText(t, func() { Balanced(tt.space, tt.n, tt.keys) }); got != tt.panic {
 				t.Errorf("%s panics with %q, want %q", name, got, tt.panic)
 			}
 		} else {
@@ -306,25 +305,26 @@ func TestATASG05KeyOrder(t *testing.T) {
 	})
 }
 
-// balancedMovement returns, for Balanced("bench", n, m0 … m(M-1)), how many shards move when
-// m<M> joins and how many of them move to it, and how many move when m(M-1) leaves and how
-// many of them move from it (ASG-110).
-func balancedMovement(n, m int) (movedJoin, toNew, movedLeave, fromLeft int) {
-	keys := seqKeys("m", m+1)
-	base, joined, left := keys[:m], keys, keys[:m-1]
-	b := Balanced("bench", n, base)
-	j := Balanced("bench", n, joined)
-	l := Balanced("bench", n, left)
-	for s := range n {
-		if joined[j[s]] != base[b[s]] {
+// balancedMovementRuns returns Balanced("bench", n, keys) for m0 … m(m-1) (base), for m0 … m(m)
+// (joined: m<m> joins) and for m0 … m(m-2) (left: m(m-1) leaves). keys is m0 … m(m).
+func balancedMovementRuns(n, m int, keys []string) (base, joined, left []int) {
+	return Balanced("bench", n, keys[:m]), Balanced("bench", n, keys), Balanced("bench", n, keys[:m-1])
+}
+
+// balancedMovement returns, from the results of balancedMovementRuns, how many shards move when
+// m<m> joins and how many of them move to it, and how many move when m(m-1) leaves and how many
+// of them move from it (ASG-110).
+func balancedMovement(m int, keys []string, base, joined, left []int) (movedJoin, toNew, movedLeave, fromLeft int) {
+	for s := range base {
+		if keys[joined[s]] != keys[base[s]] {
 			movedJoin++
-			if j[s] == m {
+			if joined[s] == m {
 				toNew++
 			}
 		}
-		if l[s] < 0 || left[l[s]] != base[b[s]] {
+		if left[s] < 0 || keys[left[s]] != keys[base[s]] {
 			movedLeave++
-			if b[s] == m-1 {
+			if base[s] == m-1 {
 				fromLeft++
 			}
 		}
@@ -347,9 +347,10 @@ func countMoved(keys []string, a, b []int) int {
 func TestBalancedMovement(t *testing.T) {
 	for _, n := range []int{64, 1024, 4096} {
 		for _, m := range []int{3, 10, 100} {
-			movedJoin, toNew, movedLeave, fromLeft := balancedMovement(n, m)
-			keys := seqKeys("m", m)
-			base, again := Balanced("bench", n, keys), Balanced("bench", n, keys)
+			keys := seqKeys("m", m+1)
+			base, joined, left := balancedMovementRuns(n, m, keys)
+			movedJoin, toNew, movedLeave, fromLeft := balancedMovement(m, keys, base, joined, left)
+			again := Balanced("bench", n, keys[:m])
 			if same := countMoved(keys, base, again); same != 0 {
 				t.Errorf("n=%d m=%d: recomputing with the same keys moves %d shards, want 0", n, m, same)
 			}
@@ -363,22 +364,10 @@ func TestBalancedMovement(t *testing.T) {
 	}
 }
 
-// copyView returns a deep copy of v, Meta maps included, so a test can check that a call left
-// it unchanged.
-func copyView(v View) View {
-	c := v
-	c.Members = slices.Clone(v.Members)
-	for i := range c.Members {
-		c.Members[i].Meta = maps.Clone(v.Members[i].Meta)
-	}
-	c.SlotHolders = slices.Clone(v.SlotHolders)
-	return c
-}
-
 // placementKeys calls PlacementKeys and fails the test if it changes v or expired.
 func placementKeys(t *testing.T, v View, at time.Time, expired []bool) (keys []string, slots []int) {
 	t.Helper()
-	vCopy, expiredCopy := copyView(v), slices.Clone(expired)
+	vCopy, expiredCopy := deepCopyView(v), slices.Clone(expired)
 	keys, slots = PlacementKeys(v, at, expired)
 	if !reflect.DeepEqual(v, vCopy) {
 		t.Errorf("PlacementKeys modified v: now %+v, was %+v", v, vCopy)
@@ -437,8 +426,8 @@ func TestATASG10PlacementKeysNoSlots(t *testing.T) {
 	})
 
 	t.Run("expired of length 1", func(t *testing.T) {
-		vCopy := copyView(v)
-		got := treePanicText(t, func() { PlacementKeys(v, t0, []bool{true}) })
+		vCopy := deepCopyView(v)
+		got := panicText(t, func() { PlacementKeys(v, t0, []bool{true}) })
 		if want := "core: PlacementKeys: len(expired) is 1, want 0"; got != want {
 			t.Errorf("panic = %q, want %q", got, want)
 		}
@@ -556,8 +545,8 @@ func TestATASG11PlacementKeysSlots(t *testing.T) {
 	}
 	for _, tt := range panics {
 		t.Run(tt.name, func(t *testing.T) {
-			vCopy, expiredCopy := copyView(tt.v), slices.Clone(tt.expired)
-			if got := treePanicText(t, func() { PlacementKeys(tt.v, t0, tt.expired) }); got != tt.want {
+			vCopy, expiredCopy := deepCopyView(tt.v), slices.Clone(tt.expired)
+			if got := panicText(t, func() { PlacementKeys(tt.v, t0, tt.expired) }); got != tt.want {
 				t.Errorf("panic = %q, want %q", got, tt.want)
 			}
 			if !reflect.DeepEqual(tt.v, vCopy) || !slices.Equal(tt.expired, expiredCopy) {

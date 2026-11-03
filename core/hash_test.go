@@ -73,24 +73,9 @@ func TestATCOR08KeyShard(t *testing.T) {
 			{-1, "core: KeyShard: n is -1, want at least 1"},
 		}
 		for _, tt := range tests {
-			func() {
-				defer func() {
-					r := recover()
-					if r == nil {
-						t.Errorf("KeyShard(%q, %d) did not panic, want %q", "a", tt.n, tt.want)
-						return
-					}
-					err, ok := r.(error)
-					if !ok {
-						t.Errorf("KeyShard(%q, %d) panicked with %v (%T), want an error", "a", tt.n, r, r)
-						return
-					}
-					if err.Error() != tt.want {
-						t.Errorf("KeyShard(%q, %d) panicked with %q, want %q", "a", tt.n, err, tt.want)
-					}
-				}()
-				KeyShard("a", tt.n)
-			}()
+			if got := panicText(t, func() { KeyShard("a", tt.n) }); got != tt.want {
+				t.Errorf("KeyShard(%q, %d) panicked with %q, want %q", "a", tt.n, got, tt.want)
+			}
 		}
 	})
 

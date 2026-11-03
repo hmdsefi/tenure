@@ -32,24 +32,8 @@ func TestATCOR04NextTerm(t *testing.T) {
 	}
 
 	t.Run("overflow panics", func(t *testing.T) {
-		panicked, value := false, any(nil)
-		func() {
-			defer func() {
-				if value = recover(); value != nil {
-					panicked = true
-				}
-			}()
-			NextTerm(math.MaxUint64, t0)
-		}()
-		if !panicked {
-			t.Fatal("NextTerm(MaxUint64, t0) did not panic")
-		}
-		err, ok := value.(error)
-		if !ok {
-			t.Fatalf("panic value = %#v, want an error", value)
-		}
-		if got, want := err.Error(), "core: NextTerm: term overflow"; got != want {
-			t.Fatalf("panic text = %q, want %q", got, want)
+		if got, want := panicText(t, func() { NextTerm(math.MaxUint64, t0) }), "core: NextTerm: term overflow"; got != want {
+			t.Fatalf("NextTerm(MaxUint64, t0) panic text = %q, want %q", got, want)
 		}
 	})
 }

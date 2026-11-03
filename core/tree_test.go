@@ -14,9 +14,9 @@ import (
 // treeTQ is the acceptance tests' tq tree.
 var treeTQ = Tree{Name: "tq", Read: 8, Write: 8, Degree: 3}
 
-// treePanicText runs f and returns the text of the error it panics with. It fails the
+// panicText runs f and returns the text of the error it panics with. It fails the
 // test if f does not panic or panics with a value that is not an error.
-func treePanicText(t *testing.T, f func()) (text string) {
+func panicText(t *testing.T, f func()) (text string) {
 	t.Helper()
 	defer func() {
 		r := recover()
@@ -113,10 +113,10 @@ func TestATPTR02Keys(t *testing.T) {
 			t.Errorf("%+v.Key(%d) = %q, want %q", k.tree, k.i, got, k.want)
 		}
 	}
-	if got := treePanicText(t, func() { treeTQ.Key(-1) }); got != "core: Tree.Key: partition -1 is negative" {
+	if got := panicText(t, func() { treeTQ.Key(-1) }); got != "core: Tree.Key: partition -1 is negative" {
 		t.Errorf("Key(-1) panic = %q", got)
 	}
-	if got := treePanicText(t, func() { treeTQ.Key(math.MinInt) }); got != "core: Tree.Key: partition "+strconv.Itoa(math.MinInt)+" is negative" {
+	if got := panicText(t, func() { treeTQ.Key(math.MinInt) }); got != "core: Tree.Key: partition "+strconv.Itoa(math.MinInt)+" is negative" {
 		t.Errorf("Key(MinInt) panic = %q", got)
 	}
 
@@ -126,7 +126,7 @@ func TestATPTR02Keys(t *testing.T) {
 	if treeTQ.IsRoot(1) {
 		t.Error("IsRoot(1) = true")
 	}
-	if got := treePanicText(t, func() { treeTQ.IsRoot(-1) }); got != "core: Tree.IsRoot: partition -1 is negative" {
+	if got := panicText(t, func() { treeTQ.IsRoot(-1) }); got != "core: Tree.IsRoot: partition -1 is negative" {
 		t.Errorf("IsRoot(-1) panic = %q", got)
 	}
 }
@@ -232,7 +232,7 @@ func TestATPTR04Topology(t *testing.T) {
 		}
 		for _, tc := range panics {
 			t.Run(tc.name, func(t *testing.T) {
-				if got := treePanicText(t, tc.f); got != tc.want {
+				if got := panicText(t, tc.f); got != tc.want {
 					t.Fatalf("panic = %q, want %q", got, tc.want)
 				}
 			})
@@ -390,16 +390,16 @@ func TestATPTR07Pick(t *testing.T) {
 		}
 	}
 
-	if got, want := treePanicText(t, func() { Tree{Write: 0}.Pick(1) }), "core: Tree.Pick: Write 0 is below 1"; got != want {
+	if got, want := panicText(t, func() { Tree{Write: 0}.Pick(1) }), "core: Tree.Pick: Write 0 is below 1"; got != want {
 		t.Errorf("Pick panic = %q, want %q", got, want)
 	}
-	if got, want := treePanicText(t, func() { Tree{Write: -3}.Pick(1) }), "core: Tree.Pick: Write -3 is below 1"; got != want {
+	if got, want := panicText(t, func() { Tree{Write: -3}.Pick(1) }), "core: Tree.Pick: Write -3 is below 1"; got != want {
 		t.Errorf("Pick panic = %q, want %q", got, want)
 	}
-	if got, want := treePanicText(t, func() { Tree{Read: 0}.PickRead(1) }), "core: Tree.PickRead: Read 0 is below 1"; got != want {
+	if got, want := panicText(t, func() { Tree{Read: 0}.PickRead(1) }), "core: Tree.PickRead: Read 0 is below 1"; got != want {
 		t.Errorf("PickRead panic = %q, want %q", got, want)
 	}
-	if got, want := treePanicText(t, func() { Tree{Read: -1}.PickRead(1) }), "core: Tree.PickRead: Read -1 is below 1"; got != want {
+	if got, want := panicText(t, func() { Tree{Read: -1}.PickRead(1) }), "core: Tree.PickRead: Read -1 is below 1"; got != want {
 		t.Errorf("PickRead panic = %q, want %q", got, want)
 	}
 	// Pick reads only Write, and PickRead only Read.
