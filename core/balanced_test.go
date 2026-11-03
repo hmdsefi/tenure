@@ -6,7 +6,9 @@ package core
 import (
 	"cmp"
 	"hash/fnv"
+	"maps"
 	"math"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -361,23 +363,16 @@ func TestBalancedMovement(t *testing.T) {
 	}
 }
 
-// copyView returns a deep copy of v, so a test can check that a call left it unchanged.
+// copyView returns a deep copy of v, Meta maps included, so a test can check that a call left
+// it unchanged.
 func copyView(v View) View {
 	c := v
 	c.Members = slices.Clone(v.Members)
+	for i := range c.Members {
+		c.Members[i].Meta = maps.Clone(v.Members[i].Meta)
+	}
 	c.SlotHolders = slices.Clone(v.SlotHolders)
 	return c
-}
-
-// viewEqual reports whether a and b are equal field by field (Member holds a map, so View is
-// not comparable with ==).
-func viewEqual(a, b View) bool {
-	return a.Version == b.Version && a.Slots == b.Slots &&
-		slices.Equal(a.SlotHolders, b.SlotHolders) &&
-		slices.EqualFunc(a.Members, b.Members, func(x, y Member) bool {
-			return x.ID == y.ID && x.Addr == y.Addr && x.Draining == y.Draining && x.Slot == y.Slot &&
-				x.JoinAt.Equal(y.JoinAt) && x.LeaveAt.Equal(y.LeaveAt)
-		})
 }
 
 // placementKeys calls PlacementKeys and fails the test if it changes v or expired.
@@ -385,7 +380,7 @@ func placementKeys(t *testing.T, v View, at time.Time, expired []bool) (keys []s
 	t.Helper()
 	vCopy, expiredCopy := copyView(v), slices.Clone(expired)
 	keys, slots = PlacementKeys(v, at, expired)
-	if !viewEqual(v, vCopy) {
+	if !reflect.DeepEqual(v, vCopy) {
 		t.Errorf("PlacementKeys modified v: now %+v, was %+v", v, vCopy)
 	}
 	if !slices.Equal(expired, expiredCopy) || (expired == nil) != (expiredCopy == nil) {
@@ -397,7 +392,7 @@ func placementKeys(t *testing.T, v View, at time.Time, expired []bool) (keys []s
 func TestATASG10PlacementKeysNoSlots(t *testing.T) {
 	v := View{Members: []Member{
 		{ID: "a", Draining: true},
-		{ID: "b"},
+		{ID: "b", Meta: map[string]string{"zone": "x"}},
 		{ID: "c", LeaveAt: t0},
 		{ID: "d"},
 	}}
@@ -447,7 +442,7 @@ func TestATASG10PlacementKeysNoSlots(t *testing.T) {
 		if want := "core: PlacementKeys: len(expired) is 1, want 0"; got != want {
 			t.Errorf("panic = %q, want %q", got, want)
 		}
-		if !viewEqual(v, vCopy) {
+		if !reflect.DeepEqual(v, vCopy) {
 			t.Errorf("PlacementKeys modified v while panicking")
 		}
 	})
@@ -459,7 +454,7 @@ func TestATASG11PlacementKeysSlots(t *testing.T) {
 		SlotHolders: []string{"p/1", "", "q/2", ""},
 		Members: []Member{
 			{ID: "p", Slot: 0, Draining: true},
-			{ID: "q", Slot: 2},
+			{ID: "q", Slot: 2, Meta: map[string]string{"zone": "y"}},
 			{ID: "r", Slot: -1},
 		},
 	}
@@ -565,7 +560,7 @@ func TestATASG11PlacementKeysSlots(t *testing.T) {
 			if got := treePanicText(t, func() { PlacementKeys(tt.v, t0, tt.expired) }); got != tt.want {
 				t.Errorf("panic = %q, want %q", got, tt.want)
 			}
-			if !viewEqual(tt.v, vCopy) || !slices.Equal(tt.expired, expiredCopy) {
+			if !reflect.DeepEqual(tt.v, vCopy) || !slices.Equal(tt.expired, expiredCopy) {
 				t.Errorf("PlacementKeys modified its arguments while panicking")
 			}
 		})
