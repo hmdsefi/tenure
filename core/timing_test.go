@@ -77,8 +77,8 @@ func TestATCOR06TimingValidate(t *testing.T) {
 			"core: invalid timing: RenewDeadline 10s must be greater than 1.2 times RetryPeriod 10s"},
 		{"check 1 before check 3", Timing{LeaseDuration: 11 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 2 * time.Second, SlotGrace: 0},
 			"core: invalid timing: SlotGrace 0s " + rangeErr},
-		{"check 1 before check 2", Timing{LeaseDuration: 15 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 0, SlotGrace: 60 * time.Second},
-			"core: invalid timing: RetryPeriod 0s " + rangeErr},
+		{"check 1 before check 2", Timing{LeaseDuration: 15 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 25 * time.Hour, SlotGrace: 60 * time.Second},
+			"core: invalid timing: RetryPeriod 25h0m0s " + rangeErr},
 
 		{"largest values", Timing{LeaseDuration: 24 * time.Hour, RenewDeadline: 20 * time.Hour, RetryPeriod: time.Hour, SlotGrace: 24 * time.Hour}, ""},
 	}
