@@ -5,7 +5,10 @@
 
 package core
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 func TestATCOR10Allocs(t *testing.T) {
 	var score uint64
@@ -17,6 +20,24 @@ func TestATCOR10Allocs(t *testing.T) {
 		t.Errorf(`KeyShard("market-42", 64) allocates %v times, want 0`, got)
 	}
 	_, _ = score, shard
+}
+
+func TestATCOR10AllocsRank(t *testing.T) {
+	ms := make([]Member, 1000)
+	for i := range ms {
+		ms[i] = Member{ID: "n" + strconv.Itoa(i)}
+	}
+	p := NewRendezvous(ms)
+	var sink int
+	for _, n := range []int{3, 1} {
+		if got := testing.AllocsPerRun(100, func() { sink += len(Rank("account", "k1", ms, n)) }); got > 2 {
+			t.Errorf(`Rank("account", "k1", n0 … n999, %d) allocates %v times, want at most 2`, n, got)
+		}
+	}
+	if got := testing.AllocsPerRun(100, func() { sink += len(p.Rank("account", "k1", 1)) }); got > 2 {
+		t.Errorf(`NewRendezvous(n0 … n999).Rank("account", "k1", 1) allocates %v times, want at most 2`, got)
+	}
+	_ = sink
 }
 
 // Results go to package-level sinks so the compiler cannot drop the calls.
