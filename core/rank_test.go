@@ -4,9 +4,11 @@
 package core
 
 import (
+	"cmp"
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -116,17 +118,13 @@ func TestATCOR13FiltersNothing(t *testing.T) {
 	}
 	want := []string{"n1", "n2", "n3", "bad/id"}
 	slices.SortFunc(want, func(a, b string) int {
-		sa, sb := Score("account", "alice", a), Score("account", "alice", b)
-		switch {
-		case sa > sb:
-			return -1
-		case sa < sb:
-			return 1
+		if c := cmp.Compare(Score("account", "alice", b), Score("account", "alice", a)); c != 0 {
+			return c
 		}
-		return 0
+		return strings.Compare(a, b)
 	})
 	if !slices.Equal(ids(got), want) {
-		t.Errorf("Rank() IDs = %v, want %v (by Score descending)", ids(got), want)
+		t.Errorf("Rank() IDs = %v, want %v (by Score descending, then ID)", ids(got), want)
 	}
 	byID := map[string]Member{}
 	for _, m := range ms {

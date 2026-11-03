@@ -27,15 +27,28 @@ func TestATCOR10AllocsRank(t *testing.T) {
 	for i := range ms {
 		ms[i] = Member{ID: "n" + strconv.Itoa(i)}
 	}
+	small := members("n1", "n2", "n3")
 	p := NewRendezvous(ms)
+	pSmall := NewRendezvous(small)
 	var sink int
-	for _, n := range []int{3, 1} {
-		if got := testing.AllocsPerRun(100, func() { sink += len(Rank("account", "k1", ms, n)) }); got > 2 {
-			t.Errorf(`Rank("account", "k1", n0 … n999, %d) allocates %v times, want at most 2`, n, got)
-		}
+	tests := []struct {
+		name string
+		f    func()
+	}{
+		{`Rank("account", "k1", n0 … n999, 3)`, func() { sink += len(Rank("account", "k1", ms, 3)) }},
+		{`Rank("account", "k1", n0 … n999, 1)`, func() { sink += len(Rank("account", "k1", ms, 1)) }},
+		{`Rank("account", "k1", n1 … n3, 1)`, func() { sink += len(Rank("account", "k1", small, 1)) }},
+		{`Rank("account", "k1", n1 … n3, 3)`, func() { sink += len(Rank("account", "k1", small, 3)) }},
+		{`Rank("account", "k1", n1 … n3, 10)`, func() { sink += len(Rank("account", "k1", small, 10)) }},
+		{`NewRendezvous(n0 … n999).Rank("account", "k1", 1)`, func() { sink += len(p.Rank("account", "k1", 1)) }},
+		{`NewRendezvous(n0 … n999).Rank("account", "k1", 3)`, func() { sink += len(p.Rank("account", "k1", 3)) }},
+		{`NewRendezvous(n1 … n3).Rank("account", "k1", 1)`, func() { sink += len(pSmall.Rank("account", "k1", 1)) }},
+		{`NewRendezvous(n1 … n3).Rank("account", "k1", 10)`, func() { sink += len(pSmall.Rank("account", "k1", 10)) }},
 	}
-	if got := testing.AllocsPerRun(100, func() { sink += len(p.Rank("account", "k1", 1)) }); got > 2 {
-		t.Errorf(`NewRendezvous(n0 … n999).Rank("account", "k1", 1) allocates %v times, want at most 2`, got)
+	for _, tt := range tests {
+		if got := testing.AllocsPerRun(100, tt.f); got > 2 {
+			t.Errorf("%s allocates %v times, want at most 2", tt.name, got)
+		}
 	}
 	_ = sink
 }
