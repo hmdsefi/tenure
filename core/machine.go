@@ -23,8 +23,15 @@ type Machine struct {
 	// status holds everything Status reports. status.Spaces is parallel to cfg.Spaces.
 	status Status
 
+	// view is the applied view.
+	view viewState
+
 	// assignments holds the placement key per shard. It is parallel to cfg.Spaces.
 	assignments [][]string
+
+	// shards holds the shards' bookkeeping that Status does not report. It is parallel to
+	// cfg.Spaces, and each entry to that space's shards.
+	shards [][]shardBook
 
 	// session holds the session's bookkeeping that Status does not report.
 	session sessionTimers
@@ -45,7 +52,7 @@ type Machine struct {
 // order, then shard order, then the order the phases emitted them.
 type outputGroup int
 
-//nolint:unused // Only groupSession has actions so far; the phases still to come emit to the rest.
+//nolint:unused // Some groups have no actions so far; the phases still to come emit to them.
 const (
 	// groupSession holds ExtendDeadline, then KeepAlive.
 	groupSession outputGroup = iota
@@ -104,10 +111,12 @@ func NewMachine(cfg MachineConfig) *Machine {
 			Spaces:  make([]SpaceStatus, len(cfg.Spaces)),
 		},
 		assignments: make([][]string, len(cfg.Spaces)),
+		shards:      make([][]shardBook, len(cfg.Spaces)),
 	}
 	for i, s := range cfg.Spaces {
 		m.status.Spaces[i] = SpaceStatus{Name: s.Name, Fenced: s.Fenced, Shards: make([]ShardStatus, s.Shards)}
 		m.assignments[i] = make([]string, s.Shards)
+		m.shards[i] = make([]shardBook, s.Shards)
 	}
 	return m
 }
@@ -135,14 +144,23 @@ func (m *Machine) Step(in Input) []Action {
 		return nil
 	}
 
-	// Phase A: the clock, the session input, and the step's one evaluation of live.
+	// Phase A: the clock, the session and view inputs, and the step's one evaluation of live.
 	m.status.Now = max(m.status.Now, inputNow(in))
 	m.applySessionInput(in)
+	m.applyViewInput(in)
 	m.refreshSession()
 	m.live = m.status.Session == SessionStateLive
 
-	// Phases B to F (slot marks, assignments, shards, slots and closing) go here, in that
-	// order. The KeepAlive comes after them because closing the session ends the cadence.
+	// Phase B (slot marks) goes here.
+
+	// Phase C: the assignments, if a view has changed them.
+	m.recomputeAssignments()
+
+	// Phase D: the shards.
+	m.stepShards(in)
+
+	// Phases E and F (slots and closing) go here. The KeepAlive comes after them because closing
+	// the session ends the cadence.
 	m.emitKeepAlive()
 	m.status.Done = m.done()
 
@@ -217,6 +235,7 @@ func (m *Machine) assemble() []Action {
 func (m *Machine) armTimers() {
 	m.wake = wakeTimer{}
 	m.armSessionTimers(&m.wake)
+	m.armShardTimers(&m.wake)
 }
 
 // NextWake returns the reading of the earliest armed timer and true, or 0 and false when no

@@ -20,7 +20,8 @@ type Tick struct {
 	Now time.Duration
 }
 
-// ViewChanged delivers a new membership snapshot.
+// ViewChanged delivers a new membership snapshot. The machine ignores a snapshot that is not valid
+// or whose version is older than the last one it applied. A snapshot of the same version applies.
 type ViewChanged struct {
 	// Now is the driver's monotonic reading.
 	Now time.Duration

@@ -9,6 +9,7 @@
 package machinecases
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 	"strings"
@@ -80,6 +81,12 @@ func Ms(ms int64) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
+// Wall returns the wall-clock time the driver of a case reports at the reading now: a fixed instant
+// plus now, so a case's readings mean the same on every run.
+func Wall(now time.Duration) time.Time {
+	return time.Unix(1_700_000_000, 0).UTC().Add(now)
+}
+
 // S returns the spec of an unfenced space.
 func S(name string, shards int) core.SpaceSpec {
 	return core.SpaceSpec{Name: name, Shards: shards}
@@ -144,6 +151,56 @@ func Fail(now time.Duration, cause core.Cause, wake time.Duration, extra ...core
 		Input: core.SessionFailed{Now: now, Cause: cause},
 		Want:  want(wake, extra...),
 	}
+}
+
+// ViewAt is a ViewChanged at now delivering v, with Wall(now). Want is extra, then Wake{wake}; a
+// wake of 0 means no timer is armed, and with no extra the result is nil.
+func ViewAt(now time.Duration, v core.View, wake time.Duration, extra ...core.Action) Step {
+	return Step{
+		Input: core.ViewChanged{Now: now, View: v, Wall: Wall(now)},
+		Want:  want(wake, extra...),
+	}
+}
+
+// Grant is an Acquired at now that starts the shard's run in term. deadline is the session deadline
+// the StartRun carries. Want is that StartRun, then Wake{wake}; a wake of 0 means no timer is armed.
+func Grant(now time.Duration, space string, shard int, term core.Term, deadline, wake time.Duration) Step {
+	return Step{
+		Input: core.Acquired{Now: now, Space: space, Shard: shard, Term: term},
+		Want:  want(wake, core.StartRun{Space: space, Shard: shard, Term: term, Deadline: deadline}),
+	}
+}
+
+// Boot takes a new machine of C(spaces...), or of CF(spaces...), from nothing to a live session with
+// every shard owned:
+//
+//	@0    Tick: KeepAlive
+//	@0.1  the renewal sent at @0, which sets the session deadline to @10
+//	@0.2  view version 1 with m1 as its only member: an Acquire per shard
+//	@0.3  a grant per shard: a StartRun per shard
+//
+// Terms count up from term, in the order the machine visits shards: by space name, then by shard.
+// After Boot the next KeepAlive is due at @2, and that is the armed Wake.
+func Boot(term core.Term, spaces ...core.SpaceSpec) []Step {
+	const wake = 2000 * time.Millisecond
+	deadline := core.DefaultTiming.RenewDeadline
+	sorted := slices.Clone(spaces)
+	slices.SortStableFunc(sorted, func(a, b core.SpaceSpec) int { return cmp.Compare(a.Name, b.Name) })
+
+	var acquires []core.Action
+	var grants []Step
+	for _, s := range sorted {
+		for shard := range s.Shards {
+			acquires = append(acquires, core.Acquire{Space: s.Name, Shard: shard})
+			grants = append(grants, Grant(Ms(300), s.Name, shard, term, deadline, wake))
+			term++
+		}
+	}
+	return append([]Step{
+		{Input: core.Tick{Now: Ms(0)}, Want: want(wake, core.KeepAlive{})},
+		Renew(Ms(100), Ms(0), wake),
+		ViewAt(Ms(200), Vm(1, "m1"), wake, acquires...),
+	}, grants...)
 }
 
 // Outage is a store outage on a machine with no shard work, driven as a driver follows Wake: at

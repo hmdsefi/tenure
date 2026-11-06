@@ -4,6 +4,7 @@
 package machinecases_test
 
 import (
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -108,6 +109,70 @@ func TestFail(t *testing.T) {
 	}
 }
 
+func TestWall(t *testing.T) {
+	if got, want := mc.Wall(mc.Ms(1500)).Sub(mc.Wall(0)), mc.Ms(1500); got != want {
+		t.Errorf("Wall(1500ms) - Wall(0) = %v, want %v", got, want)
+	}
+}
+
+func TestViewAt(t *testing.T) {
+	v := mc.Vm(1, "m1")
+	got := mc.ViewAt(mc.Ms(1), v, 0)
+	want := mc.Step{Input: core.ViewChanged{Now: mc.Ms(1), View: v, Wall: mc.Wall(mc.Ms(1))}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ViewAt with nothing to return = %#v, want a nil Want", got)
+	}
+
+	got = mc.ViewAt(mc.Ms(1), v, mc.Ms(2), core.Acquire{Space: "s"})
+	wantActions := []core.Action{core.Acquire{Space: "s"}, core.Wake{At: mc.Ms(2)}}
+	if !reflect.DeepEqual(got.Want, wantActions) {
+		t.Errorf("ViewAt with an extra action = %+v, want %+v", got.Want, wantActions)
+	}
+}
+
+func TestGrant(t *testing.T) {
+	got := mc.Grant(mc.Ms(1), "s", 2, 7, mc.Ms(10), mc.Ms(3))
+	want := mc.Step{
+		Input: core.Acquired{Now: mc.Ms(1), Space: "s", Shard: 2, Term: 7},
+		Want: []core.Action{
+			core.StartRun{Space: "s", Shard: 2, Term: 7, Deadline: mc.Ms(10)},
+			core.Wake{At: mc.Ms(3)},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Grant = %+v, want %+v", got, want)
+	}
+}
+
+func TestBoot(t *testing.T) {
+	spaces := []core.SpaceSpec{mc.S("b", 1), mc.S("a", 2)}
+	got := mc.Boot(7, spaces...)
+	wake := core.Wake{At: mc.Ms(2000)}
+	want := []mc.Step{
+		{Input: core.Tick{}, Want: []core.Action{core.KeepAlive{}, wake}},
+		mc.Renew(mc.Ms(100), 0, mc.Ms(2000)),
+		mc.ViewAt(mc.Ms(200), mc.Vm(1, "m1"), mc.Ms(2000),
+			core.Acquire{Space: "a", Shard: 0}, core.Acquire{Space: "a", Shard: 1}, core.Acquire{Space: "b", Shard: 0}),
+		mc.Grant(mc.Ms(300), "a", 0, 7, mc.Ms(10000), mc.Ms(2000)),
+		mc.Grant(mc.Ms(300), "a", 1, 8, mc.Ms(10000), mc.Ms(2000)),
+		mc.Grant(mc.Ms(300), "b", 0, 9, mc.Ms(10000), mc.Ms(2000)),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Boot = %+v, want %+v", got, want)
+	}
+	if spaces[0].Name != "b" {
+		t.Error("Boot sorted its argument")
+	}
+
+	// The same steps hold for a fenced space: nothing in them depends on Fenced.
+	m := core.NewMachine(mc.CF(spaces...))
+	for i, s := range got {
+		if result := m.Step(s.Input); !reflect.DeepEqual(result, s.Want) {
+			t.Errorf("step %d on a fenced machine = %+v, want %+v", i+1, result, s.Want)
+		}
+	}
+}
+
 func TestOutage(t *testing.T) {
 	keepAlive := func(now, wake int64) mc.Step {
 		return mc.Step{
@@ -178,6 +243,14 @@ func TestCases(t *testing.T) {
 			t.Errorf("Get(%q) = %+v, want %+v", c.ID, got, c)
 		}
 	}
+
+	t.Run("the first step of the first case is KeepAlive", func(t *testing.T) {
+		c := cases[0]
+		line := fmt.Sprintf("%s 1 %T%+v", c.AT(), c.Steps[0].Want[0], c.Steps[0].Want[0])
+		if want := "AT-MCH-01 1 core.KeepAlive{}"; line != want {
+			t.Errorf("first digest line = %q, want %q", line, want)
+		}
+	})
 
 	t.Run("results share no memory", func(t *testing.T) {
 		first := mc.Cases()

@@ -224,8 +224,9 @@ func (m *Machine) Assignment(space string) []string
     Assignment returns the placement key of each shard of the named space,
     indexed by shard number, or nil when the machine has no such space. The key
     is "" for a shard with no key, so every key is "" before the first view.
-    Callers must not modify the result. A new assignment is stored in a new
-    slice, so an earlier result never changes.
+    In a view with slots the keys are "slot-0", "slot-1" and so on. Callers
+    must not modify the result. A new assignment is stored in a new slice,
+    so an earlier result never changes.
 
 func (m *Machine) NextWake() (time.Duration, bool)
     NextWake returns the reading of the earliest armed timer and true, or 0 and
@@ -790,7 +791,9 @@ type ViewChanged struct {
 	// Wall is the wall-clock time at Now.
 	Wall time.Time
 }
-    ViewChanged delivers a new membership snapshot.
+    ViewChanged delivers a new membership snapshot. The machine ignores a
+    snapshot that is not valid or whose version is older than the last one it
+    applied. A snapshot of the same version applies.
 
 type Wake struct {
 	// At is the reading, the one NextWake returns.
