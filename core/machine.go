@@ -156,12 +156,16 @@ func (m *Machine) Step(in Input) []Action {
 		return nil
 	}
 
-	// Phase A: the clock, the session and view inputs, and the step's one evaluation of live.
+	// Phase A: the clock, the session and view inputs, the step's one evaluation of live, and what a
+	// session not live does to the Confirms.
 	m.status.Now = min(max(m.status.Now, inputNow(in)), maxReading)
 	m.applySessionInput(in)
 	m.applyViewInput(in)
 	m.refreshSession()
 	m.live = m.status.Session == SessionStateLive
+	if !m.live {
+		m.forgetConfirms()
+	}
 
 	// Phase B (slot marks) goes here.
 

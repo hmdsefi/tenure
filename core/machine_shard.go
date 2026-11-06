@@ -33,6 +33,15 @@ type shardBook struct {
 	// another holder or none. The run's RunStopped hands it to grant unless the session is lost, and
 	// nothing else acts on it, so nothing of that term goes out while the run is going.
 	grantAfterRun Term
+
+	// confirmPending says a Confirm has gone out since the session was last not live, and no answer
+	// has restored the run. Nothing else lets an answer restore it. It means something only while
+	// the shard is degraded.
+	confirmPending bool
+
+	// confirmAt is the reading of the next Confirm, and 0 sends it in the first live step. It means
+	// something only while the shard is degraded.
+	confirmAt time.Duration
 }
 
 // noShard is the target of an input that names no shard the machine has.
@@ -76,6 +85,20 @@ func (m *Machine) spaceIndex(space string) (int, bool) {
 	})
 }
 
+// forgetConfirms is the part of phase A that a session not live applies to every shard (MCH-110): no
+// Confirm is pending any more, and the next goes out in the first live step. A record read before the
+// session stopped being live says nothing about who holds the shard now, so its answer must not count.
+// This stops such a record only until that next Confirm goes out: see restoreIfConfirmed.
+func (m *Machine) forgetConfirms() {
+	for i := range m.shards {
+		for j := range m.shards[i] {
+			book := &m.shards[i][j]
+			book.confirmPending = false
+			book.confirmAt = 0
+		}
+	}
+}
+
 // stepShards is phase D. It visits the spaces by name and each space's shards in order, so that
 // the actions of a group come out in that order. After a lost session nothing here returns anything
 // but the StopRuns of the step that accepted the loss: no shard can start, acquire or release, and only
@@ -94,6 +117,7 @@ func (m *Machine) stepShards(in Input) {
 			}
 			m.expireAtDeadline(ref)
 			m.stopIfUnwanted(ref)
+			m.repeatConfirm(ref)
 			m.acquireIfDue(ref)
 			m.repeatRelease(ref)
 			m.markStuck(ref)
@@ -254,6 +278,14 @@ func (m *Machine) applyHolderChanged(ref shardRef, holder string, t Term) {
 			book.noteGrantAfterRun(mine, t)
 			m.loseRun(ref, holder)
 		}
+	case ShardStateDegraded:
+		switch {
+		case notThisRun:
+			book.noteGrantAfterRun(mine, t)
+			m.loseRun(ref, holder)
+		case t == sh.Term:
+			m.restoreIfConfirmed(ref)
+		}
 	case ShardStateStopping, ShardStateExpired:
 		if notThisRun {
 			book.noteGrantAfterRun(mine, t)
@@ -277,9 +309,26 @@ func (m *Machine) applyHolderChanged(ref shardRef, holder string, t Term) {
 		case t > sh.Term:
 			m.releaseWithoutRun(ref, t)
 		}
-	case ShardStateDegraded:
-		// No shard reaches this state yet. The task that adds it adds its rows here.
 	}
+}
+
+// restoreIfConfirmed applies a record that names this member in the degraded run's own term (MCH-490).
+// Only the answer to a Confirm returned while the session is live, with the session still live, shows
+// that no one took the shard meanwhile. The machine holds up its side of that: such a record changes
+// nothing until a Confirm is out, or once the session has stopped being live since. A Confirm carries no
+// ID, so after that the machine cannot tell its answer from an older reading of the record, and keeping
+// those out is the driver's side, as Confirm's doc says (MCH O5). Phase A forgets every Confirm when the
+// session is not live, so a pending Confirm already implies live here. The check stays because a Restore
+// that should not happen brings back a shard someone else may hold.
+func (m *Machine) restoreIfConfirmed(ref shardRef) {
+	book := &m.shards[ref.space][ref.shard]
+	if !book.confirmPending || !m.live {
+		return
+	}
+	book.confirmPending = false
+	sh := m.shardStatus(ref)
+	m.setShardState(sh, ShardStateOwned)
+	m.emit(groupRunChange, Restore{Space: m.cfg.Spaces[ref.space].Name, Shard: ref.shard, Term: sh.Term})
 }
 
 // noteGrantAfterRun keeps what a record that is not older and does not name the shard's run says about
@@ -292,8 +341,8 @@ func (b *shardBook) noteGrantAfterRun(mine bool, t Term) {
 	}
 }
 
-// loseRun tells an owned shard's run to stop because the record no longer names it, or the session it
-// was held under is gone. The shard's Term stays the run's until its RunStopped.
+// loseRun tells an owned or degraded shard's run to stop because the record no longer names it, or the
+// session it was held under is gone. The shard's Term stays the run's until its RunStopped.
 func (m *Machine) loseRun(ref shardRef, holder string) {
 	m.shardStatus(ref).Holder = holder
 	m.stopRun(ref, ShardStateLost, StopLost)
@@ -347,7 +396,8 @@ func (m *Machine) applyRunStopped(ref shardRef, t Term) {
 	m.sendRelease(ref)
 }
 
-// runToldToStop reports that the shard's run has its StopRun and has not yet reported its end.
+// runToldToStop reports that the shard's run has its StopRun and has not yet reported its end. A degraded
+// run keeps going and has no StopRun, so it is not one of these.
 func runToldToStop(sh *ShardStatus) bool {
 	return sh.State == ShardStateStopping || sh.State == ShardStateExpired || sh.State == ShardStateLost
 }
@@ -375,27 +425,30 @@ func (m *Machine) sendRelease(ref shardRef) {
 	})
 }
 
-// expireAtDeadline is D2 (MCH-450): an owned shard stops at the session deadline itself, before any
-// other holder may take over. A renewal that comes later does not undo it: the shard stops, releases
-// and acquires again for a new term, as a moved shard does.
+// expireAtDeadline is D2 (MCH-450, MCH-460): an owned shard stops at the session deadline itself, before
+// any other holder may take over. A renewal that comes later does not undo it: the shard stops, releases
+// and acquires again for a new term, as a moved shard does. A fenced space has a fence point downstream
+// of its runs, so its run keeps going instead, degraded, and only an answered Confirm makes it owned
+// again.
 func (m *Machine) expireAtDeadline(ref shardRef) {
-	if m.shardStatus(ref).State != ShardStateOwned || m.status.Session != SessionStateLate {
+	sh := m.shardStatus(ref)
+	if sh.State != ShardStateOwned || m.status.Session != SessionStateLate {
 		return
 	}
 	if m.cfg.Spaces[ref.space].Fenced {
-		// A fenced space's run does not stop at the deadline. Its own D2 step, degrading the shard, goes
-		// here with the task for fenced spaces.
+		m.setShardState(sh, ShardStateDegraded)
+		m.emit(groupRunChange, Degrade{Space: m.cfg.Spaces[ref.space].Name, Shard: ref.shard, Term: sh.Term})
 		return
 	}
 	m.stopRun(ref, ShardStateExpired, StopExpired)
 }
 
-// stopIfUnwanted is D3: a run the assignment no longer gives this member is told to stop, and the
-// shard goes on stopping even if the assignment gives it back: it must stop, release and acquire
-// again for a new term.
+// stopIfUnwanted is D3 (MCH-500): a run the assignment no longer gives this member is told to stop,
+// whether it is owned or degraded and whether or not the session is live, and the shard goes on stopping
+// even if the assignment gives it back: it must stop, release and acquire again for a new term.
 func (m *Machine) stopIfUnwanted(ref shardRef) {
 	sh := m.shardStatus(ref)
-	if sh.State != ShardStateOwned || sh.Wanted {
+	if (sh.State != ShardStateOwned && sh.State != ShardStateDegraded) || sh.Wanted {
 		return
 	}
 	reason := StopMoved
@@ -403,6 +456,20 @@ func (m *Machine) stopIfUnwanted(ref shardRef) {
 		reason = StopDraining
 	}
 	m.stopRun(ref, ShardStateStopping, reason)
+}
+
+// repeatConfirm is D4 (MCH-480): a degraded shard asks for its record to be read back while the session
+// is live, every RetryPeriod, counted from the last one. The clock is below maxReading while live, so
+// the next reading fits in a Duration.
+func (m *Machine) repeatConfirm(ref shardRef) {
+	sh := m.shardStatus(ref)
+	book := &m.shards[ref.space][ref.shard]
+	if !m.live || sh.State != ShardStateDegraded || m.status.Now < book.confirmAt {
+		return
+	}
+	book.confirmPending = true
+	book.confirmAt = m.status.Now + m.cfg.Timing.RetryPeriod
+	m.emit(groupRecord, Confirm{Space: m.cfg.Spaces[ref.space].Name, Shard: ref.shard, Term: sh.Term})
 }
 
 // repeatRelease is D6: an unanswered Release goes again every RetryPeriod, counted from the last one,
@@ -456,9 +523,11 @@ func (m *Machine) setShardState(sh *ShardStatus, state ShardState) {
 }
 
 // armShardTimers arms each shard's timer: the RetryAt of a shard waiting for it, the next Release of
-// a releasing shard, and the reading at which a run told to stop counts as stuck. Each is after
-// the clock: the RetryAt condition says so, repeatRelease has just returned a Release that was due,
-// and markStuck has just marked a run that was due. Any step that makes a shard able to acquire runs
+// a releasing shard, the next Confirm of a degraded shard while the session is live, and the reading at
+// which a run told to stop counts as stuck. Each is after the clock: the RetryAt condition says so,
+// repeatRelease and repeatConfirm have just returned what was due, and markStuck has just marked a run
+// that was due. The step that brings the session back to live returns a degraded shard's Confirm, so
+// the shard needs no timer while the session is not live. Any step that makes a shard able to acquire runs
 // this again, so a shard that cannot acquire needs no timer. After a lost session no shard can acquire
 // or is releasing, so only the stuck timer is left, and a done machine, whose shards are all idle, arms
 // none.
@@ -472,6 +541,8 @@ func (m *Machine) armShardTimers(w *wakeTimer) {
 				w.arm(sh.RetryAt)
 			case sh.State == ShardStateReleasing:
 				w.arm(m.shards[i][j].releaseAt)
+			case sh.State == ShardStateDegraded && m.live:
+				w.arm(m.shards[i][j].confirmAt)
 			case runToldToStop(sh) && !sh.Stuck:
 				w.arm(m.stuckAt(ref))
 			}

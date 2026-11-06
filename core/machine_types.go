@@ -224,6 +224,12 @@ type StopRun struct {
 
 // Confirm asks the driver to read a shard's record back, so that a degraded run can be
 // restored. The answer is a HolderChanged input.
+//
+// A Confirm carries no ID. Once one is out, and for as long as the session stays live, any record
+// that names this holder in the run's term restores the run, and the machine cannot tell the
+// answer from a reading taken earlier, before another holder took the shard. So while Status shows
+// the shard degraded, the driver must step such a record only when its read started after the
+// shard's latest Confirm, and hold back any other.
 type Confirm struct {
 	// Space and Shard name the shard.
 	Space string
