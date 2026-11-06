@@ -5106,7 +5106,10 @@ func TestRunChangesOnAnyWalk(t *testing.T) {
 		step(core.SessionRenewed{SentAt: 0})
 		step(core.ViewChanged{View: mc.Vm(version, "m1"), Wall: mc.Wall(0)})
 		for range 300 {
-			shard := int(next(2))
+			shard := 0
+			if next(2) == 0 {
+				shard = 1
+			}
 			sh := m.Status().Spaces[0].Shards[shard]
 			now += time.Millisecond
 			switch next(16) {
