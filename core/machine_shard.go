@@ -30,8 +30,8 @@ type shardBook struct {
 
 	// grantAfterRun is the term of a record that names this member above the term of a run still
 	// going, or 0 for none. It holds the largest such term, until a record that is not older names
-	// another holder or none. The run's RunStopped hands it to grant, and nothing else acts on it, so
-	// nothing of that term goes out while the run is going.
+	// another holder or none. The run's RunStopped hands it to grant unless the session is lost, and
+	// nothing else acts on it, so nothing of that term goes out while the run is going.
 	grantAfterRun Term
 
 	// confirmPending says a Confirm has gone out since the session was last not live, and no answer
