@@ -1533,6 +1533,63 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 	}
 }
 
+// TestHandoverTimersAtTheLargestReadings checks that the handover's timers fit in a Duration and stay
+// after the clock, with the longest timing fields too, at readings a driver never reaches.
+func TestHandoverTimersAtTheLargestReadings(t *testing.T) {
+	const (
+		largest = time.Duration(math.MaxInt64)
+		ceiling = largest - 24*time.Hour
+	)
+	timings := []core.Timing{
+		core.DefaultTiming,
+		{LeaseDuration: 24 * time.Hour, RenewDeadline: 21 * time.Hour, RetryPeriod: 17 * time.Hour, SlotGrace: 24 * time.Hour},
+	}
+	readings := []time.Duration{
+		largest,
+		ceiling,
+		ceiling - 1,
+		ceiling - time.Second,
+		ceiling - 3*time.Second,
+		ceiling - time.Minute,
+		ceiling - 48*time.Hour,
+	}
+	for _, timing := range timings {
+		for _, now := range readings {
+			cfg := mc.C(mc.S("s", 1))
+			cfg.Timing = timing
+			m := core.NewMachine(cfg)
+			step := func(in core.Input) []core.Action {
+				t.Helper()
+				got := m.Step(in)
+				at, armed := m.NextWake()
+				st := m.Status()
+				for _, v := range wakeViolations(got, st.Now, st.Done, at, armed) {
+					t.Errorf("timing %v, reading %v: Step(%#v): %s", timing, now, in, v)
+				}
+				return got
+			}
+			for _, s := range mc.Boot(7, mc.S("s", 1)) {
+				step(s.Input)
+			}
+
+			moved := core.ViewChanged{Now: now, View: mc.Vm(2, "m2"), Wall: mc.Wall(0)}
+			if got := step(moved); !slices.Contains(got, stopS0(7)) {
+				t.Errorf("timing %v, reading %v: the view returned %#v, want a StopRun", timing, now, got)
+			}
+			step(core.Tick{Now: now})
+			if got := step(core.RunStopped{Now: now, Space: "s", Term: 7}); !slices.Contains(got, releaseS0(7)) {
+				t.Errorf("timing %v, reading %v: the RunStopped returned %#v, want a Release", timing, now, got)
+			}
+			step(core.Tick{Now: largest})
+			step(core.Tick{Now: largest})
+			step(core.Released{Now: largest, Space: "s", Term: 7})
+			if got := m.Status().Spaces[0].Shards[0].State; got != core.ShardStateIdle {
+				t.Errorf("timing %v, reading %v: state = %v, want idle", timing, now, got)
+			}
+		}
+	}
+}
+
 // TestStopping checks what a move does to a run, and what does not undo it.
 func TestStopping(t *testing.T) {
 	t.Run("the reason is draining while the member drains", func(t *testing.T) {
