@@ -131,30 +131,35 @@ func TestATMCH40ValidConfigs(t *testing.T) {
 	}
 }
 
-// TestATMCH40ZeroTimingMeansDefault changes DefaultTiming to an invalid value, so the error
-// shows that a zero Timing reads it. No test in this package runs in parallel.
+// TestATMCH40ZeroTimingMeansDefault compares the timing a machine keeps with the values of
+// DefaultTiming written out. Nothing exported shows that timing yet, so it reads it through
+// MachineTiming.
 func TestATMCH40ZeroTimingMeansDefault(t *testing.T) {
 	cfg := validConfig()
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() with zero Timing = %v, want nil", err)
 	}
-
-	saved := core.DefaultTiming
-	t.Cleanup(func() { core.DefaultTiming = saved })
-	core.DefaultTiming.SlotGrace = time.Nanosecond
-	want := core.DefaultTiming.Validate()
-	if want == nil {
-		t.Fatal("changed DefaultTiming is still valid")
+	want := core.Timing{
+		LeaseDuration: 15 * time.Second,
+		RenewDeadline: 10 * time.Second,
+		RetryPeriod:   2 * time.Second,
+		SlotGrace:     60 * time.Second,
+	}
+	if got := core.MachineTiming(core.NewMachine(cfg)); got != want {
+		t.Fatalf("timing kept for a zero Timing = %+v, want %+v", got, want)
 	}
 
-	err := cfg.Validate()
-	if err == nil || err.Error() != want.Error() {
-		t.Fatalf("Validate() with zero Timing = %v, want %q", err, want)
+	cfg.Timing = core.Timing{
+		LeaseDuration: 30 * time.Second,
+		RenewDeadline: 20 * time.Second,
+		RetryPeriod:   4 * time.Second,
+		SlotGrace:     30 * time.Second,
 	}
-
-	cfg.Timing = saved
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() with explicit Timing = %v, want nil", err)
+	}
+	if got := core.MachineTiming(core.NewMachine(cfg)); got != cfg.Timing {
+		t.Fatalf("timing kept for an explicit Timing = %+v, want %+v", got, cfg.Timing)
 	}
 }
 
@@ -165,6 +170,7 @@ func TestATMCH40TimingErrorUnchanged(t *testing.T) {
 	}{
 		// Not the zero value, so DefaultTiming does not replace it.
 		{"partly set", core.Timing{RetryPeriod: time.Second}},
+		{"only RetryPeriod unset", core.Timing{LeaseDuration: 15 * time.Second, RenewDeadline: 10 * time.Second, SlotGrace: 60 * time.Second}},
 		{"retry too long", core.Timing{LeaseDuration: 15 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 10 * time.Second, SlotGrace: 60 * time.Second}},
 		{"grace too short", core.Timing{LeaseDuration: 15 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 2 * time.Second, SlotGrace: time.Second}},
 	}
