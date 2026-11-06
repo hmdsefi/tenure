@@ -15,23 +15,23 @@ type shardBook struct {
 	// starts twice and an older grant never starts at all.
 	highestStarted Term
 
-	// stopAt is the reading of the run's StopRun. It means something only while the shard is
-	// stopping.
+	// stopAt is the reading of the run's StopRun. It means something only while the run has that
+	// StopRun and has not reported its end.
 	stopAt time.Duration
 
 	// releaseAt is the reading of the next Release repeat. It means something only while the
 	// shard is releasing.
 	releaseAt time.Duration
 
-	// knownGone says the record no longer names this run while the shard is stopping, so the run's
-	// RunStopped has nothing of the run's to release. A lost shard needs no flag: its state says the
-	// same.
+	// knownGone says the record no longer names this run while the shard is stopping or expired, so
+	// the run's RunStopped has nothing of the run's to release. A lost shard needs no flag: its state
+	// says the same.
 	knownGone bool
 
 	// grantAfterRun is the term of a record that names this member above the term of a run still
 	// going, or 0 for none. It holds the largest such term, until a record that is not older names
-	// another holder or none. The run's RunStopped hands it to grant, and nothing else acts on it, so
-	// nothing of that term goes out while the run is going.
+	// another holder or none. The run's RunStopped hands it to grant unless the session is lost, and
+	// nothing else acts on it, so nothing of that term goes out while the run is going.
 	grantAfterRun Term
 }
 
@@ -77,25 +77,48 @@ func (m *Machine) spaceIndex(space string) (int, bool) {
 }
 
 // stepShards is phase D. It visits the spaces by name and each space's shards in order, so that
-// the actions of a group come out in that order. A done machine returns nothing, so its shards stay
-// as they are until the machine handles a lost session.
+// the actions of a group come out in that order. After a lost session nothing here returns anything
+// but the StopRuns of the step that accepted the loss: no shard can start, acquire or release, and only
+// a run still going has anything left to do.
 func (m *Machine) stepShards(in Input) {
-	if m.done() {
-		return
-	}
 	target := m.inputShard(in)
 	for i := range m.status.Spaces {
 		shards := m.status.Spaces[i].Shards
 		for shard := range shards {
 			ref := shardRef{space: i, shard: shard}
+			if m.sessionLost() {
+				m.applySessionLoss(ref)
+			}
 			if ref == target {
 				m.applyShardInput(ref, in)
 			}
+			m.expireAtDeadline(ref)
 			m.stopIfUnwanted(ref)
 			m.acquireIfDue(ref)
 			m.repeatRelease(ref)
 			m.markStuck(ref)
 		}
+	}
+}
+
+// applySessionLoss is the part of D1 that a lost session applies to every shard, starting in the step
+// that accepted the loss (MCH-250, MCH-470 item 1). The records are takeable once the session is gone,
+// so nothing is released: a run still going gets its one StopRun, a Release in flight is forgotten, and
+// a shard waiting to ask again no longer will. An acquiring shard stays until its answer, because the
+// driver owes it one. No shard can come back to a state this changes, so later steps change nothing.
+func (m *Machine) applySessionLoss(ref shardRef) {
+	sh := m.shardStatus(ref)
+	switch sh.State {
+	case ShardStateOwned, ShardStateDegraded:
+		m.loseRun(ref, sh.Holder)
+	case ShardStateReleasing:
+		m.setShardState(sh, ShardStateIdle)
+		sh.Term = 0
+		sh.Reason = StopNone
+	case ShardStateIdle:
+		sh.RetryAt = 0
+	case ShardStateAcquiring, ShardStateStopping, ShardStateExpired, ShardStateLost:
+		// An acquiring shard waits for its answer, and a run told to stop has its StopRun already.
 	}
 }
 
@@ -116,10 +139,15 @@ func (m *Machine) applyShardInput(ref shardRef, in Input) {
 }
 
 // applyAcquired applies the answer to an Acquire: a grant of term t, or no grant when t is 0. Only an
-// acquiring shard takes it, so an answer the shard has stopped waiting for does nothing.
+// acquiring shard takes it, so an answer the shard has stopped waiting for does nothing. After a lost
+// session any answer ends the wait and nothing more: a granted record is takeable (MCH-430 item 3).
 func (m *Machine) applyAcquired(ref shardRef, t Term) {
 	sh := m.shardStatus(ref)
 	if sh.State != ShardStateAcquiring {
+		return
+	}
+	if m.sessionLost() {
+		m.setShardState(sh, ShardStateIdle)
 		return
 	}
 	if t == 0 {
@@ -132,12 +160,17 @@ func (m *Machine) applyAcquired(ref shardRef, t Term) {
 // applyAcquireFailed applies the answer that the record names another holder. Only an acquiring shard
 // takes it. The driver's RetryAfter may be any value: the wait stays between RetryPeriod and
 // LeaseDuration, each of them a Timing field, so RetryAt fits in a Duration and is after the clock.
+// After a lost session there is no next Acquire, so the answer only ends the wait.
 func (m *Machine) applyAcquireFailed(ref shardRef, holder string, retryAfter time.Duration) {
 	sh := m.shardStatus(ref)
 	if sh.State != ShardStateAcquiring {
 		return
 	}
 	sh.Holder = holder
+	if m.sessionLost() {
+		m.setShardState(sh, ShardStateIdle)
+		return
+	}
 	m.waitToAcquire(sh, min(max(retryAfter, m.cfg.Timing.RetryPeriod), m.cfg.Timing.LeaseDuration))
 }
 
@@ -195,10 +228,12 @@ func (m *Machine) releaseWithoutRun(ref shardRef, t Term) {
 // the run has lost. It never takes that term while the run is going: its Term stays the run's, so the
 // run's RunStopped still matches, and no Release of either term goes out. That RunStopped grants the
 // term instead, so the record does not stay in this member's name.
+//
+// After a lost session a record has no effect at all: whatever it says, this member will not act on it.
 func (m *Machine) applyHolderChanged(ref shardRef, holder string, t Term) {
 	sh := m.shardStatus(ref)
 	book := &m.shards[ref.space][ref.shard]
-	if t != 0 && t < max(sh.Term, book.grantAfterRun) {
+	if m.sessionLost() || (t != 0 && t < max(sh.Term, book.grantAfterRun)) {
 		return
 	}
 	mine := holder == m.cfg.Holder
@@ -219,7 +254,7 @@ func (m *Machine) applyHolderChanged(ref shardRef, holder string, t Term) {
 			book.noteGrantAfterRun(mine, t)
 			m.loseRun(ref, holder)
 		}
-	case ShardStateStopping:
+	case ShardStateStopping, ShardStateExpired:
 		if notThisRun {
 			book.noteGrantAfterRun(mine, t)
 			sh.Holder = holder
@@ -242,8 +277,8 @@ func (m *Machine) applyHolderChanged(ref shardRef, holder string, t Term) {
 		case t > sh.Term:
 			m.releaseWithoutRun(ref, t)
 		}
-	case ShardStateDegraded, ShardStateExpired:
-		// No shard reaches these states yet. The tasks that add them add their rows here.
+	case ShardStateDegraded:
+		// No shard reaches this state yet. The task that adds it adds its rows here.
 	}
 }
 
@@ -257,28 +292,34 @@ func (b *shardBook) noteGrantAfterRun(mine bool, t Term) {
 	}
 }
 
-// loseRun tells an owned shard's run to stop because the record no longer names it. The shard's Term
-// stays the run's until its RunStopped.
+// loseRun tells an owned shard's run to stop because the record no longer names it, or the session it
+// was held under is gone. The shard's Term stays the run's until its RunStopped.
 func (m *Machine) loseRun(ref shardRef, holder string) {
+	m.shardStatus(ref).Holder = holder
+	m.stopRun(ref, ShardStateLost, StopLost)
+}
+
+// stopRun returns the StopRun of the shard's run and moves the shard to state, which must be one that
+// runToldToStop reports, and starts the count toward Stuck.
+func (m *Machine) stopRun(ref shardRef, state ShardState, reason StopReason) {
 	sh := m.shardStatus(ref)
-	m.setShardState(sh, ShardStateLost)
-	sh.Reason = StopLost
-	sh.Holder = holder
+	m.setShardState(sh, state)
+	sh.Reason = reason
 	m.shards[ref.space][ref.shard].stopAt = m.status.Now
 	m.emit(groupRunChange, StopRun{
 		Space:  m.cfg.Spaces[ref.space].Name,
 		Shard:  ref.shard,
 		Term:   sh.Term,
-		Reason: StopLost,
+		Reason: reason,
 	})
 }
 
 // applyRunStopped applies the report that the run of term t has ended, which is what makes the term
 // safe to release. Only a shard that told its run to stop can take the report, and only for that
 // run's term: an owned shard's run was never told to stop, and any other term is not this run's. When
-// the record no longer names the run there is nothing of the run's to release, so the shard goes to
-// idle, and a term the record gave this member while the run was going now goes to grant, unless the
-// session is lost.
+// the record no longer names the run, or the session it was held under is gone, there is nothing of the
+// run's to release, so the shard goes to idle. A term the record gave this member while the run was going
+// now goes to grant, unless the session is lost: then the record is takeable, and nothing is released.
 //
 // A Release of a shard with a run comes only after this: the shard enters ShardStateReleasing from a
 // run only here, sendRelease runs only here and for a shard in that state, and grant's Release for a
@@ -291,13 +332,13 @@ func (m *Machine) applyRunStopped(ref shardRef, t Term) {
 	}
 	sh.Stuck = false
 	book := &m.shards[ref.space][ref.shard]
-	if sh.State == ShardStateLost || book.knownGone {
+	if sh.State == ShardStateLost || book.knownGone || m.sessionLost() {
 		next := book.grantAfterRun
 		book.knownGone, book.grantAfterRun = false, 0
 		m.setShardState(sh, ShardStateIdle)
 		sh.Term = 0
 		sh.Reason = StopNone
-		if next != 0 && m.status.Session != SessionStateLost {
+		if next != 0 && !m.sessionLost() {
 			m.grant(ref, next)
 		}
 		return
@@ -308,7 +349,7 @@ func (m *Machine) applyRunStopped(ref shardRef, t Term) {
 
 // runToldToStop reports that the shard's run has its StopRun and has not yet reported its end.
 func runToldToStop(sh *ShardStatus) bool {
-	return sh.State == ShardStateStopping || sh.State == ShardStateLost
+	return sh.State == ShardStateStopping || sh.State == ShardStateExpired || sh.State == ShardStateLost
 }
 
 // applyReleased applies the answer to a Release of term t. Only a shard releasing that term takes
@@ -334,6 +375,21 @@ func (m *Machine) sendRelease(ref shardRef) {
 	})
 }
 
+// expireAtDeadline is D2 (MCH-450): an owned shard stops at the session deadline itself, before any
+// other holder may take over. A renewal that comes later does not undo it: the shard stops, releases
+// and acquires again for a new term, as a moved shard does.
+func (m *Machine) expireAtDeadline(ref shardRef) {
+	if m.shardStatus(ref).State != ShardStateOwned || m.status.Session != SessionStateLate {
+		return
+	}
+	if m.cfg.Spaces[ref.space].Fenced {
+		// A fenced space's run does not stop at the deadline. Its own D2 step, degrading the shard, goes
+		// here with the task for fenced spaces.
+		return
+	}
+	m.stopRun(ref, ShardStateExpired, StopExpired)
+}
+
 // stopIfUnwanted is D3: a run the assignment no longer gives this member is told to stop, and the
 // shard goes on stopping even if the assignment gives it back: it must stop, release and acquire
 // again for a new term.
@@ -342,18 +398,11 @@ func (m *Machine) stopIfUnwanted(ref shardRef) {
 	if sh.State != ShardStateOwned || sh.Wanted {
 		return
 	}
-	m.setShardState(sh, ShardStateStopping)
-	sh.Reason = StopMoved
+	reason := StopMoved
 	if m.status.Draining {
-		sh.Reason = StopDraining
+		reason = StopDraining
 	}
-	m.shards[ref.space][ref.shard].stopAt = m.status.Now
-	m.emit(groupRunChange, StopRun{
-		Space:  m.cfg.Spaces[ref.space].Name,
-		Shard:  ref.shard,
-		Term:   sh.Term,
-		Reason: sh.Reason,
-	})
+	m.stopRun(ref, ShardStateStopping, reason)
 }
 
 // repeatRelease is D6: an unanswered Release goes again every RetryPeriod, counted from the last one,
@@ -410,11 +459,10 @@ func (m *Machine) setShardState(sh *ShardStatus, state ShardState) {
 // a releasing shard, and the reading at which a run told to stop counts as stuck. Each is after
 // the clock: the RetryAt condition says so, repeatRelease has just returned a Release that was due,
 // and markStuck has just marked a run that was due. Any step that makes a shard able to acquire runs
-// this again, so a shard that cannot acquire needs no timer. A done machine arms none.
+// this again, so a shard that cannot acquire needs no timer. After a lost session no shard can acquire
+// or is releasing, so only the stuck timer is left, and a done machine, whose shards are all idle, arms
+// none.
 func (m *Machine) armShardTimers(w *wakeTimer) {
-	if m.done() {
-		return
-	}
 	for i := range m.status.Spaces {
 		shards := m.status.Spaces[i].Shards
 		for j := range shards {

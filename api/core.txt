@@ -256,6 +256,10 @@ func (m *Machine) Step(in Input) []Action
     result ends with a Wake for the reading NextWake returns, which is after the
     machine's clock, and contains no other Wake.
 
+    The step that accepts a lost session returns a StopRun for each run not yet
+    told to stop. Later steps return no action but a Wake, until every shard is
+    idle and Status reports Done.
+
     Once Status reports Done, Step returns nil. Once the session is closed,
     the clock stops too.
 
@@ -588,7 +592,8 @@ type Status struct {
 	// failed since the last accepted one.
 	LastFailure Cause
 
-	// Done reports that the machine has nothing left to do.
+	// Done reports that the machine has nothing left to do: its session is closed, or its session is
+	// lost and every shard is idle.
 	Done bool
 
 	// Draining reports that the member is handing its work over before it leaves.

@@ -73,6 +73,11 @@ func (m *Machine) sessionEnded() bool {
 	return false
 }
 
+// sessionLost reports that the session is lost, rather than closing or closed.
+func (m *Machine) sessionLost() bool {
+	return m.status.Session == SessionStateLost
+}
+
 // refreshSession sets the session's state from the clock: opening until the first accepted
 // renewal, then live before the deadline and late from the deadline on. A driver that wakes at
 // the deadline therefore finds it already past. A clock at maxReading cannot move on to a deadline

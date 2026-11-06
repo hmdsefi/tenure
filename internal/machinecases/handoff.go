@@ -103,6 +103,36 @@ func handoffCases() []Case {
 			),
 		},
 		{
+			// A grant that arrives after the session deadline cannot start: it is released with no
+			// run, and the shard stays idle while the session is late.
+			ID:     "AT-MCH-18 (a)",
+			Config: C(S("s", 1)),
+			Steps: []Step{
+				{Input: core.Tick{Now: Ms(0)}, Want: want(Ms(2000), core.KeepAlive{})},
+				Renew(Ms(100), Ms(0), Ms(2000)),
+				ViewAt(Ms(200), Vm(1, "m1"), Ms(2000), core.Acquire{Space: "s"}),
+				{Input: core.Tick{Now: Ms(10000)}, Want: want(Ms(12000), core.KeepAlive{})},
+				{
+					Input: core.Acquired{Now: Ms(10100), Space: "s", Term: 9},
+					Want:  want(Ms(12000), core.Release{Space: "s", Term: 9}),
+				},
+				{Input: core.Released{Now: Ms(10200), Space: "s", Term: 9}, Want: want(Ms(12000))},
+			},
+		},
+		{
+			// A grant that arrives after the session is lost ends the wait and nothing more: no run
+			// and no Release, and with that the machine is done.
+			ID:     "AT-MCH-18 (b)",
+			Config: C(S("s", 1)),
+			Steps: []Step{
+				{Input: core.Tick{Now: Ms(0)}, Want: want(Ms(2000), core.KeepAlive{})},
+				Renew(Ms(100), Ms(0), Ms(2000)),
+				ViewAt(Ms(200), Vm(1, "m1"), Ms(2000), core.Acquire{Space: "s"}),
+				Fail(Ms(300), core.CauseLost, 0),
+				{Input: core.Acquired{Now: Ms(400), Space: "s", Term: 9}},
+			},
+		},
+		{
 			// An AcquireFailed that names no holder and asks for no wait retries after RetryPeriod,
 			// and the retry is granted.
 			ID:     "AT-MCH-19 (a)",

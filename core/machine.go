@@ -144,6 +144,9 @@ func NewMachine(cfg MachineConfig) *Machine {
 // Wake last. When a timer is armed the result ends with a Wake for the reading NextWake returns,
 // which is after the machine's clock, and contains no other Wake.
 //
+// The step that accepts a lost session returns a StopRun for each run not yet told to stop. Later
+// steps return no action but a Wake, until every shard is idle and Status reports Done.
+//
 // Once Status reports Done, Step returns nil. Once the session is closed, the clock stops too.
 func (m *Machine) Step(in Input) []Action {
 	if in == nil {
