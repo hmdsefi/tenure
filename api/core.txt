@@ -237,8 +237,25 @@ func (m *Machine) Status() Status
 
 func (m *Machine) Step(in Input) []Action
     Step applies one input and returns the actions the driver must carry out,
-    or nil when there are none. It panics when in is nil. For now, every other
-    input has no effect and Step returns nil.
+    or nil when there are none. It panics when in is nil.
+
+    The machine's clock moves to the input's Now and never back, so an input
+    with an older Now runs at the machine's own reading. The clock stops 24
+    hours short of the largest Duration, where the session is never live,
+    so that every timer's reading fits. A value of any other type that satisfies
+    Input, such as a pointer to an input, leaves the clock where it is. An input
+    that does not apply, such as a renewal sent after the clock's reading or
+    an answer to a request the machine did not make, has no effect of its own,
+    but the rest of the step still runs, so whatever is due still happens.
+
+    Actions come in a fixed order: ExtendDeadline and KeepAlive; then StopRun,
+    Degrade and Restore; StartRun; Release, Confirm and Acquire; ReleaseSlot
+    and ClaimSlot; CloseSession; and Wake last. When a timer is armed the
+    result ends with a Wake for the reading NextWake returns, which is after the
+    machine's clock, and contains no other Wake.
+
+    Once Status reports Done, Step returns nil. Once the session is closed,
+    the clock stops too.
 
 type MachineConfig struct {
 	// Holder is the session holder string, the name a shard's record uses for this member's
