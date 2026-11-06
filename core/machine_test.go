@@ -5,8 +5,11 @@ package core_test
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -156,7 +159,8 @@ func runSteps(t *testing.T, c mc.Case, checks stepChecks) *core.Machine {
 			t.Fatalf("%s step %d: Step(%#v) = %#v, want %#v", c.ID, n, s.Input, got, s.Want)
 		}
 		at, armed := m.NextWake()
-		for _, v := range wakeViolations(got, m.Status().Now, at, armed) {
+		st := m.Status()
+		for _, v := range wakeViolations(got, st.Now, st.Done, at, armed) {
 			t.Errorf("%s step %d: %s", c.ID, n, v)
 		}
 		if check, ok := checks[n]; ok {
@@ -197,8 +201,8 @@ func assumeCase(t *testing.T, c mc.Case) {
 
 // wakeViolations returns how a step's result breaks the wake rules: nil rather than empty, a last
 // action of Wake{NextWake} when a timer is armed and no other Wake, an armed timer strictly after
-// the clock, and no Wake and a reading of 0 when none is.
-func wakeViolations(got []core.Action, now, at time.Duration, armed bool) []string {
+// the clock and no timer on a done machine, and no Wake and a reading of 0 when none is armed.
+func wakeViolations(got []core.Action, now time.Duration, done bool, at time.Duration, armed bool) []string {
 	var found []string
 	if got != nil && len(got) == 0 {
 		found = append(found, "result is empty but not nil")
@@ -227,6 +231,9 @@ func wakeViolations(got []core.Action, now, at time.Duration, armed bool) []stri
 	if at <= now {
 		found = append(found, fmt.Sprintf("armed timer %v is not after the clock %v", at, now))
 	}
+	if done {
+		found = append(found, fmt.Sprintf("the machine is done, but timer %v is armed", at))
+	}
 	return found
 }
 
@@ -236,6 +243,7 @@ func TestWakeViolations(t *testing.T) {
 		name  string
 		got   []core.Action
 		now   time.Duration
+		done  bool
 		at    time.Duration
 		armed bool
 		want  int
@@ -253,10 +261,12 @@ func TestWakeViolations(t *testing.T) {
 		{name: "timer before the clock", got: []core.Action{wake}, now: 3 * time.Second, at: 2 * time.Second, armed: true, want: 1},
 		{name: "Wake with no timer", got: []core.Action{wake}, want: 1},
 		{name: "reading with no timer", got: nil, at: 2 * time.Second, want: 1},
+		{name: "done with no timer", got: nil, done: true},
+		{name: "done with a timer", got: []core.Action{wake}, done: true, at: 2 * time.Second, armed: true, want: 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := wakeViolations(tc.got, tc.now, tc.at, tc.armed); len(got) != tc.want {
+			if got := wakeViolations(tc.got, tc.now, tc.done, tc.at, tc.armed); len(got) != tc.want {
 				t.Errorf("wakeViolations = %q, want %d", got, tc.want)
 			}
 		})
@@ -1394,7 +1404,8 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 			}
 			got := m.Step(in)
 			at, armed := m.NextWake()
-			for _, v := range wakeViolations(got, m.Status().Now, at, armed) {
+			st := m.Status()
+			for _, v := range wakeViolations(got, st.Now, st.Done, at, armed) {
 				t.Fatalf("seed %d: %s, after %+v", seed, v, history)
 			}
 			for _, a := range got {
@@ -1901,6 +1912,333 @@ func TestOutputOrder(t *testing.T) {
 		viewed(200, mc.Vm(1, "m1"), acquireS0(), core.Acquire{Space: "s", Shard: 1}, wakeAt(2000)),
 		acquired(2000, 7, core.KeepAlive{}, startedS0(7, 10000), wakeAt(4000)),
 	), nil)
+
+	// Shard 0 emits its Acquire before shard 1 emits its StartRun, and the StartRun still comes
+	// first.
+	t.Run("a StartRun comes before an Acquire of an earlier shard", func(t *testing.T) {
+		runSteps(t, scenarioIn(mc.C(mc.S("s", 2)),
+			keepAlive(0, 2000),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			viewed(200, mc.Vm(1, "m1"), acquireS0(), core.Acquire{Space: "s", Shard: 1}, wakeAt(2000)),
+			keepAlive(10000, 12000),
+			acquired(10100, 7, wakeAt(12000)), // RetryAt of shard 0 is @12.1.
+			keepAlive(12000, 14000),
+			renewed(12050, 12000, extended(22000), wakeAt(12100)),
+			mc.Step{
+				Input: core.Acquired{Now: mc.Ms(12100), Space: "s", Shard: 1, Term: 8},
+				Want:  []core.Action{core.StartRun{Space: "s", Shard: 1, Term: 8, Deadline: mc.Ms(22000)}, acquireS0(), wakeAt(14000)},
+			},
+		), nil)
+	})
+}
+
+// TestViewPlacementTime checks the time placement reads: exactly W in the step that applies a view,
+// and W plus the time since that step in a later recompute.
+func TestViewPlacementTime(t *testing.T) {
+	wall := mc.Wall(mc.Ms(200))
+	joins := func(version uint64, at time.Time) core.View {
+		return core.View{Version: version, Members: []core.Member{{ID: "m1", Slot: -1, JoinAt: at}}}
+	}
+	emptyThenMark := func(t *testing.T, m *core.Machine) {
+		t.Helper()
+		assignmentIs("s", "")(t, m)
+		core.MarkViewDirty(m)
+	}
+
+	t.Run("at the step that applies the view", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			member core.Member
+			want   string
+		}{
+			{"before JoinAt", core.Member{ID: "m1", Slot: -1, JoinAt: wall.Add(1)}, ""},
+			{"at JoinAt", core.Member{ID: "m1", Slot: -1, JoinAt: wall}, "m1"},
+			{"before LeaveAt", core.Member{ID: "m1", Slot: -1, LeaveAt: wall.Add(1)}, "m1"},
+			{"at LeaveAt", core.Member{ID: "m1", Slot: -1, LeaveAt: wall}, ""},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				m := core.NewMachine(mc.C(mc.S("s", 1)))
+				m.Step(core.Tick{Now: mc.Ms(200)})
+				m.Step(core.ViewChanged{
+					Now:  mc.Ms(200),
+					View: core.View{Version: 1, Members: []core.Member{tc.member}},
+					Wall: wall,
+				})
+				assignmentIs("s", tc.want)(t, m)
+			})
+		}
+	})
+
+	// The member becomes eligible one second after the view applied. An ignored view changes neither
+	// W, nor A, nor the applied view.
+	t.Run("at a later recompute", func(t *testing.T) {
+		ignoredView := func(v core.View) []mc.Step {
+			return []mc.Step{{
+				Input: core.ViewChanged{Now: mc.Ms(300), View: v, Wall: wall.Add(time.Hour)},
+				Want:  []core.Action{wakeAt(2000)},
+			}}
+		}
+		tests := []struct {
+			name    string
+			ignored []mc.Step
+		}{
+			{name: "no other view"},
+			{name: "an older view", ignored: ignoredView(mc.Vm(4, "m2"))},
+			{name: "an invalid view", ignored: ignoredView(core.View{Version: 9, Slots: -1})},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				steps := slices.Concat(
+					[]mc.Step{
+						keepAlive(0, 2000),
+						renewed(100, 0, extended(10000), wakeAt(2000)),
+						viewed(200, joins(5, wall.Add(time.Second)), wakeAt(2000)),
+					},
+					tc.ignored,
+					[]mc.Step{tick(1199, wakeAt(2000))},
+				)
+				n := len(steps)
+				steps = append(steps, tick(1200, acquireS0(), wakeAt(2000)))
+				runSteps(t, scenario(steps...), stepChecks{
+					n - 1: emptyThenMark,
+					n:     emptyThenMark,
+					n + 1: assignmentIs("s", "m1"),
+				})
+			})
+		}
+	})
+
+	t.Run("A is the machine's reading when the input's is older", func(t *testing.T) {
+		older := mc.Wall(mc.Ms(1000))
+		runSteps(t, scenario(
+			keepAlive(5000, 7000),
+			mc.Step{
+				Input: core.ViewChanged{Now: mc.Ms(1000), View: joins(1, older.Add(time.Second)), Wall: older},
+				Want:  []core.Action{wakeAt(7000)},
+			},
+			tick(5999, wakeAt(7000)),
+			tick(6000, wakeAt(7000)),
+		), stepChecks{
+			2: emptyThenMark,
+			3: emptyThenMark,
+			4: assignmentIs("s", "m1"),
+		})
+	})
+
+	t.Run("W has no monotonic reading", func(t *testing.T) {
+		now := time.Now()
+		if !strings.Contains(now.String(), "m=") {
+			t.Skip("this platform's clock has no monotonic reading")
+		}
+		m := core.NewMachine(mc.C(mc.S("s", 1)))
+		m.Step(core.ViewChanged{View: mc.Vm(1, "m1"), Wall: now})
+		got := core.ViewWall(m)
+		if !got.Equal(now) {
+			t.Errorf("W = %v, want %v", got, now)
+		}
+		if strings.Contains(got.String(), "m=") {
+			t.Errorf("W = %v still has a monotonic reading", got)
+		}
+	})
+}
+
+// agreementViews returns valid views of every shape the machine can apply: with and without slots,
+// with members that are draining, standing by or outside their window at wall.
+func agreementViews(t *testing.T, wall time.Time) []core.View {
+	t.Helper()
+	ids := []string{"m0", "m1", "m2", "m3", "m4", "m5"}
+	var views []core.View
+	for n := range len(ids) + 1 {
+		// shape picks, per member, nothing or one way of not being eligible.
+		for shape := range 5 {
+			members := make([]core.Member, n)
+			for i := range members {
+				members[i] = core.Member{ID: ids[i], Slot: -1}
+				switch (i + shape) % 5 {
+				case 1:
+					members[i].Draining = true
+				case 2:
+					members[i].JoinAt = wall.Add(1)
+				case 3:
+					members[i].LeaveAt = wall
+				}
+			}
+			views = append(views, core.View{Version: uint64(len(views)), Members: members})
+		}
+	}
+	for slots := 1; slots <= 4; slots++ {
+		for vacant := range 1 << slots {
+			holders := make([]string, slots)
+			first := -1
+			for s := range holders {
+				if vacant&(1<<s) == 0 {
+					holders[s] = "h/" + strconv.Itoa(s)
+					if first < 0 {
+						first = s
+					}
+				}
+			}
+			members := []core.Member{{ID: "m1", Slot: first}, {ID: "m2", Slot: -1}}
+			views = append(views, core.View{Version: uint64(len(views)), Members: members, Slots: slots, SlotHolders: holders})
+		}
+	}
+	for _, v := range views {
+		if err := v.Validate(); err != nil {
+			t.Fatalf("view %+v is not valid: %v", v, err)
+		}
+	}
+	return views
+}
+
+// TestViewAgreesWithPlacement checks that the assignment and the Wanted flags are what calling
+// PlacementKeys and Balanced directly gives, for every valid shape of view, and that no such view
+// panics. Each view has its own machine, and all of them run on one machine too, so a recompute
+// from an earlier view leaves nothing behind.
+func TestViewAgreesWithPlacement(t *testing.T) {
+	const reading = 200 * time.Millisecond
+	wall := mc.Wall(reading)
+	spaces := []core.SpaceSpec{mc.S("a", 1), mc.S("b", 7), mc.S("c", 64)}
+
+	check := func(t *testing.T, m *core.Machine, v core.View) {
+		t.Helper()
+		var expired []bool
+		if v.Slots > 0 {
+			expired = make([]bool, v.Slots)
+		}
+		keys, _ := core.PlacementKeys(v, wall, expired)
+		st := m.Status()
+		if st.ViewVersion != v.Version {
+			t.Fatalf("ViewVersion = %d, want %d", st.ViewVersion, v.Version)
+		}
+		for i, s := range spaces {
+			want := make([]string, s.Shards)
+			for shard, k := range core.Balanced(s.Name, s.Shards, keys) {
+				if k >= 0 {
+					want[shard] = keys[k]
+				}
+			}
+			assignmentIs(s.Name, want...)(t, m)
+			for shard, sh := range st.Spaces[i].Shards {
+				wanted := v.Slots == 0 && want[shard] == "m1"
+				if sh.Wanted != wanted {
+					t.Errorf("view %+v: %s/%d Wanted = %v, want %v", v, s.Name, shard, sh.Wanted, wanted)
+				}
+			}
+		}
+		if got := m.Assignment("unknown"); got != nil {
+			t.Errorf("Assignment(unknown) = %q, want nil", got)
+		}
+	}
+
+	shared := core.NewMachine(mc.C(spaces...))
+	shared.Step(core.Tick{Now: reading})
+	for _, v := range agreementViews(t, wall) {
+		m := core.NewMachine(mc.C(spaces...))
+		m.Step(core.Tick{Now: reading})
+		in := core.ViewChanged{Now: reading, View: v, Wall: wall}
+		m.Step(in)
+		check(t, m, v)
+
+		shared.Step(in)
+		check(t, shared, v)
+	}
+}
+
+// TestSpaceOrderDoesNotMatter runs one sequence on the same spaces given in opposite orders, and
+// expects equal results, Status and assignments after every step.
+func TestSpaceOrderDoesNotMatter(t *testing.T) {
+	spaces := []core.SpaceSpec{mc.S("a", 5), mc.S("b", 3), {Name: "c", Shards: 8, Fenced: true}}
+	reversed := slices.Clone(spaces)
+	slices.Reverse(reversed)
+	one, other := core.NewMachine(mc.C(spaces...)), core.NewMachine(mc.C(reversed...))
+
+	step := func(in core.Input) []core.Action {
+		t.Helper()
+		got, gotOther := one.Step(in), other.Step(in)
+		if !reflect.DeepEqual(got, gotOther) {
+			t.Fatalf("Step(%#v) = %#v and %#v", in, got, gotOther)
+		}
+		if st, stOther := one.Status(), other.Status(); !reflect.DeepEqual(st, stOther) {
+			t.Fatalf("after Step(%#v): Status = %+v and %+v", in, st, stOther)
+		}
+		for _, s := range spaces {
+			if a, b := one.Assignment(s.Name), other.Assignment(s.Name); !slices.Equal(a, b) {
+				t.Fatalf("after Step(%#v): Assignment(%s) = %q and %q", in, s.Name, a, b)
+			}
+		}
+		return got
+	}
+
+	step(core.Tick{Now: mc.Ms(0)})
+	step(core.SessionRenewed{Now: mc.Ms(100), SentAt: mc.Ms(0)})
+	result := step(core.ViewChanged{Now: mc.Ms(200), View: mc.Vm(1, "m1", "m2"), Wall: mc.Wall(mc.Ms(200))})
+	var grants []core.Input
+	for _, a := range result {
+		if acquire, ok := a.(core.Acquire); ok {
+			grants = append(grants, core.Acquired{
+				Now: mc.Ms(300), Space: acquire.Space, Shard: acquire.Shard, Term: core.Term(len(grants) + 1),
+			})
+		}
+	}
+	if len(grants) == 0 {
+		t.Fatal("the view gave the member no shard")
+	}
+	for _, in := range grants {
+		step(in)
+	}
+	step(core.ViewChanged{Now: mc.Ms(400), View: mc.Vm(2, "m1"), Wall: mc.Wall(mc.Ms(400))})
+}
+
+// TestMemberNamedLikeASlotKey checks that a member whose ID looks like a slot's key gets nothing in
+// a view with slots, where such a key names the slot and not the member, and is an ordinary member
+// without slots.
+func TestMemberNamedLikeASlotKey(t *testing.T) {
+	cfg := core.MachineConfig{Holder: "h1", Member: "slot-0", Spaces: []core.SpaceSpec{mc.S("s", 1)}}
+	runSteps(t, scenarioIn(cfg,
+		keepAlive(0, 2000),
+		renewed(100, 0, extended(10000), wakeAt(2000)),
+		viewed(200, mc.Vs(1, []string{"h/0"}, "slot-0"), wakeAt(2000)),
+		viewed(300, mc.Vm(2, "slot-0"), acquireS0(), wakeAt(2000)),
+	), stepChecks{
+		3: all(assignmentIs("s", "slot-0"), shardIs(0, core.ShardStatus{})),
+		4: all(
+			assignmentIs("s", "slot-0"),
+			shardIs(0, core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(300), Wanted: true}),
+		),
+	})
+}
+
+// TestRetryAtAtTheClockCeiling checks that RetryAt follows the rule of timers near the highest
+// reading the clock takes: it fits in a Duration, and an armed timer is after the clock.
+func TestRetryAtAtTheClockCeiling(t *testing.T) {
+	const (
+		retry = 2 * time.Second
+		below = maxReading - 1
+	)
+	wall := mc.Wall(0)
+	wake := core.Wake{At: below + retry}
+	idleWaiting := core.ShardStatus{Since: below, Holder: "h1", Wanted: true, RetryAt: below + retry}
+	view := func(now time.Duration, v core.View, want ...core.Action) mc.Step {
+		return mc.Step{Input: core.ViewChanged{Now: now, View: v, Wall: wall}, Want: want}
+	}
+	runSteps(t, scenarioIn(mc.C(mc.S("s", 2)),
+		mc.Step{Input: core.Tick{Now: below}, Want: []core.Action{core.KeepAlive{}, wake}},
+		mc.Step{
+			Input: core.SessionRenewed{Now: below, SentAt: below},
+			Want:  []core.Action{core.ExtendDeadline{Deadline: below + 10*time.Second}, wake},
+		},
+		view(below, mc.Vm(1, "m1"), acquireS0(), core.Acquire{Space: "s", Shard: 1}, wake),
+		view(below, mc.Vm(2, "m2"), wake),
+		mc.Step{Input: core.Acquired{Now: below, Space: "s", Term: 7}, Want: []core.Action{wake}},
+		view(below, mc.Vm(3, "m1"), wake),
+		mc.Step{Input: core.Tick{Now: math.MaxInt64}, Want: []core.Action{wake}},
+		mc.Step{Input: core.Acquired{Now: math.MaxInt64, Space: "s", Shard: 1, Term: 8}, Want: []core.Action{wake}},
+	), stepChecks{
+		6: shardIs(0, idleWaiting),
+		7: shardIs(0, idleWaiting),
+		8: shardIs(1, core.ShardStatus{Since: maxReading, Holder: "h1", Wanted: true, RetryAt: maxReading + retry}),
+	})
 }
 
 // TestMachineCases runs every shared case with no extra checks, so the wake rules hold after every
@@ -2047,6 +2385,16 @@ func TestSessionStates(t *testing.T) {
 				renewed(100, 0, extended(10000), wakeAt(2000)),
 				keepAlive(11500, 13500),
 				renewed(11600, 1000, extended(11000), wakeAt(13500)),
+			},
+			states: []core.SessionState{opening, live, late, late},
+		},
+		{
+			name: "a renewal whose deadline is the clock's reading leaves it late",
+			steps: []mc.Step{
+				keepAlive(0, 2000),
+				renewed(100, 0, extended(10000), wakeAt(2000)),
+				keepAlive(11000, 13000),
+				renewed(11000, 1000, extended(11000), wakeAt(13000)),
 			},
 			states: []core.SessionState{opening, live, late, late},
 		},
@@ -2216,13 +2564,14 @@ func TestSessionLostIsFinal(t *testing.T) {
 				core.SessionFailed{Now: mc.Ms(later), Cause: core.CauseNone},
 				&core.Tick{Now: mc.Ms(later)},
 			)
+			checks := stepChecks{
+				len(steps): sessionIs(lostAt, core.SessionStateLost, start.deadline, core.CauseLost),
+			}
+			// Checked after every one of them: a later failure must not replace the cause, and
+			// the last input must not be what puts it back.
 			for _, in := range inputs {
 				steps = append(steps, mc.Step{Input: in})
-			}
-
-			checks := stepChecks{
-				len(start.steps) + 1: sessionIs(lostAt, core.SessionStateLost, start.deadline, core.CauseLost),
-				len(steps):           sessionIs(later, core.SessionStateLost, start.deadline, core.CauseLost),
+				checks[len(steps)] = sessionIs(later, core.SessionStateLost, start.deadline, core.CauseLost)
 			}
 			m := runSteps(t, scenario(steps...), checks)
 			if at, ok := m.NextWake(); at != 0 || ok {
@@ -2361,6 +2710,232 @@ func TestStepClockOlderInput(t *testing.T) {
 			failed(1000, core.CauseUnreachable, wakeAt(7000)),
 		), stepChecks{2: sessionIs(5000, core.SessionStateOpening, 0, core.CauseUnreachable)})
 	})
+}
+
+// TestStepClockClosedMachine checks that the closed check comes before the clock: a closed machine
+// returns nil for every input and its reading stays where it was. Nothing closes a machine yet, so
+// the test closes it directly.
+func TestStepClockClosedMachine(t *testing.T) {
+	const closedAt = time.Second
+	m := core.NewMachine(mc.C(mc.S("s", 1)))
+	m.Step(core.Tick{Now: closedAt})
+	core.ForceSessionClosed(m)
+	for _, in := range allInputs(5 * time.Second) {
+		if got := m.Step(in); got != nil {
+			t.Errorf("Step(%T) on a closed machine = %#v, want nil", in, got)
+		}
+		if got := m.Status().Now; got != closedAt {
+			t.Errorf("Now after Step(%T) on a closed machine = %v, want %v", in, got, closedAt)
+		}
+	}
+	if err := panicError(t, func() { m.Step(nil) }); err.Error() != "core: Step: nil Input" {
+		t.Errorf("Step(nil) on a closed machine panicked with %q", err)
+	}
+}
+
+// maxReading is the highest reading the clock takes: 24 hours short of the largest Duration.
+const maxReading = time.Duration(math.MaxInt64) - 24*time.Hour
+
+// TestStepClockExtremeReadings pins what the machine does with readings outside the driver's range,
+// and at the top of it. The wake rules that runSteps checks are the point of most of these: a timer
+// must fit in a Duration and be after the clock.
+func TestStepClockExtremeReadings(t *testing.T) {
+	const (
+		retry    = 2 * time.Second
+		deadline = 10 * time.Second
+		top      = time.Duration(1<<62 - 1)
+	)
+	ka := func(now, wake time.Duration) mc.Step {
+		return mc.Step{Input: core.Tick{Now: now}, Want: []core.Action{core.KeepAlive{}, core.Wake{At: wake}}}
+	}
+	tests := []struct {
+		name    string
+		steps   []mc.Step
+		now     time.Duration
+		session core.SessionState
+		dl      time.Duration
+	}{
+		{
+			name:    "a negative first reading leaves the clock at 0",
+			steps:   []mc.Step{ka(-time.Second, retry)},
+			session: core.SessionStateOpening,
+		},
+		{
+			name:    "the lowest reading leaves the clock at 0",
+			steps:   []mc.Step{ka(math.MinInt64, retry)},
+			session: core.SessionStateOpening,
+		},
+		{
+			name: "a negative reading later leaves the clock where it is",
+			steps: []mc.Step{
+				ka(time.Second, time.Second+retry),
+				{Input: core.Tick{Now: -time.Second}, Want: []core.Action{core.Wake{At: time.Second + retry}}},
+			},
+			now:     time.Second,
+			session: core.SessionStateOpening,
+		},
+		{
+			name: "a negative SentAt that still reaches past the clock counts",
+			steps: []mc.Step{
+				ka(0, retry),
+				{
+					Input: core.SessionRenewed{SentAt: -time.Second},
+					Want:  []core.Action{core.ExtendDeadline{Deadline: 9 * time.Second}, core.Wake{At: retry}},
+				},
+			},
+			session: core.SessionStateLive,
+			dl:      9 * time.Second,
+		},
+		{
+			name: "a SentAt too old to reach 0 moves nothing, and the session is late",
+			steps: []mc.Step{
+				ka(0, retry),
+				{Input: core.SessionRenewed{SentAt: math.MinInt64}, Want: []core.Action{core.Wake{At: retry}}},
+			},
+			session: core.SessionStateLate,
+		},
+		{
+			name: "the top of the driver's range is an ordinary reading",
+			steps: []mc.Step{
+				ka(top, top+retry),
+				{
+					Input: core.SessionRenewed{Now: top, SentAt: top},
+					Want:  []core.Action{core.ExtendDeadline{Deadline: top + deadline}, core.Wake{At: top + retry}},
+				},
+			},
+			now:     top,
+			session: core.SessionStateLive,
+			dl:      top + deadline,
+		},
+		{
+			name:    "the highest reading is where the clock stops",
+			steps:   []mc.Step{ka(maxReading, maxReading+retry)},
+			now:     maxReading,
+			session: core.SessionStateOpening,
+		},
+		{
+			name:    "a reading above it stops there",
+			steps:   []mc.Step{ka(maxReading+1, maxReading+retry)},
+			now:     maxReading,
+			session: core.SessionStateOpening,
+		},
+		{
+			name:    "a reading whose timer would overflow stops there",
+			steps:   []mc.Step{ka(math.MaxInt64-retry+1, maxReading+retry)},
+			now:     maxReading,
+			session: core.SessionStateOpening,
+		},
+		{
+			name:    "the largest Duration stops there",
+			steps:   []mc.Step{ka(math.MaxInt64, maxReading+retry)},
+			now:     maxReading,
+			session: core.SessionStateOpening,
+		},
+		{
+			name: "a SentAt above the stopped clock is ignored",
+			steps: []mc.Step{
+				ka(math.MaxInt64, maxReading+retry),
+				{
+					Input: core.SessionRenewed{Now: math.MaxInt64, SentAt: math.MaxInt64},
+					Want:  []core.Action{core.Wake{At: maxReading + retry}},
+				},
+			},
+			now:     maxReading,
+			session: core.SessionStateOpening,
+		},
+		{
+			name: "a renewal at the stopped clock moves the deadline but cannot make it live",
+			steps: []mc.Step{
+				ka(math.MaxInt64, maxReading+retry),
+				{
+					Input: core.SessionRenewed{Now: math.MaxInt64, SentAt: maxReading},
+					Want:  []core.Action{core.ExtendDeadline{Deadline: maxReading + deadline}, core.Wake{At: maxReading + retry}},
+				},
+			},
+			now:     maxReading,
+			session: core.SessionStateLate,
+			dl:      maxReading + deadline,
+		},
+		{
+			name: "a live session goes late when the clock stops short of its deadline",
+			steps: []mc.Step{
+				ka(maxReading-1, maxReading-1+retry),
+				{
+					Input: core.SessionRenewed{Now: maxReading - 1, SentAt: maxReading - 1},
+					Want: []core.Action{
+						core.ExtendDeadline{Deadline: maxReading - 1 + deadline},
+						core.Wake{At: maxReading - 1 + retry},
+					},
+				},
+				{Input: core.Tick{Now: math.MaxInt64}, Want: []core.Action{core.Wake{At: maxReading - 1 + retry}}},
+			},
+			now:     maxReading,
+			session: core.SessionStateLate,
+			dl:      maxReading - 1 + deadline,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := runSteps(t, scenario(tc.steps...), nil).Status()
+			if st.Now != tc.now || st.Session != tc.session || st.Deadline != tc.dl {
+				t.Errorf("Now, Session, Deadline = %v, %v, %v, want %v, %v, %v",
+					st.Now, st.Session, st.Deadline, tc.now, tc.session, tc.dl)
+			}
+		})
+	}
+
+	t.Run("the largest Timing fits", func(t *testing.T) {
+		cfg := mc.C(mc.S("s", 1))
+		cfg.Timing = core.Timing{LeaseDuration: 24 * time.Hour, RenewDeadline: 21 * time.Hour, RetryPeriod: 17 * time.Hour, SlotGrace: 24 * time.Hour}
+		m := core.NewMachine(cfg)
+		m.Step(core.Tick{Now: math.MaxInt64})
+		got := m.Step(core.SessionRenewed{Now: math.MaxInt64, SentAt: maxReading})
+		want := []core.Action{
+			core.ExtendDeadline{Deadline: maxReading + 21*time.Hour},
+			core.Wake{At: maxReading + 17*time.Hour},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("renewal at the stopped clock = %#v, want %#v", got, want)
+		}
+	})
+}
+
+// TestStepClockOddReadings runs short sequences over every combination of odd readings: no Step may
+// panic, the clock never goes back, the wake rules hold, and a live session is before its deadline.
+func TestStepClockOddReadings(t *testing.T) {
+	readings := []time.Duration{
+		math.MinInt64, -time.Hour, -1, 0, 1, 2 * time.Second, 10 * time.Second,
+		1<<62 - 1, 1 << 62, maxReading - 1, maxReading, maxReading + 1, math.MaxInt64 - 1, math.MaxInt64,
+	}
+	for _, first := range readings {
+		for _, second := range readings {
+			for _, sentAt := range readings {
+				m := core.NewMachine(mc.C(mc.S("s", 1)))
+				clock := time.Duration(0)
+				for _, in := range []core.Input{
+					core.Tick{Now: first},
+					core.SessionRenewed{Now: second, SentAt: sentAt},
+					core.SessionFailed{Now: first, Cause: core.CauseUnreachable},
+					core.Tick{Now: second},
+					core.SessionRenewed{Now: first, SentAt: sentAt},
+				} {
+					got := m.Step(in)
+					at, armed := m.NextWake()
+					st := m.Status()
+					for _, v := range wakeViolations(got, st.Now, st.Done, at, armed) {
+						t.Errorf("readings %d, %d, %d: Step(%#v): %s", first, second, sentAt, in, v)
+					}
+					if st.Now < clock {
+						t.Errorf("readings %d, %d, %d: Step(%#v) moved the clock from %v to %v", first, second, sentAt, in, clock, st.Now)
+					}
+					clock = st.Now
+					if st.Session == core.SessionStateLive && st.Now >= st.Deadline {
+						t.Errorf("readings %d, %d, %d: Step(%#v): live at %v with deadline %v", first, second, sentAt, in, st.Now, st.Deadline)
+					}
+				}
+			}
+		}
+	}
 }
 
 func TestStepClockEveryInput(t *testing.T) {
