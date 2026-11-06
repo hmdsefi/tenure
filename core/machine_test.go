@@ -3754,6 +3754,53 @@ func TestSessionLoss(t *testing.T) {
 		})
 	})
 
+	// Done looks at every shard of every space, so the last shard to finish can be anywhere.
+	t.Run("not done while the last space still has a run or an Acquire out", func(t *testing.T) {
+		ran := func(ms int64, space string, shard int, term core.Term, want ...core.Action) mc.Step {
+			return mc.Step{Input: core.RunStopped{Now: mc.Ms(ms), Space: space, Shard: shard, Term: term}, Want: want}
+		}
+		stop := func(space string, shard int, term core.Term) core.StopRun {
+			return core.StopRun{Space: space, Shard: shard, Term: term, Reason: core.StopLost}
+		}
+		specs := []core.SpaceSpec{mc.S("b", 2), mc.S("a", 1)}
+
+		t.Run("a run", func(t *testing.T) {
+			steps := append(mc.Boot(7, specs...),
+				failed(1000, core.CauseLost, stop("a", 0, 7), stop("b", 0, 8), stop("b", 1, 9), wakeAt(11000)),
+				ran(1100, "a", 0, 7, wakeAt(11000)),
+				ran(1200, "b", 0, 8, wakeAt(11000)),
+				ran(1300, "b", 1, 9),
+			)
+			runSteps(t, scenarioIn(mc.C(specs...), steps...), stepChecks{
+				8:  doneIs(false),
+				9:  doneIs(false),
+				10: doneIs(true),
+			})
+		})
+
+		t.Run("an Acquire", func(t *testing.T) {
+			steps := []mc.Step{
+				keepAlive(0, 2000),
+				renewed(100, 0, extended(10000), wakeAt(2000)),
+				viewed(200, mc.Vm(1, "m1"),
+					core.Acquire{Space: "a"},
+					core.Acquire{Space: "b"},
+					core.Acquire{Space: "b", Shard: 1},
+					wakeAt(2000),
+				),
+				failed(300, core.CauseLost),
+				{Input: core.Acquired{Now: mc.Ms(400), Space: "a", Term: 7}},
+				{Input: core.AcquireFailed{Now: mc.Ms(500), Space: "b", Holder: "h2"}},
+				{Input: core.Acquired{Now: mc.Ms(600), Space: "b", Shard: 1}},
+			}
+			runSteps(t, scenarioIn(mc.C(specs...), steps...), stepChecks{
+				5: doneIs(false),
+				6: doneIs(false),
+				7: doneIs(true),
+			})
+		})
+	})
+
 	// An acquiring shard stays until the driver's answer. Whatever the answer says, it ends the wait and
 	// nothing more: no run, no Release, no RetryAt.
 	t.Run("an Acquire out", func(t *testing.T) {
