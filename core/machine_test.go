@@ -355,6 +355,47 @@ func startedS0(term core.Term, ms int64) core.Action {
 	return core.StartRun{Space: "s", Term: term, Deadline: mc.Ms(ms)}
 }
 
+// runStopped is a RunStopped for shard s/0 at ms milliseconds with the given result.
+func runStopped(ms int64, term core.Term, want ...core.Action) mc.Step {
+	return mc.Step{Input: core.RunStopped{Now: mc.Ms(ms), Space: "s", Term: term}, Want: want}
+}
+
+// released is a Released for shard s/0 at ms milliseconds with the given result.
+func released(ms int64, term core.Term, want ...core.Action) mc.Step {
+	return mc.Step{Input: core.Released{Now: mc.Ms(ms), Space: "s", Term: term}, Want: want}
+}
+
+// stopS0 is the StopRun of shard s/0 because the shard moved.
+func stopS0(term core.Term) core.Action {
+	return core.StopRun{Space: "s", Term: term, Reason: core.StopMoved}
+}
+
+// releaseS0 is the Release of shard s/0.
+func releaseS0(term core.Term) core.Action { return core.Release{Space: "s", Term: term} }
+
+// movedS0 boots a machine of the one shard s/0, whose run has term 7, and moves the shard away at @1:
+// five steps, with the next wake at @2.
+func movedS0() []mc.Step {
+	return append(mc.Boot(7, mc.S("s", 1)), viewed(1000, mc.Vm(2, "m2"), stopS0(7), wakeAt(2000)))
+}
+
+// ownedS0 is the status of a wanted shard whose run of the given term started at since milliseconds.
+func ownedS0(since int64, term core.Term) core.ShardStatus {
+	return core.ShardStatus{State: core.ShardStateOwned, Since: mc.Ms(since), Term: term, Holder: "h1", Wanted: true}
+}
+
+// stoppingS0 is the status of an unwanted shard whose run was told at since milliseconds to stop
+// because it moved.
+func stoppingS0(since int64, term core.Term) core.ShardStatus {
+	return core.ShardStatus{State: core.ShardStateStopping, Since: mc.Ms(since), Term: term, Reason: core.StopMoved, Holder: "h1"}
+}
+
+// releasingS0 is the status of an unwanted shard that moved and has been releasing its term since
+// since milliseconds.
+func releasingS0(since int64, term core.Term) core.ShardStatus {
+	return core.ShardStatus{State: core.ShardStateReleasing, Since: mc.Ms(since), Term: term, Reason: core.StopMoved, Holder: "h1"}
+}
+
 // shardIs checks one shard of Status exactly, on a machine whose only space is s.
 func shardIs(shard int, want core.ShardStatus) func(*testing.T, *core.Machine) {
 	return func(t *testing.T, m *core.Machine) {
@@ -433,7 +474,70 @@ func TestATMCH05RenewalDeadline(t *testing.T) {
 	}
 }
 
+func TestATMCH14MoveStopsTheRun(t *testing.T) {
+	runCase(t, "AT-MCH-14", stepChecks{
+		3: all(
+			assignmentIs("s", "m1", "m2"),
+			shardIs(0, core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(200), Wanted: true}),
+			shardIs(1, core.ShardStatus{}),
+		),
+		4: all(shardIs(0, ownedS0(300, 7)), shardIs(1, core.ShardStatus{})),
+		5: all(
+			assignmentIs("s", "m2", "m3"),
+			shardIs(0, stoppingS0(1000, 7)),
+			shardIs(1, core.ShardStatus{}),
+		),
+	})
+}
+
+func TestATMCH15MoveToItsEnd(t *testing.T) {
+	first, c := mc.Get("AT-MCH-14").Steps, mc.Get("AT-MCH-15").Steps
+	if len(c) <= len(first) || !reflect.DeepEqual(c[:len(first)], first) {
+		t.Errorf("AT-MCH-15 does not start with the steps of AT-MCH-14: %+v", c)
+	}
+	idle := core.ShardStatus{Since: mc.Ms(1600), Holder: "h1"}
+	runCase(t, "AT-MCH-15", stepChecks{
+		5: shardIs(0, stoppingS0(1000, 7)),
+		6: all(shardIs(0, releasingS0(1500, 7)), shardIs(1, core.ShardStatus{})),
+		7: all(shardIs(0, idle), shardIs(1, core.ShardStatus{})),
+		8: shardIs(0, idle),
+	})
+}
+
+func TestATMCH20OtherTermsAndStates(t *testing.T) {
+	owned, unwanted := shardIs(0, ownedS0(300, 7)), shardIs(0, stoppingS0(1000, 7))
+	releasing := shardIs(0, releasingS0(1500, 7))
+	idle := shardIs(0, core.ShardStatus{Since: mc.Ms(1900), Holder: "h1"})
+	runCase(t, "AT-MCH-20", stepChecks{
+		4:  owned,
+		5:  owned,
+		6:  owned,
+		7:  unwanted,
+		8:  unwanted,
+		9:  unwanted,
+		10: unwanted,
+		11: releasing,
+		12: releasing,
+		13: releasing,
+		14: releasing,
+		15: idle,
+		16: idle,
+	})
+}
+
 func TestATMCH23RepeatsUntilAnswered(t *testing.T) {
+	t.Run("a", func(t *testing.T) {
+		releasing := shardIs(0, releasingS0(1500, 7))
+		idle := shardIs(0, core.ShardStatus{Since: mc.Ms(12500), Holder: "h1"})
+		runCase(t, "AT-MCH-23 (a)", stepChecks{
+			6:  releasing,
+			8:  releasing,
+			14: all(releasing, sessionIs(9500, core.SessionStateLive, 10000, core.CauseNone)),
+			16: all(releasing, sessionIs(11500, core.SessionStateLate, 10000, core.CauseNone)),
+			18: idle,
+			19: idle,
+		})
+	})
 	t.Run("b", func(t *testing.T) {
 		const (
 			live        = core.SessionStateLive
@@ -572,8 +676,8 @@ func TestATMCH24AnswersNoAcquireWaitsFor(t *testing.T) {
 		})
 	})
 
-	// A run started for this term or an earlier one means the grant cannot start: only a higher
-	// term does. No run ends yet, so the test sets the highest started term itself.
+	// After a run of term 7 has ended, a grant of that term or an earlier one cannot start: only a
+	// higher term does.
 	t.Run("highest started term", func(t *testing.T) {
 		tests := []struct {
 			name  string
@@ -586,31 +690,42 @@ func TestATMCH24AnswersNoAcquireWaitsFor(t *testing.T) {
 		}
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
-				answer := acquired(300, tc.term, wakeAt(2000))
-				check := shardIs(0, core.ShardStatus{Since: mc.Ms(300), Holder: "h1", Wanted: true, RetryAt: mc.Ms(2300)})
+				answer := acquired(1400, tc.term, wakeAt(2000))
+				check := shardIs(0, core.ShardStatus{Since: mc.Ms(1400), Holder: "h1", Wanted: true, RetryAt: mc.Ms(3400)})
 				if tc.start {
-					answer = acquired(300, tc.term, startedS0(tc.term, 10000), wakeAt(2000))
-					check = shardIs(0, owned(300, tc.term))
+					answer = acquired(1400, tc.term, startedS0(tc.term, 10000), wakeAt(2000))
+					check = shardIs(0, owned(1400, tc.term))
 				}
-				m := runSteps(t, scenario(
-					keepAlive(0, 2000),
-					renewed(100, 0, extended(10000), wakeAt(2000)),
-					viewed(200, mc.Vm(1, "m1"), acquireS0(), wakeAt(2000)),
-					tick(250, wakeAt(2000)),
+				steps := append(movedS0(),
+					viewed(1100, mc.Vm(3, "m1"), wakeAt(2000)),
+					runStopped(1200, 7, releaseS0(7), wakeAt(2000)),
+					released(1300, 7, acquireS0(), wakeAt(2000)),
 					answer,
-				), stepChecks{
-					4: func(_ *testing.T, m *core.Machine) { *core.HighestStarted(m, 0, 0) = 7 },
-					5: check,
-				})
-				want := core.Term(7)
-				if tc.start {
-					want = tc.term
-				}
-				if got := *core.HighestStarted(m, 0, 0); got != want {
-					t.Errorf("highest started term = %d, want %d", got, want)
-				}
+				)
+				runSteps(t, scenario(steps...), stepChecks{len(steps): check})
 			})
 		}
+	})
+}
+
+func TestATMCH29StuckRun(t *testing.T) {
+	c := mc.Get("AT-MCH-29")
+	for i, s := range c.Steps[:len(c.Steps)-1] {
+		for _, a := range s.Want {
+			if _, ok := a.(core.Release); ok {
+				t.Errorf("step %d, before the RunStopped, has %#v", i+1, a)
+			}
+		}
+	}
+	running := stoppingS0(1000, 7)
+	stuck := running
+	stuck.Stuck = true
+	runCase(t, "AT-MCH-29", stepChecks{
+		5:  shardIs(0, running),
+		15: shardIs(0, running),
+		16: all(shardIs(0, running), sessionIs(10999, core.SessionStateLive, 20000, core.CauseNone)),
+		17: all(shardIs(0, stuck), sessionIs(11000, core.SessionStateLive, 20000, core.CauseNone)),
+		18: shardIs(0, releasingS0(11500, 7)),
 	})
 }
 
@@ -939,6 +1054,37 @@ func TestDroppedGrant(t *testing.T) {
 		})
 	})
 
+	// A grant that starts nothing does not count as a started term, whichever way it would move the
+	// highest one.
+	t.Run("an older term does not lower the highest started term", func(t *testing.T) {
+		waiting := core.ShardStatus{Since: mc.Ms(3500), Holder: holder, Wanted: true, RetryAt: mc.Ms(5500)}
+		steps := append(movedS0(),
+			viewed(1100, mc.Vm(3, "m1"), wakeAt(2000)),
+			runStopped(1200, 7, releaseS0(7), wakeAt(2000)),
+			released(1300, 7, acquireS0(), wakeAt(2000)),
+			acquired(1400, 6, wakeAt(2000)),
+			keepAlive(2000, 3400),
+			tick(3400, acquireS0(), wakeAt(4000)),
+			acquired(3500, 7, wakeAt(4000)),
+		)
+		runSteps(t, scenario(steps...), stepChecks{len(steps): shardIs(0, waiting)})
+	})
+
+	t.Run("a newer term that cannot start can still start later", func(t *testing.T) {
+		steps := []mc.Step{
+			keepAlive(0, 2000),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			viewed(200, mc.Vm(1, "m1"), acquireS0(), wakeAt(2000)),
+			viewed(300, mc.Vm(2, "m2"), wakeAt(2000)),
+			acquired(400, 9, wakeAt(2000)),
+			viewed(500, mc.Vm(3, "m1"), wakeAt(2000)),
+			keepAlive(2000, 2400),
+			tick(2400, acquireS0(), wakeAt(4000)),
+			acquired(2500, 9, startedS0(9, 10000), wakeAt(4000)),
+		}
+		runSteps(t, scenario(steps...), stepChecks{len(steps): shardIs(0, ownedS0(2500, 9))})
+	})
+
 	t.Run("the session is lost", func(t *testing.T) {
 		m := runSteps(t, scenario(
 			keepAlive(0, 2000),
@@ -959,8 +1105,6 @@ func TestAnswersThatStayNoOps(t *testing.T) {
 	inputs := []core.Input{
 		core.Acquired{Now: mc.Ms(2000), Space: "s", Term: 0},
 		core.AcquireFailed{Now: mc.Ms(2000), Space: "s", Holder: "h2", RetryAfter: time.Second},
-		core.Released{Now: mc.Ms(2000), Space: "s", Term: 7},
-		core.RunStopped{Now: mc.Ms(2000), Space: "s", Term: 7},
 		core.HolderChanged{Now: mc.Ms(2000), Space: "s", Holder: "h1", Term: 7},
 	}
 	for _, in := range inputs {
@@ -1043,6 +1187,825 @@ func TestRetryAtWake(t *testing.T) {
 			runSteps(t, scenario(slices.Concat(dropped, tc.steps)...), nil)
 		})
 	}
+}
+
+// adversaries returns inputs at the reading now that must not end the run of term 7 on shard s/0,
+// nor release it: other terms, the answer to a Release nobody sent, other shards, a grant, and a
+// pointer, which is not an input of the machine at all.
+func adversaries(now time.Duration) []core.Input {
+	return []core.Input{
+		core.Released{Now: now, Space: "s", Term: 7},
+		core.Released{Now: now, Space: "s", Term: 6},
+		core.Released{Now: now, Space: "s", Term: 8},
+		core.Released{Now: now, Space: "s", Term: 0},
+		core.RunStopped{Now: now, Space: "s", Term: 6},
+		core.RunStopped{Now: now, Space: "s", Term: 8},
+		core.RunStopped{Now: now, Space: "s", Term: 0},
+		core.RunStopped{Now: now, Space: "s", Shard: 1, Term: 7},
+		core.RunStopped{Now: now, Space: "s", Shard: -1, Term: 7},
+		core.RunStopped{Now: now, Space: "other", Term: 7},
+		&core.RunStopped{Now: now, Space: "s", Term: 7},
+		core.Acquired{Now: now, Space: "s", Term: 7},
+		core.Acquired{Now: now, Space: "s", Term: 8},
+		core.HolderChanged{Now: now, Space: "s", Holder: "h1", Term: 7},
+	}
+}
+
+// stepWithoutRelease steps m and fails the test if the result has a Release.
+func stepWithoutRelease(t *testing.T, m *core.Machine, in core.Input) {
+	t.Helper()
+	got := m.Step(in)
+	for _, a := range got {
+		if _, ok := a.(core.Release); ok {
+			t.Errorf("Step(%#v) = %#v, with a Release of a run that is still running", in, got)
+		}
+	}
+}
+
+// TestRunStillRunningIsNeverReleased checks the safety promise: whatever arrives, a run that has not
+// reported its own stop after its StopRun is not released, for as long as the clock runs, and its
+// RunStopped still works afterwards.
+func TestRunStillRunningIsNeverReleased(t *testing.T) {
+	const after = 90 * time.Second
+
+	// Each start leaves the shard with a live run of term 7, told to stop or not.
+	starts := []struct {
+		name  string
+		steps []mc.Step
+		at    time.Duration
+		want  core.ShardStatus
+	}{
+		{
+			name:  "owned",
+			steps: mc.Boot(7, mc.S("s", 1)),
+			at:    mc.Ms(1000),
+			want:  ownedS0(300, 7),
+		},
+		{
+			name:  "stopping",
+			steps: movedS0(),
+			at:    mc.Ms(1100),
+			want:  stoppingS0(1000, 7),
+		},
+		{
+			name:  "stuck",
+			steps: append(movedS0(), keepAlive(11000, 13000)),
+			at:    mc.Ms(11100),
+			want: func() core.ShardStatus {
+				s := stoppingS0(1000, 7)
+				s.Stuck = true
+				return s
+			}(),
+		},
+	}
+	for _, start := range starts {
+		inputs := adversaries(start.at)
+		if start.name == "owned" {
+			// An owned shard's run was never told to stop, so even its own term does not count.
+			inputs = append(inputs, core.RunStopped{Now: start.at, Space: "s", Term: 7})
+		}
+		for _, in := range inputs {
+			t.Run(fmt.Sprintf("%s/%T%+v", start.name, in, in), func(t *testing.T) {
+				// The second shard makes Shard: 1 a shard the machine has, with no run to report on.
+				m := core.NewMachine(mc.C(mc.S("s", 2)))
+				for _, s := range start.steps {
+					m.Step(s.Input)
+				}
+				stepWithoutRelease(t, m, in)
+				if got := m.Status().Spaces[0].Shards[0]; got != start.want {
+					t.Fatalf("shard 0 after the input = %+v, want %+v", got, start.want)
+				}
+				if start.want.State == core.ShardStateOwned {
+					m.Step(core.ViewChanged{Now: start.at, View: mc.Vm(9, "m2", "m3"), Wall: mc.Wall(start.at)})
+				}
+
+				now := start.at
+				for now < after {
+					now += time.Second
+					stepWithoutRelease(t, m, core.Tick{Now: now})
+					stepWithoutRelease(t, m, core.Released{Now: now, Space: "s", Term: 7})
+				}
+				sh := m.Status().Spaces[0].Shards[0]
+				if sh.State != core.ShardStateStopping || sh.Term != 7 || !sh.Stuck {
+					t.Fatalf("shard 0 after the wait = %+v, want it stopping in term 7 and stuck", sh)
+				}
+
+				got := m.Step(core.RunStopped{Now: now, Space: "s", Term: 7})
+				if !slices.Contains(got, releaseS0(7)) {
+					t.Errorf("the RunStopped returned %#v, want a Release of term 7", got)
+				}
+			})
+		}
+	}
+
+	t.Run("a repeated RunStopped sends no extra Release and moves no timer", func(t *testing.T) {
+		runSteps(t, scenario(append(movedS0(),
+			runStopped(1500, 7, releaseS0(7), wakeAt(2000)),
+			runStopped(1600, 7, wakeAt(2000)),
+			keepAlive(2000, 3500),
+			runStopped(3000, 7, wakeAt(3500)),
+			tick(3500, releaseS0(7), wakeAt(4000)),
+		)...), nil)
+	})
+
+	t.Run("the RunStopped of an old run does not release a new one", func(t *testing.T) {
+		running := stoppingS0(1600, 8)
+		runSteps(t, scenario(append(movedS0(),
+			viewed(1100, mc.Vm(3, "m1"), wakeAt(2000)),
+			runStopped(1200, 7, releaseS0(7), wakeAt(2000)),
+			released(1300, 7, acquireS0(), wakeAt(2000)),
+			acquired(1400, 8, startedS0(8, 10000), wakeAt(2000)),
+			runStopped(1450, 7, wakeAt(2000)),
+			released(1460, 7, wakeAt(2000)),
+			viewed(1600, mc.Vm(4, "m2"), stopS0(8), wakeAt(2000)),
+			runStopped(1700, 7, wakeAt(2000)),
+			released(1800, 7, wakeAt(2000)),
+			released(1900, 8, wakeAt(2000)),
+			runStopped(1950, 8, releaseS0(8), wakeAt(2000)),
+		)...), stepChecks{
+			10: shardIs(0, ownedS0(1400, 8)),
+			11: shardIs(0, ownedS0(1400, 8)),
+			15: shardIs(0, running),
+			16: shardIs(0, releasingS0(1950, 8)),
+		})
+	})
+
+	t.Run("a shard with no run takes no report", func(t *testing.T) {
+		acquiring := core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(200), Wanted: true}
+		runSteps(t, scenario(
+			keepAlive(0, 2000),
+			runStopped(10, 7, wakeAt(2000)),
+			released(20, 7, wakeAt(2000)),
+			runStopped(30, 0, wakeAt(2000)),
+			released(40, 0, wakeAt(2000)),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			viewed(200, mc.Vm(1, "m1"), acquireS0(), wakeAt(2000)),
+			runStopped(300, 7, wakeAt(2000)),
+			released(400, 7, wakeAt(2000)),
+			runStopped(500, 0, wakeAt(2000)),
+			released(600, 0, wakeAt(2000)),
+		), stepChecks{
+			5:  shardIs(0, core.ShardStatus{}),
+			11: shardIs(0, acquiring),
+		})
+	})
+
+	t.Run("the report for one shard does not move another", func(t *testing.T) {
+		// Both shards run term 7. Only the named shard moves.
+		steps := []mc.Step{
+			keepAlive(0, 2000),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			viewed(200, mc.Vm(1, "m1"), core.Acquire{Space: "s"}, core.Acquire{Space: "s", Shard: 1}, wakeAt(2000)),
+			mc.Grant(mc.Ms(300), "s", 0, 7, mc.Ms(10000), mc.Ms(2000)),
+			mc.Grant(mc.Ms(400), "s", 1, 7, mc.Ms(10000), mc.Ms(2000)),
+			viewed(1000, mc.Vm(2, "m2", "m3"),
+				core.StopRun{Space: "s", Term: 7, Reason: core.StopMoved},
+				core.StopRun{Space: "s", Shard: 1, Term: 7, Reason: core.StopMoved},
+				wakeAt(2000),
+			),
+			{
+				Input: core.RunStopped{Now: mc.Ms(1100), Space: "s", Shard: 1, Term: 7},
+				Want:  []core.Action{core.Release{Space: "s", Shard: 1, Term: 7}, wakeAt(2000)},
+			},
+			{Input: core.Released{Now: mc.Ms(1200), Space: "s", Term: 7}, Want: []core.Action{wakeAt(2000)}},
+		}
+		runSteps(t, scenarioIn(mc.C(mc.S("s", 2)), steps...), stepChecks{
+			7: all(shardIs(0, stoppingS0(1000, 7)), shardIs(1, releasingS0(1100, 7))),
+			8: all(shardIs(0, stoppingS0(1000, 7)), shardIs(1, releasingS0(1100, 7))),
+		})
+	})
+
+	t.Run("a lost session sends nothing", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			steps []mc.Step
+		}{
+			{name: "owned", steps: mc.Boot(7, mc.S("s", 1))},
+			{name: "stopping", steps: movedS0()},
+			{name: "releasing", steps: append(movedS0(), runStopped(1500, 7, releaseS0(7), wakeAt(2000)))},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				steps := append(slices.Clone(tc.steps),
+					failed(1600, core.CauseLost),
+					viewed(1700, mc.Vm(5, "m3")),
+					runStopped(1800, 7),
+					released(1900, 7),
+					tick(60000),
+				)
+				m := runSteps(t, scenario(steps...), nil)
+				if at, ok := m.NextWake(); at != 0 || ok {
+					t.Errorf("NextWake() = (%v, %v), want (0, false)", at, ok)
+				}
+			})
+		}
+	})
+}
+
+// TestNoReleaseBeforeRunStoppedOnAnyWalk feeds walks of arbitrary inputs to a machine and keeps a
+// record of what the driver has been told and has reported. It checks that a Release only ever names
+// a run whose RunStopped arrived after its StopRun, and that a term starts and stops once. The walks
+// are the same on every run.
+func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
+	type run struct {
+		shard int
+		term  core.Term
+	}
+	views := [][]string{{"m1"}, {"m1", "m2"}, {"m1", "m4"}, {"m2", "m3"}}
+
+	var starts, stops, releases, repeats, restarts, stuck int
+	for seed := range uint64(300) {
+		state := seed
+		next := func(n uint64) uint64 {
+			state = state*6364136223846793005 + 1442695040888963407
+			return (state >> 33) % n
+		}
+
+		m := core.NewMachine(mc.C(mc.S("s", 2)))
+		started, stopSent, stopped := map[run]bool{}, map[run]bool{}, map[run]bool{}
+		runsOf := [2]int{}
+		var history []core.Input
+		var now time.Duration
+		version := uint64(0)
+		term := core.Term(1)
+
+		step := func(in core.Input) {
+			history = append(history, in)
+			if v, ok := in.(core.RunStopped); ok && stopSent[run{v.Shard, v.Term}] {
+				stopped[run{v.Shard, v.Term}] = true
+			}
+			got := m.Step(in)
+			at, armed := m.NextWake()
+			st := m.Status()
+			for _, v := range wakeViolations(got, st.Now, st.Done, at, armed) {
+				t.Fatalf("seed %d: %s, after %+v", seed, v, history)
+			}
+			for _, a := range got {
+				switch v := a.(type) {
+				case core.StartRun:
+					starts++
+					runsOf[v.Shard]++
+					if runsOf[v.Shard] > 1 {
+						restarts++
+					}
+					k := run{v.Shard, v.Term}
+					if started[k] {
+						t.Fatalf("seed %d: a second %+v after %+v", seed, v, history)
+					}
+					started[k] = true
+				case core.StopRun:
+					stops++
+					k := run{v.Shard, v.Term}
+					if !started[k] || stopSent[k] {
+						t.Fatalf("seed %d: %+v of a run not running, after %+v", seed, v, history)
+					}
+					stopSent[k] = true
+				case core.Release:
+					releases++
+					k := run{v.Shard, v.Term}
+					if !stopped[k] {
+						t.Fatalf("seed %d: %+v before the run's RunStopped, after %+v", seed, v, history)
+					}
+					if _, ok := in.(core.RunStopped); !ok {
+						repeats++
+					}
+				}
+			}
+			for shard, sh := range m.Status().Spaces[0].Shards {
+				k := run{shard, sh.Term}
+				switch sh.State {
+				case core.ShardStateOwned:
+					if !started[k] || stopSent[k] {
+						t.Fatalf("seed %d: shard %d is %+v, after %+v", seed, shard, sh, history)
+					}
+				case core.ShardStateStopping:
+					if !stopSent[k] || stopped[k] {
+						t.Fatalf("seed %d: shard %d is %+v, after %+v", seed, shard, sh, history)
+					}
+				case core.ShardStateReleasing:
+					if !stopped[k] {
+						t.Fatalf("seed %d: shard %d is %+v, after %+v", seed, shard, sh, history)
+					}
+				}
+				if sh.Stuck {
+					stuck++
+					if sh.State != core.ShardStateStopping {
+						t.Fatalf("seed %d: shard %d is %+v, after %+v", seed, shard, sh, history)
+					}
+				}
+			}
+		}
+
+		step(core.Tick{})
+		step(core.SessionRenewed{SentAt: 0})
+		for range 200 {
+			shard := 0
+			if next(2) == 0 {
+				shard = 1
+			}
+			// The shard's own term half the time, so that reports often match, and otherwise any
+			// term near the ones in use.
+			answer := m.Status().Spaces[0].Shards[shard].Term
+			if next(2) == 0 {
+				answer = core.Term(next(uint64(term) + 2))
+			}
+			switch next(10) {
+			case 0:
+				now += 100 * time.Millisecond
+				step(core.Tick{Now: now})
+			case 1:
+				now += 2 * time.Second
+				step(core.Tick{Now: now})
+			case 2:
+				if next(8) == 0 {
+					now += 11 * time.Second
+					step(core.Tick{Now: now})
+				}
+			case 3:
+				now += time.Millisecond
+				step(core.SessionRenewed{Now: now, SentAt: now})
+			case 4:
+				version++
+				now += time.Millisecond
+				step(core.ViewChanged{Now: now, View: mc.Vm(version, views[next(4)]...), Wall: mc.Wall(now)})
+			case 5, 6:
+				now += time.Millisecond
+				step(core.RunStopped{Now: now, Space: "s", Shard: shard, Term: answer})
+			case 7:
+				now += time.Millisecond
+				step(core.Released{Now: now, Space: "s", Shard: shard, Term: answer})
+			default:
+				// Mostly a new term, sometimes one that may have run already.
+				grant := answer
+				if next(4) != 0 {
+					term++
+					grant = term
+				}
+				now += time.Millisecond
+				step(core.Acquired{Now: now, Space: "s", Shard: shard, Term: grant})
+			}
+		}
+	}
+
+	// The walks are only worth something if they reach the paths the promise is about.
+	for _, c := range []struct {
+		name  string
+		count int
+	}{
+		{"StartRun", starts},
+		{"StopRun", stops},
+		{"Release", releases},
+		{"Release repeat", repeats},
+		{"second run on a shard", restarts},
+		{"stuck status", stuck},
+	} {
+		if c.count == 0 {
+			t.Errorf("no walk reached a %s", c.name)
+		}
+	}
+}
+
+// TestHandoverTimersAtTheLargestReadings checks that the handover's timers fit in a Duration and stay
+// after the clock, with the longest timing fields too, at readings a driver never reaches.
+func TestHandoverTimersAtTheLargestReadings(t *testing.T) {
+	const (
+		largest = time.Duration(math.MaxInt64)
+		ceiling = largest - 24*time.Hour
+	)
+	timings := []core.Timing{
+		core.DefaultTiming,
+		{LeaseDuration: 24 * time.Hour, RenewDeadline: 21 * time.Hour, RetryPeriod: 17 * time.Hour, SlotGrace: 24 * time.Hour},
+	}
+	readings := []time.Duration{
+		largest,
+		ceiling,
+		ceiling - 1,
+		ceiling - time.Second,
+		ceiling - 3*time.Second,
+		ceiling - time.Minute,
+		ceiling - 48*time.Hour,
+	}
+	for _, timing := range timings {
+		for _, now := range readings {
+			cfg := mc.C(mc.S("s", 1))
+			cfg.Timing = timing
+			m := core.NewMachine(cfg)
+			step := func(in core.Input) []core.Action {
+				t.Helper()
+				got := m.Step(in)
+				at, armed := m.NextWake()
+				st := m.Status()
+				for _, v := range wakeViolations(got, st.Now, st.Done, at, armed) {
+					t.Errorf("timing %v, reading %v: Step(%#v): %s", timing, now, in, v)
+				}
+				return got
+			}
+			for _, s := range mc.Boot(7, mc.S("s", 1)) {
+				step(s.Input)
+			}
+
+			moved := core.ViewChanged{Now: now, View: mc.Vm(2, "m2"), Wall: mc.Wall(0)}
+			if got := step(moved); !slices.Contains(got, stopS0(7)) {
+				t.Errorf("timing %v, reading %v: the view returned %#v, want a StopRun", timing, now, got)
+			}
+			step(core.Tick{Now: now})
+			if got := step(core.RunStopped{Now: now, Space: "s", Term: 7}); !slices.Contains(got, releaseS0(7)) {
+				t.Errorf("timing %v, reading %v: the RunStopped returned %#v, want a Release", timing, now, got)
+			}
+			step(core.Tick{Now: largest})
+			step(core.Tick{Now: largest})
+			step(core.Released{Now: largest, Space: "s", Term: 7})
+			if got := m.Status().Spaces[0].Shards[0].State; got != core.ShardStateIdle {
+				t.Errorf("timing %v, reading %v: state = %v, want idle", timing, now, got)
+			}
+		}
+	}
+}
+
+// TestStopping checks what a move does to a run, and what does not undo it.
+func TestStopping(t *testing.T) {
+	t.Run("the reason is draining while the member drains", func(t *testing.T) {
+		draining := stoppingS0(1000, 7)
+		draining.Reason = core.StopDraining
+		steps := append(mc.Boot(7, mc.S("s", 1)),
+			viewed(1000, mc.Vm(2, "m2"), core.StopRun{Space: "s", Term: 7, Reason: core.StopDraining}, wakeAt(2000)),
+			runStopped(1500, 7, releaseS0(7), wakeAt(2000)),
+		)
+		releasing := releasingS0(1500, 7)
+		releasing.Reason = core.StopDraining
+		runSteps(t, scenario(steps...), stepChecks{
+			4: func(_ *testing.T, m *core.Machine) { core.ForceDraining(m) },
+			5: shardIs(0, draining),
+			6: shardIs(0, releasing),
+		})
+	})
+
+	t.Run("a late session stops a run too", func(t *testing.T) {
+		steps := append(mc.Boot(7, mc.S("s", 1)),
+			keepAlive(10000, 12000),
+			viewed(10100, mc.Vm(2, "m2"), stopS0(7), wakeAt(12000)),
+		)
+		runSteps(t, scenario(steps...), stepChecks{6: shardIs(0, stoppingS0(10100, 7))})
+	})
+
+	t.Run("a view that keeps the shard does not stop the run", func(t *testing.T) {
+		steps := append(mc.Boot(7, mc.S("s", 1)), viewed(1000, mc.Vm(2, "m1"), wakeAt(2000)))
+		runSteps(t, scenario(steps...), stepChecks{5: shardIs(0, ownedS0(300, 7))})
+	})
+
+	t.Run("a view with an older reading stops the run at the machine's reading", func(t *testing.T) {
+		steps := append(mc.Boot(7, mc.S("s", 1)),
+			keepAlive(5000, 7000),
+			viewed(1000, mc.Vm(2, "m2"), stopS0(7), wakeAt(7000)),
+		)
+		runSteps(t, scenario(steps...), stepChecks{6: shardIs(0, stoppingS0(5000, 7))})
+	})
+
+	t.Run("there is one StopRun however the view changes", func(t *testing.T) {
+		wanted := stoppingS0(1000, 7)
+		wanted.Wanted = true
+		runSteps(t, scenario(append(movedS0(),
+			viewed(1100, mc.Vm(3, "m1"), wakeAt(2000)),
+			viewed(1200, mc.Vm(4, "m2"), wakeAt(2000)),
+			viewed(1300, mc.Vm(5, "m1"), wakeAt(2000)),
+		)...), stepChecks{
+			6: shardIs(0, wanted),
+			7: shardIs(0, stoppingS0(1000, 7)),
+			8: shardIs(0, wanted),
+		})
+	})
+}
+
+// TestStuck checks when a run counts as stuck: at exactly RenewDeadline after its StopRun, until its
+// RunStopped.
+func TestStuck(t *testing.T) {
+	running := stoppingS0(1000, 7)
+	stuck := running
+	stuck.Stuck = true
+
+	t.Run("exactly at stopAt plus RenewDeadline", func(t *testing.T) {
+		const justBefore = 11*time.Second - 1
+		runSteps(t, scenario(append(movedS0(),
+			mc.Step{Input: core.Tick{Now: justBefore}, Want: []core.Action{core.KeepAlive{}, wakeAt(11000)}},
+			mc.Step{Input: core.Tick{Now: mc.Ms(11000)}, Want: []core.Action{core.Wake{At: justBefore + 2*time.Second}}},
+		)...), stepChecks{
+			6: shardIs(0, running),
+			7: shardIs(0, stuck),
+		})
+	})
+
+	t.Run("a reading past it, with no timer left", func(t *testing.T) {
+		runSteps(t, scenario(append(movedS0(), keepAlive(30000, 32000))...), stepChecks{6: shardIs(0, stuck)})
+	})
+
+	t.Run("any input marks it", func(t *testing.T) {
+		runSteps(t, scenario(append(movedS0(), runStopped(30000, 6, core.KeepAlive{}, wakeAt(32000)))...),
+			stepChecks{6: shardIs(0, stuck)})
+	})
+
+	t.Run("false again after RunStopped, and never stuck while releasing", func(t *testing.T) {
+		runSteps(t, scenario(append(movedS0(),
+			keepAlive(11000, 13000),
+			runStopped(11500, 7, releaseS0(7), wakeAt(13000)),
+			keepAlive(13000, 13500),
+			tick(13500, releaseS0(7), wakeAt(15000)),
+			tick(40000, core.KeepAlive{}, releaseS0(7), wakeAt(42000)),
+		)...), stepChecks{
+			6: shardIs(0, stuck),
+			7: shardIs(0, releasingS0(11500, 7)),
+			9: shardIs(0, releasingS0(11500, 7)),
+		})
+	})
+
+	t.Run("a RunStopped at that very reading is never stuck", func(t *testing.T) {
+		runSteps(t, scenario(append(movedS0(),
+			runStopped(11000, 7, core.KeepAlive{}, releaseS0(7), wakeAt(13000)),
+		)...), stepChecks{6: shardIs(0, releasingS0(11000, 7))})
+	})
+
+	t.Run("a stop that comes in time is not stuck", func(t *testing.T) {
+		runSteps(t, scenario(append(movedS0(),
+			runStopped(1500, 7, releaseS0(7), wakeAt(2000)),
+			released(1600, 7, wakeAt(2000)),
+			keepAlive(30000, 32000),
+		)...), stepChecks{6: shardIs(0, releasingS0(1500, 7))})
+	})
+
+	t.Run("each run counts from its own StopRun", func(t *testing.T) {
+		second := stoppingS0(20000, 8)
+		secondStuck := second
+		secondStuck.Stuck = true
+		runSteps(t, scenario(append(movedS0(),
+			keepAlive(11000, 13000),
+			viewed(11100, mc.Vm(3, "m1"), wakeAt(13000)),
+			runStopped(11200, 7, releaseS0(7), wakeAt(13000)),
+			renewed(11300, 11300, extended(21300), wakeAt(13000)),
+			released(11400, 7, acquireS0(), wakeAt(13000)),
+			acquired(11500, 8, startedS0(8, 21300), wakeAt(13000)),
+			viewed(20000, mc.Vm(4, "m2"), core.KeepAlive{}, stopS0(8), wakeAt(21300)),
+			tick(21300, wakeAt(22000)),
+			keepAlive(22000, 24000),
+			keepAlive(24000, 26000),
+			keepAlive(26000, 28000),
+			keepAlive(28000, 30000),
+			tick(29999, wakeAt(30000)),
+			keepAlive(30000, 32000),
+		)...), stepChecks{
+			12: shardIs(0, second),
+			18: shardIs(0, second),
+			19: shardIs(0, secondStuck),
+		})
+	})
+}
+
+// TestReleaseRepeat checks the Release cadence: a repeat at exactly releaseAt, counted from the last
+// Release, whichever input brings the clock there.
+func TestReleaseRepeat(t *testing.T) {
+	stopped := append(movedS0(), runStopped(1500, 7, releaseS0(7), wakeAt(2000)), keepAlive(2000, 3500))
+	releasing := releasingS0(1500, 7)
+	tests := []struct {
+		name  string
+		steps []mc.Step
+	}{
+		{
+			name: "not before releaseAt, and exactly at it",
+			steps: []mc.Step{
+				{Input: core.Tick{Now: mc.Ms(3500) - 1}, Want: []core.Action{wakeAt(3500)}},
+				tick(3500, releaseS0(7), wakeAt(4000)),
+			},
+		},
+		{
+			name: "each repeat counts from itself, not from the last due reading",
+			steps: []mc.Step{
+				tick(4200, core.KeepAlive{}, releaseS0(7), wakeAt(6200)),
+				tick(6199, wakeAt(6200)),
+				tick(6200, core.KeepAlive{}, releaseS0(7), wakeAt(8200)),
+			},
+		},
+		{
+			name: "one Release for a reading many periods late",
+			steps: []mc.Step{
+				tick(30000, core.KeepAlive{}, releaseS0(7), wakeAt(32000)),
+				tick(31000, wakeAt(32000)),
+			},
+		},
+		{
+			name:  "an ignored input at releaseAt still repeats",
+			steps: []mc.Step{runStopped(3500, 7, releaseS0(7), wakeAt(4000))},
+		},
+		{
+			name:  "a wrong answer at releaseAt still repeats",
+			steps: []mc.Step{released(3500, 6, releaseS0(7), wakeAt(4000))},
+		},
+		{
+			name:  "the answer at releaseAt comes first, so no repeat goes",
+			steps: []mc.Step{released(3500, 7, wakeAt(4000))},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runSteps(t, scenario(slices.Concat(stopped, tc.steps)...), stepChecks{6: shardIs(0, releasing)})
+		})
+	}
+
+	t.Run("an older reading counts from the machine's clock", func(t *testing.T) {
+		runSteps(t, scenario(append(movedS0(),
+			keepAlive(5000, 7000),
+			runStopped(1500, 7, releaseS0(7), wakeAt(7000)),
+			tick(6999, wakeAt(7000)),
+			tick(7000, core.KeepAlive{}, releaseS0(7), wakeAt(9000)),
+		)...), stepChecks{7: shardIs(0, releasingS0(5000, 7))})
+	})
+
+	t.Run("the term and the reason stay while it repeats", func(t *testing.T) {
+		runSteps(t, scenario(slices.Concat(stopped, []mc.Step{
+			tick(3500, releaseS0(7), wakeAt(4000)),
+			keepAlive(4000, 5500),
+			tick(5500, releaseS0(7), wakeAt(6000)),
+		})...), stepChecks{
+			8:  shardIs(0, releasing),
+			10: shardIs(0, releasing),
+		})
+	})
+}
+
+// TestWantedAgain checks a shard the assignment gives back during its handover: it finishes the
+// handover first, and acquires again for a new term.
+func TestWantedAgain(t *testing.T) {
+	acquiring := core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(1300), Holder: "h1", Wanted: true}
+
+	t.Run("while stopping", func(t *testing.T) {
+		stopping, releasing := stoppingS0(1000, 7), releasingS0(1200, 7)
+		stopping.Wanted, releasing.Wanted = true, true
+		runSteps(t, scenario(append(movedS0(),
+			viewed(1100, mc.Vm(3, "m1"), wakeAt(2000)),
+			runStopped(1200, 7, releaseS0(7), wakeAt(2000)),
+			released(1300, 7, acquireS0(), wakeAt(2000)),
+			acquired(1400, 8, startedS0(8, 10000), wakeAt(2000)),
+		)...), stepChecks{
+			6: shardIs(0, stopping),
+			7: shardIs(0, releasing),
+			8: shardIs(0, acquiring),
+			9: shardIs(0, ownedS0(1400, 8)),
+		})
+	})
+
+	t.Run("while releasing", func(t *testing.T) {
+		releasing := releasingS0(1100, 7)
+		releasing.Wanted = true
+		runSteps(t, scenario(append(movedS0(),
+			runStopped(1100, 7, releaseS0(7), wakeAt(2000)),
+			viewed(1200, mc.Vm(3, "m1"), wakeAt(2000)),
+			released(1300, 7, acquireS0(), wakeAt(2000)),
+			acquired(1400, 8, startedS0(8, 10000), wakeAt(2000)),
+		)...), stepChecks{
+			7: shardIs(0, releasing),
+			8: shardIs(0, acquiring),
+			9: shardIs(0, ownedS0(1400, 8)),
+		})
+	})
+
+	t.Run("the repeats go on while it is wanted", func(t *testing.T) {
+		runSteps(t, scenario(append(movedS0(),
+			runStopped(1100, 7, releaseS0(7), wakeAt(2000)),
+			viewed(1200, mc.Vm(3, "m1"), wakeAt(2000)),
+			keepAlive(2000, 3100),
+			tick(3100, releaseS0(7), wakeAt(4000)),
+		)...), nil)
+	})
+
+	t.Run("a grant of the old term does not start a second run", func(t *testing.T) {
+		runSteps(t, scenario(append(movedS0(),
+			viewed(1100, mc.Vm(3, "m1"), wakeAt(2000)),
+			runStopped(1200, 7, releaseS0(7), wakeAt(2000)),
+			released(1300, 7, acquireS0(), wakeAt(2000)),
+			acquired(1400, 7, wakeAt(2000)),
+		)...), nil)
+	})
+
+	t.Run("released while the session is late, it acquires when the session is live", func(t *testing.T) {
+		idle := core.ShardStatus{Since: mc.Ms(10100), Holder: "h1", Wanted: true}
+		runSteps(t, scenario(append(movedS0(),
+			runStopped(1100, 7, releaseS0(7), wakeAt(2000)),
+			viewed(1200, mc.Vm(3, "m1"), wakeAt(2000)),
+			tick(10000, core.KeepAlive{}, releaseS0(7), wakeAt(12000)),
+			released(10100, 7, wakeAt(12000)),
+			keepAlive(12000, 14000),
+			renewed(12100, 12000, extended(22000), acquireS0(), wakeAt(14000)),
+		)...), stepChecks{
+			9:  shardIs(0, idle),
+			10: shardIs(0, idle),
+			11: shardIs(0, core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(12100), Holder: "h1", Wanted: true}),
+		})
+	})
+
+	t.Run("not wanted, it stays idle", func(t *testing.T) {
+		runSteps(t, scenario(append(movedS0(),
+			runStopped(1100, 7, releaseS0(7), wakeAt(2000)),
+			released(1200, 7, wakeAt(2000)),
+			keepAlive(2000, 4000),
+		)...), stepChecks{8: shardIs(0, core.ShardStatus{Since: mc.Ms(1200), Holder: "h1"})})
+	})
+}
+
+// TestHandoverOutputOrder checks that a handover's actions come in the order of their groups, not of
+// their shards. Only a view returns a StopRun and only a grant a StartRun, so no one step has both.
+func TestHandoverOutputOrder(t *testing.T) {
+	stop := func(shard int, term core.Term) core.Action {
+		return core.StopRun{Space: "s", Shard: shard, Term: term, Reason: core.StopMoved}
+	}
+	release := func(shard int, term core.Term) core.Action {
+		return core.Release{Space: "s", Shard: shard, Term: term}
+	}
+	// With m1 and m3 this member wants only shard 2, and with m1 and m4 only shard 1.
+	steps := append(mc.Boot(7, mc.S("s", 3)),
+		viewed(1000, mc.Vm(2, "m1", "m3"), stop(0, 7), stop(1, 8), wakeAt(2000)),
+		mc.Step{
+			Input: core.RunStopped{Now: mc.Ms(1500), Space: "s", Shard: 0, Term: 7},
+			Want:  []core.Action{release(0, 7), wakeAt(2000)},
+		},
+		mc.Step{
+			Input: core.RunStopped{Now: mc.Ms(1600), Space: "s", Shard: 1, Term: 8},
+			Want:  []core.Action{release(1, 8), wakeAt(2000)},
+		},
+		mc.Step{
+			Input: core.Released{Now: mc.Ms(1700), Space: "s", Shard: 1, Term: 8},
+			Want:  []core.Action{wakeAt(2000)},
+		},
+		keepAlive(2000, 3500),
+		// One step returns a StopRun of the last shard, a Release of the first and an Acquire of
+		// the one between.
+		viewed(3500, mc.Vm(3, "m1", "m4"),
+			stop(2, 9),
+			release(0, 7),
+			core.Acquire{Space: "s", Shard: 1},
+			wakeAt(4000),
+		),
+		keepAlive(4000, 5500),
+		// One step returns a StartRun of a later shard, then the Release of the first.
+		mc.Step{
+			Input: core.Acquired{Now: mc.Ms(5500), Space: "s", Shard: 1, Term: 10},
+			Want: []core.Action{
+				core.StartRun{Space: "s", Shard: 1, Term: 10, Deadline: mc.Ms(10000)},
+				release(0, 7),
+				wakeAt(6000),
+			},
+		},
+		// A KeepAlive comes before them all, and an answer's Acquire after the Release of an
+		// earlier shard.
+		mc.Step{
+			Input: core.RunStopped{Now: mc.Ms(6000), Space: "s", Shard: 2, Term: 9},
+			Want:  []core.Action{core.KeepAlive{}, release(2, 9), wakeAt(7500)},
+		},
+	)
+	runSteps(t, scenarioIn(mc.C(mc.S("s", 3)), steps...), nil)
+
+	// The shard an input names takes its place among the others: its actions do not come first.
+	t.Run("the named shard goes in shard order", func(t *testing.T) {
+		acquiring := core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(5100), Holder: "h1", Wanted: true}
+		steps := append(mc.Boot(7, mc.S("s", 3)),
+			viewed(1000, mc.Vm(2, "m2"), stop(0, 7), stop(1, 8), stop(2, 9), wakeAt(2000)),
+			mc.Step{
+				Input: core.RunStopped{Now: mc.Ms(1100), Space: "s", Shard: 0, Term: 7},
+				Want:  []core.Action{release(0, 7), wakeAt(2000)},
+			},
+			mc.Step{
+				Input: core.RunStopped{Now: mc.Ms(1100), Space: "s", Shard: 1, Term: 8},
+				Want:  []core.Action{release(1, 8), wakeAt(2000)},
+			},
+			viewed(1200, mc.Vm(3, "m1", "m4"), wakeAt(2000)),
+			keepAlive(2000, 3100),
+			// The report for the last shard comes at the repeats of the first two.
+			mc.Step{
+				Input: core.RunStopped{Now: mc.Ms(3100), Space: "s", Shard: 2, Term: 9},
+				Want:  []core.Action{release(0, 7), release(1, 8), release(2, 9), wakeAt(4000)},
+			},
+			keepAlive(4000, 5100),
+			// The answer for the shard between them comes at the repeats of the other two, and the
+			// shard, wanted again, acquires in that step.
+			mc.Step{
+				Input: core.Released{Now: mc.Ms(5100), Space: "s", Shard: 1, Term: 8},
+				Want:  []core.Action{release(0, 7), core.Acquire{Space: "s", Shard: 1}, release(2, 9), wakeAt(6000)},
+			},
+		)
+		runSteps(t, scenarioIn(mc.C(mc.S("s", 3)), steps...), stepChecks{len(steps): shardIs(1, acquiring)})
+	})
+
+	t.Run("by space name, then shard", func(t *testing.T) {
+		a0 := core.Release{Space: "a", Term: 7}
+		b0 := core.Release{Space: "b", Term: 8}
+		spaces := []core.SpaceSpec{mc.S("b", 1), mc.S("a", 1)}
+		runSteps(t, scenarioIn(mc.C(spaces...), append(mc.Boot(7, spaces...),
+			viewed(1000, mc.Vm(2, "m2"),
+				core.StopRun{Space: "a", Term: 7, Reason: core.StopMoved},
+				core.StopRun{Space: "b", Term: 8, Reason: core.StopMoved},
+				wakeAt(2000),
+			),
+			mc.Step{Input: core.RunStopped{Now: mc.Ms(1500), Space: "b", Term: 8}, Want: []core.Action{b0, wakeAt(2000)}},
+			mc.Step{Input: core.RunStopped{Now: mc.Ms(1500), Space: "a", Term: 7}, Want: []core.Action{a0, wakeAt(2000)}},
+			keepAlive(2000, 3500),
+			tick(3500, a0, b0, wakeAt(4000)),
+		)...), nil)
+	})
 }
 
 func TestAcquireOrderAcrossSpaces(t *testing.T) {
