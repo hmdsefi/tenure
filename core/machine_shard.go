@@ -24,8 +24,15 @@ type shardBook struct {
 	releaseAt time.Duration
 
 	// knownGone says the record no longer names this run while the shard is stopping, so the run's
-	// RunStopped has nothing to release. A lost shard needs no flag: its state says the same.
+	// RunStopped has nothing of the run's to release. A lost shard needs no flag: its state says the
+	// same.
 	knownGone bool
+
+	// grantAfterRun is the term of a record that names this member above the term of a run still
+	// going, or 0 for none. It holds the largest such term, until a record that is not older names
+	// another holder or none. The run's RunStopped hands it to grant, and nothing else acts on it, so
+	// nothing of that term goes out while the run is going.
+	grantAfterRun Term
 }
 
 // noShard is the target of an input that names no shard the machine has.
@@ -141,9 +148,10 @@ func (m *Machine) waitToAcquire(sh *ShardStatus, wait time.Duration) {
 }
 
 // grant applies a record that names this member in term t, whether an Acquired or a HolderChanged
-// said so. The shard must be idle or acquiring, and so has no run. A grant the machine can run starts
-// it, and any other is released without a run. That covers a term at or below the highest started:
-// it never starts twice, and since the shard has no run, whatever run it had has returned.
+// said so. The shard must have no run: it is idle or acquiring, or applyRunStopped has just ended its
+// run. A grant the machine can run starts it, and any other is released without a run. That covers a
+// term at or below the highest started: it never starts twice, and since the shard has no run,
+// whatever run it had has returned.
 func (m *Machine) grant(ref shardRef, t Term) {
 	sh := m.shardStatus(ref)
 	book := &m.shards[ref.space][ref.shard]
@@ -185,13 +193,16 @@ func (m *Machine) releaseWithoutRun(ref shardRef, t Term) {
 //
 // A larger term that names this member is not this run's, so a shard with a run treats it as a record
 // the run has lost. It never takes that term while the run is going: its Term stays the run's, so the
-// run's RunStopped still matches, and no Release of either term goes out.
+// run's RunStopped still matches, and no Release of either term goes out. That RunStopped grants the
+// term instead, so the record does not stay in this member's name.
 func (m *Machine) applyHolderChanged(ref shardRef, holder string, t Term) {
 	sh := m.shardStatus(ref)
-	if t != 0 && t < sh.Term {
+	book := &m.shards[ref.space][ref.shard]
+	if t != 0 && t < max(sh.Term, book.grantAfterRun) {
 		return
 	}
 	mine := holder == m.cfg.Holder
+	notThisRun := !mine || t > sh.Term
 	switch sh.State {
 	case ShardStateIdle, ShardStateAcquiring:
 		switch {
@@ -204,13 +215,22 @@ func (m *Machine) applyHolderChanged(ref shardRef, holder string, t Term) {
 			}
 		}
 	case ShardStateOwned:
-		if !mine || t > sh.Term {
+		if notThisRun {
+			book.noteGrantAfterRun(mine, t)
 			m.loseRun(ref, holder)
 		}
 	case ShardStateStopping:
-		if !mine || t > sh.Term {
+		if notThisRun {
+			book.noteGrantAfterRun(mine, t)
 			sh.Holder = holder
-			m.shards[ref.space][ref.shard].knownGone = true
+			book.knownGone = true
+		}
+	case ShardStateLost:
+		// The run has its StopRun and nothing here brings it back. All a record can still change is
+		// what the run's RunStopped grants.
+		if notThisRun && (mine || book.grantAfterRun != 0) {
+			book.noteGrantAfterRun(mine, t)
+			sh.Holder = holder
 		}
 	case ShardStateReleasing:
 		switch {
@@ -222,10 +242,18 @@ func (m *Machine) applyHolderChanged(ref shardRef, holder string, t Term) {
 		case t > sh.Term:
 			m.releaseWithoutRun(ref, t)
 		}
-	case ShardStateLost:
-		// The run has its StopRun and its RunStopped leads to idle, whatever the record says.
 	case ShardStateDegraded, ShardStateExpired:
 		// No shard reaches these states yet. The tasks that add them add their rows here.
+	}
+}
+
+// noteGrantAfterRun keeps what a record that is not older and does not name the shard's run says about
+// the run's RunStopped: a term of this member's is granted then, and any other holder, or none, ends
+// the wait for one that came before it.
+func (b *shardBook) noteGrantAfterRun(mine bool, t Term) {
+	b.grantAfterRun = 0
+	if mine {
+		b.grantAfterRun = t
 	}
 }
 
@@ -248,11 +276,14 @@ func (m *Machine) loseRun(ref shardRef, holder string) {
 // applyRunStopped applies the report that the run of term t has ended, which is what makes the term
 // safe to release. Only a shard that told its run to stop can take the report, and only for that
 // run's term: an owned shard's run was never told to stop, and any other term is not this run's. When
-// the record no longer names the run there is nothing to release, so the shard goes to idle.
+// the record no longer names the run there is nothing of the run's to release, so the shard goes to
+// idle, and a term the record gave this member while the run was going now goes to grant, unless the
+// session is lost.
 //
-// This is the only way from a run into ShardStateReleasing, and sendRelease runs only here and for a
-// shard in that state, so no Release comes before the RunStopped of the shard's run. The one Release
-// that comes without a RunStopped is releaseWithoutRun's, which only a shard with no run reaches.
+// A Release of a shard with a run comes only after this: the shard enters ShardStateReleasing from a
+// run only here, sendRelease runs only here and for a shard in that state, and grant's Release for a
+// term that waited for this RunStopped goes out here too. The one Release that comes without a
+// RunStopped is releaseWithoutRun's, which only a shard with no run reaches.
 func (m *Machine) applyRunStopped(ref shardRef, t Term) {
 	sh := m.shardStatus(ref)
 	if !runToldToStop(sh) || t != sh.Term {
@@ -261,10 +292,14 @@ func (m *Machine) applyRunStopped(ref shardRef, t Term) {
 	sh.Stuck = false
 	book := &m.shards[ref.space][ref.shard]
 	if sh.State == ShardStateLost || book.knownGone {
-		book.knownGone = false
+		next := book.grantAfterRun
+		book.knownGone, book.grantAfterRun = false, 0
 		m.setShardState(sh, ShardStateIdle)
 		sh.Term = 0
 		sh.Reason = StopNone
+		if next != 0 && m.status.Session != SessionStateLost {
+			m.grant(ref, next)
+		}
 		return
 	}
 	m.setShardState(sh, ShardStateReleasing)
