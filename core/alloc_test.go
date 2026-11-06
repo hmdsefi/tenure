@@ -148,3 +148,25 @@ func TestATASG07Allocs(t *testing.T) {
 	}
 	_ = sink
 }
+
+// TestMachineTickAllocs checks that a plain tick allocates its result and nothing per shard: the
+// result slice and the boxed Wake.
+func TestMachineTickAllocs(t *testing.T) {
+	for _, n := range []int{64, 4096} {
+		m := NewMachine(MachineConfig{Holder: "h1", Member: "m1", Spaces: []SpaceSpec{{Name: "s", Shards: n}}})
+		m.Step(Tick{})
+		m.Step(SessionRenewed{SentAt: 0})
+		m.Step(ViewChanged{View: View{Version: 1, Members: []Member{{ID: "m1", Slot: -1}}}})
+		for shard := range n {
+			m.Step(Acquired{Space: "s", Shard: shard, Term: 1})
+		}
+		var sink []Action
+		got := testing.AllocsPerRun(100, func() { sink = m.Step(Tick{}) })
+		if got > 2 {
+			t.Errorf("Step(Tick) with %d shards allocates %v times, want at most 2", n, got)
+		}
+		if len(sink) != 1 {
+			t.Errorf("Step(Tick) with %d shards = %v, want only a Wake", n, sink)
+		}
+	}
+}

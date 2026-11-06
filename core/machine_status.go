@@ -4,7 +4,6 @@
 package core
 
 import (
-	"cmp"
 	"slices"
 	"time"
 )
@@ -95,12 +94,11 @@ func (m *Machine) done() bool {
 
 // Assignment returns the placement key of each shard of the named space, indexed by shard
 // number, or nil when the machine has no such space. The key is "" for a shard with no key, so
-// every key is "" before the first view. Callers must not modify the result. A new assignment
-// is stored in a new slice, so an earlier result never changes.
+// every key is "" before the first view. In a view with slots the keys are "slot-0", "slot-1" and
+// so on. Callers must not modify the result. A new assignment is stored in a new slice, so an
+// earlier result never changes.
 func (m *Machine) Assignment(space string) []string {
-	i, ok := slices.BinarySearchFunc(m.cfg.Spaces, space, func(s SpaceSpec, name string) int {
-		return cmp.Compare(s.Name, name)
-	})
+	i, ok := m.spaceIndex(space)
 	if !ok {
 		return nil
 	}
