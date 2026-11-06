@@ -23,7 +23,8 @@ type Status struct {
 	// failed since the last accepted one.
 	LastFailure Cause
 
-	// Done reports that the machine has nothing left to do.
+	// Done reports that the machine has nothing left to do: its session is closed, or its session is
+	// lost and every shard is idle.
 	Done bool
 
 	// Draining reports that the member is handing its work over before it leaves.
@@ -87,9 +88,28 @@ func (m *Machine) Status() Status {
 	return st
 }
 
-// done reports that the machine has nothing left to do: its session is lost or closed.
+// done reports that the machine has nothing left to do (MCH-860): its session is closed, or it is lost
+// and every shard is idle, so no run is going and no answer is owed.
 func (m *Machine) done() bool {
-	return m.status.Session == SessionStateLost || m.status.Session == SessionStateClosed
+	switch m.status.Session {
+	case SessionStateClosed:
+		return true
+	case SessionStateLost:
+		return m.everyShardIdle()
+	}
+	return false
+}
+
+// everyShardIdle reports that no shard has a run, an Acquire out or a Release out.
+func (m *Machine) everyShardIdle() bool {
+	for i := range m.status.Spaces {
+		for j := range m.status.Spaces[i].Shards {
+			if m.status.Spaces[i].Shards[j].State != ShardStateIdle {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Assignment returns the placement key of each shard of the named space, indexed by shard
