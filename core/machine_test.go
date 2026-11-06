@@ -1234,6 +1234,36 @@ func TestGrantThatCannotStart(t *testing.T) {
 		runSteps(t, scenario(steps...), stepChecks{7: shardIs(0, ownedS0(600, 9))})
 	})
 
+	// A grant that starts nothing does not count as a started term, whichever way it would move the
+	// highest one.
+	t.Run("an older term does not lower the highest started term", func(t *testing.T) {
+		releasing := noRunS0(1600, 7)
+		releasing.Wanted = true
+		steps := append(movedS0(),
+			viewed(1100, mc.Vm(3, "m1"), wakeAt(2000)),
+			runStopped(1200, 7, releaseS0(7), wakeAt(2000)),
+			released(1300, 7, acquireS0(), wakeAt(2000)),
+			acquired(1400, 6, releaseS0(6), wakeAt(2000)),
+			released(1500, 6, acquireS0(), wakeAt(2000)),
+			acquired(1600, 7, releaseS0(7), wakeAt(2000)),
+		)
+		runSteps(t, scenario(steps...), stepChecks{len(steps): shardIs(0, releasing)})
+	})
+
+	t.Run("a newer term that cannot start can still start later", func(t *testing.T) {
+		steps := []mc.Step{
+			keepAlive(0, 2000),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			viewed(200, mc.Vm(1, "m1"), acquireS0(), wakeAt(2000)),
+			viewed(300, mc.Vm(2, "m2"), wakeAt(2000)),
+			acquired(400, 9, releaseS0(9), wakeAt(2000)),
+			viewed(500, mc.Vm(3, "m1"), wakeAt(2000)),
+			released(600, 9, acquireS0(), wakeAt(2000)),
+			acquired(700, 9, startedS0(9, 10000), wakeAt(2000)),
+		}
+		runSteps(t, scenario(steps...), stepChecks{len(steps): shardIs(0, ownedS0(700, 9))})
+	})
+
 	t.Run("the session is lost", func(t *testing.T) {
 		m := runSteps(t, scenario(
 			keepAlive(0, 2000),
@@ -2771,6 +2801,37 @@ func TestHandoverOutputOrder(t *testing.T) {
 		},
 	)
 	runSteps(t, scenarioIn(mc.C(mc.S("s", 3)), steps...), nil)
+
+	// The shard an input names takes its place among the others: its actions do not come first.
+	t.Run("the named shard goes in shard order", func(t *testing.T) {
+		acquiring := core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(5100), Holder: "h1", Wanted: true}
+		steps := append(mc.Boot(7, mc.S("s", 3)),
+			viewed(1000, mc.Vm(2, "m2"), stop(0, 7), stop(1, 8), stop(2, 9), wakeAt(2000)),
+			mc.Step{
+				Input: core.RunStopped{Now: mc.Ms(1100), Space: "s", Shard: 0, Term: 7},
+				Want:  []core.Action{release(0, 7), wakeAt(2000)},
+			},
+			mc.Step{
+				Input: core.RunStopped{Now: mc.Ms(1100), Space: "s", Shard: 1, Term: 8},
+				Want:  []core.Action{release(1, 8), wakeAt(2000)},
+			},
+			viewed(1200, mc.Vm(3, "m1", "m4"), wakeAt(2000)),
+			keepAlive(2000, 3100),
+			// The report for the last shard comes at the repeats of the first two.
+			mc.Step{
+				Input: core.RunStopped{Now: mc.Ms(3100), Space: "s", Shard: 2, Term: 9},
+				Want:  []core.Action{release(0, 7), release(1, 8), release(2, 9), wakeAt(4000)},
+			},
+			keepAlive(4000, 5100),
+			// The answer for the shard between them comes at the repeats of the other two, and the
+			// shard, wanted again, acquires in that step.
+			mc.Step{
+				Input: core.Released{Now: mc.Ms(5100), Space: "s", Shard: 1, Term: 8},
+				Want:  []core.Action{release(0, 7), core.Acquire{Space: "s", Shard: 1}, release(2, 9), wakeAt(6000)},
+			},
+		)
+		runSteps(t, scenarioIn(mc.C(mc.S("s", 3)), steps...), stepChecks{len(steps): shardIs(1, acquiring)})
+	})
 
 	t.Run("by space name, then shard", func(t *testing.T) {
 		a0 := core.Release{Space: "a", Term: 7}
