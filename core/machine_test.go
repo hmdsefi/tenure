@@ -2683,6 +2683,20 @@ func TestGrantAfterRunStopped(t *testing.T) {
 		)...), stepChecks{8: shardIs(0, releasingS0(1300, 9))})
 	})
 
+	t.Run("the term does not outlive its run", func(t *testing.T) {
+		// A term below the one that waited is no older than anything once the shard has no run.
+		runSteps(t, scenario(append(movedS0(),
+			holderChanged(1100, "h1", 9, wakeAt(2000)),
+			runStopped(1200, 7, releaseS0(9), wakeAt(2000)),
+			released(1300, 9, wakeAt(2000)),
+			holderChanged(1400, "h2", 8, wakeAt(2000)),
+			holderChanged(1500, "h1", 8, releaseS0(8), wakeAt(2000)),
+		)...), stepChecks{
+			9:  shardIs(0, core.ShardStatus{Since: mc.Ms(1300), Holder: "h2"}),
+			10: shardIs(0, noRunS0(1500, 8)),
+		})
+	})
+
 	t.Run("after a term taken back, the next run ends as usual", func(t *testing.T) {
 		runSteps(t, scenario(append(movedS0(),
 			viewed(1050, mc.Vm(3, "m1"), wakeAt(2000)),
