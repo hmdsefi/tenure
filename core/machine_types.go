@@ -82,7 +82,8 @@ type AcquireFailed struct {
 	// Holder is the holder the shard's record names.
 	Holder string
 
-	// RetryAfter is how long the store asks the member to wait before it tries again.
+	// RetryAfter is how long the store asks the member to wait before it tries again. The machine
+	// waits at least RetryPeriod and at most LeaseDuration, whatever this says.
 	RetryAfter time.Duration
 }
 
@@ -377,7 +378,7 @@ const (
 	// shard.
 	ShardStateLost
 
-	// ShardStateReleasing means the run is over and a Release action waits for its answer.
+	// ShardStateReleasing means the shard has no run and a Release action waits for its answer.
 	ShardStateReleasing
 )
 
