@@ -5,6 +5,7 @@ package core_test
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
 	"testing"
@@ -156,7 +157,8 @@ func runSteps(t *testing.T, c mc.Case, checks stepChecks) *core.Machine {
 			t.Fatalf("%s step %d: Step(%#v) = %#v, want %#v", c.ID, n, s.Input, got, s.Want)
 		}
 		at, armed := m.NextWake()
-		for _, v := range wakeViolations(got, m.Status().Now, at, armed) {
+		st := m.Status()
+		for _, v := range wakeViolations(got, st.Now, st.Done, at, armed) {
 			t.Errorf("%s step %d: %s", c.ID, n, v)
 		}
 		if check, ok := checks[n]; ok {
@@ -197,8 +199,8 @@ func assumeCase(t *testing.T, c mc.Case) {
 
 // wakeViolations returns how a step's result breaks the wake rules: nil rather than empty, a last
 // action of Wake{NextWake} when a timer is armed and no other Wake, an armed timer strictly after
-// the clock, and no Wake and a reading of 0 when none is.
-func wakeViolations(got []core.Action, now, at time.Duration, armed bool) []string {
+// the clock and no timer on a done machine, and no Wake and a reading of 0 when none is armed.
+func wakeViolations(got []core.Action, now time.Duration, done bool, at time.Duration, armed bool) []string {
 	var found []string
 	if got != nil && len(got) == 0 {
 		found = append(found, "result is empty but not nil")
@@ -227,6 +229,9 @@ func wakeViolations(got []core.Action, now, at time.Duration, armed bool) []stri
 	if at <= now {
 		found = append(found, fmt.Sprintf("armed timer %v is not after the clock %v", at, now))
 	}
+	if done {
+		found = append(found, fmt.Sprintf("the machine is done, but timer %v is armed", at))
+	}
 	return found
 }
 
@@ -236,6 +241,7 @@ func TestWakeViolations(t *testing.T) {
 		name  string
 		got   []core.Action
 		now   time.Duration
+		done  bool
 		at    time.Duration
 		armed bool
 		want  int
@@ -253,10 +259,12 @@ func TestWakeViolations(t *testing.T) {
 		{name: "timer before the clock", got: []core.Action{wake}, now: 3 * time.Second, at: 2 * time.Second, armed: true, want: 1},
 		{name: "Wake with no timer", got: []core.Action{wake}, want: 1},
 		{name: "reading with no timer", got: nil, at: 2 * time.Second, want: 1},
+		{name: "done with no timer", got: nil, done: true},
+		{name: "done with a timer", got: []core.Action{wake}, done: true, at: 2 * time.Second, armed: true, want: 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := wakeViolations(tc.got, tc.now, tc.at, tc.armed); len(got) != tc.want {
+			if got := wakeViolations(tc.got, tc.now, tc.done, tc.at, tc.armed); len(got) != tc.want {
 				t.Errorf("wakeViolations = %q, want %d", got, tc.want)
 			}
 		})
@@ -528,6 +536,16 @@ func TestSessionStates(t *testing.T) {
 			states: []core.SessionState{opening, live, late, late},
 		},
 		{
+			name: "a renewal whose deadline is the clock's reading leaves it late",
+			steps: []mc.Step{
+				keepAlive(0, 2000),
+				renewed(100, 0, extended(10000), wakeAt(2000)),
+				keepAlive(11000, 13000),
+				renewed(11000, 1000, extended(11000), wakeAt(13000)),
+			},
+			states: []core.SessionState{opening, live, late, late},
+		},
+		{
 			name: "an older renewal leaves it late",
 			steps: []mc.Step{
 				keepAlive(0, 2000),
@@ -693,13 +711,14 @@ func TestSessionLostIsFinal(t *testing.T) {
 				core.SessionFailed{Now: mc.Ms(later), Cause: core.CauseNone},
 				&core.Tick{Now: mc.Ms(later)},
 			)
+			checks := stepChecks{
+				len(steps): sessionIs(lostAt, core.SessionStateLost, start.deadline, core.CauseLost),
+			}
+			// Checked after every one of them: a later failure must not replace the cause, and
+			// the last input must not be what puts it back.
 			for _, in := range inputs {
 				steps = append(steps, mc.Step{Input: in})
-			}
-
-			checks := stepChecks{
-				len(start.steps) + 1: sessionIs(lostAt, core.SessionStateLost, start.deadline, core.CauseLost),
-				len(steps):           sessionIs(later, core.SessionStateLost, start.deadline, core.CauseLost),
+				checks[len(steps)] = sessionIs(later, core.SessionStateLost, start.deadline, core.CauseLost)
 			}
 			m := runSteps(t, scenario(steps...), checks)
 			if at, ok := m.NextWake(); at != 0 || ok {
@@ -838,6 +857,232 @@ func TestStepClockOlderInput(t *testing.T) {
 			failed(1000, core.CauseUnreachable, wakeAt(7000)),
 		), stepChecks{2: sessionIs(5000, core.SessionStateOpening, 0, core.CauseUnreachable)})
 	})
+}
+
+// TestStepClockClosedMachine checks that the closed check comes before the clock: a closed machine
+// returns nil for every input and its reading stays where it was. Nothing closes a machine yet, so
+// the test closes it directly.
+func TestStepClockClosedMachine(t *testing.T) {
+	const closedAt = time.Second
+	m := core.NewMachine(mc.C(mc.S("s", 1)))
+	m.Step(core.Tick{Now: closedAt})
+	core.ForceSessionClosed(m)
+	for _, in := range allInputs(5 * time.Second) {
+		if got := m.Step(in); got != nil {
+			t.Errorf("Step(%T) on a closed machine = %#v, want nil", in, got)
+		}
+		if got := m.Status().Now; got != closedAt {
+			t.Errorf("Now after Step(%T) on a closed machine = %v, want %v", in, got, closedAt)
+		}
+	}
+	if err := panicError(t, func() { m.Step(nil) }); err.Error() != "core: Step: nil Input" {
+		t.Errorf("Step(nil) on a closed machine panicked with %q", err)
+	}
+}
+
+// maxReading is the highest reading the clock takes: 24 hours short of the largest Duration.
+const maxReading = time.Duration(math.MaxInt64) - 24*time.Hour
+
+// TestStepClockExtremeReadings pins what the machine does with readings outside the driver's range,
+// and at the top of it. The wake rules that runSteps checks are the point of most of these: a timer
+// must fit in a Duration and be after the clock.
+func TestStepClockExtremeReadings(t *testing.T) {
+	const (
+		retry    = 2 * time.Second
+		deadline = 10 * time.Second
+		top      = time.Duration(1<<62 - 1)
+	)
+	ka := func(now, wake time.Duration) mc.Step {
+		return mc.Step{Input: core.Tick{Now: now}, Want: []core.Action{core.KeepAlive{}, core.Wake{At: wake}}}
+	}
+	tests := []struct {
+		name    string
+		steps   []mc.Step
+		now     time.Duration
+		session core.SessionState
+		dl      time.Duration
+	}{
+		{
+			name:    "a negative first reading leaves the clock at 0",
+			steps:   []mc.Step{ka(-time.Second, retry)},
+			session: core.SessionStateOpening,
+		},
+		{
+			name:    "the lowest reading leaves the clock at 0",
+			steps:   []mc.Step{ka(math.MinInt64, retry)},
+			session: core.SessionStateOpening,
+		},
+		{
+			name: "a negative reading later leaves the clock where it is",
+			steps: []mc.Step{
+				ka(time.Second, time.Second+retry),
+				{Input: core.Tick{Now: -time.Second}, Want: []core.Action{core.Wake{At: time.Second + retry}}},
+			},
+			now:     time.Second,
+			session: core.SessionStateOpening,
+		},
+		{
+			name: "a negative SentAt that still reaches past the clock counts",
+			steps: []mc.Step{
+				ka(0, retry),
+				{
+					Input: core.SessionRenewed{SentAt: -time.Second},
+					Want:  []core.Action{core.ExtendDeadline{Deadline: 9 * time.Second}, core.Wake{At: retry}},
+				},
+			},
+			session: core.SessionStateLive,
+			dl:      9 * time.Second,
+		},
+		{
+			name: "a SentAt too old to reach 0 moves nothing, and the session is late",
+			steps: []mc.Step{
+				ka(0, retry),
+				{Input: core.SessionRenewed{SentAt: math.MinInt64}, Want: []core.Action{core.Wake{At: retry}}},
+			},
+			session: core.SessionStateLate,
+		},
+		{
+			name: "the top of the driver's range is an ordinary reading",
+			steps: []mc.Step{
+				ka(top, top+retry),
+				{
+					Input: core.SessionRenewed{Now: top, SentAt: top},
+					Want:  []core.Action{core.ExtendDeadline{Deadline: top + deadline}, core.Wake{At: top + retry}},
+				},
+			},
+			now:     top,
+			session: core.SessionStateLive,
+			dl:      top + deadline,
+		},
+		{
+			name:    "the highest reading is where the clock stops",
+			steps:   []mc.Step{ka(maxReading, maxReading+retry)},
+			now:     maxReading,
+			session: core.SessionStateOpening,
+		},
+		{
+			name:    "a reading above it stops there",
+			steps:   []mc.Step{ka(maxReading+1, maxReading+retry)},
+			now:     maxReading,
+			session: core.SessionStateOpening,
+		},
+		{
+			name:    "a reading whose timer would overflow stops there",
+			steps:   []mc.Step{ka(math.MaxInt64-retry+1, maxReading+retry)},
+			now:     maxReading,
+			session: core.SessionStateOpening,
+		},
+		{
+			name:    "the largest Duration stops there",
+			steps:   []mc.Step{ka(math.MaxInt64, maxReading+retry)},
+			now:     maxReading,
+			session: core.SessionStateOpening,
+		},
+		{
+			name: "a SentAt above the stopped clock is ignored",
+			steps: []mc.Step{
+				ka(math.MaxInt64, maxReading+retry),
+				{
+					Input: core.SessionRenewed{Now: math.MaxInt64, SentAt: math.MaxInt64},
+					Want:  []core.Action{core.Wake{At: maxReading + retry}},
+				},
+			},
+			now:     maxReading,
+			session: core.SessionStateOpening,
+		},
+		{
+			name: "a renewal at the stopped clock moves the deadline but cannot make it live",
+			steps: []mc.Step{
+				ka(math.MaxInt64, maxReading+retry),
+				{
+					Input: core.SessionRenewed{Now: math.MaxInt64, SentAt: maxReading},
+					Want:  []core.Action{core.ExtendDeadline{Deadline: maxReading + deadline}, core.Wake{At: maxReading + retry}},
+				},
+			},
+			now:     maxReading,
+			session: core.SessionStateLate,
+			dl:      maxReading + deadline,
+		},
+		{
+			name: "a live session goes late when the clock stops short of its deadline",
+			steps: []mc.Step{
+				ka(maxReading-1, maxReading-1+retry),
+				{
+					Input: core.SessionRenewed{Now: maxReading - 1, SentAt: maxReading - 1},
+					Want: []core.Action{
+						core.ExtendDeadline{Deadline: maxReading - 1 + deadline},
+						core.Wake{At: maxReading - 1 + retry},
+					},
+				},
+				{Input: core.Tick{Now: math.MaxInt64}, Want: []core.Action{core.Wake{At: maxReading - 1 + retry}}},
+			},
+			now:     maxReading,
+			session: core.SessionStateLate,
+			dl:      maxReading - 1 + deadline,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := runSteps(t, scenario(tc.steps...), nil).Status()
+			if st.Now != tc.now || st.Session != tc.session || st.Deadline != tc.dl {
+				t.Errorf("Now, Session, Deadline = %v, %v, %v, want %v, %v, %v",
+					st.Now, st.Session, st.Deadline, tc.now, tc.session, tc.dl)
+			}
+		})
+	}
+
+	t.Run("the largest Timing fits", func(t *testing.T) {
+		cfg := mc.C(mc.S("s", 1))
+		cfg.Timing = core.Timing{LeaseDuration: 24 * time.Hour, RenewDeadline: 21 * time.Hour, RetryPeriod: 17 * time.Hour, SlotGrace: 24 * time.Hour}
+		m := core.NewMachine(cfg)
+		m.Step(core.Tick{Now: math.MaxInt64})
+		got := m.Step(core.SessionRenewed{Now: math.MaxInt64, SentAt: maxReading})
+		want := []core.Action{
+			core.ExtendDeadline{Deadline: maxReading + 21*time.Hour},
+			core.Wake{At: maxReading + 17*time.Hour},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("renewal at the stopped clock = %#v, want %#v", got, want)
+		}
+	})
+}
+
+// TestStepClockOddReadings runs short sequences over every combination of odd readings: no Step may
+// panic, the clock never goes back, the wake rules hold, and a live session is before its deadline.
+func TestStepClockOddReadings(t *testing.T) {
+	readings := []time.Duration{
+		math.MinInt64, -time.Hour, -1, 0, 1, 2 * time.Second, 10 * time.Second,
+		1<<62 - 1, 1 << 62, maxReading - 1, maxReading, maxReading + 1, math.MaxInt64 - 1, math.MaxInt64,
+	}
+	for _, first := range readings {
+		for _, second := range readings {
+			for _, sentAt := range readings {
+				m := core.NewMachine(mc.C(mc.S("s", 1)))
+				clock := time.Duration(0)
+				for _, in := range []core.Input{
+					core.Tick{Now: first},
+					core.SessionRenewed{Now: second, SentAt: sentAt},
+					core.SessionFailed{Now: first, Cause: core.CauseUnreachable},
+					core.Tick{Now: second},
+					core.SessionRenewed{Now: first, SentAt: sentAt},
+				} {
+					got := m.Step(in)
+					at, armed := m.NextWake()
+					st := m.Status()
+					for _, v := range wakeViolations(got, st.Now, st.Done, at, armed) {
+						t.Errorf("readings %d, %d, %d: Step(%#v): %s", first, second, sentAt, in, v)
+					}
+					if st.Now < clock {
+						t.Errorf("readings %d, %d, %d: Step(%#v) moved the clock from %v to %v", first, second, sentAt, in, clock, st.Now)
+					}
+					clock = st.Now
+					if st.Session == core.SessionStateLive && st.Now >= st.Deadline {
+						t.Errorf("readings %d, %d, %d: Step(%#v): live at %v with deadline %v", first, second, sentAt, in, st.Now, st.Deadline)
+					}
+				}
+			}
+		}
+	}
 }
 
 func TestStepClockEveryInput(t *testing.T) {

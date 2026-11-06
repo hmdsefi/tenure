@@ -6,9 +6,16 @@ package core
 import (
 	"cmp"
 	"errors"
+	"math"
 	"slices"
 	"time"
 )
+
+// maxReading is the highest reading the clock takes. A timer's reading is a reading at or below the
+// clock plus one Timing field, and maxTimingField bounds those, so every timer's reading fits in a
+// Duration and an armed timer is after the clock. A driver's readings stay far below this: only a
+// driver that breaks its contract reaches it.
+const maxReading = time.Duration(math.MaxInt64) - maxTimingField
 
 // Machine is the ownership state machine of one member. It reads no clock, starts nothing and
 // performs no I/O: the driver feeds it inputs through Step and carries out the actions Step
@@ -116,10 +123,12 @@ func NewMachine(cfg MachineConfig) *Machine {
 // are none. It panics when in is nil.
 //
 // The machine's clock moves to the input's Now and never back, so an input with an older Now
-// runs at the machine's own reading. A value of any other type that satisfies Input, such as a
-// pointer to an input, leaves the clock where it is. An input that does not apply, such as a
-// renewal sent after the clock's reading or an answer to a request the machine did not make, has
-// no effect of its own, but the rest of the step still runs, so whatever is due still happens.
+// runs at the machine's own reading. The clock stops 24 hours short of the largest Duration, where
+// the session is never live, so that every timer's reading fits. A value of any other type that
+// satisfies Input, such as a pointer to an input, leaves the clock where it is. An input that does
+// not apply, such as a renewal sent after the clock's reading or an answer to a request the machine
+// did not make, has no effect of its own, but the rest of the step still runs, so whatever is due
+// still happens.
 //
 // Actions come in a fixed order: ExtendDeadline and KeepAlive; then StopRun, Degrade and
 // Restore; StartRun; Release, Confirm and Acquire; ReleaseSlot and ClaimSlot; CloseSession; and
@@ -136,7 +145,7 @@ func (m *Machine) Step(in Input) []Action {
 	}
 
 	// Phase A: the clock, the session input, and the step's one evaluation of live.
-	m.status.Now = max(m.status.Now, inputNow(in))
+	m.status.Now = min(max(m.status.Now, inputNow(in)), maxReading)
 	m.applySessionInput(in)
 	m.refreshSession()
 	m.live = m.status.Session == SessionStateLive

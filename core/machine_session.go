@@ -75,11 +75,12 @@ func (m *Machine) sessionEnded() bool {
 
 // refreshSession sets the session's state from the clock: opening until the first accepted
 // renewal, then live before the deadline and late from the deadline on. A driver that wakes at
-// the deadline therefore finds it already past.
+// the deadline therefore finds it already past. A clock at maxReading cannot move on to a deadline
+// past it, so the session is late there too rather than live for good.
 func (m *Machine) refreshSession() {
 	switch {
 	case m.sessionEnded() || !m.session.renewed:
-	case m.status.Now < m.status.Deadline:
+	case m.status.Now < m.status.Deadline && m.status.Now < maxReading:
 		m.status.Session = SessionStateLive
 	default:
 		m.status.Session = SessionStateLate
