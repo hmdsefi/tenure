@@ -173,6 +173,57 @@ func TestBoot(t *testing.T) {
 	}
 }
 
+func TestBootF(t *testing.T) {
+	spaces := []core.SpaceSpec{mc.S("b", 1), mc.S("a", 2)}
+	got := mc.BootF(7, spaces...)
+	want := append(mc.Boot(7, spaces...), mc.Step{
+		Input: core.Tick{Now: mc.Ms(10000)},
+		Want: []core.Action{
+			core.KeepAlive{},
+			core.Degrade{Space: "a", Shard: 0, Term: 7},
+			core.Degrade{Space: "a", Shard: 1, Term: 8},
+			core.Degrade{Space: "b", Shard: 0, Term: 9},
+			core.Wake{At: mc.Ms(12000)},
+		},
+	})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("BootF = %+v, want %+v", got, want)
+	}
+	if spaces[0].Name != "b" {
+		t.Error("BootF sorted its argument")
+	}
+
+	m := core.NewMachine(mc.CF(spaces...))
+	for i, s := range got {
+		if result := m.Step(s.Input); !reflect.DeepEqual(result, s.Want) {
+			t.Errorf("step %d = %+v, want %+v", i+1, result, s.Want)
+		}
+	}
+}
+
+// TestFencedCasesPrint pins the text a digest of the fenced actions hashes: it holds no pointer, map or
+// time.Time, so it is the same on every run.
+func TestFencedCasesPrint(t *testing.T) {
+	var got []string
+	for _, s := range mc.Get("AT-MCH-08").Steps {
+		for _, a := range s.Want {
+			switch a.(type) {
+			case core.StartRun, core.Degrade, core.Confirm, core.Restore:
+				got = append(got, fmt.Sprintf("%T%+v", a, a))
+			}
+		}
+	}
+	want := []string{
+		"core.StartRun{Space:s Shard:0 Term:7 Deadline:10s}",
+		"core.Degrade{Space:s Shard:0 Term:7}",
+		"core.Confirm{Space:s Shard:0 Term:7}",
+		"core.Restore{Space:s Shard:0 Term:7}",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("AT-MCH-08 prints %q, want %q", got, want)
+	}
+}
+
 func TestOutage(t *testing.T) {
 	keepAlive := func(now, wake int64) mc.Step {
 		return mc.Step{

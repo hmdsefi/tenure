@@ -184,12 +184,10 @@ func Grant(now time.Duration, space string, shard int, term core.Term, deadline,
 func Boot(term core.Term, spaces ...core.SpaceSpec) []Step {
 	const wake = 2000 * time.Millisecond
 	deadline := core.DefaultTiming.RenewDeadline
-	sorted := slices.Clone(spaces)
-	slices.SortStableFunc(sorted, func(a, b core.SpaceSpec) int { return cmp.Compare(a.Name, b.Name) })
 
 	var acquires []core.Action
 	var grants []Step
-	for _, s := range sorted {
+	for _, s := range byName(spaces) {
 		for shard := range s.Shards {
 			acquires = append(acquires, core.Acquire{Space: s.Name, Shard: shard})
 			grants = append(grants, Grant(Ms(300), s.Name, shard, term, deadline, wake))
@@ -201,6 +199,37 @@ func Boot(term core.Term, spaces ...core.SpaceSpec) []Step {
 		Renew(Ms(100), Ms(0), wake),
 		ViewAt(Ms(200), Vm(1, "m1"), wake, acquires...),
 	}, grants...)
+}
+
+// BootF takes a new machine of CF(spaces...) through Boot and on to the session deadline, with no renewal
+// after the first:
+//
+//	@10   Tick: KeepAlive, and a Degrade per shard
+//
+// Every run keeps going. After BootF the session is late, and the next KeepAlive is due at @12, which is
+// the armed Wake. For a fenced machine that has not reached the deadline, use Boot: its steps do not
+// depend on Fenced.
+func BootF(term core.Term, spaces ...core.SpaceSpec) []Step {
+	deadline := core.DefaultTiming.RenewDeadline
+	actions := []core.Action{core.KeepAlive{}}
+	next := term
+	for _, s := range byName(spaces) {
+		for shard := range s.Shards {
+			actions = append(actions, core.Degrade{Space: s.Name, Shard: shard, Term: next})
+			next++
+		}
+	}
+	return append(Boot(term, spaces...), Step{
+		Input: core.Tick{Now: deadline},
+		Want:  want(deadline+core.DefaultTiming.RetryPeriod, actions...),
+	})
+}
+
+// byName returns a copy of spaces in the order the machine visits them.
+func byName(spaces []core.SpaceSpec) []core.SpaceSpec {
+	sorted := slices.Clone(spaces)
+	slices.SortStableFunc(sorted, func(a, b core.SpaceSpec) int { return cmp.Compare(a.Name, b.Name) })
+	return sorted
 }
 
 // Outage is a store outage on a machine with no shard work, driven as a driver follows Wake: at
