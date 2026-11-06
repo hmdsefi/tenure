@@ -25,6 +25,63 @@ type Machine struct {
 
 	// assignments holds the placement key per shard. It is parallel to cfg.Spaces.
 	assignments [][]string
+
+	// session holds the session's bookkeeping that Status does not report.
+	session sessionTimers
+
+	// live is the step's one evaluation of the session, made in phase A. Every later phase of
+	// the step reads it, so they all agree.
+	live bool
+
+	// out holds the current step's actions per output group. Between steps its slices are
+	// empty; they keep their capacity.
+	out [groupCount][]Action
+
+	// wake is the earliest armed timer as of the end of the last step.
+	wake wakeTimer
+}
+
+// outputGroup is one group of Step's output order. Within a group, actions are in space name
+// order, then shard order, then the order the phases emitted them.
+type outputGroup int
+
+const (
+	// groupSession holds ExtendDeadline, then KeepAlive.
+	groupSession outputGroup = iota
+
+	// groupRunChange holds StopRun, Degrade and Restore.
+	groupRunChange
+
+	// groupRunStart holds StartRun.
+	groupRunStart
+
+	// groupRecord holds Release, Confirm and Acquire.
+	groupRecord
+
+	// groupSlot holds ReleaseSlot and ClaimSlot.
+	groupSlot
+
+	// groupClose holds CloseSession.
+	groupClose
+
+	// groupReserved stays empty until a later phase of the project adds its action.
+	groupReserved
+
+	// groupCount is the number of groups. The Wake comes after them all: phase H appends it.
+	groupCount
+)
+
+// wakeTimer is the earliest of the timers armed so far.
+type wakeTimer struct {
+	at    time.Duration
+	armed bool
+}
+
+// arm makes at the timer's reading if no timer is armed or at is earlier.
+func (w *wakeTimer) arm(at time.Duration) {
+	if !w.armed || at < w.at {
+		w.at, w.armed = at, true
+	}
 }
 
 // NewMachine returns a Machine for cfg, with its spaces sorted by name, its session opening, no
@@ -55,17 +112,114 @@ func NewMachine(cfg MachineConfig) *Machine {
 }
 
 // Step applies one input and returns the actions the driver must carry out, or nil when there
-// are none. It panics when in is nil. For now, every other input has no effect and Step returns
-// nil.
+// are none. It panics when in is nil.
+//
+// The machine's clock moves to the input's Now and never back, so an input with an older Now
+// runs at the machine's own reading. A value of any other type that satisfies Input, such as a
+// pointer to an input, leaves the clock where it is. An input that does not apply, such as a
+// renewal sent after the clock's reading or an answer to a request the machine did not make, has
+// no effect of its own, but the rest of the step still runs, so whatever is due still happens.
+//
+// Actions come in a fixed order: ExtendDeadline and KeepAlive; then StopRun, Degrade and
+// Restore; StartRun; Release, Confirm and Acquire; ReleaseSlot and ClaimSlot; CloseSession; and
+// Wake last. When a timer is armed the result ends with a Wake for the reading NextWake returns,
+// which is after the machine's clock, and contains no other Wake.
+//
+// Once Status reports Done, Step returns nil. Once the session is closed, the clock stops too.
 func (m *Machine) Step(in Input) []Action {
 	if in == nil {
 		panic(errors.New("core: Step: nil Input"))
 	}
-	return nil
+	if m.status.Session == SessionStateClosed {
+		return nil
+	}
+
+	// Phase A: the clock, the session input, and the step's one evaluation of live.
+	m.status.Now = max(m.status.Now, inputNow(in))
+	m.applySessionInput(in)
+	m.refreshSession()
+	m.live = m.status.Session == SessionStateLive
+
+	// Phases B to F (slot marks, assignments, shards, slots and closing) go here, in that
+	// order. The KeepAlive comes after them because closing the session ends the cadence.
+	m.emitKeepAlive()
+	m.status.Done = m.done()
+
+	// Phase G: the output order. Phase H: the wake.
+	result := m.assemble()
+	m.armTimers()
+	if m.wake.armed {
+		result = append(result, Wake{At: m.wake.at})
+	}
+	return result
+}
+
+// inputNow returns the reading in carries, or 0, which never moves the clock, for a type that
+// is not one of the machine's inputs.
+func inputNow(in Input) time.Duration {
+	switch v := in.(type) {
+	case Tick:
+		return v.Now
+	case ViewChanged:
+		return v.Now
+	case SessionRenewed:
+		return v.Now
+	case SessionFailed:
+		return v.Now
+	case SessionClosed:
+		return v.Now
+	case Acquired:
+		return v.Now
+	case AcquireFailed:
+		return v.Now
+	case Released:
+		return v.Now
+	case RunStopped:
+		return v.Now
+	case HolderChanged:
+		return v.Now
+	case SlotClaimed:
+		return v.Now
+	case SlotReleased:
+		return v.Now
+	case Drain:
+		return v.Now
+	}
+	return 0
+}
+
+// emit adds a to group g of the current step's output.
+func (m *Machine) emit(g outputGroup, a Action) {
+	m.out[g] = append(m.out[g], a)
+}
+
+// assemble empties the group buffers into a new slice, in group order, with room for the Wake.
+// It returns nil when they are empty.
+func (m *Machine) assemble() []Action {
+	n := 0
+	for g := range m.out {
+		n += len(m.out[g])
+	}
+	if n == 0 {
+		return nil
+	}
+	result := make([]Action, 0, n+1)
+	for g := range m.out {
+		result = append(result, m.out[g]...)
+		clear(m.out[g])
+		m.out[g] = m.out[g][:0]
+	}
+	return result
+}
+
+// armTimers sets the earliest armed timer. Every timer it arms is after the clock.
+func (m *Machine) armTimers() {
+	m.wake = wakeTimer{}
+	m.armSessionTimers(&m.wake)
 }
 
 // NextWake returns the reading of the earliest armed timer and true, or 0 and false when no
 // timer is armed. A new Machine has no timer armed.
 func (m *Machine) NextWake() (time.Duration, bool) {
-	return 0, false
+	return m.wake.at, m.wake.armed
 }

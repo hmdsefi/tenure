@@ -88,6 +88,11 @@ func (m *Machine) Status() Status {
 	return st
 }
 
+// done reports that the machine has nothing left to do: its session is lost or closed.
+func (m *Machine) done() bool {
+	return m.status.Session == SessionStateLost || m.status.Session == SessionStateClosed
+}
+
 // Assignment returns the placement key of each shard of the named space, indexed by shard
 // number, or nil when the machine has no such space. The key is "" for a shard with no key, so
 // every key is "" before the first view. Callers must not modify the result. A new assignment
