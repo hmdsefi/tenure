@@ -23,6 +23,10 @@ var DefaultTiming = Timing{
     60 s SlotGrace. It tolerates clock-rate error strictly below 20%. To change
     a field, copy DefaultTiming and change the copy.
 
+var ErrInvalidMachineConfig = errors.New("core: invalid machine config")
+    ErrInvalidMachineConfig is wrapped by the errors MachineConfig.Validate
+    returns, except a timing error, which wraps ErrInvalidTiming.
+
 var ErrInvalidTree = errors.New("core: invalid tree")
     ErrInvalidTree is wrapped by the errors Tree.Validate and
     Tree.ValidateChange return.
@@ -75,6 +79,193 @@ func Score(namespace, key, memberID string) uint64
 
 
 TYPES
+
+type Acquire struct {
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+}
+    Acquire asks the driver to try to acquire a shard.
+
+type AcquireFailed struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Holder is the holder the shard's record names.
+	Holder string
+
+	// RetryAfter is how long the store asks the member to wait before it tries again.
+	RetryAfter time.Duration
+}
+    AcquireFailed answers an Acquire action when another holder has the shard.
+
+type Acquired struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Term is the term the store granted; 0 means no grant.
+	Term Term
+}
+    Acquired answers an Acquire action.
+
+type Action interface {
+	// Has unexported methods.
+}
+    Action is one thing a Machine asks its driver to do.
+
+type Cause int
+    Cause says how a session renewal failed.
+
+const (
+	// CauseNone means no failure.
+	CauseNone Cause = iota
+
+	// CauseUnreachable means the store could not be reached. The session may still exist.
+	CauseUnreachable
+
+	// CauseLost means the session is gone for good.
+	CauseLost
+)
+func (c Cause) String() string
+    String returns the name of c, or text such as "Cause(7)" for a value without
+    a name.
+
+type ClaimSlot struct{}
+    ClaimSlot asks the driver to try to claim a slot.
+
+type CloseSession struct{}
+    CloseSession asks the driver to close the session.
+
+type Confirm struct {
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Term is the term of the run.
+	Term Term
+}
+    Confirm asks the driver to read a shard's record back, so that a degraded
+    run can be restored. The answer is a HolderChanged input.
+
+type Degrade struct {
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Term is the term of the run.
+	Term Term
+}
+    Degrade tells the driver that a run in a fenced space has lost its live
+    session. The run keeps going.
+
+type Drain struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+}
+    Drain asks the member to hand its work over before it leaves.
+
+type ExtendDeadline struct {
+	// Deadline is the new session deadline, as a monotonic reading.
+	Deadline time.Duration
+}
+    ExtendDeadline reports that the session deadline has moved later.
+
+type HolderChanged struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Holder is the holder the record names; "" means the record has no holder.
+	Holder string
+
+	// Term is the term of the record.
+	Term Term
+}
+    HolderChanged reports what a shard's record says now.
+
+type Input interface {
+	// Has unexported methods.
+}
+    Input is one event the driver feeds to a Machine through Step. Every input
+    carries Now, the driver's monotonic reading when it made the input.
+
+    Write input values with keyed fields: later versions add fields.
+
+type KeepAlive struct{}
+    KeepAlive asks the driver to send a session renewal.
+
+type Machine struct {
+	// Has unexported fields.
+}
+    Machine is the ownership state machine of one member. It reads no clock,
+    starts nothing and performs no I/O: the driver feeds it inputs through Step
+    and carries out the actions Step returns.
+
+    A Machine is not safe for concurrent use.
+
+func NewMachine(cfg MachineConfig) *Machine
+    NewMachine returns a Machine for cfg, with its spaces sorted by name,
+    its session opening, no slot, every shard idle and no timer armed. It panics
+    with the error of cfg.Validate when cfg is not valid. It copies cfg.Spaces
+    and does not modify it.
+
+func (m *Machine) Assignment(space string) []string
+    Assignment returns the placement key of each shard of the named space,
+    indexed by shard number, or nil when the machine has no such space. The key
+    is "" for a shard with no key, so every key is "" before the first view.
+    Callers must not modify the result. A new assignment is stored in a new
+    slice, so an earlier result never changes.
+
+func (m *Machine) NextWake() (time.Duration, bool)
+    NextWake returns the reading of the earliest armed timer and true, or 0 and
+    false when no timer is armed. A new Machine has no timer armed.
+
+func (m *Machine) Status() Status
+    Status returns a snapshot of the machine. The result shares no memory with
+    the machine.
+
+func (m *Machine) Step(in Input) []Action
+    Step applies one input and returns the actions the driver must carry out,
+    or nil when there are none. It panics when in is nil. For now, every other
+    input has no effect and Step returns nil.
+
+type MachineConfig struct {
+	// Holder is the session holder string, the name a shard's record uses for this member's
+	// session. It is non-empty.
+	Holder string
+
+	// Member is this member's ID, which is also its placement key in a view without slots.
+	// It is non-empty and contains neither '/' nor a zero byte.
+	Member string
+
+	// Spaces lists the spaces the member takes part in, at least one.
+	Spaces []SpaceSpec
+
+	// Timing holds the session timings. The zero value means DefaultTiming.
+	Timing Timing
+}
+    MachineConfig configures a Machine.
+
+    Write MachineConfig values with keyed fields: later versions add fields.
+
+func (c MachineConfig) Validate() error
+    Validate reports whether c can configure a Machine: Holder is non-empty,
+    Member is non-empty and contains neither '/' nor a zero byte, there is at
+    least one space, every space has a non-empty, distinct Name and at least one
+    shard, and Timing is valid. It checks in that order and returns the first
+    failure, which wraps ErrInvalidMachineConfig. A failure of Timing is the
+    error of Timing.Validate, unchanged, so it wraps ErrInvalidTiming instead.
 
 type Member struct {
 	// ID identifies the member across restarts, for example its pod name. It is non-empty
@@ -143,6 +334,294 @@ func NewRendezvous(members []Member) Placement
     so later changes to the slice do not affect it. NewRendezvous panics if two
     members share an ID.
 
+type Release struct {
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Term is the term to release.
+	Term Term
+}
+    Release asks the driver to release a shard's record at a term.
+
+type ReleaseSlot struct {
+	// Slot is the slot to release.
+	Slot int
+}
+    ReleaseSlot asks the driver to release a slot.
+
+type Released struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Term is the term that was released.
+	Term Term
+}
+    Released answers a Release action.
+
+type Restore struct {
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Term is the term of the run.
+	Term Term
+}
+    Restore tells the driver that a degraded run is owned again.
+
+type RunStopped struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Term is the term of the run that ended.
+	Term Term
+}
+    RunStopped reports that the run of a shard has ended.
+
+type SessionClosed struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+}
+    SessionClosed reports that the session has been closed.
+
+type SessionFailed struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+
+	// Cause says how the renewal failed.
+	Cause Cause
+}
+    SessionFailed reports a failed session renewal.
+
+type SessionRenewed struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+
+	// SentAt is the driver's monotonic reading when it sent the renewal.
+	SentAt time.Duration
+}
+    SessionRenewed reports a successful session renewal.
+
+type SessionState int
+    SessionState is where the member's session stands.
+
+const (
+	// SessionStateOpening means no renewal has been accepted yet.
+	SessionStateOpening SessionState = iota
+
+	// SessionStateLive means the session deadline has not passed.
+	SessionStateLive
+
+	// SessionStateLate means the session deadline has passed. A renewal can make the session
+	// live again.
+	SessionStateLate
+
+	// SessionStateLost means the session is gone for good.
+	SessionStateLost
+
+	// SessionStateClosing means the member is closing the session.
+	SessionStateClosing
+
+	// SessionStateClosed means the session is closed.
+	SessionStateClosed
+)
+func (s SessionState) String() string
+    String returns the name of s, or text such as "SessionState(9)" for a value
+    without a name.
+
+type ShardState int
+    ShardState is where a shard stands on one member.
+
+const (
+	// ShardStateIdle means the member has neither a run of the shard nor a request for it.
+	ShardStateIdle ShardState = iota
+
+	// ShardStateAcquiring means an Acquire action waits for its answer.
+	ShardStateAcquiring
+
+	// ShardStateOwned means the shard's run is going under a live session.
+	ShardStateOwned
+
+	// ShardStateDegraded means the run of a fenced space keeps going, not yet confirmed
+	// after the session stopped being live.
+	ShardStateDegraded
+
+	// ShardStateStopping means the run was told to stop because the shard is no longer
+	// wanted.
+	ShardStateStopping
+
+	// ShardStateExpired means the run was told to stop because the session deadline passed.
+	ShardStateExpired
+
+	// ShardStateLost means the run was told to stop because the member no longer holds the
+	// shard.
+	ShardStateLost
+
+	// ShardStateReleasing means the run is over and a Release action waits for its answer.
+	ShardStateReleasing
+)
+func (s ShardState) String() string
+    String returns the name of s, or text such as "ShardState(9)" for a value
+    without a name.
+
+type ShardStatus struct {
+	// State is where the shard stands.
+	State ShardState
+
+	// Since is the machine's reading at the last change of State.
+	Since time.Duration
+
+	// Term is the term of the shard's run, or the term being released.
+	Term Term
+
+	// Reason says why the run was stopped, or is StopNone when it was not.
+	Reason StopReason
+
+	// Holder is the last known holder of the shard's record.
+	Holder string
+
+	// Wanted reports that the assignment gives the shard to this member.
+	Wanted bool
+
+	// Stuck reports that the run has outlived RenewDeadline since its StopRun action.
+	Stuck bool
+
+	// RetryAt is the earliest reading for the next Acquire action, or 0 for none.
+	RetryAt time.Duration
+}
+    ShardStatus is the state of one shard in a SpaceStatus.
+
+type SlotClaimed struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+
+	// Slot is the slot the member claimed.
+	Slot int
+}
+    SlotClaimed reports that the member now holds a slot.
+
+type SlotReleased struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+
+	// Slot is the slot the member released.
+	Slot int
+}
+    SlotReleased reports that the member no longer holds a slot.
+
+type SpaceSpec struct {
+	// Name identifies the space. It is non-empty and distinct within a MachineConfig.
+	Name string
+
+	// Shards is the number of shards in the space, at least 1.
+	Shards int
+
+	// Fenced reports that the space's runs keep going, degraded, when the session is not
+	// live, instead of being told to stop.
+	Fenced bool
+}
+    SpaceSpec describes one space of shards.
+
+    Write SpaceSpec values with keyed fields: later versions add fields.
+
+type SpaceStatus struct {
+	// Name and Fenced are the values of the space's SpaceSpec.
+	Name   string
+	Fenced bool
+
+	// Shards holds one entry per shard, indexed by shard number.
+	Shards []ShardStatus
+}
+    SpaceStatus is the state of one space in a Status.
+
+type StartRun struct {
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Term is the term of the run.
+	Term Term
+
+	// Deadline is the session deadline when the run starts, as a monotonic reading.
+	Deadline time.Duration
+}
+    StartRun asks the driver to start the run of a shard.
+
+type Status struct {
+	// Now is the machine's monotonic reading.
+	Now time.Duration
+
+	// Session is where the session stands.
+	Session SessionState
+
+	// Deadline is the session deadline, or 0 until the first accepted renewal.
+	Deadline time.Duration
+
+	// LastFailure is the cause of the last renewal failure, or CauseNone when no renewal has
+	// failed since the last accepted one.
+	LastFailure Cause
+
+	// Done reports that the machine has nothing left to do.
+	Done bool
+
+	// Draining reports that the member is handing its work over before it leaves.
+	Draining bool
+
+	// Slot is the slot the member holds, or -1 for none.
+	Slot int
+
+	// ViewVersion is the version of the last applied view.
+	ViewVersion uint64
+
+	// Spaces holds the spaces sorted by name.
+	Spaces []SpaceStatus
+}
+    Status is a snapshot of a Machine.
+
+type StopReason int
+    StopReason says why a run was stopped.
+
+const (
+	// StopNone means the run was not stopped.
+	StopNone StopReason = iota
+
+	// StopMoved means the assignment no longer gives the shard to this member.
+	StopMoved
+
+	// StopDraining means the member is handing its work over before it leaves.
+	StopDraining
+
+	// StopExpired means the session deadline passed in a space without fencing.
+	StopExpired
+
+	// StopLost means another holder has the shard, or the session is gone for good.
+	StopLost
+)
+func (r StopReason) String() string
+    String returns the name of r, or text such as "StopReason(7)" for a value
+    without a name.
+
+type StopRun struct {
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Term is the term of the run.
+	Term Term
+
+	// Reason says why the run must stop.
+	Reason StopReason
+}
+    StopRun asks the driver to stop the run of a shard.
+
 type Term uint64
     Term numbers one acquisition of a shard. A store grants a new, larger term
     on every acquisition and never on renewal. Term 0 is never granted and means
@@ -153,6 +632,12 @@ func NextTerm(prev Term, wall time.Time) Term
     prev+1 and wall in Unix milliseconds, where a time before 1970 counts as 0.
     prev is the shard record's previous term, or 0 when the store has no record.
     NextTerm panics if prev is the largest Term.
+
+type Tick struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+}
+    Tick reports that time has passed and nothing else has happened.
 
 type Timing struct {
 	// LeaseDuration is how long another holder must observe a session unchanged before it
@@ -278,4 +763,23 @@ func (v View) Validate() error
     are sorted by ID with distinct IDs, Slots is not negative, SlotHolders has
     Slots entries, and in a view with slots every member's Slot is -1 or a held
     slot that no other member claims. The error wraps ErrInvalidView.
+
+type ViewChanged struct {
+	// Now is the driver's monotonic reading.
+	Now time.Duration
+
+	// View is the new snapshot.
+	View View
+
+	// Wall is the wall-clock time at Now.
+	Wall time.Time
+}
+    ViewChanged delivers a new membership snapshot.
+
+type Wake struct {
+	// At is the reading, the one NextWake returns.
+	At time.Duration
+}
+    Wake asks the driver to call Step again once its monotonic clock reaches a
+    reading.
 
