@@ -88,6 +88,7 @@ func (m *Machine) spaceIndex(space string) (int, bool) {
 // forgetConfirms is the part of phase A that a session not live applies to every shard (MCH-110): no
 // Confirm is pending any more, and the next goes out in the first live step. A record read before the
 // session stopped being live says nothing about who holds the shard now, so its answer must not count.
+// This stops such a record only until that next Confirm goes out: see restoreIfConfirmed.
 func (m *Machine) forgetConfirms() {
 	for i := range m.shards {
 		for j := range m.shards[i] {
@@ -313,9 +314,12 @@ func (m *Machine) applyHolderChanged(ref shardRef, holder string, t Term) {
 
 // restoreIfConfirmed applies a record that names this member in the degraded run's own term (MCH-490).
 // Only the answer to a Confirm returned while the session is live, with the session still live, shows
-// that no one took the shard meanwhile, so any other such record changes nothing. Phase A forgets every
-// Confirm when the session is not live, so a pending Confirm already implies live here. The check stays
-// because a Restore that should not happen brings back a shard someone else may hold.
+// that no one took the shard meanwhile. The machine holds up its side of that: such a record changes
+// nothing until a Confirm is out, or once the session has stopped being live since. A Confirm carries no
+// ID, so after that the machine cannot tell its answer from an older reading of the record, and keeping
+// those out is the driver's side, as Confirm's doc says (MCH O5). Phase A forgets every Confirm when the
+// session is not live, so a pending Confirm already implies live here. The check stays because a Restore
+// that should not happen brings back a shard someone else may hold.
 func (m *Machine) restoreIfConfirmed(ref shardRef) {
 	book := &m.shards[ref.space][ref.shard]
 	if !book.confirmPending || !m.live {

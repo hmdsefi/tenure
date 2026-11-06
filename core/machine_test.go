@@ -4478,6 +4478,35 @@ func TestRestoreNeedsAnAnsweredConfirm(t *testing.T) {
 		runSteps(t, fencedS0(steps...), stepChecks{8: shardIs(0, degraded)})
 	})
 
+	// Where the machine's side of the rule ends. A reading taken before the outage is refused until the
+	// renewal's Confirm goes out, and after that it restores the run, even with a reading older than that
+	// Confirm: a Confirm carries no ID, so only the driver can tell, and Confirm's doc makes it hold such a
+	// record back. If this ever stops restoring, that doc and the driver's filter can change too.
+	t.Run("once a Confirm is out, an older reading looks like its answer", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			now  int64
+		}{
+			{name: "stepped after the Confirm", now: 20800},
+			{name: "stamped before the Confirm", now: 15000},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				steps := append(confirmingS0Steps(),
+					tick(20400, core.KeepAlive{}, wakeAt(22400)),
+					holderChanged(20500, "h1", 7, wakeAt(22400)),
+					renewed(20700, 20650, extended(30650), confirmS0(7), wakeAt(22400)),
+					holderChanged(tc.now, "h1", 7, restoreS0(7), wakeAt(22400)),
+				)
+				since := max(tc.now, 20700)
+				runSteps(t, fencedS0(steps...), stepChecks{
+					8:  all(shardIs(0, degraded), confirmPendingIs(false)),
+					9:  all(shardIs(0, degraded), confirmPendingIs(true)),
+					10: shardIs(0, ownedS0(since, 7)),
+				})
+			})
+		}
+	})
+
 	// A record that says nothing about this run leaves the shard degraded, and its Confirm still counts.
 	for _, r := range []struct {
 		holder string
