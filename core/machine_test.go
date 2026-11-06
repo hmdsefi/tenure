@@ -8,6 +8,8 @@ import (
 	"math"
 	"reflect"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1066,6 +1068,333 @@ func TestOutputOrder(t *testing.T) {
 		viewed(200, mc.Vm(1, "m1"), acquireS0(), core.Acquire{Space: "s", Shard: 1}, wakeAt(2000)),
 		acquired(2000, 7, core.KeepAlive{}, startedS0(7, 10000), wakeAt(4000)),
 	), nil)
+
+	// Shard 0 emits its Acquire before shard 1 emits its StartRun, and the StartRun still comes
+	// first.
+	t.Run("a StartRun comes before an Acquire of an earlier shard", func(t *testing.T) {
+		runSteps(t, scenarioIn(mc.C(mc.S("s", 2)),
+			keepAlive(0, 2000),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			viewed(200, mc.Vm(1, "m1"), acquireS0(), core.Acquire{Space: "s", Shard: 1}, wakeAt(2000)),
+			keepAlive(10000, 12000),
+			acquired(10100, 7, wakeAt(12000)), // RetryAt of shard 0 is @12.1.
+			keepAlive(12000, 14000),
+			renewed(12050, 12000, extended(22000), wakeAt(12100)),
+			mc.Step{
+				Input: core.Acquired{Now: mc.Ms(12100), Space: "s", Shard: 1, Term: 8},
+				Want:  []core.Action{core.StartRun{Space: "s", Shard: 1, Term: 8, Deadline: mc.Ms(22000)}, acquireS0(), wakeAt(14000)},
+			},
+		), nil)
+	})
+}
+
+// TestViewPlacementTime checks the time placement reads: exactly W in the step that applies a view,
+// and W plus the time since that step in a later recompute.
+func TestViewPlacementTime(t *testing.T) {
+	wall := mc.Wall(mc.Ms(200))
+	joins := func(version uint64, at time.Time) core.View {
+		return core.View{Version: version, Members: []core.Member{{ID: "m1", Slot: -1, JoinAt: at}}}
+	}
+	emptyThenMark := func(t *testing.T, m *core.Machine) {
+		t.Helper()
+		assignmentIs("s", "")(t, m)
+		core.MarkViewDirty(m)
+	}
+
+	t.Run("at the step that applies the view", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			member core.Member
+			want   string
+		}{
+			{"before JoinAt", core.Member{ID: "m1", Slot: -1, JoinAt: wall.Add(1)}, ""},
+			{"at JoinAt", core.Member{ID: "m1", Slot: -1, JoinAt: wall}, "m1"},
+			{"before LeaveAt", core.Member{ID: "m1", Slot: -1, LeaveAt: wall.Add(1)}, "m1"},
+			{"at LeaveAt", core.Member{ID: "m1", Slot: -1, LeaveAt: wall}, ""},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				m := core.NewMachine(mc.C(mc.S("s", 1)))
+				m.Step(core.Tick{Now: mc.Ms(200)})
+				m.Step(core.ViewChanged{
+					Now:  mc.Ms(200),
+					View: core.View{Version: 1, Members: []core.Member{tc.member}},
+					Wall: wall,
+				})
+				assignmentIs("s", tc.want)(t, m)
+			})
+		}
+	})
+
+	// The member becomes eligible one second after the view applied. An ignored view changes neither
+	// W, nor A, nor the applied view.
+	t.Run("at a later recompute", func(t *testing.T) {
+		ignoredView := func(v core.View) []mc.Step {
+			return []mc.Step{{
+				Input: core.ViewChanged{Now: mc.Ms(300), View: v, Wall: wall.Add(time.Hour)},
+				Want:  []core.Action{wakeAt(2000)},
+			}}
+		}
+		tests := []struct {
+			name    string
+			ignored []mc.Step
+		}{
+			{name: "no other view"},
+			{name: "an older view", ignored: ignoredView(mc.Vm(4, "m2"))},
+			{name: "an invalid view", ignored: ignoredView(core.View{Version: 9, Slots: -1})},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				steps := slices.Concat(
+					[]mc.Step{
+						keepAlive(0, 2000),
+						renewed(100, 0, extended(10000), wakeAt(2000)),
+						viewed(200, joins(5, wall.Add(time.Second)), wakeAt(2000)),
+					},
+					tc.ignored,
+					[]mc.Step{tick(1199, wakeAt(2000))},
+				)
+				n := len(steps)
+				steps = append(steps, tick(1200, acquireS0(), wakeAt(2000)))
+				runSteps(t, scenario(steps...), stepChecks{
+					n - 1: emptyThenMark,
+					n:     emptyThenMark,
+					n + 1: assignmentIs("s", "m1"),
+				})
+			})
+		}
+	})
+
+	t.Run("A is the machine's reading when the input's is older", func(t *testing.T) {
+		older := mc.Wall(mc.Ms(1000))
+		runSteps(t, scenario(
+			keepAlive(5000, 7000),
+			mc.Step{
+				Input: core.ViewChanged{Now: mc.Ms(1000), View: joins(1, older.Add(time.Second)), Wall: older},
+				Want:  []core.Action{wakeAt(7000)},
+			},
+			tick(5999, wakeAt(7000)),
+			tick(6000, wakeAt(7000)),
+		), stepChecks{
+			2: emptyThenMark,
+			3: emptyThenMark,
+			4: assignmentIs("s", "m1"),
+		})
+	})
+
+	t.Run("W has no monotonic reading", func(t *testing.T) {
+		now := time.Now()
+		if !strings.Contains(now.String(), "m=") {
+			t.Skip("this platform's clock has no monotonic reading")
+		}
+		m := core.NewMachine(mc.C(mc.S("s", 1)))
+		m.Step(core.ViewChanged{View: mc.Vm(1, "m1"), Wall: now})
+		got := core.ViewWall(m)
+		if !got.Equal(now) {
+			t.Errorf("W = %v, want %v", got, now)
+		}
+		if strings.Contains(got.String(), "m=") {
+			t.Errorf("W = %v still has a monotonic reading", got)
+		}
+	})
+}
+
+// agreementViews returns valid views of every shape the machine can apply: with and without slots,
+// with members that are draining, standing by or outside their window at wall.
+func agreementViews(t *testing.T, wall time.Time) []core.View {
+	t.Helper()
+	ids := []string{"m0", "m1", "m2", "m3", "m4", "m5"}
+	var views []core.View
+	for n := range len(ids) + 1 {
+		// shape picks, per member, nothing or one way of not being eligible.
+		for shape := range 5 {
+			members := make([]core.Member, n)
+			for i := range members {
+				members[i] = core.Member{ID: ids[i], Slot: -1}
+				switch (i + shape) % 5 {
+				case 1:
+					members[i].Draining = true
+				case 2:
+					members[i].JoinAt = wall.Add(1)
+				case 3:
+					members[i].LeaveAt = wall
+				}
+			}
+			views = append(views, core.View{Version: uint64(len(views)), Members: members})
+		}
+	}
+	for slots := 1; slots <= 4; slots++ {
+		for vacant := range 1 << slots {
+			holders := make([]string, slots)
+			first := -1
+			for s := range holders {
+				if vacant&(1<<s) == 0 {
+					holders[s] = "h/" + strconv.Itoa(s)
+					if first < 0 {
+						first = s
+					}
+				}
+			}
+			members := []core.Member{{ID: "m1", Slot: first}, {ID: "m2", Slot: -1}}
+			views = append(views, core.View{Version: uint64(len(views)), Members: members, Slots: slots, SlotHolders: holders})
+		}
+	}
+	for _, v := range views {
+		if err := v.Validate(); err != nil {
+			t.Fatalf("view %+v is not valid: %v", v, err)
+		}
+	}
+	return views
+}
+
+// TestViewAgreesWithPlacement checks that the assignment and the Wanted flags are what calling
+// PlacementKeys and Balanced directly gives, for every valid shape of view, and that no such view
+// panics. Each view has its own machine, and all of them run on one machine too, so a recompute
+// from an earlier view leaves nothing behind.
+func TestViewAgreesWithPlacement(t *testing.T) {
+	const reading = 200 * time.Millisecond
+	wall := mc.Wall(reading)
+	spaces := []core.SpaceSpec{mc.S("a", 1), mc.S("b", 7), mc.S("c", 64)}
+
+	check := func(t *testing.T, m *core.Machine, v core.View) {
+		t.Helper()
+		var expired []bool
+		if v.Slots > 0 {
+			expired = make([]bool, v.Slots)
+		}
+		keys, _ := core.PlacementKeys(v, wall, expired)
+		st := m.Status()
+		if st.ViewVersion != v.Version {
+			t.Fatalf("ViewVersion = %d, want %d", st.ViewVersion, v.Version)
+		}
+		for i, s := range spaces {
+			want := make([]string, s.Shards)
+			for shard, k := range core.Balanced(s.Name, s.Shards, keys) {
+				if k >= 0 {
+					want[shard] = keys[k]
+				}
+			}
+			assignmentIs(s.Name, want...)(t, m)
+			for shard, sh := range st.Spaces[i].Shards {
+				wanted := v.Slots == 0 && want[shard] == "m1"
+				if sh.Wanted != wanted {
+					t.Errorf("view %+v: %s/%d Wanted = %v, want %v", v, s.Name, shard, sh.Wanted, wanted)
+				}
+			}
+		}
+		if got := m.Assignment("unknown"); got != nil {
+			t.Errorf("Assignment(unknown) = %q, want nil", got)
+		}
+	}
+
+	shared := core.NewMachine(mc.C(spaces...))
+	shared.Step(core.Tick{Now: reading})
+	for _, v := range agreementViews(t, wall) {
+		m := core.NewMachine(mc.C(spaces...))
+		m.Step(core.Tick{Now: reading})
+		in := core.ViewChanged{Now: reading, View: v, Wall: wall}
+		m.Step(in)
+		check(t, m, v)
+
+		shared.Step(in)
+		check(t, shared, v)
+	}
+}
+
+// TestSpaceOrderDoesNotMatter runs one sequence on the same spaces given in opposite orders, and
+// expects equal results, Status and assignments after every step.
+func TestSpaceOrderDoesNotMatter(t *testing.T) {
+	spaces := []core.SpaceSpec{mc.S("a", 5), mc.S("b", 3), {Name: "c", Shards: 8, Fenced: true}}
+	reversed := slices.Clone(spaces)
+	slices.Reverse(reversed)
+	one, other := core.NewMachine(mc.C(spaces...)), core.NewMachine(mc.C(reversed...))
+
+	step := func(in core.Input) []core.Action {
+		t.Helper()
+		got, gotOther := one.Step(in), other.Step(in)
+		if !reflect.DeepEqual(got, gotOther) {
+			t.Fatalf("Step(%#v) = %#v and %#v", in, got, gotOther)
+		}
+		if st, stOther := one.Status(), other.Status(); !reflect.DeepEqual(st, stOther) {
+			t.Fatalf("after Step(%#v): Status = %+v and %+v", in, st, stOther)
+		}
+		for _, s := range spaces {
+			if a, b := one.Assignment(s.Name), other.Assignment(s.Name); !slices.Equal(a, b) {
+				t.Fatalf("after Step(%#v): Assignment(%s) = %q and %q", in, s.Name, a, b)
+			}
+		}
+		return got
+	}
+
+	step(core.Tick{Now: mc.Ms(0)})
+	step(core.SessionRenewed{Now: mc.Ms(100), SentAt: mc.Ms(0)})
+	result := step(core.ViewChanged{Now: mc.Ms(200), View: mc.Vm(1, "m1", "m2"), Wall: mc.Wall(mc.Ms(200))})
+	var grants []core.Input
+	for _, a := range result {
+		if acquire, ok := a.(core.Acquire); ok {
+			grants = append(grants, core.Acquired{
+				Now: mc.Ms(300), Space: acquire.Space, Shard: acquire.Shard, Term: core.Term(len(grants) + 1),
+			})
+		}
+	}
+	if len(grants) == 0 {
+		t.Fatal("the view gave the member no shard")
+	}
+	for _, in := range grants {
+		step(in)
+	}
+	step(core.ViewChanged{Now: mc.Ms(400), View: mc.Vm(2, "m1"), Wall: mc.Wall(mc.Ms(400))})
+}
+
+// TestMemberNamedLikeASlotKey checks that a member whose ID looks like a slot's key gets nothing in
+// a view with slots, where such a key names the slot and not the member, and is an ordinary member
+// without slots.
+func TestMemberNamedLikeASlotKey(t *testing.T) {
+	cfg := core.MachineConfig{Holder: "h1", Member: "slot-0", Spaces: []core.SpaceSpec{mc.S("s", 1)}}
+	runSteps(t, scenarioIn(cfg,
+		keepAlive(0, 2000),
+		renewed(100, 0, extended(10000), wakeAt(2000)),
+		viewed(200, mc.Vs(1, []string{"h/0"}, "slot-0"), wakeAt(2000)),
+		viewed(300, mc.Vm(2, "slot-0"), acquireS0(), wakeAt(2000)),
+	), stepChecks{
+		3: all(assignmentIs("s", "slot-0"), shardIs(0, core.ShardStatus{})),
+		4: all(
+			assignmentIs("s", "slot-0"),
+			shardIs(0, core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(300), Wanted: true}),
+		),
+	})
+}
+
+// TestRetryAtAtTheClockCeiling checks that RetryAt follows the rule of timers near the highest
+// reading the clock takes: it fits in a Duration, and an armed timer is after the clock.
+func TestRetryAtAtTheClockCeiling(t *testing.T) {
+	const (
+		retry = 2 * time.Second
+		below = maxReading - 1
+	)
+	wall := mc.Wall(0)
+	wake := core.Wake{At: below + retry}
+	idleWaiting := core.ShardStatus{Since: below, Holder: "h1", Wanted: true, RetryAt: below + retry}
+	view := func(now time.Duration, v core.View, want ...core.Action) mc.Step {
+		return mc.Step{Input: core.ViewChanged{Now: now, View: v, Wall: wall}, Want: want}
+	}
+	runSteps(t, scenarioIn(mc.C(mc.S("s", 2)),
+		mc.Step{Input: core.Tick{Now: below}, Want: []core.Action{core.KeepAlive{}, wake}},
+		mc.Step{
+			Input: core.SessionRenewed{Now: below, SentAt: below},
+			Want:  []core.Action{core.ExtendDeadline{Deadline: below + 10*time.Second}, wake},
+		},
+		view(below, mc.Vm(1, "m1"), acquireS0(), core.Acquire{Space: "s", Shard: 1}, wake),
+		view(below, mc.Vm(2, "m2"), wake),
+		mc.Step{Input: core.Acquired{Now: below, Space: "s", Term: 7}, Want: []core.Action{wake}},
+		view(below, mc.Vm(3, "m1"), wake),
+		mc.Step{Input: core.Tick{Now: math.MaxInt64}, Want: []core.Action{wake}},
+		mc.Step{Input: core.Acquired{Now: math.MaxInt64, Space: "s", Shard: 1, Term: 8}, Want: []core.Action{wake}},
+	), stepChecks{
+		6: shardIs(0, idleWaiting),
+		7: shardIs(0, idleWaiting),
+		8: shardIs(1, core.ShardStatus{Since: maxReading, Holder: "h1", Wanted: true, RetryAt: maxReading + retry}),
+	})
 }
 
 // TestMachineCases runs every shared case with no extra checks, so the wake rules hold after every

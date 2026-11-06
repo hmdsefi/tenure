@@ -63,10 +63,15 @@ func BenchmarkMachineViewChanged(b *testing.B) {
 					ids[i] = "m" + strconv.Itoa(1000+i)
 				}
 				in := core.ViewChanged{Now: now, View: mc.Vm(2, ids...), Wall: mc.Wall(now)}
+				before := m.Assignment("s")
 				b.ReportAllocs()
 				for b.Loop() {
 					// The same version applies and recomputes every time.
 					m.Step(in)
+				}
+				b.StopTimer()
+				if &m.Assignment("s")[0] == &before[0] {
+					b.Fatal("the view did not recompute the assignment")
 				}
 			})
 		}
