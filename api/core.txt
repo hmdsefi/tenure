@@ -242,9 +242,10 @@ func (m *Machine) Step(in Input) []Action
     The machine's clock moves to the input's Now and never back, so an input
     with an older Now runs at the machine's own reading. A value of any other
     type that satisfies Input, such as a pointer to an input, leaves the clock
-    where it is. An input that does not apply, such as a renewal sent after its
-    Now or an answer to a request the machine did not make, has no effect of its
-    own, but the rest of the step still runs, so whatever is due still happens.
+    where it is. An input that does not apply, such as a renewal sent after
+    the clock's reading or an answer to a request the machine did not make,
+    has no effect of its own, but the rest of the step still runs, so whatever
+    is due still happens.
 
     Actions come in a fixed order: ExtendDeadline and KeepAlive; then StopRun,
     Degrade and Restore; StartRun; Release, Confirm and Acquire; ReleaseSlot

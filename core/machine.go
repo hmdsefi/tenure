@@ -45,6 +45,7 @@ type Machine struct {
 // order, then shard order, then the order the phases emitted them.
 type outputGroup int
 
+//nolint:unused // Only groupSession has actions so far; the phases still to come emit to the rest.
 const (
 	// groupSession holds ExtendDeadline, then KeepAlive.
 	groupSession outputGroup = iota
