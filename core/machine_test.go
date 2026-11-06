@@ -4627,6 +4627,163 @@ func TestDegradedRecords(t *testing.T) {
 	}
 }
 
+// TestDegradedLargerOwnTerm checks a record naming this member in a larger term while a degraded run is
+// going. The shard goes lost and waits for the run's RunStopped, which passes the term to grant. A record
+// that is not older than the waiting term and names another holder, or none, takes it back. Older ones
+// than that say nothing, so the run's own term is no answer to its Confirm any more.
+func TestDegradedLargerOwnTerm(t *testing.T) {
+	const larger = 9
+
+	t.Run("while late: the term is released with no run at the RunStopped", func(t *testing.T) {
+		waiting := noRunS0(10900, larger)
+		waiting.Wanted = true
+		steps := append(degradedS0Steps(),
+			holderChanged(10500, "h1", larger, stopLostS0(), wakeAt(12000)),
+			holderChanged(10600, "h1", larger, wakeAt(12000)),
+			holderChanged(10650, "h1", 7, wakeAt(12000)),
+			acquired(10700, larger, wakeAt(12000)),
+			runStopped(10800, larger, wakeAt(12000)),
+			released(10850, larger, wakeAt(12000)),
+			runStopped(10900, 7, releaseS0(larger), wakeAt(12000)),
+		)
+		runSteps(t, fencedS0(steps...), stepChecks{
+			6:  shardIs(0, lostS0(10500, "h1")),
+			11: shardIs(0, lostS0(10500, "h1")),
+			12: shardIs(0, waiting),
+		})
+	})
+
+	t.Run("while live: the term starts at the RunStopped, and goes through the rule like any run", func(t *testing.T) {
+		steps := append(confirmingS0Steps(),
+			holderChanged(11000, "h1", larger, stopLostS0(), wakeAt(12000)),
+			holderChanged(11100, "h1", 7, wakeAt(12000)),
+			keepAlive(12000, 14000),
+			tick(12500, wakeAt(14000)),
+			runStopped(12600, 7, startedS0(larger, 20400), wakeAt(14000)),
+			holderChanged(12700, "h1", larger, wakeAt(14000)),
+			tick(20400, core.KeepAlive{}, degradeS0(larger), wakeAt(22400)),
+			holderChanged(20500, "h1", larger, wakeAt(22400)),
+			renewed(20600, 20550, extended(30550), confirmS0(larger), wakeAt(22400)),
+			holderChanged(20700, "h1", larger, restoreS0(larger), wakeAt(22400)),
+		)
+		runSteps(t, fencedS0(steps...), stepChecks{
+			7:  shardIs(0, lostS0(11000, "h1")),
+			8:  shardIs(0, lostS0(11000, "h1")),
+			10: shardIs(0, lostS0(11000, "h1")),
+			11: shardIs(0, ownedS0(12600, larger)),
+			12: shardIs(0, ownedS0(12600, larger)),
+			13: shardIs(0, degradedS0(20400, larger)),
+			14: shardIs(0, degradedS0(20400, larger)),
+			16: shardIs(0, ownedS0(20700, larger)),
+		})
+	})
+
+	t.Run("and moved: the term is released with no run at the RunStopped", func(t *testing.T) {
+		steps := append(confirmingS0Steps(),
+			holderChanged(11000, "h1", larger, stopLostS0(), wakeAt(12000)),
+			viewed(11100, mc.Vm(2, "m2"), wakeAt(12000)),
+			runStopped(11200, 7, releaseS0(larger), wakeAt(12000)),
+		)
+		runSteps(t, fencedS0(steps...), stepChecks{9: shardIs(0, noRunS0(11200, larger))})
+	})
+
+	t.Run("after another holder: the term still waits for the RunStopped", func(t *testing.T) {
+		steps := append(confirmingS0Steps(),
+			holderChanged(11000, "h2", 8, stopLostS0(), wakeAt(12000)),
+			holderChanged(11100, "h1", larger, wakeAt(12000)),
+			runStopped(11200, 7, startedS0(larger, 20400), wakeAt(12000)),
+		)
+		runSteps(t, fencedS0(steps...), stepChecks{
+			7: shardIs(0, lostS0(11000, "h2")),
+			8: shardIs(0, lostS0(11000, "h1")),
+			9: shardIs(0, ownedS0(11200, larger)),
+		})
+	})
+
+	// The record is at or above the waiting term, or has no term to compare, so the wait is over. The
+	// RunStopped has nothing to grant, and the shard asks for its record in the ordinary way.
+	for _, r := range []struct {
+		holder string
+		term   core.Term
+	}{
+		{holder: "h2", term: larger},
+		{holder: "h2", term: larger + 1},
+		{holder: "h2", term: 0},
+		{holder: "", term: larger},
+		{holder: "", term: larger + 1},
+		{holder: "", term: 0},
+	} {
+		t.Run(fmt.Sprintf("taken back by %q term %d", r.holder, r.term), func(t *testing.T) {
+			steps := append(confirmingS0Steps(),
+				holderChanged(11000, "h1", larger, stopLostS0(), wakeAt(12000)),
+				holderChanged(11100, r.holder, r.term, wakeAt(12000)),
+				runStopped(11200, 7, acquireS0(), wakeAt(12000)),
+			)
+			runSteps(t, fencedS0(steps...), stepChecks{
+				8: shardIs(0, lostS0(11000, r.holder)),
+				9: shardIs(0, core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(11200), Holder: r.holder, Wanted: true}),
+			})
+		})
+
+		t.Run(fmt.Sprintf("taken back while late by %q term %d", r.holder, r.term), func(t *testing.T) {
+			steps := append(degradedS0Steps(),
+				holderChanged(10500, "h1", larger, stopLostS0(), wakeAt(12000)),
+				holderChanged(10600, r.holder, r.term, wakeAt(12000)),
+				runStopped(10700, 7, wakeAt(12000)),
+			)
+			runSteps(t, fencedS0(steps...), stepChecks{
+				8: shardIs(0, core.ShardStatus{Since: mc.Ms(10700), Holder: r.holder, Wanted: true}),
+			})
+		})
+	}
+
+	// The record is older than the waiting term, though not older than the run's: the ignore rule looks
+	// at the larger of the two.
+	for _, r := range []struct {
+		holder string
+		term   core.Term
+	}{
+		{holder: "h2", term: 7},
+		{holder: "h2", term: 8},
+		{holder: "", term: 7},
+		{holder: "", term: 8},
+	} {
+		t.Run(fmt.Sprintf("not taken back by %q term %d", r.holder, r.term), func(t *testing.T) {
+			steps := append(confirmingS0Steps(),
+				holderChanged(11000, "h1", larger, stopLostS0(), wakeAt(12000)),
+				holderChanged(11100, r.holder, r.term, wakeAt(12000)),
+				runStopped(11200, 7, startedS0(larger, 20400), wakeAt(12000)),
+			)
+			runSteps(t, fencedS0(steps...), stepChecks{
+				8: shardIs(0, lostS0(11000, "h1")),
+				9: shardIs(0, ownedS0(11200, larger)),
+			})
+		})
+	}
+
+	t.Run("taken back, then a term larger still waits again", func(t *testing.T) {
+		steps := append(confirmingS0Steps(),
+			holderChanged(11000, "h1", larger, stopLostS0(), wakeAt(12000)),
+			holderChanged(11100, "h2", larger, wakeAt(12000)),
+			holderChanged(11200, "h1", larger+1, wakeAt(12000)),
+			runStopped(11300, 7, startedS0(larger+1, 20400), wakeAt(12000)),
+		)
+		runSteps(t, fencedS0(steps...), stepChecks{10: shardIs(0, ownedS0(11300, larger+1))})
+	})
+
+	t.Run("a lost session drops the term: no StartRun and no Release", func(t *testing.T) {
+		steps := append(confirmingS0Steps(),
+			holderChanged(11000, "h1", larger, stopLostS0(), wakeAt(12000)),
+			failed(11100, core.CauseLost, wakeAt(21000)),
+			runStopped(11200, 7),
+		)
+		runSteps(t, fencedS0(steps...), stepChecks{
+			8: all(shardIs(0, lostS0(11000, "h1")), doneIs(false)),
+			9: all(shardIs(0, core.ShardStatus{Since: mc.Ms(11200), Holder: "h1", Wanted: true}), doneIs(true)),
+		})
+	})
+}
+
 // TestDegradedMove checks D3 on a degraded shard: a move stops the run, live or not, with the reason the
 // move has, and the shard then goes the way any moved shard goes.
 func TestDegradedMove(t *testing.T) {
@@ -4667,6 +4824,15 @@ func TestDegradedMove(t *testing.T) {
 			7:          shardIs(0, stoppingS0(11000, 7)),
 			len(steps): shardIs(0, stoppingS0(11000, 7)),
 		})
+	})
+
+	// D3 comes before D4, so a run told to stop asks for nothing in the same step.
+	t.Run("a move at the reading a Confirm is due: the StopRun and no Confirm", func(t *testing.T) {
+		steps := append(confirmingS0Steps(),
+			keepAlive(12000, 12500),
+			viewed(12500, mc.Vm(2, "m2"), stopS0(7), wakeAt(14000)),
+		)
+		runSteps(t, fencedS0(steps...), stepChecks{8: shardIs(0, stoppingS0(12500, 7))})
 	})
 
 	for _, tc := range []struct {
