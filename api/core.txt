@@ -143,7 +143,8 @@ type ClaimSlot struct{}
     ClaimSlot asks the driver to try to claim a slot.
 
 type CloseSession struct{}
-    CloseSession asks the driver to close the session.
+    CloseSession asks the driver to close the session. Every run has returned by
+    then. The driver answers it with SessionClosed once the session is closed.
 
 type Confirm struct {
 	// Space and Shard name the shard.
@@ -178,7 +179,9 @@ type Drain struct {
 	// Now is the driver's monotonic reading.
 	Now time.Duration
 }
-    Drain asks the member to hand its work over before it leaves.
+    Drain asks the member to hand its work over before it leaves, and then
+    to close its session. It is for good: nothing ends it, and a second Drain
+    changes nothing. It is ignored once the session has ended.
 
 type ExtendDeadline struct {
 	// Deadline is the new session deadline, as a monotonic reading.
@@ -266,6 +269,13 @@ func (m *Machine) Step(in Input) []Action
     The step that accepts a lost session returns a StopRun for each run not yet
     told to stop. Later steps return no action but a Wake, until every shard is
     idle and Status reports Done.
+
+    After a Drain the machine wants no shard, so it stops every run and hands
+    each shard over. Once every shard is idle, every run having returned,
+    a stuck one included, it returns CloseSession, and again every RetryPeriod
+    until a SessionClosed. While the session is closing, every input but a Tick
+    and a SessionClosed is ignored, and a step returns nothing but CloseSession
+    and Wake. A lost session is never closed.
 
     Once Status reports Done, Step returns nil. Once the session is closed,
     the clock stops too.
@@ -420,7 +430,8 @@ type SessionClosed struct {
 	// Now is the driver's monotonic reading.
 	Now time.Duration
 }
-    SessionClosed reports that the session has been closed.
+    SessionClosed reports that the session has been closed. It answers a
+    CloseSession action, and it is ignored before the machine has returned one.
 
 type SessionFailed struct {
 	// Now is the driver's monotonic reading.

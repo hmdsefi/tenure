@@ -17,6 +17,10 @@ type sessionTimers struct {
 	// renewal comes before any KeepAlive, it is that renewal's SentAt: the driver opens the
 	// session before its first Step, and that open counts as the first send.
 	keepAliveAt time.Duration
+
+	// closeAt is the reading of the next CloseSession: X + RetryPeriod, where X is the reading of the
+	// last one. It means something only while the session is closing.
+	closeAt time.Duration
 }
 
 // applySessionInput applies the effect of a session input. Other inputs have none here.
@@ -26,7 +30,72 @@ func (m *Machine) applySessionInput(in Input) {
 		m.applyRenewal(v.SentAt)
 	case SessionFailed:
 		m.applyFailure(v.Cause)
+	case SessionClosed:
+		m.applySessionClosed()
+	case Drain:
+		m.applyDrain()
 	}
+}
+
+// closingInput returns the input a step applies while the session is closing (MCH-140): a Tick or a
+// SessionClosed as it is, and in place of any other a Tick at the clock's reading, which has no effect
+// of its own. The session is about to end and every shard is idle, so nothing else may act any more:
+// not a renewal, a failure, a view, a record or an answer, however late it arrives.
+func (m *Machine) closingInput(in Input) Input {
+	switch in.(type) {
+	case Tick, SessionClosed:
+		return in
+	}
+	return Tick{Now: m.status.Now}
+}
+
+// applySessionClosed applies the report that the session is closed. Only a closing session takes it,
+// so a report the machine did not ask for does nothing, and once closed every later Step returns nil.
+func (m *Machine) applySessionClosed() {
+	if m.status.Session == SessionStateClosing {
+		m.status.Session = SessionStateClosed
+	}
+}
+
+// applyDrain starts draining for good (MCH-700): from this step on nothing is wanted, so D3 stops every
+// run with StopRun{draining}, a grant takes the Release without a run, no shard acquires again, and phase F
+// closes the session once every shard is idle. No shard waits to ask again, so RetryAt is cleared. A
+// second Drain changes nothing, and a Drain after the session has ended is ignored: a lost session ends
+// on its own path and never closes.
+func (m *Machine) applyDrain() {
+	if m.status.Draining || m.sessionEnded() {
+		return
+	}
+	m.status.Draining = true
+	for i := range m.status.Spaces {
+		shards := m.status.Spaces[i].Shards
+		for j := range shards {
+			shards[j].Wanted = false
+			shards[j].RetryAt = 0
+		}
+	}
+}
+
+// closeIfDrained is phase F (MCH-710, MCH-730): a draining member whose shards are all idle closes its
+// session, and the CloseSession goes again every RetryPeriod, counted from the last one, until the
+// session is closed. Closing makes every record of this member's takeable, so it must wait for every run
+// to return, a stuck one included: a shard is idle only once its run has returned, and its Acquire and
+// Release answered. A lost session never closes: its records are takeable already. The session closes
+// from opening and late too, since the handover needs nothing more from it. The clock is at or below
+// maxReading, so the next reading fits in a Duration.
+func (m *Machine) closeIfDrained() {
+	switch {
+	case m.status.Session == SessionStateClosing:
+		if m.status.Now < m.session.closeAt {
+			return
+		}
+	case !m.status.Draining || m.sessionEnded() || !m.everyShardIdle():
+		return
+	default:
+		m.status.Session = SessionStateClosing
+	}
+	m.session.closeAt = m.status.Now + m.cfg.Timing.RetryPeriod
+	m.emit(groupClose, CloseSession{})
 }
 
 // applyRenewal applies a renewal sent at sentAt. The deadline counts from the send time and
@@ -106,10 +175,15 @@ func (m *Machine) emitKeepAlive() {
 	m.emit(groupSession, KeepAlive{})
 }
 
-// armSessionTimers arms the next KeepAlive and, while the session is live, its deadline. Both
-// are after the clock: emitKeepAlive has just returned any KeepAlive that was due, and live
-// means the deadline has not passed.
+// armSessionTimers arms the next KeepAlive and, while the session is live, its deadline, or, while
+// the session is closing, only the next CloseSession (MCH-800 item 11). Each is after the clock:
+// emitKeepAlive and closeIfDrained have just returned whatever was due, and live means the deadline has
+// not passed.
 func (m *Machine) armSessionTimers(w *wakeTimer) {
+	if m.status.Session == SessionStateClosing {
+		w.arm(m.session.closeAt)
+		return
+	}
 	if m.sessionEnded() {
 		return
 	}

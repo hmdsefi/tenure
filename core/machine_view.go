@@ -40,7 +40,8 @@ func (m *Machine) applyView(in ViewChanged) {
 }
 
 // recomputeAssignments is phase C: it stores a new assignment for every space, and the Wanted flag
-// of every shard, when the applied view has changed since the last time.
+// of every shard, when the applied view has changed since the last time. The assignment follows the
+// view while the member drains, but nothing is wanted then.
 func (m *Machine) recomputeAssignments() {
 	if !m.view.dirty {
 		return
@@ -62,7 +63,7 @@ func (m *Machine) recomputeAssignments() {
 			if k >= 0 {
 				assignment[shard] = keys[k]
 			}
-			shards[shard].Wanted = own != "" && assignment[shard] == own
+			shards[shard].Wanted = !m.status.Draining && own != "" && assignment[shard] == own
 		}
 		m.assignments[i] = assignment
 	}
