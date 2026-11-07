@@ -198,10 +198,13 @@ func (m *Machine) applyAcquireFailed(ref shardRef, holder string, retryAfter tim
 	m.waitToAcquire(sh, min(max(retryAfter, m.cfg.Timing.RetryPeriod), m.cfg.Timing.LeaseDuration))
 }
 
-// waitToAcquire moves an acquiring shard to idle, with its next Acquire wait away.
+// waitToAcquire moves an acquiring shard to idle, with its next Acquire wait away. A draining member
+// acquires nothing again, so its shard has no next Acquire to wait for.
 func (m *Machine) waitToAcquire(sh *ShardStatus, wait time.Duration) {
 	m.setShardState(sh, ShardStateIdle)
-	sh.RetryAt = m.status.Now + wait
+	if !m.status.Draining {
+		sh.RetryAt = m.status.Now + wait
+	}
 }
 
 // grant applies a record that names this member in term t, whether an Acquired or a HolderChanged

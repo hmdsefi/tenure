@@ -8,14 +8,6 @@ import "time"
 // MachineTiming returns the timing m keeps, for tests in package core_test.
 func MachineTiming(m *Machine) Timing { return m.cfg.Timing }
 
-// ForceDraining sets m's draining flag directly, for tests of what the flag changes that do not
-// depend on how it was set.
-func ForceDraining(m *Machine) { m.status.Draining = true }
-
-// ForceSessionClosed closes m's session directly, for tests of a closed machine that do not depend
-// on how it closed.
-func ForceSessionClosed(m *Machine) { m.status.Session = SessionStateClosed }
-
 // ViewWall returns the wall-clock time m keeps for its applied view, for tests in package core_test.
 func ViewWall(m *Machine) time.Time { return m.view.wall }
 
