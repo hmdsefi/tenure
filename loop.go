@@ -212,7 +212,9 @@ func (l *loop) run(first []loopInput, started chan<- struct{}) {
 			for _, in := range ins {
 				l.step(in)
 			}
-			if v != nil && !n.merge.stale(v.Version) { // stale reads the merger's own Version
+			// The merger marks stale views by its own Version, before the bump of new
+			// incarnations is added.
+			if v != nil && !n.merge.stale(v.Version) {
 				v.Version += l.bump
 				l.step(loopInput{in: core.ViewChanged{View: *v}})
 			}

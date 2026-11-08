@@ -703,3 +703,91 @@ func TestATRUN70DrainWithSlot(t *testing.T) {
 		check()
 	})
 }
+
+// TestSlotsAfterRecovery loses the session of a member that holds the only slot at T0+10s. The
+// new incarnation starts with no slot and a view that shows slot 0 held by the old holder. It
+// claims slot 0 (the memstore ended the old session when the new one opened), holds it, and runs
+// every shard again. A Slots read follows the new claim at once, the Versions of the stepped
+// views keep rising across the incarnations, and no view the new machine steps after its
+// SlotClaimed shows slot 0 vacant or held by another holder.
+func TestSlotsAfterRecovery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		r := newShardRig(t)
+		cfg := r.slotConfig(1)
+		cfg.Rand = recoveryRand()
+
+		var (
+			mu       sync.Mutex
+			versions []uint64
+			claimed  bool // the new machine has stepped its SlotClaimed
+			released bool // and a SlotReleased since
+			bad      []string
+		)
+		hook := tenure.WithStepHook(context.Background(), func(rec tenure.StepRecord) {
+			mu.Lock()
+			defer mu.Unlock()
+			switch in := rec.Input.(type) {
+			case core.SlotClaimed:
+				claimed = claimed || rec.Gen > 1
+			case core.SlotReleased:
+				released = claimed
+			case core.ViewChanged:
+				versions = append(versions, in.View.Version)
+				if claimed && !released && in.View.SlotHolders[0] != holder02 {
+					bad = append(bad, fmt.Sprintf("view at %v with slot 0 held by %q", rec.Now, in.View.SlotHolders[0]))
+				}
+			}
+		})
+		t0 := time.Now()
+		n := start(t, hook, cfg)
+		synctest.Wait()
+		if got := slotted(published(t, n)); !slices.Equal(got, []string{"n1:0"}) {
+			t.Fatalf("members with a slot = %v, want n1 on slot 0", got)
+		}
+		sleepUntil(t0.Add(9 * time.Second))
+		loseSession(r.fs)
+		sleepUntil(t0.Add(40 * time.Second))
+		synctest.Wait()
+
+		calls := r.fs.Calls()
+		wantLossAt(t, calls, t0.Add(10*time.Second))
+		var won call
+		for _, c := range callsOf(calls, holder02) {
+			if c.Method == "ClaimSlot" && c.Err == nil {
+				won = c
+				break
+			}
+		}
+		if won.Method == "" || resultAt[int](won.Result, 0) != 0 || !won.Start.Equal(t0.Add(10*time.Second)) {
+			t.Fatalf("calls of %s = %v, want a ClaimSlot at T0+10s that returns slot 0", holder02, callsOf(calls, holder02))
+		}
+		if v := published(t, n); !slices.Equal(v.SlotHolders, []string{holder02}) {
+			t.Errorf("published view has slot holders %q, want %s", v.SlotHolders, holder02)
+		}
+		for _, s := range allShards {
+			wantSlotRoute(t, n, s, "n1", 0)
+		}
+		if got := running(r.runs); !slices.Equal(got, allShards) {
+			t.Errorf("runs %v, want every shard again under %s", got, holder02)
+		}
+		after := slices.IndexFunc(r.fs.Calls("Slots"), func(c call) bool { return c.Seq > won.EndSeq })
+		if after < 0 || !r.fs.Calls("Slots")[after].Start.Equal(won.End) {
+			t.Errorf("Slots calls at %v, want one right after the new claim at T0+%v",
+				startsAt(r.fs.Calls("Slots"), t0), won.End.Sub(t0))
+		}
+		closeNode(t, n)
+		mu.Lock()
+		defer mu.Unlock()
+		for i := 1; i < len(versions); i++ {
+			if versions[i] <= versions[i-1] {
+				t.Errorf("stepped view Versions %v, want each above the one before", versions)
+				break
+			}
+		}
+		if !claimed || len(bad) > 0 {
+			t.Errorf("new claim stepped %t; after it: %q", claimed, bad)
+		}
+		check()
+	})
+}
