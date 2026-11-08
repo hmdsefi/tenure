@@ -139,25 +139,32 @@ func (n *Node) rewatch() (<-chan core.View, error) {
 }
 
 // offer takes one view from the membership. It merges the node's slot data into it (none yet) and
-// drops it when the merged view is not valid or its Version is not above the published one's.
-// Without a store it publishes the merged view; with a store the loop steps it and publishes.
+// drops it when the merged view is not valid or its Version is not above that of the last view
+// offer took. Without a store it publishes the merged view; with a store it hands the view to the
+// loop, which steps it and then publishes it. The first view it takes lets Start go on.
 func (n *Node) offer(v core.View) {
 	merged := mergeView(v, 0, nil)
 	if merged.Validate() != nil {
 		return
 	}
-	if last := n.view.Load(); last != nil && merged.Version <= last.Version {
+	if n.offered && merged.Version <= n.offeredVersion {
 		return
 	}
-	n.publish(merged)
-}
-
-// publish makes v the node's published view, feeds it to every node resolver, reports it, and
-// on the first view lets Start return.
-func (n *Node) publish(v core.View) {
-	if n.view.Swap(&v) == nil {
+	first := !n.offered
+	n.offered, n.offeredVersion = true, merged.Version
+	if n.cfg.Store == nil {
+		n.publish(merged)
+	} else {
+		n.inbox.postView(merged)
+	}
+	if first {
 		close(n.first)
 	}
+}
+
+// publish makes v the node's published view, feeds it to every node resolver, and reports it.
+func (n *Node) publish(v core.View) {
+	n.view.Store(&v)
 	n.feedResolvers(v)
 	n.obs.view(v)
 }

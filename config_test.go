@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -227,6 +228,11 @@ func TestATRUN01InvalidConfig(t *testing.T) {
 					d := newConfigDoubles(t)
 					cfg := d.config()
 					row.mutate(&cfg, d)
+					n, err := tenure.Start(context.Background(), cfg)
+					if n != nil {
+						t.Errorf("Start returned a node with the error %v", err)
+					}
+					wantInvalid(t, err, row.reason, row.is)
 					got, err := tenure.CheckConfig(cfg)
 					wantInvalid(t, err, row.reason, row.is)
 					if !reflect.DeepEqual(got, tenure.Config{}) {
@@ -375,6 +381,8 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 	names := []string{"orders", "markets"}
 	sNames := fmt.Sprintf("store CheckNames(%v, n1)", names)
 	mNames := fmt.Sprintf("membership CheckNames(%v, n1)", names)
+	sNoNames := "store CheckNames([], n1)"
+	mNoNames := "membership CheckNames([], n1)"
 	sTiming := fmt.Sprintf("store CheckTiming(%v)", applied)
 	mTiming := fmt.Sprintf("membership CheckTiming(%v)", applied)
 
@@ -382,8 +390,9 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 		name                      string
 		storeNames, storeTiming   error
 		memberNames, memberTiming error
-		reason                    string // "" for no error
-		calls                     []string
+		reason                    string // "" for a node that starts
+		noSpaces                  bool
+		calls                     []string // the checkers' calls
 	}{
 		{name: "store refuses names", storeNames: boom, reason: "Store: boom",
 			calls: []string{sNames}},
@@ -393,8 +402,9 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 			calls: []string{sNames, mNames, sTiming}},
 		{name: "membership refuses timing", memberTiming: boom, reason: "Membership: boom",
 			calls: []string{sNames, mNames, sTiming, mTiming}},
-		{name: "both accept",
-			calls: []string{sNames, mNames, sTiming, mTiming}},
+		// Start runs no shards yet (1.5-08), so the node that starts has no spaces.
+		{name: "both accept", noSpaces: true,
+			calls: []string{sNoNames, mNoNames, sTiming, mTiming}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -405,6 +415,9 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 				for i, n := range names {
 					spaces[i] = tenure.Space{Name: n, Shards: 2, Run: noRun}
 				}
+				if tc.noSpaces {
+					spaces = nil
+				}
 				cfg := tenure.Config{
 					Self:       tenure.Member{ID: "n1"},
 					Membership: d.sm.Checking(tc.memberNames, tc.memberTiming),
@@ -413,16 +426,31 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 					Spaces:     spaces,
 					Timing:     timing,
 				}
-				_, err := tenure.CheckConfig(cfg)
+				n, err := tenure.Start(context.Background(), cfg)
+				got := checkerCalls(d)
 				if tc.reason == "" {
 					if err != nil {
-						t.Errorf("CheckConfig = %v, want nil", err)
+						t.Fatalf("Start = %v, want nil", err)
+					}
+					// After the checkers, Start joins, watches, reads the slots and opens the session.
+					want := append(slices.Clone(tc.calls), "membership Join", "membership Watch", "store Slots", "store KeepAlive")
+					for i := len(tc.calls); i < len(got); i++ {
+						got[i], _, _ = strings.Cut(got[i], "(")
+					}
+					if !reflect.DeepEqual(got, want) {
+						t.Errorf("calls = %q, want %q", got, want)
+					}
+					if err := n.Close(context.Background()); err != nil {
+						t.Errorf("Close() = %v, want nil", err)
 					}
 				} else {
+					if n != nil {
+						t.Errorf("Start returned a node with the error %v", err)
+					}
 					wantInvalid(t, err, tc.reason, boom)
-				}
-				if got := checkerCalls(d); !reflect.DeepEqual(got, tc.calls) {
-					t.Errorf("calls = %q, want %q", got, tc.calls)
+					if !reflect.DeepEqual(got, tc.calls) {
+						t.Errorf("calls = %q, want %q", got, tc.calls)
+					}
 				}
 				check()
 			})

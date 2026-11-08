@@ -4,6 +4,7 @@
 package tenure
 
 import (
+	"context"
 	"time"
 
 	"github.com/hmdsefi/tenure/core"
@@ -29,3 +30,16 @@ func (n *Node) PublishedView() (core.View, bool) {
 	}
 	return *v, true
 }
+
+// StepRecord is what one step of a node's loop did.
+type StepRecord = stepRecord
+
+// WithStepHook returns a copy of ctx that makes Start, given it, call f after each step of the
+// node's loop, on the loop goroutine. f must not block for long: the loop waits for it.
+func WithStepHook(ctx context.Context, f func(StepRecord)) context.Context {
+	return context.WithValue(ctx, stepHookKey{}, f)
+}
+
+// SessionDeadline returns the session deadline the loop keeps for unfenced shards, as a reading
+// since the epoch.
+func (n *Node) SessionDeadline() time.Duration { return time.Duration(n.deadline.Load()) }

@@ -5,6 +5,7 @@ package core_test
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -59,8 +60,6 @@ func TestATMCH40MachineConfigValidate(t *testing.T) {
 		{"empty Member", with(func(c *core.MachineConfig) { c.Member = "" }), "empty Member"},
 		{"Member with slash", with(func(c *core.MachineConfig) { c.Member = "a/b" }), `Member "a/b" contains '/'`},
 		{"Member with zero byte", with(func(c *core.MachineConfig) { c.Member = "a\x00b" }), `Member "a\x00b" contains a zero byte`},
-		{"nil Spaces", with(func(c *core.MachineConfig) { c.Spaces = nil }), "no spaces"},
-		{"empty Spaces", withSpaces(), "no spaces"},
 		{"empty Name", withSpaces(core.SpaceSpec{Name: "a", Shards: 1}, core.SpaceSpec{Shards: 1}), "Spaces[1]: empty Name"},
 		{"zero Shards", withSpaces(core.SpaceSpec{Name: "a"}), `space "a": Shards 0 is below 1`},
 		{"negative Shards", withSpaces(core.SpaceSpec{Name: "a", Shards: -3}), `space "a": Shards -3 is below 1`},
@@ -69,8 +68,7 @@ func TestATMCH40MachineConfigValidate(t *testing.T) {
 		// Check order: the first failing check wins.
 		{"Holder before Member", core.MachineConfig{Member: "a/b"}, "empty Holder"},
 		{"slash before zero byte", with(func(c *core.MachineConfig) { c.Member = "a\x00/b" }), `Member "a\x00/b" contains '/'`},
-		{"Member before Spaces", core.MachineConfig{Holder: "h1", Member: "a/b"}, `Member "a/b" contains '/'`},
-		{"Spaces before Timing", core.MachineConfig{Holder: "h1", Member: "m1", Timing: core.Timing{RetryPeriod: 1}}, "no spaces"},
+		{"Member before Spaces", core.MachineConfig{Holder: "h1", Member: "a/b", Spaces: []core.SpaceSpec{{}}}, `Member "a/b" contains '/'`},
 		{"Name before Shards", withSpaces(core.SpaceSpec{}), "Spaces[0]: empty Name"},
 		{"Shards before duplicate", withSpaces(core.SpaceSpec{Name: "a", Shards: 1}, core.SpaceSpec{Name: "a"}), `space "a": Shards 0 is below 1`},
 		{"spaces in the given order", withSpaces(core.SpaceSpec{Name: "b"}, core.SpaceSpec{Name: "a"}), `space "b": Shards 0 is below 1`},
@@ -110,6 +108,8 @@ func TestATMCH40ValidConfigs(t *testing.T) {
 		cfg  core.MachineConfig
 	}{
 		{"one space", validConfig()},
+		{"nil Spaces", core.MachineConfig{Holder: "h1", Member: "m1"}},
+		{"empty Spaces", core.MachineConfig{Holder: "h1", Member: "m1", Spaces: []core.SpaceSpec{}}},
 		{"Holder with slash", core.MachineConfig{Holder: "n1/0001", Member: "m1", Spaces: []core.SpaceSpec{{Name: "a", Shards: 1}}}},
 		{"explicit Timing", core.MachineConfig{Holder: "h1", Member: "m1", Spaces: []core.SpaceSpec{{Name: "a", Shards: 1}}, Timing: core.Timing{
 			LeaseDuration: 30 * time.Second,
@@ -202,5 +202,55 @@ func TestATMCH40TimingErrorUnchanged(t *testing.T) {
 				t.Fatalf("errors.Is(%q, ErrInvalidTiming) = false", got)
 			}
 		})
+	}
+}
+
+// TestMachineWithoutSpaces runs a machine with no spaces through its life: it renews its
+// session, claims and gives back a slot, drains and closes.
+func TestMachineWithoutSpaces(t *testing.T) {
+	const s = time.Second
+	bad := core.MachineConfig{Holder: "h1", Member: "m1", Timing: core.Timing{RetryPeriod: s}}
+	if err := bad.Validate(); !errors.Is(err, core.ErrInvalidTiming) {
+		t.Errorf("Validate() without spaces and with an invalid Timing = %v, want ErrInvalidTiming", err)
+	}
+	m := core.NewMachine(core.MachineConfig{Holder: "h1", Member: "m1"})
+	if st := m.Status(); st.Session != core.SessionStateOpening || st.Slot != -1 || st.Spaces == nil || len(st.Spaces) != 0 {
+		t.Errorf("Status() = %+v, want opening, Slot -1 and an empty Spaces", st)
+	}
+	if got := m.Assignment("orders"); got != nil {
+		t.Errorf("Assignment(orders) = %v, want nil", got)
+	}
+	self := []core.Member{{ID: "m1", Slot: -1}}
+	steps := []struct {
+		in      core.Input
+		want    []core.Action
+		session core.SessionState
+		slot    int
+	}{
+		{core.SessionRenewed{SentAt: 0}, []core.Action{core.ExtendDeadline{Deadline: 10 * s}, core.Wake{At: 2 * s}}, core.SessionStateLive, -1},
+		{core.ViewChanged{View: core.View{Version: 1, Members: self}}, []core.Action{core.Wake{At: 2 * s}}, core.SessionStateLive, -1},
+		{core.Tick{Now: 2 * s}, []core.Action{core.KeepAlive{}, core.Wake{At: 4 * s}}, core.SessionStateLive, -1},
+		{core.SessionRenewed{Now: 2 * s, SentAt: 2 * s}, []core.Action{core.ExtendDeadline{Deadline: 12 * s}, core.Wake{At: 4 * s}}, core.SessionStateLive, -1},
+		{core.ViewChanged{Now: 3 * s, View: core.View{Version: 2, Members: self, Slots: 1, SlotHolders: []string{""}}},
+			[]core.Action{core.ClaimSlot{}, core.Wake{At: 4 * s}}, core.SessionStateLive, -1},
+		{core.SlotClaimed{Now: 3 * s, Slot: 0}, []core.Action{core.Wake{At: 4 * s}}, core.SessionStateLive, 0},
+		{core.Drain{Now: 3 * s}, []core.Action{core.ReleaseSlot{Slot: 0}, core.Wake{At: 4 * s}}, core.SessionStateLive, 0},
+		{core.SlotReleased{Now: 3 * s, Slot: 0}, []core.Action{core.CloseSession{}, core.Wake{At: 5 * s}}, core.SessionStateClosing, -1},
+		{core.SessionClosed{Now: 4 * s}, nil, core.SessionStateClosed, -1},
+	}
+	for i, st := range steps {
+		got := m.Step(st.in)
+		if !reflect.DeepEqual(got, st.want) {
+			t.Fatalf("step %d: Step(%#v) = %#v, want %#v", i, st.in, got, st.want)
+		}
+		if status := m.Status(); status.Session != st.session || status.Slot != st.slot {
+			t.Fatalf("step %d: Status() = %+v, want session %v and slot %d", i, status, st.session, st.slot)
+		}
+	}
+	if st := m.Status(); !st.Done || !st.Draining {
+		t.Errorf("Status() after SessionClosed = %+v, want Done and Draining", st)
+	}
+	if at, ok := m.NextWake(); ok {
+		t.Errorf("NextWake() after SessionClosed = %v, true; want none", at)
 	}
 }
