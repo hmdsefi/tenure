@@ -196,7 +196,16 @@ func TestATRUN51ShardOfAndUnknownSpace(t *testing.T) {
 
 // TestATRUN52NoMembers checks Route's fourth step in the draining case: once every member of the
 // group drains, no member is eligible, so no shard has a placement key; Local then names no route.
+// In "view after close" the view that shows this member draining reaches the node only after its
+// machine has closed the session and takes no more views: the latest view still wins.
 func TestATRUN52NoMembers(t *testing.T) {
+	t.Run("draining", func(t *testing.T) { testNoMembers(t, false) })
+	t.Run("view after close", func(t *testing.T) { testNoMembers(t, true) })
+}
+
+// testNoMembers is AT-RUN-52's draining case. With late, the membership holds back every view
+// from before Drain until the session is closed.
+func testNoMembers(t *testing.T, late bool) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
 		r := newPairRig(t)
@@ -207,10 +216,24 @@ func TestATRUN52NoMembers(t *testing.T) {
 			wantRoute(t, n, "orders", keyOf(s), "n1")
 		}
 
+		if late {
+			r.sm.Pause()
+		}
 		if err := n.Drain(context.Background()); err != nil {
 			t.Fatalf("Drain() = %v, want nil", err)
 		}
 		synctest.Wait()
+		if late {
+			if len(r.fs.Calls("CloseSession")) == 0 {
+				t.Fatal("no CloseSession before the held view is delivered, want the session closed")
+			}
+			if v := published(t, n); slices.ContainsFunc(v.Members, func(m core.Member) bool { return m.ID == "n1" && m.Draining }) {
+				t.Fatalf("published view %+v shows n1 draining before Resume", v)
+			}
+			wantRoute(t, n, "orders", keyOf(0), "n1")
+			r.sm.Resume()
+			synctest.Wait()
+		}
 		for _, s := range allShards {
 			key := keyOf(s)
 			want := fmt.Sprintf("tenure: no members: orders/%d: no placement keys", s)
