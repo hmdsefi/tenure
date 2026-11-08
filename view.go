@@ -6,6 +6,7 @@ package tenure
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -430,7 +431,7 @@ func (r *refresher) read() (res slotsRead, again, ok bool) {
 		ctx, cancel := context.WithTimeout(n.ctx, n.cfg.Timing.RetryPeriod)
 		defer cancel()
 		stamp = n.exec.stamp()
-		count, holders, err = r.store.Slots(ctx)
+		count, holders, err = readSlotData(ctx, r.store)
 	}) || n.ctx.Err() != nil {
 		return slotsRead{}, false, false
 	}
@@ -440,6 +441,16 @@ func (r *refresher) read() (res slotsRead, again, ok bool) {
 	}
 	version, stale := n.merge.slots(stamp, count, holders)
 	return slotsRead{version: version}, stale, true
+}
+
+// readSlotData calls ss.Slots and fails for a negative count, which breaks the SlotStore
+// contract and which the merger cannot hold.
+func readSlotData(ctx context.Context, ss SlotStore) (int, []string, error) {
+	count, holders, err := ss.Slots(ctx)
+	if err == nil && count < 0 {
+		return 0, nil, fmt.Errorf("negative slot count %d", count)
+	}
+	return count, holders, err
 }
 
 // serve hands res to every waiter whose request a read starting with upTo requests made serves,

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -329,6 +330,15 @@ func TestRefresher(t *testing.T) {
 		}
 		obs.mu.Unlock()
 
+		// A negative count breaks the SlotStore contract: the read fails and changes nothing.
+		st.script(-1, nil)
+		if _, err := r.refreshWait(context.Background()); err == nil || err.Error() != "negative slot count -1" {
+			t.Errorf("refreshWait() over a count of -1 = %v, want negative slot count -1", err)
+		}
+		if ps := posts(); len(ps) != 3 || ps[2].Slots != 3 {
+			t.Errorf("%d posts, the latest with %d slots; want 3 posts, the latest with 3", len(ps), ps[len(ps)-1].Slots)
+		}
+
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		if _, err := r.refreshWait(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -363,6 +373,7 @@ func TestReadSlots(t *testing.T) {
 		{name: "first read fails", configured: 3, st: &slotsDouble{failRead: 1}, wantErr: "tenure: read slots: boom"},
 		{name: "seeding fails", configured: 3, st: &slotsDouble{setErr: errSlotsBoom}, wantErr: "tenure: seed slots: boom"},
 		{name: "second read fails", configured: 3, st: &slotsDouble{failRead: 2}, wantErr: "tenure: seed slots: boom"},
+		{name: "negative count", configured: 3, st: &slotsDouble{count: -1}, wantErr: "tenure: read slots: negative slot count -1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -374,7 +385,8 @@ func TestReadSlots(t *testing.T) {
 				}
 				_, err := n.readSlots(context.Background(), st)
 				if tt.wantErr != "" {
-					if err == nil || err.Error() != tt.wantErr || !errors.Is(err, errSlotsBoom) {
+					boom := strings.HasSuffix(tt.wantErr, "boom")
+					if err == nil || err.Error() != tt.wantErr || errors.Is(err, errSlotsBoom) != boom {
 						t.Errorf("readSlots() = %v, want %q", err, tt.wantErr)
 					}
 					return
