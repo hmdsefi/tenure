@@ -5,6 +5,7 @@ package tenure_test
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -114,7 +115,7 @@ func maxInFlight(calls []call) int {
 			edges = append(edges, edge{c.EndSeq, -1})
 		}
 	}
-	slices.SortFunc(edges, func(a, b edge) int { return int(a.at) - int(b.at) })
+	slices.SortFunc(edges, func(a, b edge) int { return cmp.Compare(a.at, b.at) })
 	most, cur := 0, 0
 	for _, e := range edges {
 		cur += e.delta
@@ -774,7 +775,7 @@ func TestATRUN71DrainHandsOver(t *testing.T) {
 		}
 		for _, id := range allShards {
 			all := slices.Concat(runs1.Of("orders", id), runs2.Of("orders", id))
-			slices.SortFunc(all, func(a, b runCall) int { return int(a.Seq) - int(b.Seq) })
+			slices.SortFunc(all, func(a, b runCall) int { return cmp.Compare(a.Seq, b.Seq) })
 			for i := 1; i < len(all); i++ {
 				if !all[i-1].Done || all[i-1].EndSeq > all[i].Seq {
 					t.Errorf("orders/%d: %v started before %v returned", id, all[i], all[i-1])

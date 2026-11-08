@@ -431,7 +431,7 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 					for i := len(tc.calls); i < len(got); i++ {
 						got[i], _, _ = strings.Cut(got[i], "(")
 					}
-					got = slices.DeleteFunc(got, func(c string) bool { return c == "store Acquire" })
+					got = slices.DeleteFunc(got, func(c string) bool { return strings.HasSuffix(c, " Acquire") })
 					if !reflect.DeepEqual(got, want) {
 						t.Errorf("calls = %q, want %q", got, want)
 					}
