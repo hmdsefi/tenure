@@ -251,3 +251,40 @@ func TestLoopChainsRuns(t *testing.T) {
 		n.sups.Wait()
 	})
 }
+
+// TestAssignmentsMatchMachine checks that assignments, which routing takes for a view the machine
+// did not apply, gives every space the assignment the machine computes when it applies the same
+// view: with a draining member and members outside their JoinAt/LeaveAt window, and with slots.
+func TestAssignmentsMatchMachine(t *testing.T) {
+	wall := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	spaces := []Space{{Name: "orders", Shards: 8}, {Name: "carts", Shards: 3}}
+	views := []struct {
+		name string
+		v    core.View
+	}{
+		{"members", core.View{Version: 4, Members: []core.Member{
+			{ID: "a", Slot: -1},
+			{ID: "b", Slot: -1, Draining: true},
+			{ID: "c", Slot: -1, JoinAt: wall.Add(time.Second)},
+			{ID: "d", Slot: -1, LeaveAt: wall},
+			{ID: "e", Slot: -1, JoinAt: wall.Add(-time.Second), LeaveAt: wall.Add(time.Second)},
+		}}},
+		{"slots", core.View{Version: 6, Slots: 3, SlotHolders: []string{"a/1", "", "b/2"}, Members: []core.Member{
+			{ID: "a", Slot: 0},
+			{ID: "b", Slot: 2, Draining: true},
+		}}},
+	}
+	for _, c := range views {
+		m := core.NewMachine(core.MachineConfig{Holder: "a/1", Member: "a", Spaces: spaceSpecs(spaces)})
+		m.Step(core.ViewChanged{View: c.v, Now: time.Second, Wall: wall})
+		if got := m.Status().ViewVersion; got != c.v.Version {
+			t.Fatalf("%s: the machine applied version %d, want %d", c.name, got, c.v.Version)
+		}
+		got := assignments(c.v, wall, spaces)
+		for _, sp := range spaces {
+			if want := m.Assignment(sp.Name); !reflect.DeepEqual(got[sp.Name], want) {
+				t.Errorf("%s: assignments(%s) = %q, want the machine's %q", c.name, sp.Name, got[sp.Name], want)
+			}
+		}
+	}
+}

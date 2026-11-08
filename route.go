@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/hmdsefi/tenure/core"
 )
@@ -191,8 +192,8 @@ func (n *Node) closeRoutes() {
 
 // publishRoutes publishes a new routing snapshot after a step that changed the published view,
 // the assignment of any space or the held slot (RUN-400). A recompute stores a new assignment
-// slice (MCH-340), so comparing slices by their first element's address finds every change,
-// including the first step of a new machine. Only the loop calls it, under n.stepMu.
+// slice (MCH-340), and so does assignments, so comparing slices by their first element's address
+// finds every change, including the first step of a new machine. Only the loop calls it, under n.stepMu.
 func (l *loop) publishRoutes() {
 	n := l.n
 	cur := n.snap.Load()
@@ -203,7 +204,7 @@ func (l *loop) publishRoutes() {
 	held := l.status.Slot
 	changed := cur.view != v || cur.held != held
 	for _, sp := range n.cfg.Spaces {
-		if !sameSlice(l.m.Assignment(sp.Name), cur.assign[sp.Name]) {
+		if !sameSlice(l.assignment(sp.Name), cur.assign[sp.Name]) {
 			changed = true
 			break
 		}
@@ -213,7 +214,7 @@ func (l *loop) publishRoutes() {
 	}
 	assign := make(map[string][]string, len(n.cfg.Spaces))
 	for _, sp := range n.cfg.Spaces {
-		assign[sp.Name] = l.m.Assignment(sp.Name)
+		assign[sp.Name] = l.assignment(sp.Name)
 	}
 	var byID map[string]int
 	if cur.view == v {
@@ -225,6 +226,44 @@ func (l *loop) publishRoutes() {
 		r.heldKey = "slot-" + strconv.Itoa(held)
 	}
 	n.snap.Store(r)
+}
+
+// assignment returns the assignment of space that routing follows: the one the loop computed for
+// a view the machine did not apply, else the machine's.
+func (l *loop) assignment(space string) []string {
+	if l.assign != nil {
+		return l.assign[space]
+	}
+	return l.m.Assignment(space)
+}
+
+// viewApplied reports whether the step rec, of a ViewChanged of v, applied v: the machine's
+// session was neither closing nor closed, so it took views, and its view version moved to v's.
+func viewApplied(rec stepRecord, v core.View) bool {
+	switch rec.Before.Session {
+	case core.SessionStateClosing, core.SessionStateClosed:
+		return false
+	}
+	return rec.After.ViewVersion == v.Version
+}
+
+// assignments returns each space's assignment for view v at the wall-clock time wall, by space
+// name, as the machine computes it when it applies v: the placement keys of v, then Balanced over
+// them. It takes no slot as expired, since a machine that no longer applies views no longer marks
+// slots.
+func assignments(v core.View, wall time.Time, spaces []Space) map[string][]string {
+	keys, _ := core.PlacementKeys(v, wall.Round(0), nil)
+	out := make(map[string][]string, len(spaces))
+	for _, sp := range spaces {
+		a := make([]string, sp.Shards)
+		for shard, k := range core.Balanced(sp.Name, sp.Shards, keys) {
+			if k >= 0 {
+				a[shard] = keys[k]
+			}
+		}
+		out[sp.Name] = a
+	}
+	return out
 }
 
 // sameSlice reports whether a and b are the same slice: the same length and, unless empty, the
