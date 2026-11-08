@@ -211,18 +211,17 @@ func (m *Machine) stepSlots() {
 // one, until a SlotReleased answers it. A shard is released when it is idle, or when its run is stuck:
 // that run still holds its shard record, and whoever claims the slot next cannot acquire the shard while
 // it does, so the slot need not wait for it. A shard whose run is stopping and not stuck, or whose Release
-// or Acquire is out, holds the slot back.
+// or Acquire is out, holds the slot back, repeats included: a stuck run that returns makes its shard
+// release, and the repeat waits for that Release to be answered.
 func (m *Machine) releaseHeldSlot() {
 	h := m.status.Slot
 	switch {
-	case h < 0:
+	case h < 0 || !(m.slot.retired || m.status.Draining) || !m.shardsReleased():
 		return
 	case m.slot.releasing:
 		if m.status.Now < m.slot.releaseAt {
 			return
 		}
-	case !(m.slot.retired || m.status.Draining) || !m.shardsReleased():
-		return
 	default:
 		m.slot.releasing = true
 	}
@@ -273,15 +272,16 @@ func (m *Machine) applySlotLoss(ref shardRef) {
 	m.loseRun(ref, sh.Holder)
 }
 
-// armSlotTimers arms the next ReleaseSlot of the held slot (MCH-800 item 10), of each slot being given
-// back (item 13), and the next ClaimSlot (item 9). Each is after the clock: stepSlots has just returned
-// what was due. A session that has ended arms none: a lost one holds no slot, and a closing one holds none
+// armSlotTimers arms the next ReleaseSlot of the held slot (MCH-800 item 10), while its shards are
+// released, of each slot being given back (item 13), and the next ClaimSlot (item 9). Each is after the
+// clock: stepSlots has just returned what was due. A step that makes the shards released again runs
+// stepSlots first, so a repeat that waited for them goes in that step. A session that has ended arms none: a lost one holds no slot, and a closing one holds none
 // and gives none back.
 func (m *Machine) armSlotTimers(w *wakeTimer) {
 	if m.sessionEnded() {
 		return
 	}
-	if m.slot.releasing {
+	if m.slot.releasing && m.shardsReleased() {
 		w.arm(m.slot.releaseAt)
 	}
 	for _, g := range m.slot.giveBacks {
