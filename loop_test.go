@@ -678,14 +678,21 @@ func TestATRUN76SetDrainingRetries(t *testing.T) {
 			t.Errorf("KeepAlive calls = %v, want only Start's: the session closed at T0+1s", ka)
 		}
 		closeNode(t, n)
-		// The drain goroutine's first SetDraining and the lane's CloseSession both start at
-		// T0+1s on different goroutines, so either may come first.
-		got := callMethods(callsInOrder(r.fs.Calls(), r.sm.Calls()))
-		if len(got) > 5 && got[4] == "CloseSession" && got[5] == "SetDraining" {
-			got[4], got[5] = got[5], got[4]
+		// Drain posts Drain{} to the loop and makes its first SetDraining attempt at the same
+		// instant, so that attempt and CloseSession, both at T0+1s, may come in either order.
+		// Each double's own order is fixed, and so is the order across them at other instants.
+		if got, want := callMethods(r.fs.Calls()), []string{"Slots", "KeepAlive", "CloseSession"}; !slices.Equal(got, want) {
+			t.Errorf("store calls = %v, want %v", got, want)
 		}
-		if want := []string{"Join", "Watch", "Slots", "KeepAlive", "SetDraining", "CloseSession", "SetDraining", "SetDraining", "Leave"}; !slices.Equal(got, want) {
-			t.Errorf("calls = %v, want %v, the first SetDraining and CloseSession in either order", got, want)
+		if got, want := callMethods(r.sm.Calls()), []string{"Join", "Watch", "SetDraining", "SetDraining", "SetDraining", "Leave"}; !slices.Equal(got, want) {
+			t.Errorf("membership calls = %v, want %v", got, want)
+		}
+		all := callMethods(callsInOrder(r.fs.Calls(), r.sm.Calls()))
+		if i := slices.Index(all, "KeepAlive"); i < 0 || slices.Index(all, "SetDraining") < i || slices.Index(all, "CloseSession") < i {
+			t.Errorf("calls = %v, want SetDraining and CloseSession after KeepAlive", all)
+		}
+		if all[len(all)-1] != "Leave" {
+			t.Errorf("calls = %v, want Leave last", all)
 		}
 		check()
 	})
