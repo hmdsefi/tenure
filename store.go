@@ -30,9 +30,12 @@ import (
 // when ctx is already done at the call. It then checks its arguments in parameter order, with
 // errors of the store's own; then, if it needs the live session of holder, returns
 // ErrSessionLost when that session is not live; and only then returns a *HeldError or ErrNoSlot.
-// A call that fails an argument check, or returns ErrSessionLost, a *HeldError or ErrNoSlot,
-// changes nothing. Any other error, such as a failed request or a context that ends during the
-// call, leaves the outcome unknown: the call may have taken effect.
+// The argument checks reject at least an empty holder or space, a holder or space that contains a
+// zero byte, a space that contains "/", a negative shard or slot, a term of 0 and a negative slot
+// count; a store may reject more, such as names its backend cannot hold. A call that fails an
+// argument check, or returns ErrSessionLost, a *HeldError or ErrNoSlot, changes nothing. Any other
+// error, such as a failed request or a context that ends during the call, leaves the outcome
+// unknown: the call may have taken effect.
 type Store interface {
 	// KeepAlive opens a session for a holder that has never had one, or renews the live session
 	// of holder and stores timing as its new Timing. It returns ErrSessionLost when the session
