@@ -1257,6 +1257,395 @@ func TestATMCH38AdoptTheLowestListed(t *testing.T) {
 	}
 }
 
+// slotBootS0 is mc.SlotBoot on the one shard s/0, whose run has term 7: five steps, holding slot 0, with
+// the next wake at @2.
+func slotBootS0() []mc.Step { return mc.SlotBoot(7, mc.S("s", 1)) }
+
+// slotClaimed is a SlotClaimed of slot at ms milliseconds with the given result.
+func slotClaimed(ms int64, slot int, want ...core.Action) mc.Step {
+	return mc.Step{Input: core.SlotClaimed{Now: mc.Ms(ms), Slot: slot}, Want: want}
+}
+
+// slotReleased is a SlotReleased of slot at ms milliseconds with the given result.
+func slotReleased(ms int64, slot int, want ...core.Action) mc.Step {
+	return mc.Step{Input: core.SlotReleased{Now: mc.Ms(ms), Slot: slot}, Want: want}
+}
+
+// tickAt is a Tick at the reading now with the given result.
+func tickAt(now time.Duration, want ...core.Action) mc.Step {
+	return mc.Step{Input: core.Tick{Now: now}, Want: want}
+}
+
+// releaseSlot is the ReleaseSlot of slot.
+func releaseSlot(slot int) core.Action { return core.ReleaseSlot{Slot: slot} }
+
+// grantS1 is the grant of shard s/1 in term 7 at @0.4, with the session deadline at @10.
+func grantS1() mc.Step { return mc.Grant(mc.Ms(400), "s", 1, 7, mc.Ms(10000), mc.Ms(2000)) }
+
+// beatSteps are the KeepAlive and its renewal, 100 ms later, every RetryPeriod from from through to, in
+// milliseconds, on a machine with nothing else due, with last the wake after to's renewal.
+func beatSteps(from, to, last int64) []mc.Step {
+	var steps []mc.Step
+	for now := from; now <= to; now += 2000 {
+		wake := now + 2000
+		if now == to {
+			wake = last
+		}
+		steps = append(steps, keepAlive(now, wake), renewed(now+100, now, extended(now+10000), wakeAt(wake)))
+	}
+	return steps
+}
+
+// TestSlots checks the slot rules that the AT cases leave out.
+func TestSlots(t *testing.T) {
+	const live = core.SessionStateLive
+	none := core.CauseNone
+	lostRun := core.ShardStatus{State: core.ShardStateLost, Since: mc.Ms(1000), Term: 7, Reason: core.StopLost, Holder: "h1"}
+
+	t.Run("a claim answer while draining is given back, and closing drops the give-back", func(t *testing.T) {
+		steps := append(slotBootS0(),
+			viewed(1000, mc.Vs(2, []string{"h2"}, "m1", "m2"), stopLostS0(), core.ClaimSlot{}, wakeAt(2000)),
+			drained(1100, wakeAt(2000)),
+			slotClaimed(1200, 0, releaseSlot(0), wakeAt(2000)),
+			runStopped(1300, 7, releaseS0(7), wakeAt(2000)),
+			released(1400, 7, core.CloseSession{}, wakeAt(3400)),
+			tick(3200, wakeAt(3400)),
+			tick(3400, core.CloseSession{}, wakeAt(5400)),
+		)
+		checks := stepChecks{
+			6:  all(sessionIs(1000, live, 10000, none), shardIs(0, lostRun)),
+			7:  all(drainingIs(true), nextWakeIs(2000)),
+			8:  nextWakeIs(2000),
+			10: all(sessionIs(1400, core.SessionStateClosing, 10000, none), shardIs(0, idleS0(1400))),
+			11: nextWakeIs(3400),
+		}
+		slotsAre(checks, 6, 12, -1)
+		runSteps(t, scenario(steps...), checks)
+	})
+
+	t.Run("a claim answer for the held slot, for a slot being given back, or for none changes nothing", func(t *testing.T) {
+		owned := shardsAre(core.ShardStatus{}, slotS1(core.ShardStateOwned, 400, 7))
+		checks := stepChecks{7: owned, 8: owned, 9: owned, 10: all(owned, nextWakeIs(2000))}
+		slotsAre(checks, 4, 10, 0)
+		runSteps(t, scenarioIn(mc.C(mc.S("s", 2)),
+			keepAlive(0, 2000),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			viewed(200, mc.Vs(1, []string{"", ""}, "m1"), core.ClaimSlot{}, wakeAt(2000)),
+			slotClaimed(300, 0, core.Acquire{Space: "s", Shard: 1}, wakeAt(2000)),
+			grantS1(),
+			slotClaimed(500, 1, releaseSlot(1), wakeAt(2000)),
+			slotClaimed(600, 1, wakeAt(2000)),
+			slotClaimed(700, 0, wakeAt(2000)),
+			slotClaimed(800, -1, wakeAt(2000)),
+			slotReleased(900, 0, wakeAt(2000)),
+		), checks)
+	})
+
+	t.Run("a claim answer before any view is taken", func(t *testing.T) {
+		runSteps(t, scenario(
+			keepAlive(0, 2000),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			slotClaimed(200, 0, wakeAt(2000)),
+			viewed(300, mc.Vs(1, []string{""}, "m1"), acquireS0(), wakeAt(2000)),
+		), stepChecks{
+			3: all(slotIs(0), shardIs(0, core.ShardStatus{})),
+			4: all(slotIs(0), assignmentIs("s", "slot-0")),
+		})
+	})
+
+	t.Run("views that lag behind a claim keep the slot", func(t *testing.T) {
+		owned := all(slotIs(0), shardIs(0, ownedS0(400, 7)))
+		runSteps(t, scenario(append(slotBootS0(),
+			viewed(1000, mc.Vs(0, []string{"h2"}, "m1", "m2"), wakeAt(2000)),
+			viewed(1100, mc.Vs(1, []string{""}, "m1"), wakeAt(2000)),
+			viewed(1200, mc.Vs(2, []string{""}, "m1", "m2"), wakeAt(2000)),
+			viewed(1300, mc.Vs(3, []string{"h1"}, "m1"), wakeAt(2000)),
+		)...), stepChecks{
+			6: all(owned, viewVersionIs(1)),
+			7: owned,
+			8: all(owned, viewVersionIs(2)),
+			9: all(owned, nextWakeIs(2000)),
+		})
+	})
+
+	t.Run("a view without slots retires the slot, and only its release lets the member run shards", func(t *testing.T) {
+		retired := idleS0(700)
+		steps := append(slotBootS0(),
+			viewed(500, mc.Vm(2, "m1"), stopS0(7), wakeAt(2000)),
+			runStopped(600, 7, releaseS0(7), wakeAt(2000)),
+			released(700, 7, releaseSlot(0), wakeAt(2000)),
+			viewed(1000, mc.Vs(3, []string{"h1"}, "m1"), wakeAt(2000)),
+			keepAlive(2000, 2700),
+			tick(2700, releaseSlot(0), wakeAt(4000)),
+			viewed(3000, mc.Vm(4, "m1"), wakeAt(4000)),
+			slotReleased(3100, 0, acquireS0(), wakeAt(4000)),
+		)
+		checks := stepChecks{
+			6:  all(assignmentIs("s", "m1"), shardIs(0, stoppingS0(500, 7))),
+			8:  shardIs(0, retired),
+			9:  all(assignmentIs("s", "slot-0"), shardIs(0, retired)),
+			12: all(assignmentIs("s", "m1"), shardIs(0, retired)),
+			13: all(
+				sessionIs(3100, live, 10000, none),
+				shardIs(0, core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(3100), Holder: "h1", Wanted: true}),
+			),
+		}
+		slotsAre(checks, 4, 12, 0)
+		slotsAre(checks, 13, 13, -1)
+		runSteps(t, scenario(steps...), checks)
+	})
+
+	t.Run("a held slot's release waits for every shard, and a repeat waits again for a stuck run that returns", func(t *testing.T) {
+		stuck := drainingS0(1000, 7)
+		stuck.Stuck = true
+		steps := slices.Concat(slotBootS0(),
+			[]mc.Step{drained(1000, stopDrainingS0(), wakeAt(2000))},
+			beatSteps(2000, 10000, 11000),
+			[]mc.Step{
+				// The run is stuck, so the ReleaseSlot goes.
+				tick(11000, releaseSlot(0), wakeAt(12000)),
+				keepAlive(12000, 13000),
+				renewed(12100, 12000, extended(22000), wakeAt(13000)),
+				// The run returns before the repeat is due, and its Release holds the repeat back.
+				runStopped(12500, 7, releaseS0(7), wakeAt(14000)),
+				tick(13000, wakeAt(14000)),
+				keepAlive(14000, 14500),
+				// The answer lets the repeat go at once, after it fell due.
+				released(14100, 7, releaseSlot(0), wakeAt(16000)),
+				slotReleased(14200, 0, core.CloseSession{}, wakeAt(16200)),
+			},
+		)
+		checks := stepChecks{
+			6:  shardIs(0, drainingS0(1000, 7)),
+			17: all(shardIs(0, stuck), nextWakeIs(12000)),
+			20: all(sessionIs(12500, live, 22000, none), shardIs(0, releasingDrainedS0(12500, 7))),
+			21: nextWakeIs(14000),
+			23: shardIs(0, idleS0(14100)),
+			24: all(sessionIs(14200, core.SessionStateClosing, 22000, none), slotIs(-1)),
+		}
+		slotsAre(checks, 4, 23, 0)
+		runSteps(t, scenario(steps...), checks)
+	})
+
+	t.Run("each timer goes at its exact instant", func(t *testing.T) {
+		const ns = time.Nanosecond
+		runSteps(t, scenario(
+			keepAlive(0, 2000),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			viewed(200, mc.Vs(1, []string{"h2"}, "m1", "m2"), core.ClaimSlot{}, wakeAt(2000)),
+			slotClaimed(1000, 1, releaseSlot(1), wakeAt(2000)),
+			keepAlive(2000, 2200),
+			tickAt(mc.Ms(2200)-ns, wakeAt(2200)),
+			tick(2200, core.ClaimSlot{}, wakeAt(3000)),
+			tickAt(mc.Ms(3000)-ns, wakeAt(3000)),
+			tick(3000, releaseSlot(1), wakeAt(4000)),
+			keepAlive(4000, 4200),
+			tick(4200, core.ClaimSlot{}, wakeAt(5000)),
+			tick(5000, releaseSlot(1), wakeAt(6000)),
+			slotReleased(5100, 1, wakeAt(6000)),
+		), stepChecks{13: all(slotIs(-1), nextWakeIs(6000))})
+
+		runSteps(t, scenario(append(slotBootS0(),
+			drained(1000, stopDrainingS0(), wakeAt(2000)),
+			runStopped(1200, 7, releaseS0(7), wakeAt(2000)),
+			released(1400, 7, releaseSlot(0), wakeAt(2000)),
+			keepAlive(2000, 3400),
+			tickAt(mc.Ms(3400)-ns, wakeAt(3400)),
+			tick(3400, releaseSlot(0), wakeAt(4000)),
+		)...), stepChecks{11: all(slotIs(0), nextWakeIs(4000))})
+	})
+
+	t.Run("no claim while the session is not live, and the claim goes in the step that makes it live", func(t *testing.T) {
+		runSteps(t, scenario(
+			keepAlive(0, 2000),
+			viewed(100, mc.Vs(1, []string{""}, "m1"), wakeAt(2000)),
+			keepAlive(2000, 4000),
+			renewed(2100, 2000, extended(12000), core.ClaimSlot{}, wakeAt(4000)),
+			keepAlive(12000, 14000),
+			renewed(12100, 12000, extended(22000), core.ClaimSlot{}, wakeAt(14000)),
+		), stepChecks{5: all(sessionIs(12000, core.SessionStateLate, 12000, none), nextWakeIs(14000))})
+	})
+
+	t.Run("a lost slot's run whose record goes to another holder is not released", func(t *testing.T) {
+		runSteps(t, scenario(append(slotBootS0(),
+			viewed(1000, mc.Vs(2, []string{"h2"}, "m1", "m2"), stopLostS0(), core.ClaimSlot{}, wakeAt(2000)),
+			holderChanged(1100, "h2", 8, wakeAt(2000)),
+			runStopped(1200, 7, wakeAt(2000)),
+		)...), stepChecks{
+			7: shardIs(0, core.ShardStatus{State: core.ShardStateLost, Since: mc.Ms(1000), Term: 7, Reason: core.StopLost, Holder: "h2"}),
+			8: shardIs(0, core.ShardStatus{Since: mc.Ms(1200), Holder: "h2"}),
+		})
+	})
+
+	t.Run("a lost slot ends a degraded run too, and its RunStopped releases the record", func(t *testing.T) {
+		steps := append(slotBootS0(),
+			tick(10000, core.KeepAlive{}, degradeS0(7), wakeAt(12000)),
+			viewed(10500, mc.Vs(2, []string{"h2"}, "m1", "m2"), stopLostS0(), wakeAt(12000)),
+			runStopped(10600, 7, releaseS0(7), wakeAt(12000)),
+		)
+		lost := lostRun
+		lost.Since = mc.Ms(10500)
+		runSteps(t, fencedS0(steps...), stepChecks{7: all(slotIs(-1), shardIs(0, lost))})
+	})
+
+	t.Run("a lost session drops the slot and its give-backs and sends no slot action", func(t *testing.T) {
+		c := scenario(append(slotBootS0(),
+			slotClaimed(1000, 1, releaseSlot(1), wakeAt(2000)),
+			failed(1100, core.CauseLost, stopLostS0(), wakeAt(11100)),
+			tick(11100),
+			runStopped(11200, 7),
+			slotReleased(11300, 1),
+			slotClaimed(11400, 0),
+			viewed(11500, mc.Vs(2, []string{"h1", "h1"}, "m1")),
+		)...)
+		runSteps(t, c, stepChecks{
+			7:  all(slotIs(-1), sessionIs(1100, core.SessionStateLost, 10000, core.CauseLost)),
+			9:  all(slotIs(-1), doneIs(true), shardIs(0, core.ShardStatus{Since: mc.Ms(11200), Holder: "h1"})),
+			12: all(slotIs(-1), doneIs(true)),
+		})
+		if n := countActions[core.Release](c); n != 0 {
+			t.Errorf("the case returns %d Releases after the loss, want none", n)
+		}
+	})
+
+	t.Run("one view can lose the held slot, adopt the lowest other and give back the rest", func(t *testing.T) {
+		// With three slots, slot-1 has s/0 and slot-0 has s/1.
+		runSteps(t, scenarioIn(mc.C(mc.S("s", 2)),
+			keepAlive(0, 2000),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			viewed(200, mc.Vs(1, []string{"", ""}, "m1"), core.ClaimSlot{}, wakeAt(2000)),
+			slotClaimed(300, 0, core.Acquire{Space: "s", Shard: 1}, wakeAt(2000)),
+			grantS1(),
+			viewed(1000, mc.Vs(2, []string{"h2", "h1", "h1"}, "m1"),
+				core.StopRun{Space: "s", Shard: 1, Term: 7, Reason: core.StopLost},
+				acquireS0(),
+				releaseSlot(2),
+				wakeAt(2000)),
+		), stepChecks{6: all(slotIs(1), assignmentIs("s", "slot-1", "slot-0"))})
+	})
+}
+
+// TestSlotTimersAtTheLargestReadings checks that the slot timers fit in a Duration and stay after the
+// clock, with the longest timing fields too, at readings a driver never reaches.
+func TestSlotTimersAtTheLargestReadings(t *testing.T) {
+	const (
+		largest = time.Duration(math.MaxInt64)
+		ceiling = largest - 24*time.Hour
+	)
+	timings := []core.Timing{
+		core.DefaultTiming,
+		{LeaseDuration: 24 * time.Hour, RenewDeadline: 21 * time.Hour, RetryPeriod: 17 * time.Hour, SlotGrace: 24 * time.Hour},
+	}
+	readings := []time.Duration{largest, ceiling, ceiling - 1, ceiling - time.Second, ceiling - time.Minute, ceiling - 48*time.Hour}
+	var claims, releases int
+	for _, timing := range timings {
+		for _, now := range readings {
+			cfg := mc.C(mc.S("s", 1))
+			cfg.Timing = timing
+			m := core.NewMachine(cfg)
+			step := func(in core.Input) {
+				t.Helper()
+				got := m.Step(in)
+				at, armed := m.NextWake()
+				st := m.Status()
+				for _, v := range wakeViolations(got, st.Now, st.Done, at, armed) {
+					t.Errorf("timing %v, reading %v: Step(%#v): %s", timing, now, in, v)
+				}
+				for _, a := range got {
+					switch a.(type) {
+					case core.ClaimSlot:
+						claims++
+					case core.ReleaseSlot:
+						releases++
+					}
+				}
+			}
+			for _, s := range slotBootS0() {
+				step(s.Input)
+			}
+			// A renewal at the reading, a claim answer to give back, the loss of the slot, a claim answer
+			// to take, and a Drain whose run returns and is released, so the held slot is released too.
+			step(core.SessionRenewed{Now: now, SentAt: now})
+			step(core.SlotClaimed{Now: now, Slot: 3})
+			step(core.ViewChanged{Now: now, View: mc.Vs(2, []string{"h2"}, "m1", "m2"), Wall: mc.Wall(0)})
+			step(core.SlotClaimed{Now: now, Slot: 0})
+			step(core.ViewChanged{Now: now, View: mc.Vs(3, []string{""}, "m1"), Wall: mc.Wall(0)})
+			step(core.Drain{Now: now})
+			step(core.RunStopped{Now: now, Space: "s", Term: 7})
+			step(core.Released{Now: now, Space: "s", Term: 7})
+			step(core.Tick{Now: largest})
+			step(core.Tick{Now: largest})
+			step(core.SlotReleased{Now: largest, Slot: 0})
+			step(core.SlotReleased{Now: largest, Slot: 3})
+			step(core.Tick{Now: largest})
+		}
+	}
+	if claims == 0 || releases == 0 {
+		t.Errorf("%d ClaimSlots and %d ReleaseSlots, want some of each", claims, releases)
+	}
+}
+
+// TestSlotSpaceOrderDoesNotMatter runs a slotted sequence on spaces given as b then a and as a then b,
+// and expects equal results, Status, assignments and wakes after every step.
+func TestSlotSpaceOrderDoesNotMatter(t *testing.T) {
+	spaces := []core.SpaceSpec{mc.S("b", 3), {Name: "a", Shards: 2, Fenced: true}}
+	reversed := slices.Clone(spaces)
+	slices.Reverse(reversed)
+	one, other := core.NewMachine(mc.C(spaces...)), core.NewMachine(mc.C(reversed...))
+	var history []core.Input
+	step := func(in core.Input) []core.Action {
+		t.Helper()
+		history = append(history, in)
+		got, gotOther := one.Step(in), other.Step(in)
+		if !reflect.DeepEqual(got, gotOther) {
+			t.Fatalf("Step(%#v) = %#v and %#v, after %+v", in, got, gotOther, history)
+		}
+		if st, stOther := one.Status(), other.Status(); !reflect.DeepEqual(st, stOther) {
+			t.Fatalf("Status = %+v and %+v, after %+v", st, stOther, history)
+		}
+		for _, name := range []string{"a", "b"} {
+			if x, y := one.Assignment(name), other.Assignment(name); !slices.Equal(x, y) {
+				t.Fatalf("Assignment(%s) = %q and %q, after %+v", name, x, y, history)
+			}
+		}
+		at, armed := one.NextWake()
+		if atOther, armedOther := other.NextWake(); at != atOther || armed != armedOther {
+			t.Fatalf("NextWake = (%v, %v) and (%v, %v), after %+v", at, armed, atOther, armedOther, history)
+		}
+		return got
+	}
+
+	for _, s := range mc.SlotBoot(1, spaces...) {
+		step(s.Input)
+	}
+	// Another holder takes slot 0 and the view lists slot 1 for this member: every run stops as lost,
+	// the member adopts slot 1, and each answer goes back in the order the actions came.
+	now := mc.Ms(1000)
+	queue := step(core.ViewChanged{Now: now, View: mc.Vs(2, []string{"h2", "h1"}, "m1", "m2"), Wall: mc.Wall(now)})
+	stops := 0
+	for n := 0; len(queue) > 0 && n < 100; n++ {
+		a := queue[0]
+		queue = queue[1:]
+		now += time.Millisecond
+		switch v := a.(type) {
+		case core.StopRun:
+			stops++
+			queue = append(queue, step(core.RunStopped{Now: now, Space: v.Space, Shard: v.Shard, Term: v.Term})...)
+		case core.Release:
+			queue = append(queue, step(core.Released{Now: now, Space: v.Space, Shard: v.Shard, Term: v.Term})...)
+		case core.Acquire:
+			queue = append(queue, step(core.Acquired{Now: now, Space: v.Space, Shard: v.Shard, Term: core.Term(100 + n)})...)
+		}
+	}
+	if st := one.Status(); stops != 5 || st.Slot != 1 {
+		t.Fatalf("%d StopRuns and Status %+v, want 5 and slot 1", stops, st)
+	}
+	step(core.Drain{Now: now + time.Millisecond})
+	if st := one.Status(); st.Slot != 1 || !st.Draining {
+		t.Fatalf("Status = %+v, want slot 1 and draining", st)
+	}
+}
+
 // TestATMCH39SpaceOrderWhileDraining runs AT-MCH-39, with its spaces given as b then a, and its steps
 // again on the spaces given as a then b, and expects equal results, Status, assignments and wakes
 // after every step.
@@ -2706,13 +3095,13 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 						givingBack[v.Slot] = true
 						continue
 					}
-					if was != h || !(st.Draining || retired) {
+					if was != h || !st.Draining && !retired {
 						t.Fatalf("seed %d: %+v of a slot taken %d, draining %v, retired %v, after %+v", seed, v, was, st.Draining, retired, history)
 					}
 					over := false
 					for shard, sh := range st.Spaces[0].Shards {
 						told := sh.State == core.ShardStateStopping || sh.State == core.ShardStateExpired || sh.State == core.ShardStateLost
-						if sh.State != core.ShardStateIdle && !(told && sh.Stuck) {
+						if sh.State != core.ShardStateIdle && (!told || !sh.Stuck) {
 							t.Fatalf("seed %d: %+v with shard %d %+v, after %+v", seed, v, shard, sh, history)
 						}
 						over = over || sh.Stuck
@@ -3022,13 +3411,14 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 				// needs more often to release a held slot.
 				now += time.Millisecond
 				held := m.Status().Slot
+				anySlot := []int{-1, 0, 1, 2, 3}
 				switch v := next(16); {
 				case v < 6:
-					step(core.SlotClaimed{Now: now, Slot: int(next(5)) - 1})
+					step(core.SlotClaimed{Now: now, Slot: anySlot[next(5)]})
 				case v < 14 && held >= 0 && next(2) == 0:
 					step(core.SlotReleased{Now: now, Slot: held})
 				case v < 14:
-					step(core.SlotReleased{Now: now, Slot: int(next(4)) - 1})
+					step(core.SlotReleased{Now: now, Slot: anySlot[next(4)]})
 				default:
 					step(core.Drain{Now: now})
 				}
