@@ -79,7 +79,9 @@ func contextCanceled(e *env) {
 	e.open(h1)
 	e.lostAcq(h3, "a", 2)
 	if slots {
-		e.slots(h2, h1, "")
+		e.slots(h1, h1, "")
+		e.setSlots(3)
+		e.slots(h2, h1, "", "")
 		e.claim(h2, 1)
 		e.claim(h1, 0)
 	}
@@ -164,7 +166,9 @@ func argsInvalid(e *env) {
 	e.open(h1)
 	e.lostAcq(h3, "a", 2)
 	if slots {
-		e.slots(h2, h1, "")
+		e.slots(h1, h1, "")
+		e.setSlots(3)
+		e.slots(h2, h1, "", "")
 		e.claim(h2, 1)
 		e.claim(h1, 0)
 	}

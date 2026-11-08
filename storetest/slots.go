@@ -45,32 +45,37 @@ func slotsOwn(e *env) {
 	e.open(h2)
 	e.setSlots(3)
 	e.claim(h1, 0)
-	e.claim(h1, 0)
 	e.slots(h2, h1, "", "")
 	e.claim(h2, 1)
 	e.claim(h2, 1)
-	e.slots(h1, h1, h2, "")
+	e.slots(h2, h1, h2, "")
+	e.claim(h1, 0)
 	e.claim(h1, 0)
 	e.slots(h2, h1, h2, "")
+	e.slots(h1, h1, h2, "")
 }
 
 // slotsFull: with every slot below the count held, ClaimSlot returns -1 and tenure.ErrNoSlot and
 // changes nothing.
 func slotsFull(e *env) {
-	h1, h2, h3 := holder(1, 1), holder(2, 1), holder(3, 1)
+	h1, h2, h3, h4 := holder(1, 1), holder(2, 1), holder(3, 1), holder(4, 1)
 	e.open(h1)
 	e.open(h2)
 	e.open(h3)
+	e.open(h4)
 	e.setSlots(2)
 	e.claim(h1, 0)
 	e.slots(h2, h1, "")
 	e.claim(h2, 1)
+	e.slots(h4, h1, h2)
+	e.noSlot(h4)
+	e.claim(h2, 1)
 	e.slots(h3, h1, h2)
 	e.noSlot(h3)
 	e.noSlot(h3)
-	e.slots(h2, h1, h2)
 	e.claim(h1, 0)
-	e.claim(h2, 1)
+	e.slots(h4, h1, h2)
+	e.slots(h3, h1, h2)
 }
 
 // slotsNoSession: ClaimSlot by a holder with no live session (never opened, closed, or replaced)
@@ -83,14 +88,14 @@ func slotsNoSession(e *env) {
 	e.closeSession(h3)
 	e.open(holder(5, 2))
 	e.setSlots(2)
-	e.lostSlot(h1)
-	e.lostSlot(h3)
-	e.lostSlot(h5)
 	e.slots(h2, "", "")
 	e.claim(h2, 0)
 	e.slots(h1, h2, "")
 	e.lostSlot(h1)
+	e.lostSlot(h3)
+	e.lostSlot(h5)
 	e.slots(h2, h2, "")
+	e.slots(h1, h2, "")
 }
 
 // slotsExpired: once the session of a slot's holder expires, Slots shows the slot as free and
@@ -217,11 +222,10 @@ func slotsZero(e *env) {
 // ClaimSlot returns -1 and tenure.ErrNoSlot, also when a slot below the count is free, which
 // another holder then claims.
 func slotsRetired(e *env) {
-	h1, h2, h3, h4 := holder(1, 1), holder(2, 1), holder(3, 1), holder(4, 1)
+	h1, h2, h3 := holder(1, 1), holder(2, 1), holder(3, 1)
 	e.open(h1)
 	e.open(h2)
 	e.open(h3)
-	e.open(h4)
 	e.setSlots(3)
 	e.claim(h1, 0)
 	e.slots(h2, h1, "", "")
@@ -231,18 +235,18 @@ func slotsRetired(e *env) {
 	e.releaseSlot(h1, 0)
 
 	e.setSlots(2)
-	e.slots(h3, "", h2)
-	e.noSlot(h3)
 	e.slots(h2, "", h2)
 	e.claim(h2, 1)
+	e.slots(h3, "", h2)
+	e.noSlot(h3)
 
 	e.setSlots(1)
 	e.slots(h2, "")
 	e.noSlot(h2)
 	e.slots(h3, "")
 	e.noSlot(h3)
-	e.slots(h4, "")
-	e.claim(h4, 0)
+	e.claim(h1, 0)
+	e.slots(h2, h1)
 }
 
 // slotsGrow: raising the count back over a retired slot returns it to its holder: Slots shows it
