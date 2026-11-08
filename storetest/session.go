@@ -34,7 +34,8 @@ func sessionExpiryBoundary(e *env) {
 	h1, h2 := holder(1, 1), holder(2, 1)
 	e.open(h1)
 	e.open(h2)
-	e.acq(h1, "a", 0)
+	t1 := e.acq(h1, "a", 0)
+	e.rec(h2, "a", 0, h1, t1)
 	e.held(h2, "a", 0, h1)
 
 	e.elapse(e.f.Timing.LeaseDuration-time.Millisecond, h2)
@@ -51,7 +52,8 @@ func sessionExpired(e *env) {
 	h1, h2 := holder(1, 1), holder(2, 1)
 	e.open(h1)
 	e.open(h2)
-	e.acq(h1, "a", 0)
+	t1 := e.acq(h1, "a", 0)
+	e.rec(h2, "a", 0, h1, t1)
 	e.held(h2, "a", 0, h1)
 
 	e.expire(h2)
@@ -160,7 +162,7 @@ func sessionHolderLease(e *env) {
 func sessionRetryAfter(e *env) {
 	h1, h2, h3 := holder(1, 1), holder(2, 1), holder(3, 1)
 	e.open(h1)
-	e.acq(h1, "a", 0)
+	t1 := e.acq(h1, "a", 0)
 
 	half := e.f.Timing
 	half.RetryPeriod /= 2
@@ -168,6 +170,7 @@ func sessionRetryAfter(e *env) {
 	e.held(h3, "a", 0, h1)
 
 	e.open(h2)
+	e.rec(h2, "a", 0, h1, t1)
 	e.held(h2, "a", 0, h1)
 
 	quarter := e.f.Timing
