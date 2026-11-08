@@ -197,8 +197,9 @@ func (l *loop) tickUntil(now time.Duration) {
 }
 
 // apply steps in, whose Now is set to now, and carries the step out (RUN-100): under n.stepMu it
-// executes the actions in order, publishes a stepped view, unpublishes the shard of a stepped
-// RunStopped that is still published, and reports the step to the observer and the hook. It then re-arms the timer and, the first time the machine is done,
+// executes the actions in order, publishes a stepped view, publishes the routing snapshot when the
+// view or an assignment changed, unpublishes the shard of a stepped RunStopped that is still
+// published, and reports the step to the observer and the hook. It then re-arms the timer and, the first time the machine is done,
 // closes n.machineDone.
 func (l *loop) apply(in loopInput, now time.Duration) {
 	n := l.n
@@ -222,6 +223,7 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 	if v, ok := in.in.(core.ViewChanged); ok {
 		n.publish(v.View)
 	}
+	l.publishRoutes()
 	if in.sh != nil {
 		n.shards[in.sh.Space].local[in.sh.ID].CompareAndSwap(in.sh, nil)
 	}

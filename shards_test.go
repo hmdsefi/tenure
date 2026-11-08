@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -126,6 +127,7 @@ func maxInFlight(calls []call) int {
 
 // TestATRUN10PermitsAndRenewals checks that at most 16 shard calls are in flight at once while
 // renewals, which need no permit, keep their cadence: 40 Acquire calls block from T0 to T0+7s.
+// Route answers while they block, without bubble time passing.
 func TestATRUN10PermitsAndRenewals(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
@@ -138,6 +140,14 @@ func TestATRUN10PermitsAndRenewals(t *testing.T) {
 		synctest.Wait()
 		if got := len(r.fs.Calls("Acquire")); got != 16 {
 			t.Errorf("%d Acquire calls at T0, want 16", got)
+		}
+		// Route answers from the published snapshot while the Acquire calls block: no bubble
+		// time passes.
+		for i := range 100 {
+			wantRoute(t, n, "orders", "key-"+strconv.Itoa(i), "n1")
+		}
+		if !time.Now().Equal(t0) {
+			t.Errorf("Route took %v while Acquire blocks, want none", time.Since(t0))
 		}
 
 		sleepUntil(t0.Add(7 * time.Second))
@@ -317,7 +327,8 @@ func TestATRUN12ExpiryAtDeadline(t *testing.T) {
 
 // TestATRUN15AcquireRetry checks that a shard the store does not grant is acquired again: after a
 // HeldError at the RetryAfter the error gives (raised to RetryPeriod), after any other error
-// RetryPeriod later; its Run starts once an Acquire succeeds.
+// RetryPeriod later; its Run starts once an Acquire succeeds. Until then Local names this member
+// as the shard's route; afterwards it serves the Shard of that Run.
 func TestATRUN15AcquireRetry(t *testing.T) {
 	t.Run("held", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -329,11 +340,25 @@ func TestATRUN15AcquireRetry(t *testing.T) {
 			}
 			t0 := time.Now()
 			n := start(t, context.Background(), r.config())
+			synctest.Wait()
+			// While the outside holder keeps orders/3, Local names this member as its route,
+			// and serves the shards it owns.
+			sh, err := n.Local("orders", keyOf(3))
+			if sh != nil {
+				t.Errorf("Local(orders/3) = %v while held outside, want nil", sh)
+			}
+			wantNotOwner(t, err, "orders", 3, "n1")
+			if sh, err := n.Local("orders", keyOf(0)); err != nil || sh != n.PublishedShard("orders", 0) || sh.Check() != nil {
+				t.Errorf("Local(orders/0) = %v, %v, want the published Shard", sh, err)
+			}
 			sleepUntil(t0.Add(5 * time.Second))
 			if err := o.Release("orders", 3); err != nil {
 				t.Fatalf("outside Release(orders/3) = %v", err)
 			}
 			sleepUntil(t0.Add(7 * time.Second))
+			if sh, err := n.Local("orders", keyOf(3)); err != nil || len(r.runs.Of("orders", 3)) != 1 || sh != r.runs.Of("orders", 3)[0].Shard {
+				t.Errorf("Local(orders/3) = %v, %v after its Acquire succeeded, want the Shard its Run got", sh, err)
+			}
 
 			acq := shardCalls(r.fs.Calls("Acquire"), 3)
 			if got, want := startsAt(acq, t0), secs(0, 2, 4, 6); !slices.Equal(got, want) {

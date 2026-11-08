@@ -83,6 +83,12 @@ type Space struct {
 	// Shard and cancels ctx when the ownership ends. When Run returns while the member still
 	// owns the shard, the node calls it again after a backoff. It is required.
 	Run func(ctx context.Context, s *Shard) error
+
+	// ShardOf maps a key to its shard for Node.Route and Node.Local. It must return a shard
+	// from 0 to Shards minus 1, the same one for the same key on every member, and be safe for
+	// concurrent use; Route and Local fail for a key it maps outside. nil means
+	// core.KeyShard(key, Shards).
+	ShardOf func(key string) int
 }
 
 // NameChecker is implemented by a Store or a Membership that cannot hold every name tenure
