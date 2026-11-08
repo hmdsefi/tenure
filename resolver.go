@@ -336,11 +336,13 @@ func (r *Resolver) Subscribe() <-chan []Member {
 }
 
 // Close stops the Resolver: lookups return ErrClosed, every channel of Subscribe is closed, and
-// every goroutine of the Resolver has returned when Close returns. Later calls return ErrClosed.
+// every goroutine of the Resolver has returned when Close returns. Later calls return ErrClosed,
+// also only once those goroutines have returned.
 func (r *Resolver) Close() error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
+		r.wait() // a Close still in progress may be waiting for them
 		return ErrClosed
 	}
 	r.closed = true
@@ -354,11 +356,19 @@ func (r *Resolver) Close() error {
 
 	if r.stop != nil {
 		r.stop()
-		<-r.done
 	}
-	r.timers.Wait()
+	r.wait()
 	if r.onClose != nil {
 		r.onClose(r)
 	}
 	return nil
+}
+
+// wait waits, once Close has begun, for a standalone Resolver's watcher and for every timer
+// callback to return. Once r.closed is set no timer is armed, so the wait ends.
+func (r *Resolver) wait() {
+	if r.done != nil {
+		<-r.done
+	}
+	r.timers.Wait()
 }

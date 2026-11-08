@@ -260,7 +260,8 @@ func NewResolver(m Membership, opts ...ResolverOption) (*Resolver, error)
 func (r *Resolver) Close() error
     Close stops the Resolver: lookups return ErrClosed, every channel of
     Subscribe is closed, and every goroutine of the Resolver has returned when
-    Close returns. Later calls return ErrClosed.
+    Close returns. Later calls return ErrClosed, also only once those goroutines
+    have returned.
 
 func (r *Resolver) Lookup(key string) (Member, error)
     Lookup returns the member ranked first for key. It returns ErrNoMembers when
