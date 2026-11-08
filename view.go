@@ -170,21 +170,26 @@ func (n *Node) leaving() bool {
 }
 
 // leave calls Leave with ctx bounded by RetryPeriod (RUN-070). It first marks the node as left and
-// waits, within that bound, for a Watch call in flight, so that no Watch starts after Leave. A
-// failed Leave is reported and otherwise ignored.
+// waits, at most RetryPeriod or until ctx is done, for a Watch call in flight, so that no Watch
+// starts after Leave; Leave's own bound starts after that wait. A failed Leave is reported and
+// otherwise ignored.
 func (n *Node) leave(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, n.cfg.Timing.RetryPeriod)
-	defer cancel()
+	period := n.cfg.Timing.RetryPeriod
 	n.mu.Lock()
 	n.left = true
 	call := n.watchCall
 	n.mu.Unlock()
 	if call != nil {
+		t := time.NewTimer(period)
 		select {
 		case <-call:
+		case <-t.C:
 		case <-ctx.Done():
 		}
+		t.Stop()
 	}
+	ctx, cancel := context.WithTimeout(ctx, period)
+	defer cancel()
 	if err := n.cfg.Membership.Leave(ctx); err != nil {
 		n.obs.membershipFailed("Leave", err)
 	}
