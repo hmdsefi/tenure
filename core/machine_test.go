@@ -1755,6 +1755,33 @@ func TestSlotVacancy(t *testing.T) {
 		runSteps(t, fencedS0(steps...), checks)
 	})
 
+	t.Run("a release of the held slot that is never answered ends when the views show the slot vacant", func(t *testing.T) {
+		steps := append(slotBootS0(),
+			drained(1000, stopDrainingS0(), wakeAt(2000)),
+			runStopped(1200, 7, releaseS0(7), wakeAt(2000)),
+			released(1400, 7, releaseSlot(0), wakeAt(2000)),
+		)
+		for now := int64(2000); now < 14000; now += 2000 {
+			steps = append(steps,
+				tick(now, core.KeepAlive{}, wakeAt(now+1400)),
+				renewed(now+100, now, extended(now+10000), wakeAt(now+1400)),
+				tick(now+1400, releaseSlot(0), wakeAt(now+2000)),
+			)
+		}
+		steps = append(steps,
+			tick(14000, core.KeepAlive{}, wakeAt(15300)),
+			renewed(14100, 14000, extended(24000), wakeAt(15300)),
+			// The slot the member took at @0.3 has been shown vacant for LeaseDuration: it is given up,
+			// and with every shard idle the session closes.
+			tick(15300, core.CloseSession{}, wakeAt(17300)),
+		)
+		checks := stepChecks{
+			len(steps) - 1: all(slotIs(0), nextWakeIs(15300)),
+			len(steps):     all(sessionIs(15300, core.SessionStateClosing, 24000, none), slotIs(-1)),
+		}
+		runSteps(t, scenario(steps...), checks)
+	})
+
 	// In these two, s/0 goes to slot-1 or slot-2 of three, but to slot-0 if both of those expired.
 	t.Run("after a lost session no slot expires and no held slot is lost", func(t *testing.T) {
 		c := scenario(append(slotBootS0(),
@@ -3728,11 +3755,13 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 				r, isRelease := in.(core.SlotReleased)
 				c, isClaim := in.(core.SlotClaimed)
 				otherHolder := isView && was >= 0 && was < applied.Slots && applied.SlotHolders[was] != "" && applied.SlotHolders[was] != "h1"
+				releasedHeld := isRelease && r.Slot == was && releaseSent
+				countedClaim := !viewApplied || c.Slot < applied.Slots
 				switch {
 				case h != -1:
-				case was >= 0 && !(isRelease && r.Slot == was && releaseSent) && !otherHolder:
+				case was >= 0 && !releasedHeld && !otherHolder:
 					hA = was
-				case was == -1 && isClaim && c.Slot >= 0 && !prior.Draining && !givingBack[c.Slot] && !(viewApplied && c.Slot >= applied.Slots):
+				case was == -1 && isClaim && c.Slot >= 0 && !prior.Draining && !givingBack[c.Slot] && countedClaim:
 					hA = c.Slot
 				}
 				if hA != was && was >= 0 && vac.start(was, st.Now, applied) {
