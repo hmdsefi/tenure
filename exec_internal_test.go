@@ -254,7 +254,11 @@ func sortedMethods(cs []*scriptCall) string {
 }
 
 // laneGoroutines counts the executor's lane goroutines.
+// laneGoroutines counts the executor's lane goroutines in the bubble. It waits until every
+// goroutine of the bubble is blocked first, so a lane that has signalled wait but is still
+// returning from run is not counted.
 func laneGoroutines() int {
+	synctest.Wait()
 	buf := make([]byte, 1<<20)
 	n := runtime.Stack(buf, true)
 	return strings.Count(string(buf[:n]), "tenure.(*executor).run(")
