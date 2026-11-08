@@ -15,8 +15,9 @@
 // on the Store's clock, never by the acquirer. Confirm is a plain read and never writes. Each
 // grant, clear and deletion of an existing record takes the next value of one counter shared by
 // every record, so record versions go up by exactly 1 per write; slot writes take none. Every
-// such write reaches each watch channel before the method that makes it returns. A call that
-// returns an error has changed nothing, whatever the error.
+// such write reaches each open watch channel, or closes it when its buffer is full, before the
+// method that makes it returns. A call that returns an error has changed nothing, whatever the
+// error.
 //
 // Every method takes one lock for the whole Store, so a Store is safe for concurrent use, also
 // inside a testing/synctest bubble.
