@@ -328,8 +328,10 @@ func (n *Node) closeSession(ctx context.Context) {
 // the drain goes on: a later Drain waits for it again. The error names the shards not released
 // yet, those whose Run has not returned or whose release is still out, by space and then shard,
 // as in "tenure: drain: context deadline exceeded (not released: orders/3, orders/5)". When every
-// shard is released but the session is not closed yet, it ends in "(session not closed)". After
-// Close, Drain returns ErrClosed.
+// shard is released but the session is not closed yet, it ends in "(session not closed)".
+//
+// Drain returns ErrClosed after Close, during a Close whose ctx was done when it was called and
+// that so skipped the drain, and when a Close stops the node before the drain completes.
 func (n *Node) Drain(ctx context.Context) error {
 	n.mu.Lock()
 	if n.closed || (n.closing && n.drainDone == nil) {
