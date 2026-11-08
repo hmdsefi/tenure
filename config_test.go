@@ -99,7 +99,10 @@ func TestATRUN01InvalidConfig(t *testing.T) {
 				c.Self.LeaveAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 			}, `Self: core: invalid member "n1": LeaveAt is not after JoinAt`, core.ErrInvalidMember},
 			{"Self before everything", func(c *tenure.Config, _ configDoubles) {
-				*c = tenure.Config{Self: tenure.Member{ID: ""}, Slots: -1, Spaces: []tenure.Space{{}}}
+				*c = tenure.Config{
+					Self:  tenure.Member{ID: "", Meta: map[string]string{"tenure.x": ""}},
+					Slots: -1, Spaces: []tenure.Space{{}},
+				}
 			}, `Self: core: invalid member: empty ID`, core.ErrInvalidMember},
 
 			// Check 2: reserved Meta keys, the lowest one named.
@@ -130,6 +133,11 @@ func TestATRUN01InvalidConfig(t *testing.T) {
 				c.Timing = core.DefaultTiming
 				c.Timing.LeaseDuration = -time.Second
 			}, `Timing: core: invalid timing: LeaseDuration -1s must be in (0s, 24h0m0s]`, core.ErrInvalidTiming},
+
+			{"Timing before Slots", func(c *tenure.Config, _ configDoubles) {
+				c.Timing = core.Timing{LeaseDuration: time.Second}
+				c.Slots = -1
+			}, `Timing: core: invalid timing: RenewDeadline 0s must be in (0s, 24h0m0s]`, core.ErrInvalidTiming},
 
 			// Check 5: Slots.
 			{"negative Slots", func(c *tenure.Config, _ configDoubles) { c.Slots = -1 },
