@@ -43,3 +43,8 @@ func WithStepHook(ctx context.Context, f func(StepRecord)) context.Context {
 // SessionDeadline returns the session deadline the loop keeps for unfenced shards, as a reading
 // since the epoch.
 func (n *Node) SessionDeadline() time.Duration { return time.Duration(n.deadline.Load()) }
+
+// PublishedShard returns the published Shard of shard id of space, nil when none is published.
+func (n *Node) PublishedShard(space string, id int) *Shard {
+	return n.shards[space].local[id].Load()
+}

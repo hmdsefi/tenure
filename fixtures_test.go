@@ -1034,3 +1034,119 @@ func stacks(all bool) string {
 		buf = make([]byte, 2*len(buf))
 	}
 }
+
+// orders returns RUN §10's space orders: 8 shards without fencing, served by run.
+func orders(run func(context.Context, *tenure.Shard) error) tenure.Space {
+	return tenure.Space{Name: "orders", Shards: 8, Run: run}
+}
+
+// runCall is one call of a runLog's Run.
+type runCall struct {
+	Shard *tenure.Shard // the Shard Run got
+
+	Deadline    time.Time // ctx's deadline, if HasDeadline
+	HasDeadline bool
+
+	Start, End  time.Time // bubble times; End is zero while Run runs
+	Seq, EndSeq uint64    // stamps from seq at the start and the return
+	Done        bool      // Run has returned
+
+	// CtxDone is when ctx was done, zero while it is not. CheckAtDone is what the Shard's Check
+	// returned at that instant.
+	CtxDone     time.Time
+	CheckAtDone error
+
+	Cause error // context.Cause(ctx) when Run returned, nil when ctx was not done then
+	Err   error // what Run returned
+}
+
+// String formats c for failure messages, such as `Run(orders/3 term 5) = boom (cause <nil>)`.
+func (c runCall) String() string {
+	s := fmt.Sprintf("Run(%s/%d term %d)", c.Shard.Space, c.Shard.ID, c.Shard.Term)
+	if !c.Done {
+		return s + " running"
+	}
+	return fmt.Sprintf("%s = %v (cause %v)", s, c.Err, c.Cause)
+}
+
+// runScript replaces the body of a runLog's Run: it gets Run's arguments and the number of
+// earlier calls for the same shard of the same space.
+type runScript func(ctx context.Context, sh *tenure.Shard, earlier int) error
+
+// runLog is RUN §10's rec: its Run records every call (its start, ctx's deadline, when ctx is
+// done, the cause and the return) and, unless a script replaces its body, blocks until ctx is
+// done and returns the cause. The methods are safe for concurrent use.
+type runLog struct {
+	mu     sync.Mutex
+	calls  []*runCall
+	script runScript
+}
+
+// Script makes f the body of every later call; nil restores blocking until ctx is done.
+func (l *runLog) Script(f runScript) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.script = f
+}
+
+// Run is a Space.Run that records the call and runs the script.
+func (l *runLog) Run(ctx context.Context, sh *tenure.Shard) error {
+	c := &runCall{Shard: sh, Start: time.Now()}
+	c.Deadline, c.HasDeadline = ctx.Deadline()
+	l.mu.Lock()
+	c.Seq = seq()
+	earlier := 0
+	for _, o := range l.calls {
+		if o.Shard.Space == sh.Space && o.Shard.ID == sh.ID {
+			earlier++
+		}
+	}
+	l.calls = append(l.calls, c)
+	f := l.script
+	l.mu.Unlock()
+
+	stop := context.AfterFunc(ctx, func() {
+		at, check := time.Now(), sh.Check()
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		c.CtxDone, c.CheckAtDone = at, check
+	})
+	var err error
+	if f != nil {
+		err = f(ctx, sh, earlier)
+	} else {
+		<-ctx.Done()
+		err = context.Cause(ctx)
+	}
+	stop()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	c.End, c.EndSeq, c.Done, c.Err = time.Now(), seq(), true, err
+	if ctx.Err() != nil {
+		c.Cause = context.Cause(ctx)
+	}
+	return err
+}
+
+// Calls returns a copy of the recorded calls in start order.
+func (l *runLog) Calls() []runCall {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]runCall, len(l.calls))
+	for i, c := range l.calls {
+		out[i] = *c
+	}
+	return out
+}
+
+// Of returns a copy of the recorded calls for shard id of space, in start order.
+func (l *runLog) Of(space string, id int) []runCall {
+	var out []runCall
+	for _, c := range l.Calls() {
+		if c.Shard.Space == space && c.Shard.ID == id {
+			out = append(out, c)
+		}
+	}
+	return out
+}
