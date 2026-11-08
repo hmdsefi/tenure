@@ -24,11 +24,20 @@ const incarnationBytes = 16
 
 // Node is a running member of a group, as Start returns it. Its methods are safe for concurrent
 // use.
+//
+// When the store reports the member's session lost, the node stops every shard it owns with a
+// "lost" error, waits for every Run to return, and then goes on with a new incarnation: a new
+// holder and a new session, under which it acquires its shards again. It stays in the group
+// meanwhile, and keeps its watches.
 type Node struct {
-	cfg    Config    // checkConfig's result: defaults applied, Spaces and Self.Meta copied
-	holder string    // Self.ID + "/" + the incarnation in lowercase hex
-	epoch  time.Time // the node's monotonic origin, taken after the incarnation is drawn
-	obs    observer
+	cfg Config // checkConfig's result: defaults applied, Spaces and Self.Meta copied
+
+	// holder is Self.ID + "/" + the incarnation in lowercase hex. After Start only the loop
+	// changes it, under stepMu, when it starts a new incarnation (RUN-180).
+	holder string
+
+	epoch time.Time // the node's monotonic origin, taken after the incarnation is drawn
+	obs   observer
 
 	// ctx is the internal context, context.WithCancel(context.WithoutCancel(Start's ctx)):
 	// every goroutine and every call after Start runs under it, and Close cancels it.
@@ -56,7 +65,7 @@ type Node struct {
 	stepMu      sync.Mutex    // held while the loop carries a step out
 	halted      bool          // a forced Close stopped driving the machine; guarded by stepMu
 	deadline    atomic.Int64  // the session deadline in ns since epoch; only the loop writes it
-	machineDone chan struct{} // closed when the machine's Status first reports Done
+	machineDone chan struct{} // closed when a machine is done and no new incarnation follows it
 
 	// Holder observations (RUN-170, RUN-175): the freshness filter, which only the loop uses, the
 	// readings that the store watch and the resyncs hand to the loop, and the resync requests.
@@ -99,13 +108,13 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		return nil, err
 	}
 
-	var inc [incarnationBytes]byte
-	if _, err := io.ReadFull(cfg.Rand, inc[:]); err != nil {
+	holder, err := drawHolder(cfg.Self.ID, cfg.Rand)
+	if err != nil {
 		return nil, fmt.Errorf("tenure: draw incarnation: %w", err)
 	}
 	n := &Node{
 		cfg:         cfg,
-		holder:      cfg.Self.ID + "/" + hex.EncodeToString(inc[:]),
+		holder:      holder,
 		epoch:       time.Now(),
 		obs:         nopObserver{},
 		first:       make(chan struct{}),
@@ -177,12 +186,7 @@ func (n *Node) openSession(ctx context.Context) error {
 	n.sessionOpen = true
 
 	const gen = 1
-	m := core.NewMachine(core.MachineConfig{
-		Holder: n.holder,
-		Member: n.cfg.Self.ID,
-		Spaces: spaceSpecs(n.cfg.Spaces),
-		Timing: n.cfg.Timing,
-	})
+	m := n.newMachine(n.holder)
 	n.exec = newExecutor(n.ctx, n.cfg.Store, n.cfg.Timing, n.epoch, n.obs.callFailed)
 	n.fresh = newFreshness(n.holder, n.cfg.Spaces, n.exec.confirmStarted)
 	n.readings = newReadings()
@@ -249,6 +253,26 @@ func (n *Node) readSlots(ctx context.Context, ss SlotStore) (time.Time, error) {
 	return at, nil
 }
 
+// drawHolder reads an incarnation of incarnationBytes bytes from r and returns the holder of
+// member id with it: id, "/" and the incarnation in lowercase hex.
+func drawHolder(id string, r io.Reader) (string, error) {
+	var inc [incarnationBytes]byte
+	if _, err := io.ReadFull(r, inc[:]); err != nil {
+		return "", err
+	}
+	return id + "/" + hex.EncodeToString(inc[:]), nil
+}
+
+// newMachine returns a new machine of the node's member and spaces for holder.
+func (n *Node) newMachine(holder string) *core.Machine {
+	return core.NewMachine(core.MachineConfig{
+		Holder: holder,
+		Member: n.cfg.Self.ID,
+		Spaces: spaceSpecs(n.cfg.Spaces),
+		Timing: n.cfg.Timing,
+	})
+}
+
 // spaceSpecs returns the machine's description of spaces, in the same order.
 func spaceSpecs(spaces []Space) []core.SpaceSpec {
 	specs := make([]core.SpaceSpec, len(spaces))
@@ -296,8 +320,10 @@ func (n *Node) closeSession(ctx context.Context) {
 
 // Drain hands the member's work over: it marks the member as draining in the group and, with a
 // Store, stops the Run of every shard the member owns, releases each shard once its Run has
-// returned, and closes the member's session. It returns nil once all of that is done. The first
-// call of Drain or Close starts the drain; later and concurrent calls wait for the same drain.
+// returned, and closes the member's session. It returns nil once all of that is done. When the
+// session is lost during the drain, there is nothing left to release or close: Drain returns nil
+// once every Run has returned, and the node starts no new incarnation. The first call of Drain
+// or Close starts the drain; later and concurrent calls wait for the same drain.
 //
 // When ctx ends first, Drain returns an error that wraps ctx's error and says what is left, and
 // the drain goes on: a later Drain waits for it again. The error names the shards not released
@@ -402,8 +428,11 @@ func (n *Node) undrainedLocked() string {
 // drain is the drain goroutine (RUN-500). With a store it first posts Drain to the loop, so the
 // machine hands everything over and closes the session. It calls SetDraining(true) with a
 // context bounded by RetryPeriod, and again RetryPeriod after each failed attempt started, until
-// one succeeds. The drain completes once that call has succeeded and, with a store, the
-// machine's Status reports Done. It ends early when the internal context is done.
+// one succeeds. The drain completes once that call has succeeded and, with a store, the loop has
+// closed n.machineDone: the machine's session is closed, or it was lost and the machine is done
+// with every Run returned. After a loss the loop starts no new incarnation once a drain has been
+// requested, and nothing closes the lost session (RUN-190). It ends early when the internal
+// context is done.
 func (n *Node) drain() {
 	if n.cfg.Store != nil {
 		n.inbox.post(core.Drain{})
@@ -420,6 +449,13 @@ func (n *Node) drain() {
 	}
 	n.obs.drained()
 	close(n.drainDone)
+}
+
+// drainRequested reports whether Drain or Close has started the drain.
+func (n *Node) drainRequested() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.drainDone != nil
 }
 
 // setDraining calls SetDraining(true) until a call succeeds, as drain says, and reports whether

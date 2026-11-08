@@ -26,8 +26,8 @@ import (
 // slot actions and Route over slot keys. Steps carrying an AT-RUN number were written from the
 // issue's text.
 
-// holder02 is the holder of member n2 whose incarnation is the bytes 0 to 15.
-const holder02 = "n2/000102030405060708090a0b0c0d0e0f"
+// holderN2 is the holder of member n2 whose incarnation is the bytes 0 to 15.
+const holderN2 = "n2/000102030405060708090a0b0c0d0e0f"
 
 // withoutRefreshes returns calls, in Seq order, without the Slots calls of the slot refresher:
 // those that start after the first KeepAlive, which opens the session in Start.
@@ -273,8 +273,8 @@ func TestATRUN21MergedSlots(t *testing.T) {
 		if got, want := slotted(published(t, n1)), []string{"n2:0"}; !slices.Equal(got, want) {
 			t.Errorf("n1's published view: members with a slot = %v, want %v", got, want)
 		}
-		if v := published(t, n1); !slices.Equal(v.SlotHolders, []string{holder02}) || !slices.Equal(memberIDs(v), []string{"n1", "n2"}) {
-			t.Errorf("n1's published view = %+v, want n1 and n2 with slot 0 held by %s", v, holder02)
+		if v := published(t, n1); !slices.Equal(v.SlotHolders, []string{holderN2}) || !slices.Equal(memberIDs(v), []string{"n1", "n2"}) {
+			t.Errorf("n1's published view = %+v, want n1 and n2 with slot 0 held by %s", v, holderN2)
 		}
 		recs, _ := log.records()
 		views := 0
