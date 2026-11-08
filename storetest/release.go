@@ -248,10 +248,10 @@ func holdingsOrder(e *env) {
 	e.holdings(h2, "a", want)
 }
 
-// holdingsVersion: every grant, clear and lost record takes a version above that of every
-// earlier write to any record of the store, across shards and spaces, and a refused Acquire or a
-// Release that matches nothing leaves every version as it is. When the fixture can lose records,
-// a record granted again after its loss still takes a larger version.
+// holdingsVersion: every grant and clear takes a version above that of every earlier write to
+// any record of the store, across shards and spaces, and a refused Acquire or a Release that
+// matches nothing leaves every version as it is. When the fixture can lose records, a grant after
+// a lost record, of that shard or another, still takes a larger version.
 func holdingsVersion(e *env) {
 	h1, h2 := holder(1, 1), holder(2, 1)
 	e.open(h1)
@@ -293,7 +293,7 @@ func holdingsVersion(e *env) {
 	}
 	e.f.DeleteRecord("a", 0)
 	e.rec(h1, "a", 0, "", 0)
-	ta0 = e.acqIn(h1, "a", 0, 1, math.MaxUint64)
+	ta0 = e.acqIn(h1, "a", 0, 1, exactly(math.MaxUint64))
 	grew(e.rec(h1, "a", 0, h1, ta0))
 	e.f.DeleteRecord("a", 3)
 	tb4 = e.acq(h1, "b", 4)

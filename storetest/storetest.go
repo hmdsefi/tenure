@@ -346,14 +346,15 @@ func (e *env) held(h, space string, shard int, by string) {
 	}
 }
 
-// acqIn checks that h is granted the shard at a term in [lo, hi], and returns the term. Unlike
-// acq it allows a term below those the case has seen, as after a lost record.
-func (e *env) acqIn(h, space string, shard int, lo, hi core.Term) core.Term {
+// acqIn checks that h is granted the shard at a term in [lo, hi()], and returns the term. hi is
+// called once the grant has returned. Unlike acq it allows a term below those the case has seen,
+// as after a lost record.
+func (e *env) acqIn(h, space string, shard int, lo core.Term, hi func() core.Term) core.Term {
 	e.t.Helper()
 	term, err := e.client(h).Acquire(e.ctx, h, space, shard)
-	if err != nil || term < lo || term > hi {
-		want := fmt.Sprintf("a term in [%d, %d]", lo, hi)
-		if lo == hi {
+	if top := hi(); err != nil || term < lo || term > top {
+		want := fmt.Sprintf("a term in [%d, %d]", lo, top)
+		if lo == top {
 			want = strconv.FormatUint(uint64(lo), 10)
 		}
 		e.t.Fatalf("Acquire(%q, %q, %d) = %d, %s, want %s, nil", h, space, shard, term, errText(err), want)
@@ -361,6 +362,9 @@ func (e *env) acqIn(h, space string, shard int, lo, hi core.Term) core.Term {
 	e.terms[shardKey{space, shard}] = term
 	return term
 }
+
+// exactly returns a bound for acqIn that is always t.
+func exactly(t core.Term) func() core.Term { return func() core.Term { return t } }
 
 // release checks that h's Release of the shard at term returns nil.
 func (e *env) release(h, space string, shard int, term core.Term) {

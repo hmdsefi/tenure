@@ -132,16 +132,14 @@ func termWallAhead(e *env) {
 
 	w := wallOf(t1).Add(time.Hour)
 	at := e.setWall(w)
-	lo, hi := e.wallTerms(t1, w, at)
-	t2 := e.acqIn(h1, "a", 0, lo, hi)
+	t2 := e.acqWall(h1, "a", 0, t1, w, at)
 	e.rec(h2, "a", 0, h1, t2)
 	e.release(h1, "a", 0, t2)
 
 	e.rec(h2, "a", 0, "", t2)
 	w = wallOf(t2).Add(24 * time.Hour)
 	at = e.setWall(w)
-	lo, hi = e.wallTerms(t2, w, at)
-	t3 := e.acqIn(h2, "a", 0, lo, hi)
+	t3 := e.acqWall(h2, "a", 0, t2, w, at)
 	e.rec(h1, "a", 0, h2, t3)
 }
 
@@ -154,21 +152,22 @@ func termWallBehind(e *env) {
 	t1 := e.acq(h1, "a", 0)
 
 	e.setWall(wallOf(t1).Add(-time.Hour))
-	e.acqIn(h1, "a", 0, t1+1, t1+1)
-	e.acqIn(h1, "a", 0, t1+2, t1+2)
+	e.acqIn(h1, "a", 0, t1+1, exactly(t1+1))
+	e.acqIn(h1, "a", 0, t1+2, exactly(t1+2))
 	e.release(h1, "a", 0, t1+2)
 	e.rec(h2, "a", 0, "", t1+2)
-	e.acqIn(h2, "a", 0, t1+3, t1+3)
+	e.acqIn(h2, "a", 0, t1+3, exactly(t1+3))
 	e.rec(h1, "a", 0, h2, t1+3)
 
 	e.setWall(time.Unix(-3600, 0))
-	e.acqIn(h2, "a", 0, t1+4, t1+4)
+	e.acqIn(h2, "a", 0, t1+4, exactly(t1+4))
 	e.rec(h1, "a", 0, h2, t1+4)
 }
 
 // termLostRecord: once a shard's record is lost, it reads as absent, and the next grant takes a
 // new record at a term from the wall clock, above the lost term since the wall clock has moved
-// on, with a version above the lost record's.
+// on, with a version above the lost record's. A late Release at the lost term leaves the new
+// record as it is.
 func termLostRecord(e *env) {
 	h1, h2 := holder(1, 1), holder(2, 1)
 	e.open(h1)
@@ -183,9 +182,10 @@ func termLostRecord(e *env) {
 	e.elapse(e.f.Timing.RetryPeriod, h1, h2)
 
 	t2 := e.acq(h2, "a", 0)
-	e.ver(r1, e.rec(h1, "a", 0, h2, t2))
+	r2 := e.rec(h1, "a", 0, h2, t2)
+	e.ver(r1, r2)
 	e.release(h1, "a", 0, t1)
-	e.rec(h1, "a", 0, h2, t2)
+	e.same(r2, e.rec(h1, "a", 0, h2, t2))
 	e.held(h1, "a", 0, h2)
 }
 
@@ -203,8 +203,7 @@ func termLostRecordWallBehind(e *env) {
 	e.f.DeleteRecord("b", 3)
 	e.rec(h1, "b", 3, "", 0)
 	e.rec(h2, "b", 3, "", 0)
-	lo, hi := e.wallTerms(0, w, at)
-	t2 := e.acqIn(h2, "b", 3, lo, hi)
+	t2 := e.acqWall(h2, "b", 3, 0, w, at)
 	e.rec(h1, "b", 3, h2, t2)
 
 	t3 := e.acq(h2, "b", 3)
@@ -264,15 +263,19 @@ func (e *env) setWall(w time.Time) time.Time {
 	return at
 }
 
-// wallTerms returns the bounds of the term a grant over prev gets after the store's wall clock
-// was set to w at real time at. In virtual time the wall clock stays at w, so the term is exact;
-// in real time it has run on since at.
-func (e *env) wallTerms(prev core.Term, w, at time.Time) (lo, hi core.Term) {
-	lo = core.NextTerm(prev, w)
-	if e.f.Advance != nil {
-		return lo, lo
-	}
-	return lo, core.NextTerm(prev, w.Add(time.Since(at)))
+// acqWall checks that h is granted the shard at the term a grant over prev gets after the
+// store's wall clock was set to w at real time at, and returns the term. In virtual time the wall
+// clock stays at w, so the term is exact; in real time it has run on since at, up to the moment
+// the grant returns.
+func (e *env) acqWall(h, space string, shard int, prev core.Term, w, at time.Time) core.Term {
+	e.t.Helper()
+	lo := core.NextTerm(prev, w)
+	return e.acqIn(h, space, shard, lo, func() core.Term {
+		if e.f.Advance != nil {
+			return lo
+		}
+		return core.NextTerm(prev, w.Add(time.Since(at)))
+	})
 }
 
 // wallOf returns the wall time whose Unix milliseconds are t.
