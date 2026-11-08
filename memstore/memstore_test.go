@@ -194,6 +194,90 @@ func TestRecordRules(t *testing.T) {
 		}
 	})
 
+	t.Run("every grant builds on the record's term", func(t *testing.T) {
+		// The wall clock stays put, so each term is the record's term plus 1.
+		s, c := newStore(t)
+		keepAlive(t, s, h1, timing)
+		keepAlive(t, s, h2, timing)
+		first := acquire(t, s, h1, "a", 0)
+		if err := s.Release(ctx, h1, "a", 0, first); err != nil {
+			t.Fatalf("Release(h1, a, 0, %d) = %v, want nil", first, err)
+		}
+		if got := acquire(t, s, h2, "a", 0); got != first+1 {
+			t.Errorf("grant of a cleared record = %d, want %d", got, first+1)
+		}
+		c.setMono(lease - time.Millisecond)
+		keepAlive(t, s, h1, timing)
+		keepAlive(t, s, h3, timing)
+		c.setMono(lease)
+		if got := acquire(t, s, h3, "a", 0); got != first+2 {
+			t.Errorf("grant over an expired holder = %d, want %d", got, first+2)
+		}
+		keepAlive(t, s, holder(3, 2), timing)
+		if got := acquire(t, s, h1, "a", 0); got != first+3 {
+			t.Errorf("grant over a replaced holder = %d, want %d", got, first+3)
+		}
+	})
+
+	t.Run("of racing holders exactly one is granted", func(t *testing.T) {
+		s, _ := newStore(t)
+		const n = 8
+		holders := make([]string, n)
+		for i := range holders {
+			holders[i] = holder(10+i, 1)
+			keepAlive(t, s, holders[i], timing)
+		}
+		// Each holder tries again and again while others read, so the race detector sees every
+		// method run alongside the writes; only the first winner is ever granted, re-grants
+		// included.
+		var wg sync.WaitGroup
+		grants := make([]int, n)
+		errs := make([]error, 2*n)
+		for i, h := range holders {
+			wg.Go(func() {
+				for range 20 {
+					term, err := s.Acquire(ctx, h, "a", 0)
+					var held *tenure.HeldError
+					switch {
+					case err == nil && term != 0:
+						grants[i]++
+					case errors.As(err, &held):
+					default:
+						errs[2*i] = fmt.Errorf("Acquire(%q) = %d, %v, want a term or a *tenure.HeldError", h, term, err)
+						return
+					}
+				}
+			})
+			wg.Go(func() {
+				for range 20 {
+					if _, err := s.Holdings(ctx, "a"); err != nil {
+						errs[2*i+1] = err
+						return
+					}
+					if _, err := s.Confirm(ctx, h, "a", 0, 1); err != nil {
+						errs[2*i+1] = err
+						return
+					}
+				}
+			})
+		}
+		wg.Wait()
+		for _, err := range errs {
+			if err != nil {
+				t.Error(err)
+			}
+		}
+		winners := 0
+		for _, g := range grants {
+			if g > 0 {
+				winners++
+			}
+		}
+		if winners != 1 {
+			t.Errorf("%d racing holders were granted the shard, want 1", winners)
+		}
+	})
+
 	t.Run("mismatched Release changes nothing", func(t *testing.T) {
 		s, _ := newStore(t)
 		keepAlive(t, s, h1, timing)
