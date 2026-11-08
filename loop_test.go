@@ -197,19 +197,28 @@ func TestATRUN01ValidConfigStarts(t *testing.T) {
 		})
 	}
 
-	t.Run("spaces not supported yet", func(t *testing.T) {
+	t.Run("with spaces", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			check := baseline(t)
 			r := newRig(t)
+			var runs runLog
 			cfg := r.config()
-			cfg.Spaces = []tenure.Space{{Name: "orders", Shards: 8, Run: noRun}}
-			n, err := tenure.Start(context.Background(), cfg)
-			if n != nil || err == nil || err.Error() != "tenure: Start: a Config with Spaces is not supported yet" {
-				t.Errorf("Start() = %v, %v, want nil and the spaces error", n, err)
+			cfg.Spaces = []tenure.Space{orders(runs.Run)}
+			n := start(t, context.Background(), cfg)
+			synctest.Wait()
+			var got []int
+			for _, c := range runs.Calls() {
+				got = append(got, c.Shard.ID)
 			}
-			if c := slices.Concat(r.fs.Calls(), r.sm.Calls()); len(c) != 0 {
-				t.Errorf("calls = %v, want none", c)
+			slices.Sort(got)
+			if want := bal("orders", 8, "n1", "n2")["n1"]; !slices.Equal(got, want) {
+				t.Errorf("runs of shards %v, want %v", got, want)
 			}
+			closeNode(t, n)
+			if got, want := len(r.fs.Calls("Release")), len(runs.Calls()); got != want {
+				t.Errorf("%d Release calls, want %d", got, want)
+			}
+			r.wantSessionClosed(t)
 			check()
 		})
 	})
@@ -410,16 +419,33 @@ func TestATRUN05StartFailureCleanup(t *testing.T) {
 }
 
 // TestATRUN06StartContextScope checks that Start's ctx bounds only Start's own calls: the
-// session is renewed every RetryPeriod after it ended, each renewal bounded by RetryPeriod.
+// session is renewed every RetryPeriod after it ended, each renewal bounded by RetryPeriod; each
+// Acquire is bounded by RetryPeriod; and the runs neither end with it nor have its deadline.
 func TestATRUN06StartContextScope(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
 		r := newRig(t)
+		var runs runLog
+		cfg := r.config()
+		cfg.Spaces = []tenure.Space{orders(runs.Run)}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		t0 := time.Now()
-		n := start(t, ctx, r.config())
+		n := start(t, ctx, cfg)
 		time.Sleep(9 * time.Second)
+
+		mine := bal("orders", 8, "n1", "n2")["n1"]
+		rc := runs.Calls()
+		if len(rc) != len(mine) {
+			t.Errorf("runs = %v, want one for each of %v", rc, mine)
+		}
+		for _, c := range rc {
+			if !slices.Contains(mine, c.Shard.ID) || c.HasDeadline || !c.CtxDone.IsZero() || !c.Shard.Valid() {
+				t.Errorf("%v: deadline set %t, ctx done at %v, Valid %t; want a run of n1 with no deadline that goes on",
+					c, c.HasDeadline, c.CtxDone, c.Shard.Valid())
+			}
+		}
+		wantDeadlines(t, r.fs.Calls("Acquire"))
 
 		ka := r.fs.Calls("KeepAlive")
 		if got, want := startsAt(ka, t0), secs(0, 2, 4, 6, 8); !slices.Equal(got, want) {

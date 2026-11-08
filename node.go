@@ -17,9 +17,6 @@ import (
 	"github.com/hmdsefi/tenure/core"
 )
 
-// errSpacesNotSupported is Start's error for a Config with Spaces, until the node runs shards.
-var errSpacesNotSupported = errors.New("tenure: Start: a Config with Spaces is not supported yet")
-
 // incarnationBytes is the number of random bytes that name one session of a member.
 const incarnationBytes = 16
 
@@ -55,6 +52,11 @@ type Node struct {
 	deadline    atomic.Int64  // the session deadline in ns since epoch; only the loop writes it
 	machineDone chan struct{} // closed when the machine's Status first reports Done
 
+	// The shard table: each space's shards by name, kept for the node's life, across machines.
+	// sups counts the supervisor goroutines, which Close and failStart wait for after wg.
+	shards map[string]*spaceShards
+	sups   sync.WaitGroup
+
 	mu        sync.Mutex
 	left      bool          // leave has been called: the watcher calls Watch no more
 	watchCall chan struct{} // open while the watcher's Watch call is in flight, else nil
@@ -75,15 +77,12 @@ type Node struct {
 // one, leaves the group again if it joined, and leaves no goroutine behind.
 //
 // ctx bounds Start only: Start's own calls of the membership and the store use it, and the node
-// keeps running after ctx ends, until Close. Start does not yet run shards: it returns an error
-// for a Config with Spaces.
+// keeps running after ctx ends, until Close. Start does not wait for the shards of Spaces: the
+// node acquires and runs them in the background, never under ctx.
 func Start(ctx context.Context, cfg Config) (*Node, error) {
 	cfg, err := checkConfig(cfg)
 	if err != nil {
 		return nil, err
-	}
-	if len(cfg.Spaces) > 0 {
-		return nil, errSpacesNotSupported
 	}
 
 	var inc [incarnationBytes]byte
@@ -99,6 +98,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		ended:       make(chan struct{}),
 		inbox:       newInbox(),
 		machineDone: make(chan struct{}),
+		shards:      newShardTable(cfg.Spaces),
 	}
 	n.obs.start(n.holder)
 
@@ -195,21 +195,29 @@ func spaceSpecs(spaces []Space) []core.SpaceSpec {
 }
 
 // failStart runs RUN-070's cleanup after Join succeeded and returns err. Once the session is
-// open it first stops the loop and the executor, and closes the session with a fresh context
-// bounded by RetryPeriod. Then it calls Leave with a fresh context bounded by RetryPeriod,
-// cancels the internal context and waits for every goroutine.
+// open it first stops the loop and the executor, waits for every Run the loop may have started
+// to return, and closes the session with a fresh context bounded by RetryPeriod. Then it calls
+// Leave with a fresh context bounded by RetryPeriod, cancels the internal context and waits for
+// every goroutine.
 func (n *Node) failStart(ctx context.Context, err error) error {
 	fresh := context.WithoutCancel(ctx)
 	if n.sessionOpen {
 		n.cancel()
-		n.wg.Wait()
+		n.wait()
 		n.closeSession(fresh)
 	}
 	n.leave(fresh)
 	n.cancel()
-	n.wg.Wait()
+	n.wait()
 	n.obs.startFailed(ctx, err)
 	return err
+}
+
+// wait waits for every goroutine of the node: first the loop and the others, then the
+// supervisors, which the loop may start until it returns.
+func (n *Node) wait() {
+	n.wg.Wait()
+	n.sups.Wait()
 }
 
 // closeSession calls CloseSession with ctx bounded by RetryPeriod. A failure is reported and
@@ -223,9 +231,11 @@ func (n *Node) closeSession(ctx context.Context) {
 }
 
 // Drain hands the member's work over: it marks the member as draining in the group and, with a
-// Store, closes the member's session, and returns nil once both are done. The first call of
-// Drain or Close starts the drain; later and concurrent calls wait for the same drain. When ctx ends first, Drain returns ctx's error and
-// the drain goes on. After Close, Drain returns ErrClosed.
+// Store, stops the Run of every shard the member owns, releases each shard once its Run has
+// returned, and closes the member's session. It returns nil once all of that is done. The first
+// call of Drain or Close starts the drain; later and concurrent calls wait for the same drain.
+// When ctx ends first, Drain returns ctx's error and the drain goes on. After Close, Drain
+// returns ErrClosed.
 func (n *Node) Drain(ctx context.Context) error {
 	n.mu.Lock()
 	if n.closed {
@@ -329,7 +339,7 @@ func (n *Node) Close(ctx context.Context) error {
 	}
 	n.closeResolvers()
 	n.cancel()
-	n.wg.Wait()
+	n.wait()
 
 	n.mu.Lock()
 	n.closed = true

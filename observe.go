@@ -5,6 +5,7 @@ package tenure
 
 import (
 	"context"
+	"time"
 
 	"github.com/hmdsefi/tenure/core"
 )
@@ -21,6 +22,8 @@ import (
 //   - callFailed, for each failed store call other than Acquire and KeepAlive, on the call's
 //     lane (KeepAlive failures reach step as SessionFailed with Err), and for a failed
 //     CloseSession of Start's cleanup;
+//   - runReturned, for each return of a Run that its supervisor restarts (RUN-330): the Run's
+//     Shard and error, the count of consecutive returns and the backoff before the restart;
 //   - membershipFailed, for each failed call of the membership after Join that the node retries
 //     or gives up: "Watch" (also a channel that closed before Leave), "SetDraining" and "Leave";
 //   - draining, once, when the first Drain or Close starts the drain;
@@ -31,14 +34,15 @@ import (
 // start, startFailed, closed, membershipFailed("Leave") and the callFailed of Start's cleanup are
 // called from the goroutine of Start or Close, draining from the first Drain or Close while it
 // holds n.mu, step and a store's view from the loop goroutine, the other callFailed calls from
-// the executor's lanes, and the rest from the node's watcher and drain goroutines. No call may
-// block, or call back into the node.
+// the executor's lanes, runReturned from the shard's supervisor goroutine, and the rest from the
+// node's watcher and drain goroutines. No call may block, or call back into the node.
 type observer interface {
 	start(holder string)
 	startFailed(ctx context.Context, err error)
 	view(v core.View)
 	step(rec stepRecord)
 	callFailed(r callResult)
+	runReturned(sh *Shard, err error, count int, backoff time.Duration)
 	membershipFailed(op string, err error)
 	draining()
 	drained()
@@ -50,12 +54,13 @@ type nopObserver struct{}
 
 var _ observer = nopObserver{}
 
-func (nopObserver) start(string)                       {}
-func (nopObserver) startFailed(context.Context, error) {}
-func (nopObserver) view(core.View)                     {}
-func (nopObserver) step(stepRecord)                    {}
-func (nopObserver) callFailed(callResult)              {}
-func (nopObserver) membershipFailed(string, error)     {}
-func (nopObserver) draining()                          {}
-func (nopObserver) drained()                           {}
-func (nopObserver) closed(context.Context, string)     {}
+func (nopObserver) start(string)                                  {}
+func (nopObserver) startFailed(context.Context, error)            {}
+func (nopObserver) view(core.View)                                {}
+func (nopObserver) step(stepRecord)                               {}
+func (nopObserver) callFailed(callResult)                         {}
+func (nopObserver) runReturned(*Shard, error, int, time.Duration) {}
+func (nopObserver) membershipFailed(string, error)                {}
+func (nopObserver) draining()                                     {}
+func (nopObserver) drained()                                      {}
+func (nopObserver) closed(context.Context, string)                {}

@@ -381,8 +381,6 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 	names := []string{"orders", "markets"}
 	sNames := fmt.Sprintf("store CheckNames(%v, n1)", names)
 	mNames := fmt.Sprintf("membership CheckNames(%v, n1)", names)
-	sNoNames := "store CheckNames([], n1)"
-	mNoNames := "membership CheckNames([], n1)"
 	sTiming := fmt.Sprintf("store CheckTiming(%v)", applied)
 	mTiming := fmt.Sprintf("membership CheckTiming(%v)", applied)
 
@@ -390,8 +388,7 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 		name                      string
 		storeNames, storeTiming   error
 		memberNames, memberTiming error
-		reason                    string // "" for a node that starts
-		noSpaces                  bool
+		reason                    string   // "" for a node that starts
 		calls                     []string // the checkers' calls
 	}{
 		{name: "store refuses names", storeNames: boom, reason: "Store: boom",
@@ -402,9 +399,8 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 			calls: []string{sNames, mNames, sTiming}},
 		{name: "membership refuses timing", memberTiming: boom, reason: "Membership: boom",
 			calls: []string{sNames, mNames, sTiming, mTiming}},
-		// Start runs no shards yet (1.5-08), so the node that starts has no spaces.
-		{name: "both accept", noSpaces: true,
-			calls: []string{sNoNames, mNoNames, sTiming, mTiming}},
+		{name: "both accept",
+			calls: []string{sNames, mNames, sTiming, mTiming}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -414,9 +410,6 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 				spaces := make([]tenure.Space, len(names))
 				for i, n := range names {
 					spaces[i] = tenure.Space{Name: n, Shards: 2, Run: noRun}
-				}
-				if tc.noSpaces {
-					spaces = nil
 				}
 				cfg := tenure.Config{
 					Self:       tenure.Member{ID: "n1"},
@@ -433,9 +426,14 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 						t.Fatalf("Start = %v, want nil", err)
 					}
 					// After the checkers, Start joins, watches, reads the slots and opens the session.
+					// The loop's Acquire calls, which may start before Start returns, come last and
+					// are left out.
 					want := append(slices.Clone(tc.calls), "membership Join", "membership Watch", "store Slots", "store KeepAlive")
 					for i := len(tc.calls); i < len(got); i++ {
 						got[i], _, _ = strings.Cut(got[i], "(")
+					}
+					for len(got) > len(want) && got[len(got)-1] == "store Acquire" {
+						got = got[:len(got)-1]
 					}
 					if !reflect.DeepEqual(got, want) {
 						t.Errorf("calls = %q, want %q", got, want)
@@ -484,11 +482,13 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 // "membership" followed by the call's method and arguments.
 func checkerCalls(d configDoubles) []string {
 	var out []string
+	// One read of the store's log: a node's loop may still add calls to it.
+	fs := d.fs.Calls()
 	store := map[uint64]bool{}
-	for _, c := range d.fs.Calls() {
+	for _, c := range fs {
 		store[c.Seq] = true
 	}
-	for _, c := range callsInOrder(d.fs.Calls(), d.sm.Calls()) {
+	for _, c := range callsInOrder(fs, d.sm.Calls()) {
 		who := "membership"
 		if store[c.Seq] {
 			who = "store"

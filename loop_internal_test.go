@@ -5,7 +5,9 @@ package tenure
 
 import (
 	"context"
+	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -81,10 +83,171 @@ func TestLoopExecute(t *testing.T) {
 			t.Errorf("deadline = %v, want 10s", got)
 		}
 		defer func() {
-			if r := recover(); r != "tenure: unknown action core.Acquire" {
-				t.Errorf("execute(Acquire) panicked with %v, want tenure: unknown action core.Acquire", r)
+			if r := recover(); r != "tenure: unknown action core.Confirm" {
+				t.Errorf("execute(Confirm) panicked with %v, want tenure: unknown action core.Confirm", r)
 			}
 		}()
-		l.execute(core.Acquire{Space: "orders", Shard: 1})
+		l.execute(core.Confirm{Space: "orders", Shard: 1, Term: 5})
+	})
+}
+
+// runObserver records the observer's runReturned calls.
+type runObserver struct {
+	nopObserver
+	mu      sync.Mutex
+	returns []runReturn
+}
+
+// runReturn is one runReturned call.
+type runReturn struct {
+	sh      *Shard
+	err     error
+	count   int
+	backoff time.Duration
+}
+
+func (o *runObserver) runReturned(sh *Shard, err error, count int, backoff time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.returns = append(o.returns, runReturn{sh, err, count, backoff})
+}
+
+// TestLoopRunsShards checks StartRun and StopRun as the loop carries them out: StartRun raises
+// the deadline, publishes the Shard and starts a supervisor that reports Run's returns to the
+// observer; a StopRun of another term changes nothing; StopRun stops the Shard, the supervisor
+// then posts RunStopped with it, and stepping that unpublishes the Shard.
+func TestLoopRunsShards(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var recs []stepRecord
+		l := newLoopHarness(t, &recs)
+		n := l.n
+		obs := &runObserver{}
+		n.obs = obs
+		n.cfg.Timing = core.DefaultTiming
+		boom := errors.New("boom")
+		n.shards = newShardTable([]Space{{Name: "orders", Shards: 2, Run: func(context.Context, *Shard) error { return boom }}})
+
+		n.stepMu.Lock()
+		l.execute(core.StartRun{Space: "orders", Shard: 1, Term: 7, Deadline: 10 * time.Second})
+		n.stepMu.Unlock()
+		sh := n.shards["orders"].local[1].Load()
+		if sh == nil || sh.Space != "orders" || sh.ID != 1 || sh.Term != 7 || !sh.Valid() {
+			t.Fatalf("published %+v, want a valid orders/1 at term 7", sh)
+		}
+		if p := n.shards["orders"].local[0].Load(); p != nil {
+			t.Errorf("orders/0 published %+v, want none", p)
+		}
+		if got := time.Duration(n.deadline.Load()); got != 10*time.Second {
+			t.Errorf("deadline = %v, want StartRun's 10s", got)
+		}
+
+		time.Sleep(3 * time.Second) // returns at 0 s and 2 s
+		obs.mu.Lock()
+		got := obs.returns
+		obs.mu.Unlock()
+		want := []runReturn{{sh, boom, 1, 2 * time.Second}, {sh, boom, 2, 4 * time.Second}}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("runReturned calls = %+v, want %+v", got, want)
+		}
+
+		n.stepMu.Lock()
+		l.execute(core.StopRun{Space: "orders", Shard: 1, Term: 6, Reason: core.StopMoved})
+		n.stepMu.Unlock()
+		if err := sh.Check(); err != nil {
+			t.Errorf("after a StopRun of term 6, Check() = %v, want nil", err)
+		}
+		n.stepMu.Lock()
+		l.execute(core.StopRun{Space: "orders", Shard: 1, Term: 7, Reason: core.StopMoved})
+		n.stepMu.Unlock()
+		n.sups.Wait()
+		if err := sh.Check(); err == nil || err.Error() != "tenure: not owner of orders/1 (term 7): moved" {
+			t.Errorf("after StopRun, Check() = %v, want the moved error", err)
+		}
+		ins, _ := n.inbox.take()
+		wantIn := []loopInput{{in: core.RunStopped{Space: "orders", Shard: 1, Term: 7}, sh: sh}}
+		if !reflect.DeepEqual(ins, wantIn) {
+			t.Fatalf("posted %+v, want %+v", ins, wantIn)
+		}
+		if p := n.shards["orders"].local[1].Load(); p != sh {
+			t.Errorf("published %+v before RunStopped is stepped, want %+v", p, sh)
+		}
+		l.step(ins[0])
+		if p := n.shards["orders"].local[1].Load(); p != nil {
+			t.Errorf("published %+v after RunStopped was stepped, want none", p)
+		}
+	})
+}
+
+// TestLoopChainsRuns checks that a StartRun for a new term while the shard's previous Run has
+// not returned publishes the new Shard at once but starts its Run only once the previous Run
+// has returned, and that the previous run's RunStopped leaves the new Shard published.
+func TestLoopChainsRuns(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var recs []stepRecord
+		l := newLoopHarness(t, &recs)
+		n := l.n
+		n.cfg.Timing = core.DefaultTiming
+		t0 := time.Now()
+		var mu sync.Mutex
+		starts := map[core.Term]time.Duration{}
+		run := func(ctx context.Context, sh *Shard) error {
+			mu.Lock()
+			starts[sh.Term] = time.Since(t0)
+			mu.Unlock()
+			<-ctx.Done()
+			if sh.Term == 7 {
+				time.Sleep(30 * time.Second) // ignores ctx for 30 s
+			}
+			return nil
+		}
+		n.shards = newShardTable([]Space{{Name: "orders", Shards: 2, Fenced: true, Run: run}})
+		exec := func(a core.Action) {
+			n.stepMu.Lock()
+			defer n.stepMu.Unlock()
+			l.execute(a)
+		}
+		started := func(term core.Term) (time.Duration, bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			d, ok := starts[term]
+			return d, ok
+		}
+
+		exec(core.StartRun{Space: "orders", Shard: 1, Term: 7})
+		sh7 := n.shards["orders"].local[1].Load()
+		time.Sleep(time.Second)
+		exec(core.StopRun{Space: "orders", Shard: 1, Term: 7, Reason: core.StopMoved})
+		exec(core.StartRun{Space: "orders", Shard: 1, Term: 8})
+		sh8 := n.shards["orders"].local[1].Load()
+		if sh8 == nil || sh8 == sh7 || sh8.Term != 8 {
+			t.Fatalf("published %+v after StartRun of term 8, want its Shard", sh8)
+		}
+
+		time.Sleep(30*time.Second - time.Nanosecond)
+		synctest.Wait()
+		if d, ok := started(8); ok {
+			t.Errorf("term 8's Run started at %v, before term 7's Run returned", d)
+		}
+		if ins, _ := n.inbox.take(); len(ins) != 0 {
+			t.Errorf("posted %+v before term 7's Run returned, want nothing", ins)
+		}
+
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		if d, ok := started(8); !ok || d != 31*time.Second {
+			t.Errorf("term 8's Run started at %v (%t), want 31s, when term 7's returned", d, ok)
+		}
+		ins, _ := n.inbox.take()
+		wantIn := []loopInput{{in: core.RunStopped{Space: "orders", Shard: 1, Term: 7}, sh: sh7}}
+		if !reflect.DeepEqual(ins, wantIn) {
+			t.Fatalf("posted %+v, want %+v", ins, wantIn)
+		}
+		l.step(ins[0])
+		if p := n.shards["orders"].local[1].Load(); p != sh8 {
+			t.Errorf("published %+v after term 7's RunStopped, want term 8's Shard", p)
+		}
+
+		exec(core.StopRun{Space: "orders", Shard: 1, Term: 8, Reason: core.StopMoved})
+		n.sups.Wait()
 	})
 }
