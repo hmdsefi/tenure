@@ -162,9 +162,10 @@ func (n *Node) offer(v core.View) {
 	}
 }
 
-// publish makes v the node's published view and reports it.
+// publish makes v the node's published view, feeds it to every node resolver, and reports it.
 func (n *Node) publish(v core.View) {
 	n.view.Store(&v)
+	n.feedResolvers(v)
 	n.obs.view(v)
 }
 

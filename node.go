@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,6 +63,10 @@ type Node struct {
 	drainDone chan struct{} // nil before the first Drain or Close; closed when the drain completes
 	closing   bool          // Close has been called
 	closed    bool          // Close has returned
+
+	resMu     sync.Mutex
+	resolvers []*Resolver // every open Resolver that Resolver returned
+	resClosed bool        // Close has closed the resolvers: Resolver returns closed ones
 }
 
 // Start starts a node for cfg and returns it once the member has joined the group, the node
@@ -327,6 +332,7 @@ func (n *Node) Close(ctx context.Context) error {
 	} else {
 		reason, err = "deadline", fmt.Errorf("tenure: close: %w", err)
 	}
+	n.closeResolvers()
 	n.cancel()
 	n.wait()
 
@@ -335,4 +341,53 @@ func (n *Node) Close(ctx context.Context) error {
 	n.mu.Unlock()
 	n.obs.closed(ctx, reason)
 	return err
+}
+
+// Resolver returns a Resolver that ranks keys in namespace over the node's views, the same views
+// the node itself follows, with no watch of its own. It holds the node's current view at once,
+// and places keys with core.NewRendezvous. Close of the node closes it; after Close, Resolver
+// returns a closed Resolver, whose lookups return ErrClosed.
+func (n *Node) Resolver(namespace string) *Resolver {
+	r := newResolver(namespace, core.NewRendezvous)
+	n.resMu.Lock()
+	defer n.resMu.Unlock()
+	if n.resClosed {
+		_ = r.Close()
+		return r
+	}
+	if v := n.view.Load(); v != nil {
+		r.update(*v)
+	}
+	r.onClose = n.dropResolver
+	n.resolvers = append(n.resolvers, r)
+	return r
+}
+
+// feedResolvers gives v, a view the node publishes, to every open Resolver of the node.
+func (n *Node) feedResolvers(v core.View) {
+	n.resMu.Lock()
+	defer n.resMu.Unlock()
+	for _, r := range n.resolvers {
+		r.update(v)
+	}
+}
+
+// dropResolver removes r, which has been closed, from the node's resolvers.
+func (n *Node) dropResolver(r *Resolver) {
+	n.resMu.Lock()
+	defer n.resMu.Unlock()
+	n.resolvers = slices.DeleteFunc(n.resolvers, func(x *Resolver) bool { return x == r })
+}
+
+// closeResolvers closes every Resolver of the node (RUN-540), and makes Resolver return closed
+// ones from now on.
+func (n *Node) closeResolvers() {
+	n.resMu.Lock()
+	n.resClosed = true
+	rs := n.resolvers
+	n.resolvers = nil
+	n.resMu.Unlock()
+	for _, r := range rs {
+		_ = r.Close()
+	}
 }

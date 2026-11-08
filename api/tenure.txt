@@ -197,6 +197,13 @@ func (n *Node) Drain(ctx context.Context) error
     When ctx ends first, Drain returns ctx's error and the drain goes on.
     After Close, Drain returns ErrClosed.
 
+func (n *Node) Resolver(namespace string) *Resolver
+    Resolver returns a Resolver that ranks keys in namespace over the node's
+    views, the same views the node itself follows, with no watch of its own.
+    It holds the node's current view at once, and places keys with
+    core.NewRendezvous. Close of the node closes it; after Close, Resolver
+    returns a closed Resolver, whose lookups return ErrClosed.
+
 type NotOwnerError struct {
 	// Space and Shard name the shard.
 	Space string
@@ -224,6 +231,77 @@ type PropagationEstimator interface {
 }
     PropagationEstimator is implemented by a Membership that can tell how long a
     change takes to reach every member.
+
+type Resolver struct {
+	// Has unexported fields.
+}
+    Resolver places keys on the members of a group, by rendezvous rank unless
+    WithPlacement says otherwise, with no leases: any number of keys, each
+    served by the members ranked first for it. It ranks the eligible members of
+    the latest view, as core.Eligible gives them at the current wall-clock time:
+    members that are not draining, inside their JoinAt and LeaveAt window,
+    and not standbys. It builds one core.Placement for each new list of eligible
+    members and keeps it until that list changes; when a member's JoinAt or
+    LeaveAt comes, it updates the list at that instant.
+
+    NewResolver returns a Resolver that follows a Membership itself;
+    Node.Resolver returns one that follows the node's views. A Resolver's
+    methods are safe for concurrent use. Lookup, LookupN and Members never wait
+    for a view or for another call.
+
+func NewResolver(m Membership, opts ...ResolverOption) (*Resolver, error)
+    NewResolver returns a Resolver that follows the views of m. It calls m.Watch
+    once and returns its error, as "tenure: NewResolver: watch: " and the error,
+    but never calls Join: m serves only to watch the group, and the Resolver
+    ranks whatever members its views hold. NewResolver does not wait for the
+    first view; until it comes, Lookup returns ErrNoMembers.
+
+    When the channel of Watch closes, or a later Watch fails, the Resolver calls
+    Watch again core.DefaultTiming.RetryPeriod later, until Close or until Watch
+    returns ErrClosed; after ErrClosed it keeps its last list. Views that are
+    not valid are ignored.
+
+func (r *Resolver) Close() error
+    Close stops the Resolver: lookups return ErrClosed, every channel of
+    Subscribe is closed, and every goroutine of the Resolver has returned when
+    Close returns. Later calls return ErrClosed, also only once those goroutines
+    have returned.
+
+func (r *Resolver) Lookup(key string) (Member, error)
+    Lookup returns the member ranked first for key. It returns ErrNoMembers when
+    no member is eligible, and ErrClosed after Close.
+
+func (r *Resolver) LookupN(key string, n int) ([]Member, error)
+    LookupN returns the first n members for key, best first, as a new slice:
+    all the eligible members when fewer than n are. The first member is the one
+    Lookup returns, and for a <= b, LookupN(key, a) is a prefix of LookupN(key,
+    b). It returns ErrClosed after Close, an error when n is below 1, and
+    ErrNoMembers when no member is eligible.
+
+func (r *Resolver) Members() []Member
+    Members returns the eligible members in ID order, as a new slice; nil when
+    none is eligible, before the first view and after Close.
+
+func (r *Resolver) Subscribe() <-chan []Member
+    Subscribe returns a channel that receives the list of eligible members,
+    as Members returns it, each time the list changes. It holds the current
+    list at once when a view has come. The channel holds one list, and a newer
+    list replaces one not yet received, so a slow receiver gets the latest.
+    Close closes the channel; after Close, Subscribe returns a closed channel.
+
+type ResolverOption func(*resolverOptions)
+    A ResolverOption changes how NewResolver builds a Resolver.
+
+func WithNamespace(namespace string) ResolverOption
+    WithNamespace makes the Resolver rank keys in namespace, so that the same
+    key in different namespaces lands on different members. The default is "".
+
+func WithPlacement(place func(members []Member) core.Placement) ResolverOption
+    WithPlacement makes the Resolver build its placements with place instead
+    of core.NewRendezvous. The Resolver calls place once for each new non-empty
+    list of eligible members, in ID order, and asks the returned Placement,
+    which must not be nil, for every lookup until the list changes. A nil place
+    keeps the default.
 
 type Shard struct {
 	// Space is the name of the shard's space.
