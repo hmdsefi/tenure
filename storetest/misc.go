@@ -11,14 +11,13 @@ import (
 	"github.com/hmdsefi/tenure"
 )
 
-// Context/Canceled checks that every method returns the context's error when its context is
-// already done, and Args/Invalid that every method rejects the arguments the contract rules out
+// Context/Canceled checks that every method returns the context's error itself when its context
+// is already done, and Args/Invalid that every method rejects the arguments the contract rules out
 // before it looks at sessions or records. Neither kind of call changes anything.
 
 // contextCanceled: every method of Store, and of tenure.SlotStore and tenure.Watcher when the
-// store implements them, called through each client with a canceled context, returns an error
-// that is context.Canceled and changes nothing: records, sessions, slots and watches are as
-// before.
+// store implements them, called through each client with a canceled context, returns the
+// context's error itself and changes nothing: records, sessions, slots and watches are as before.
 func contextCanceled(e *env) {
 	h1, h2, h3 := holder(1, 1), holder(2, 1), holder(3, 1)
 	slots, watches := e.slotStores(), e.watchStores()
@@ -40,8 +39,8 @@ func contextCanceled(e *env) {
 	tm := e.f.Timing
 	check := func(call, got string, err error) {
 		e.t.Helper()
-		if !errors.Is(err, context.Canceled) {
-			e.t.Fatalf("%s = %s%s, want %s", call, got, errText(err), context.Canceled)
+		if err != done.Err() {
+			e.t.Fatalf("%s = %s%s, want %s", call, got, errText(err), errText(done.Err()))
 		}
 	}
 	const ctx = "a canceled context"

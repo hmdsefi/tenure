@@ -5,7 +5,6 @@ package storetest
 
 import (
 	"context"
-	"errors"
 	"math"
 	"time"
 
@@ -226,7 +225,7 @@ func watchCancel(e *env) {
 }
 
 // watchCanceled: WatchHolders with a context already canceled or past its deadline returns the
-// context's error, and a watch opened afterwards works.
+// context's error itself, and a watch opened afterwards works.
 func watchCanceled(e *env) {
 	h1 := holder(1, 1)
 	e.open(h1)
@@ -234,14 +233,14 @@ func watchCanceled(e *env) {
 
 	canceled, cancel := context.WithCancel(e.ctx)
 	cancel()
-	if _, err := wt.WatchHolders(canceled); !errors.Is(err, context.Canceled) {
-		e.t.Fatalf("WatchHolders(a canceled context) = %s, want %s", errText(err), context.Canceled)
+	if _, err := wt.WatchHolders(canceled); err != canceled.Err() {
+		e.t.Fatalf("WatchHolders(a canceled context) = %s, want %s", errText(err), errText(canceled.Err()))
 	}
 	expired, cancel := context.WithDeadline(e.ctx, time.Unix(0, 0))
 	defer cancel()
-	if _, err := wt.WatchHolders(expired); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := wt.WatchHolders(expired); err != expired.Err() {
 		e.t.Fatalf("WatchHolders(a context past its deadline) = %s, want %s", errText(err),
-			context.DeadlineExceeded)
+			errText(expired.Err()))
 	}
 
 	w := e.watch(e.ctx)
