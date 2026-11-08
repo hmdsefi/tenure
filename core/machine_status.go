@@ -30,7 +30,8 @@ type Status struct {
 	// Draining reports that the member is handing its work over before it leaves.
 	Draining bool
 
-	// Slot is the slot the member holds, or -1 for none.
+	// Slot is the slot the member holds, or -1 for none. The member holds at most one slot, and in a
+	// view with slots it runs only the shards of that slot.
 	Slot int
 
 	// ViewVersion is the version of the last applied view.
@@ -68,7 +69,9 @@ type ShardStatus struct {
 	Holder string
 
 	// Wanted reports that the assignment gives the shard to this member and the member is not
-	// draining.
+	// draining. In a view with slots the assignment gives the member the shards of the slot it holds,
+	// unless the view has retired that slot; without slots, it gives a member that still holds a slot
+	// none.
 	Wanted bool
 
 	// Stuck reports that the run has outlived RenewDeadline since its StopRun action.

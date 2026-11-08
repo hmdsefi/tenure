@@ -173,6 +173,42 @@ func TestBoot(t *testing.T) {
 	}
 }
 
+func TestSlotBoot(t *testing.T) {
+	spaces := []core.SpaceSpec{mc.S("b", 1), mc.S("a", 2)}
+	got := mc.SlotBoot(7, spaces...)
+	wake := core.Wake{At: mc.Ms(2000)}
+	want := []mc.Step{
+		{Input: core.Tick{}, Want: []core.Action{core.KeepAlive{}, wake}},
+		mc.Renew(mc.Ms(100), 0, mc.Ms(2000)),
+		mc.ViewAt(mc.Ms(200), mc.Vs(1, []string{""}, "m1"), mc.Ms(2000), core.ClaimSlot{}),
+		{
+			Input: core.SlotClaimed{Now: mc.Ms(300), Slot: 0},
+			Want: []core.Action{
+				core.Acquire{Space: "a", Shard: 0}, core.Acquire{Space: "a", Shard: 1}, core.Acquire{Space: "b", Shard: 0}, wake,
+			},
+		},
+		mc.Grant(mc.Ms(400), "a", 0, 7, mc.Ms(10000), mc.Ms(2000)),
+		mc.Grant(mc.Ms(400), "a", 1, 8, mc.Ms(10000), mc.Ms(2000)),
+		mc.Grant(mc.Ms(400), "b", 0, 9, mc.Ms(10000), mc.Ms(2000)),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("SlotBoot = %+v, want %+v", got, want)
+	}
+	if spaces[0].Name != "b" {
+		t.Error("SlotBoot sorted its argument")
+	}
+
+	m := core.NewMachine(mc.C(spaces...))
+	for i, s := range got {
+		if result := m.Step(s.Input); !reflect.DeepEqual(result, s.Want) {
+			t.Errorf("step %d = %+v, want %+v", i+1, result, s.Want)
+		}
+	}
+	if st := m.Status(); st.Slot != 0 {
+		t.Errorf("Slot after SlotBoot = %d, want 0", st.Slot)
+	}
+}
+
 func TestBootF(t *testing.T) {
 	spaces := []core.SpaceSpec{mc.S("b", 1), mc.S("a", 2)}
 	got := mc.BootF(7, spaces...)

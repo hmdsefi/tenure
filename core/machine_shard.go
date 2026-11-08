@@ -28,6 +28,11 @@ type shardBook struct {
 	// says the same.
 	knownGone bool
 
+	// recordHeld says a lost run's shard record still names this member: the run was lost with its slot,
+	// not with its record, so its RunStopped releases the record. It means something only while the
+	// shard is lost.
+	recordHeld bool
+
 	// grantAfterRun is the term of a record that names this member above the term of a run still
 	// going, or 0 for none. It holds the largest such term, until a record that is not older names
 	// another holder or none. The run's RunStopped hands it to grant unless the session is lost, and
@@ -111,6 +116,9 @@ func (m *Machine) stepShards(in Input) {
 			ref := shardRef{space: i, shard: shard}
 			if m.sessionLost() {
 				m.applySessionLoss(ref)
+			}
+			if m.slot.lost {
+				m.applySlotLoss(ref)
 			}
 			if ref == target {
 				m.applyShardInput(ref, in)
@@ -297,9 +305,10 @@ func (m *Machine) applyHolderChanged(ref shardRef, holder string, t Term) {
 		}
 	case ShardStateLost:
 		// The run has its StopRun and nothing here brings it back. All a record can still change is
-		// what the run's RunStopped grants.
-		if notThisRun && (mine || book.grantAfterRun != 0) {
+		// what the run's RunStopped grants or releases.
+		if notThisRun && (mine || book.grantAfterRun != 0 || book.recordHeld) {
 			book.noteGrantAfterRun(mine, t)
+			book.recordHeld = false
 			sh.Holder = holder
 		}
 	case ShardStateReleasing:
@@ -370,7 +379,8 @@ func (m *Machine) stopRun(ref shardRef, state ShardState, reason StopReason) {
 // safe to release. Only a shard that told its run to stop can take the report, and only for that
 // run's term: an owned shard's run was never told to stop, and any other term is not this run's. When
 // the record no longer names the run, or the session it was held under is gone, there is nothing of the
-// run's to release, so the shard goes to idle. A term the record gave this member while the run was going
+// run's to release, so the shard goes to idle. A run lost with its slot rather than its record is
+// released like any other. A term the record gave this member while the run was going
 // now goes to grant, unless the session is lost: then the record is takeable, and nothing is released.
 //
 // A Release of a shard with a run comes only after this: the shard enters ShardStateReleasing from a
@@ -384,7 +394,9 @@ func (m *Machine) applyRunStopped(ref shardRef, t Term) {
 	}
 	sh.Stuck = false
 	book := &m.shards[ref.space][ref.shard]
-	if sh.State == ShardStateLost || book.knownGone || m.sessionLost() {
+	held := book.recordHeld
+	book.recordHeld = false
+	if (sh.State == ShardStateLost && !held) || book.knownGone || m.sessionLost() {
 		next := book.grantAfterRun
 		book.knownGone, book.grantAfterRun = false, 0
 		m.setShardState(sh, ShardStateIdle)
