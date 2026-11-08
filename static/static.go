@@ -24,7 +24,8 @@ import (
 )
 
 // Membership is one handle on a static group. It implements tenure.Membership and
-// tenure.PropagationEstimator. A handle that has not joined still watches the group.
+// tenure.PropagationEstimator. A handle that has not joined still watches the group. Make one
+// with New or Share; the zero value is not usable.
 //
 // The methods are safe for concurrent use.
 type Membership struct {
@@ -40,7 +41,7 @@ type Membership struct {
 type group struct {
 	mu      sync.Mutex
 	members []core.Member // sorted by ID; owned by the group, never shared with a view
-	view    core.View     // the current view; its Members are a copy of members
+	version uint64        // Version of the current view
 	joined  map[string]*Membership
 	handles map[*Membership]struct{} // handles with open watches
 }
@@ -74,12 +75,13 @@ func New(members []core.Member) (*Membership, error) {
 		joined:  make(map[string]*Membership),
 		handles: make(map[*Membership]struct{}),
 	}
-	g.view = core.View{Version: 1, Members: copyMembers(list)}
+	g.version = 1
 	return &Membership{g: g}, nil
 }
 
 // Share returns a new handle on the same group as m. The new handle has its own joined state and
-// its own channels; it shares the members and the views with m.
+// its own channels; it shares the members and the views with m. It is open even when m has
+// left.
 func (m *Membership) Share() *Membership {
 	return &Membership{g: m.g}
 }
@@ -136,7 +138,7 @@ func (m *Membership) Watch(ctx context.Context) (<-chan core.View, error) {
 		return nil, tenure.ErrClosed
 	}
 	w := &watch{ch: make(chan core.View, 1)}
-	w.ch <- g.view
+	w.ch <- g.view()
 	if m.watches == nil {
 		m.watches = make(map[*watch]struct{})
 	}
@@ -227,22 +229,29 @@ func (g *group) index(id string) int {
 	return i
 }
 
-// update makes next, sorted by ID, the group's member list. When member data changed, it makes a
-// view with the next Version and delivers it to every open channel: a view not yet received is
-// replaced. The caller holds g.mu.
+// view returns the current view with its own copy of the members, Meta maps included, so no two
+// channels share a map. The caller holds g.mu.
+func (g *group) view() core.View {
+	return core.View{Version: g.version, Members: copyMembers(g.members)}
+}
+
+// update makes next, sorted by ID, the group's member list. When member data changed, it moves
+// to the next Version and delivers the new view to every open channel: a view not yet received
+// is replaced. The caller holds g.mu.
 func (g *group) update(next []core.Member) {
 	if slices.EqualFunc(g.members, next, sameData) {
 		return
 	}
 	g.members = next
-	g.view = core.View{Version: g.view.Version + 1, Members: copyMembers(next)}
+	g.version++
 	for h := range g.handles {
 		for w := range h.watches {
+			// Only the group sends, under g.mu, so after the drain the send does not block.
 			select {
 			case <-w.ch:
 			default:
 			}
-			w.ch <- g.view
+			w.ch <- g.view()
 		}
 	}
 }

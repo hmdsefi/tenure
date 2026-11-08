@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -562,6 +564,21 @@ func TestATMEM15Join(t *testing.T) {
 		if got := find(t, next(t, ch), "a").Meta["zone"]; got != "z1" {
 			t.Errorf("view 3: a.Meta[zone] = %q, want z1", got)
 		}
+		// Each channel gets its own copy: a change to one receiver's view reaches no other.
+		other := m.Share()
+		first, second := watch(t, m), watch(t, other)
+		find(t, next(t, first), "a").Meta["zone"] = "scribbled"
+		if got := find(t, next(t, second), "a").Meta["zone"]; got != "z1" {
+			t.Errorf("view 3 on another channel: a.Meta[zone] = %q after a receiver changed its map, want z1", got)
+		}
+		if err := m.SetDraining(t.Context(), false); err != nil {
+			t.Fatalf("SetDraining(false) = %v, want nil", err)
+		}
+		v4a, v4b := next(t, first), next(t, second)
+		find(t, v4a, "a").Meta["zone"] = "scribbled"
+		if got := find(t, v4b, "a").Meta["zone"]; got != "z1" {
+			t.Errorf("view 4 on another channel: a.Meta[zone] = %q after a receiver changed its map, want z1", got)
+		}
 	})
 
 	t.Run("Twice", func(t *testing.T) {
@@ -792,4 +809,52 @@ func TestATMEM25Synctest(t *testing.T) {
 			t.Errorf("time passed in the bubble = %v, want 0", got)
 		}
 	})
+}
+
+// TestConcurrent runs Join, SetDraining, Watch, context ends and Leave on shared handles at the
+// same time, for the race detector: every channel is closed once, by its context or by Leave,
+// and no view is sent on a closed channel.
+func TestConcurrent(t *testing.T) {
+	m := newGroup(t, member("l"))
+	var wg sync.WaitGroup
+	for i := range 16 {
+		h := m.Share()
+		wg.Go(func() {
+			ctx, cancel := context.WithCancel(t.Context())
+			chans := make([]<-chan core.View, 0, 3)
+			for range 3 {
+				ch, err := h.Watch(ctx)
+				if err != nil {
+					t.Errorf("Watch() = %v, want nil", err)
+					cancel()
+					return
+				}
+				chans = append(chans, ch)
+			}
+			id := "h" + strconv.Itoa(i)
+			if err := h.Join(t.Context(), member(id)); err != nil {
+				t.Errorf("Join(%s) = %v, want nil", id, err)
+			}
+			if err := h.SetDraining(t.Context(), true); err != nil {
+				t.Errorf("SetDraining(true) on %s = %v, want nil", id, err)
+			}
+			// Half the handles end their watches and leave at once, racing the
+			// context.AfterFunc against Leave; the rest leave with their watches open.
+			if i%2 == 0 {
+				cancel()
+			}
+			if err := h.Leave(t.Context()); err != nil {
+				t.Errorf("Leave() on %s = %v, want nil", id, err)
+			}
+			cancel()
+			for _, ch := range chans {
+				for range ch {
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if v := next(t, watch(t, m)); v.Version < 2 || !reflect.DeepEqual(ids(v), []string{"l"}) {
+		t.Errorf("view %d: %v, want a version above 1 with [l]", v.Version, ids(v))
+	}
 }
