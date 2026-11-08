@@ -16,6 +16,17 @@ var (
 	// ErrClosed means the value has been closed, for example a Membership after Leave, and
 	// takes no further calls.
 	ErrClosed = errors.New("tenure: closed")
+
+	// ErrNotOwner means this member does not own the shard. Every error of a Shard that is no
+	// longer owned, and every *NotOwnerError, matches it with errors.Is.
+	ErrNotOwner = errors.New("tenure: not owner")
+
+	// ErrNoMembers means no member can serve the key, for example because no member of the
+	// group is eligible.
+	ErrNoMembers = errors.New("tenure: no members")
+
+	// ErrDraining means the node is draining, or has drained, and refuses the call.
+	ErrDraining = errors.New("tenure: draining")
 )
 
 TYPES
@@ -51,6 +62,10 @@ type Holding struct {
 }
     Holding is a shard record as a Store reports it.
 
+type Member = core.Member
+    Member is a member of a group, as core.Member describes it. The alias lets a
+    program that uses tenure name members without importing core.
+
 type Membership interface {
 	// Join adds self to the group, or replaces the member with the same ID. It returns an error
 	// that wraps core.ErrInvalidMember when self is not valid, and an error when the Membership
@@ -83,6 +98,26 @@ type Membership interface {
     nothing. Once Leave has returned nil, Join, SetDraining and Watch return
     ErrClosed.
 
+type NotOwnerError struct {
+	// Space and Shard name the shard.
+	Space string
+	Shard int
+
+	// Route is the member that serves the shard, or the zero Member when none is known.
+	Route Member
+}
+    NotOwnerError reports that this member does not own a shard, and names the
+    member a request for the shard should go to instead.
+
+func (e *NotOwnerError) Error() string
+    Error returns text such as "tenure: not owner of orders/3: route to n2
+    (10.0.0.7:8080)". The address is left out when Route has none, and the text
+    ends in "no route" when Route has no ID.
+
+func (e *NotOwnerError) Is(target error) bool
+    Is reports whether target is ErrNotOwner, so that errors.Is(err,
+    ErrNotOwner) holds for a *NotOwnerError.
+
 type PropagationEstimator interface {
 	// Propagation returns how long a change of one member takes to appear in the views of every
 	// member; 0 means at once.
@@ -90,6 +125,42 @@ type PropagationEstimator interface {
 }
     PropagationEstimator is implemented by a Membership that can tell how long a
     change takes to reach every member.
+
+type Shard struct {
+	// Space is the name of the shard's space.
+	Space string
+
+	// ID is the shard's number in its space, from 0 to the space's Shards minus 1.
+	ID int
+
+	// Term is the term of this ownership. It grows with every acquisition of the shard, so a
+	// downstream fence that keeps the highest term seen rejects the writes of an older owner.
+	Term core.Term
+
+	// Has unexported fields.
+}
+    Shard is one ownership of a shard by this member: the node hands it to a
+    space's Run when the member takes the shard, and Run checks it before every
+    side effect. A Shard stays valid until the member stops owning the shard
+    under its Term; a later ownership of the same shard gets a new Shard.
+
+    A Shard is safe for concurrent use, and a copy of a Shard checks the same
+    ownership. A Shard that the node did not make, such as the zero Shard,
+    is never owned.
+
+func (s *Shard) Check() error
+    Check returns nil while this member owns the shard. Otherwise it returns
+    an error that matches ErrNotOwner and says why, for example "tenure:
+    not owner of orders/3 (term 42): moved". Once the shard has stopped, every
+    call returns the same error, which is also the cause of Run's context. In a
+    space without fencing the shard is owned only until the session deadline:
+    from that instant Check returns an error ending in "expired", even before
+    the node stops the shard. A Shard the node did not make returns ErrNotOwner.
+    Check does not allocate.
+
+func (s *Shard) Valid() bool
+    Valid reports whether this member owns the shard: it is Check() == nil.
+    Valid does not allocate.
 
 type SlotStore interface {
 	// ClaimSlot returns the lowest slot that holder holds below the count, without writing. When
