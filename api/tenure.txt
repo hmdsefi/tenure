@@ -166,6 +166,12 @@ type Node struct {
     Node is a running member of a group, as Start returns it. Its methods are
     safe for concurrent use.
 
+    When the store reports the member's session lost, the node stops every
+    shard it owns with a "lost" error, waits for every Run to return,
+    and then goes on with a new incarnation: a new holder and a new session,
+    under which it acquires its shards again. It stays in the group meanwhile,
+    and keeps its watches.
+
 func Start(ctx context.Context, cfg Config) (*Node, error)
     Start starts a node for cfg and returns it once the member has joined the
     group, the node holds a valid view of it and, with a Store, the member's
@@ -192,10 +198,12 @@ func (n *Node) Drain(ctx context.Context) error
     Drain hands the member's work over: it marks the member as draining in
     the group and, with a Store, stops the Run of every shard the member owns,
     releases each shard once its Run has returned, and closes the member's
-    session. It returns nil once all of that is done. The first call of Drain or
-    Close starts the drain; later and concurrent calls wait for the same drain.
-    When ctx ends first, Drain returns ctx's error and the drain goes on.
-    After Close, Drain returns ErrClosed.
+    session. It returns nil once all of that is done. When the session is lost
+    during the drain, there is nothing left to release or close: Drain returns
+    nil once every Run has returned, and the node starts no new incarnation.
+    The first call of Drain or Close starts the drain; later and concurrent
+    calls wait for the same drain. When ctx ends first, Drain returns ctx's
+    error and the drain goes on. After Close, Drain returns ErrClosed.
 
 func (n *Node) Local(space, key string) (*Shard, error)
     Local returns this member's Shard for key in space while the member owns it,

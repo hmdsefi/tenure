@@ -118,6 +118,11 @@ func (b *inbox) take() ([]loopInput, *core.View) {
 
 // loop is the loop goroutine's state (RUN-100): the machine, of which the loop is the only
 // caller, and its wake timer. Only the loop goroutine touches it once run has started.
+//
+// A lost session is final for its machine. Once the machine is done after the loss, the loop
+// starts a new incarnation (RUN-180): a new holder, the next generation, a new machine and a new
+// session, keeping the membership, the watches, the shard table and the freshness floors. A drain
+// requested by then completes instead (RUN-190).
 type loop struct {
 	n    *Node
 	m    *core.Machine
@@ -126,6 +131,28 @@ type loop struct {
 
 	status core.Status // the machine's Status after the latest step
 	done   bool        // n.machineDone has been closed
+
+	// recoverDue reports that the machine is done after a lost session and no drain has been
+	// requested: run starts a new incarnation once the input at hand has been carried out.
+	recoverDue bool
+
+	// opening reports that the machine of a new incarnation waits for the answer to its first
+	// KeepAlive, which it steps first; until then the loop steps nothing else into it.
+	opening bool
+
+	// unrenewed reports that no renewal of a new incarnation's session has been accepted yet: the
+	// first one makes a resync of every space due (RUN-170). Start's machine has none.
+	unrenewed bool
+
+	// bump is the number of new incarnations opened so far. Each opening steps the published view
+	// with its Version raised by one (open), and every later merged view is stepped with its
+	// Version raised by bump, so the Versions the loop steps and publishes keep rising across
+	// incarnations, however many come between two views of the membership.
+	bump uint64
+
+	// opened is when the latest new incarnation sent its first KeepAlive, zero before the first:
+	// the next one draws no sooner than RetryPeriod later (draw).
+	opened time.Time
 
 	// assign, when not nil, is the assignment of each space that the loop computed itself for the
 	// latest stepped view, which the machine did not apply: a machine whose session is closing or
@@ -146,7 +173,9 @@ func newLoop(n *Node, m *core.Machine, gen uint64, hook func(stepRecord)) *loop 
 }
 
 // run is the loop goroutine. It steps first, closes started, and then steps every input that
-// reaches it, until the internal context is done. It then waits for the executor's lanes.
+// reaches it, until the internal context is done. After the input that leaves a lost machine
+// done, it starts a new incarnation. While a new machine waits for its first KeepAlive's answer,
+// views, posted inputs and readings wait. On return it waits for the executor's lanes.
 func (l *loop) run(first []loopInput, started chan<- struct{}) {
 	n := l.n
 	defer n.exec.wait()
@@ -156,6 +185,13 @@ func (l *loop) run(first []loopInput, started chan<- struct{}) {
 	}
 	close(started)
 	for {
+		if l.recoverDue {
+			l.recover()
+		}
+		var inbox, rds <-chan struct{}
+		if !l.opening {
+			inbox, rds = n.inbox.ready, n.readings.ready
+		}
 		select {
 		case <-n.ctx.Done():
 			return
@@ -167,16 +203,17 @@ func (l *loop) run(first []loopInput, started chan<- struct{}) {
 			for _, r := range n.exec.take() {
 				l.deliver(r)
 			}
-		case <-n.readings.ready:
+		case <-rds:
 			for _, rd := range n.readings.take() {
 				l.observe(rd)
 			}
-		case <-n.inbox.ready:
+		case <-inbox:
 			ins, v := n.inbox.take()
 			for _, in := range ins {
 				l.step(in)
 			}
 			if v != nil {
+				v.Version += l.bump
 				l.step(loopInput{in: core.ViewChanged{View: *v}})
 			}
 		}
@@ -207,9 +244,11 @@ func (l *loop) tickUntil(now time.Duration) {
 // apply steps in, whose Now is set to now, and carries the step out (RUN-100): under n.stepMu it
 // executes the actions in order, publishes a stepped view, computes the view's assignments itself
 // when the machine did not apply the view, publishes the routing snapshot when the view or an
-// assignment changed, unpublishes the shard of a stepped RunStopped that is still
-// published, and reports the step to the observer and the hook. It then re-arms the timer and,
-// the first time the machine is done, closes n.machineDone.
+// assignment changed, unpublishes the shard of a stepped RunStopped that is still published, and
+// reports the step to the observer and the hook. After the step that loses the session it runs
+// lose. It then re-arms the timer. The first time the machine is done, it closes n.machineDone,
+// unless the machine is done after a lost session and no drain has been requested: then a new
+// incarnation is due instead.
 func (l *loop) apply(in loopInput, now time.Duration) {
 	n := l.n
 	acts := l.m.Step(in.in)
@@ -246,10 +285,160 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 	}
 	n.stepMu.Unlock()
 
+	if rec.Before.Session != core.SessionStateLost && rec.After.Session == core.SessionStateLost {
+		l.lose(now)
+	}
 	l.rearm()
-	if rec.After.Done && !l.done {
-		l.done = true
-		close(n.machineDone)
+	if l.status.Done && !l.done && !l.recoverDue {
+		if l.status.Session == core.SessionStateLost && !n.drainRequested() {
+			l.recoverDue = true
+		} else {
+			l.finish()
+		}
+	}
+}
+
+// finish closes n.machineDone: the machine is done and no new incarnation follows it.
+func (l *loop) finish() {
+	l.done = true
+	close(l.n.machineDone)
+}
+
+// lose runs right after the step that lost the session. One session lane serves every
+// generation, so it first drops the queued calls of this machine and discards the results of its
+// calls in flight: no call of the lost holder, such as a Release or a CloseSession, goes out after
+// the loss. The machine still waits for the answer to each Acquire it sent, and that answer is now
+// discarded, so lose steps Acquired with no grant at now for every acquiring shard in its place;
+// after a loss that only ends the wait. A record that the discarded call granted names the lost
+// holder, so it is takeable.
+func (l *loop) lose(now time.Duration) {
+	l.n.exec.dropOlder(l.gen + 1)
+	var owed []core.Acquired
+	for _, sp := range l.status.Spaces {
+		for i, sh := range sp.Shards {
+			if sh.State == core.ShardStateAcquiring {
+				owed = append(owed, core.Acquired{Space: sp.Name, Shard: i, Now: now})
+			}
+		}
+	}
+	for _, a := range owed {
+		l.apply(loopInput{in: a}, now)
+	}
+}
+
+// recover starts a new incarnation (RUN-180) once the machine is done after a lost session. It
+// waits for every supervisor in the shard table to end, so that no Run of an earlier machine is
+// left; draws a new incarnation from Rand (draw); makes the new holder the node's and reports the
+// previous one to the observer; moves to the next generation; clears the session deadline; starts
+// the freshness state of a new machine, which keeps the floors; makes the new machine; and sends
+// KeepAlive for the new holder through the executor. The new machine steps that KeepAlive's
+// answer first, then the latest merged view (open). A drain requested by the time of a draw
+// completes instead (RUN-190). The internal context ending stops recover.
+func (l *loop) recover() {
+	n := l.n
+	l.recoverDue = false
+	for _, sp := range n.shards {
+		for _, r := range sp.runs {
+			if r.done == nil {
+				continue
+			}
+			select {
+			case <-r.done:
+			case <-n.ctx.Done():
+				return
+			}
+		}
+	}
+	holder, ok := l.draw()
+	if !ok {
+		return
+	}
+
+	n.stepMu.Lock()
+	prev := n.holder
+	n.holder = holder
+	n.stepMu.Unlock()
+	n.obs.newIncarnation(prev)
+
+	l.gen++
+	n.exec.dropOlder(l.gen) // done at the loss already; repeated, it changes nothing
+	n.deadline.Store(0)
+	n.fresh.newMachine(holder)
+	if l.assign == nil {
+		// Routing keeps the lost machine's assignment until the new machine has taken a view.
+		l.assign = make(map[string][]string, len(n.cfg.Spaces))
+		for _, sp := range n.cfg.Spaces {
+			l.assign[sp.Name] = l.m.Assignment(sp.Name)
+		}
+	}
+	l.m = n.newMachine(holder)
+	l.status = l.m.Status()
+	l.opening, l.unrenewed = true, true
+	l.opened = time.Now()
+	n.exec.do(l.gen, holder, core.KeepAlive{})
+	l.rearm()
+}
+
+// draw returns a new holder drawn from Rand, as Start draws one. After a failed read it reads
+// again RetryPeriod after the start of the failed one. The first read comes no sooner than
+// RetryPeriod after the previous new incarnation's KeepAlive, so a store that ends each new
+// session at once gets at most one KeepAlive per RetryPeriod, as a live session does. Before each
+// read it checks for a drain request: when there is one, it completes the drain with finish and
+// returns false, as it does when the internal context ends.
+func (l *loop) draw() (string, bool) {
+	n := l.n
+	period := n.cfg.Timing.RetryPeriod
+	next := time.Now()
+	if !l.opened.IsZero() {
+		next = l.opened.Add(period)
+	}
+	for {
+		if d := time.Until(next); d > 0 {
+			t := time.NewTimer(d)
+			select {
+			case <-t.C:
+			case <-n.ctx.Done():
+				t.Stop()
+				return "", false
+			}
+		}
+		if n.drainRequested() {
+			l.finish()
+			return "", false
+		}
+		at := time.Now()
+		holder, err := drawHolder(n.cfg.Self.ID, n.cfg.Rand)
+		if err == nil {
+			return holder, true
+		}
+		next = at.Add(period)
+	}
+}
+
+// open steps r, the answer to the first KeepAlive of a new incarnation's machine, and then the
+// latest merged view with the Version after it, so that the view is newer than every view the
+// node has published; bump grows by one, so that later views stay above it. Until then the
+// machine has stepped nothing. The view's step moves routing to the new machine's assignment.
+func (l *loop) open(r callResult) {
+	l.opening = false
+	for _, in := range r.inputs {
+		l.step(loopInput{in: in, sentWall: r.sentWall, err: r.err})
+	}
+	l.renewed()
+	v := *l.n.view.Load()
+	v.Version++
+	l.bump++
+	l.step(loopInput{in: core.ViewChanged{View: v}})
+}
+
+// renewed makes a resync of every space due once the first renewal of a new incarnation's
+// session has been accepted (RUN-170). The resync waits for the Confirm calls queued so far, as
+// one after failed renewals does.
+func (l *loop) renewed() {
+	if l.unrenewed && l.status.LastFailure == core.CauseNone && l.status.Session != core.SessionStateOpening {
+		l.unrenewed = false
+		f := l.n.fresh
+		f.wait, f.resyncAt = true, f.issued
 	}
 }
 
