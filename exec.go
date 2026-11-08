@@ -35,11 +35,19 @@ type laneKey struct {
 	shard int
 }
 
-// execCall is one machine action to run on a lane for the machine of generation gen.
+// execCall is one machine action to run on a lane for the machine of generation gen. tag is
+// the tag doConfirm gave a Confirm, 0 for every other call.
 type execCall struct {
 	gen    uint64
 	holder string
 	act    core.Action
+	tag    uint64
+}
+
+// confirmMark is the latest Confirm call that went out on a shard lane: the tag doConfirm gave
+// it, and its start stamp.
+type confirmMark struct {
+	tag, start uint64
 }
 
 // lane runs the calls on one record in FIFO order, one at a time. It exists, with its
@@ -56,14 +64,19 @@ type callResult struct {
 	// gen is the generation of the machine whose action this was.
 	gen uint64
 
-	// act is the machine action that was run.
+	// act is the machine action that was run, nil for a call that runs no machine action.
 	act core.Action
+
+	// op and space name a call that runs no machine action, for the observer: op is "Holdings",
+	// with the space read, or "WatchHolders" for the store watch (RUN-170).
+	op, space string
 
 	// inputs are RUN-150's machine inputs for the outcome, with Now 0: the loop sets Now when
 	// it steps them. Empty when the machine repeats the call itself.
 	inputs []core.Input
 
-	// holding is the record a successful Confirm returned.
+	// holding is the record a successful Confirm returned. The loop steps it through the
+	// freshness filter (RUN-175) in place of the HolderChanged in inputs.
 	holding Holding
 
 	// err is the store's error.
@@ -93,11 +106,12 @@ type executor struct {
 	readyc  chan struct{}
 	wg      sync.WaitGroup
 
-	mu      sync.Mutex
-	lanes   map[laneKey]*lane
-	results []callResult
-	floor   uint64 // calls and results of older generations are dropped
-	closed  bool   // wait was called: do queues nothing more
+	mu       sync.Mutex
+	lanes    map[laneKey]*lane
+	results  []callResult
+	floor    uint64                  // calls and results of older generations are dropped
+	closed   bool                    // wait was called: do queues nothing more
+	confirms map[laneKey]confirmMark // the latest Confirm call that went out, by shard lane
 }
 
 // newExecutor returns an executor whose calls derive their contexts from ctx and send t with
@@ -111,15 +125,16 @@ func newExecutor(ctx context.Context, store Store, t core.Timing, epoch time.Tim
 	}
 	slots, _ := store.(SlotStore)
 	return &executor{
-		ctx:     ctx,
-		store:   store,
-		slots:   slots,
-		timing:  t,
-		epoch:   epoch,
-		failed:  failed,
-		permits: make(chan struct{}, execPermits),
-		readyc:  make(chan struct{}, 1),
-		lanes:   make(map[laneKey]*lane),
+		ctx:      ctx,
+		store:    store,
+		slots:    slots,
+		timing:   t,
+		epoch:    epoch,
+		failed:   failed,
+		permits:  make(chan struct{}, execPermits),
+		readyc:   make(chan struct{}, 1),
+		lanes:    make(map[laneKey]*lane),
+		confirms: make(map[laneKey]confirmMark),
 	}
 }
 
@@ -148,15 +163,36 @@ func laneOf(act core.Action) laneKey {
 // panics for an action that is not a store call, and for a slot action when the store is not a
 // SlotStore.
 func (e *executor) do(gen uint64, holder string, act core.Action) bool {
-	key := laneOf(act)
+	return e.enqueue(execCall{gen: gen, holder: holder, act: act})
+}
+
+// doConfirm queues a as do does and returns the tag it gives the call, a fresh stamp, also when
+// the call is dropped. confirmStarted reports the tag once the call has gone out, so the loop can
+// tell when the shard's latest Confirm started (RUN-175, MCH O5).
+func (e *executor) doConfirm(gen uint64, holder string, a core.Confirm) (tag uint64, queued bool) {
+	tag = e.stamp()
+	return tag, e.enqueue(execCall{gen: gen, holder: holder, act: a, tag: tag})
+}
+
+// confirmStarted returns the tag and the start stamp of the latest Confirm call that went out
+// for the shard, or zeros when none has.
+func (e *executor) confirmStarted(space string, shard int) (tag, start uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	m := e.confirms[laneKey{kind: laneShard, space: space, shard: shard}]
+	return m.tag, m.start
+}
+
+// enqueue queues c on its lane as do says, and reports whether it was queued.
+func (e *executor) enqueue(c execCall) bool {
+	key := laneOf(c.act)
 	if key.kind == laneSlot && e.slots == nil {
-		panic(fmt.Sprintf("tenure: %T needs a SlotStore", act))
+		panic(fmt.Sprintf("tenure: %T needs a SlotStore", c.act))
 	}
-	c := execCall{gen: gen, holder: holder, act: act}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.closed || e.ctx.Err() != nil || gen < e.floor {
+	if e.closed || e.ctx.Err() != nil || c.gen < e.floor {
 		return false
 	}
 	l := e.lanes[key]
@@ -353,6 +389,11 @@ func (e *executor) exec(l *lane, c execCall) (callResult, bool) {
 		r.sentWall = e.epoch.Add(sentAt)
 	}
 	r.start = e.stamp()
+	if c.tag != 0 {
+		e.mu.Lock()
+		e.confirms[l.key] = confirmMark{tag: c.tag, start: r.start}
+		e.mu.Unlock()
+	}
 	o := e.invoke(ctx, c)
 	cancel()
 
