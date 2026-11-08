@@ -93,9 +93,20 @@ func (m *Machine) closeIfDrained() {
 		return
 	default:
 		m.status.Session = SessionStateClosing
+		m.dropSessionOutput()
 	}
 	m.session.closeAt = m.status.Now + m.cfg.Timing.RetryPeriod
 	m.emit(groupClose, CloseSession{})
+}
+
+// dropSessionOutput drops the ExtendDeadline of the step that starts closing, which returns only
+// CloseSession and Wake, as every step while closing does. Only a renewal step holds one, and a renewal
+// step starts closing only when the session it makes live gives up a held slot the views have shown
+// vacant too long (MCH-640). The session is about to end and no run is left, so nothing needs the later
+// deadline. The KeepAlive comes after phase F, so the step has none to drop.
+func (m *Machine) dropSessionOutput() {
+	clear(m.out[groupSession])
+	m.out[groupSession] = m.out[groupSession][:0]
 }
 
 // readyToClose reports that phase F starts closing the session in this step: the member drains, the

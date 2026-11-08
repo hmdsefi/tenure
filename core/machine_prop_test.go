@@ -565,8 +565,9 @@ func sessionEnded(st core.Status) bool {
 // RetryPeriod at most, never once the session has ended or in the step that starts closing.
 //
 // Draining is for good, starts only with a Drain and never after a loss, and nothing is wanted, started or
-// acquired then. A closing or closed session has every shard idle, drains and holds no slot, and while
-// closing a step returns only CloseSession and Wake and changes nothing but the clock and the session.
+// acquired then. A closing or closed session has every shard idle, drains and holds no slot. From the step
+// that starts closing a step returns only CloseSession and Wake, so the renewal step that starts it returns
+// no ExtendDeadline, and while closing a step changes nothing but the clock and the session.
 // CloseSession goes only from such a state, and again RetryPeriod after the last at the soonest. After a loss the machine holds no slot and no shard is owned,
 // degraded or releasing or waits to acquire, and it returns only the StopRuns of the step that accepted the
 // loss, then Wakes for the runs still to mark stuck.
@@ -680,11 +681,11 @@ func checkSession(l *sessionLedger, s propStep) error {
 				return fmt.Errorf("%s: %+v after the loss", rule, v)
 			}
 		case core.StopRun:
-			if wasClosing || isLost && (wasLost || v.Reason != core.StopLost) {
+			if wasClosing || isClosing || isLost && (wasLost || v.Reason != core.StopLost) {
 				return fmt.Errorf("%s: %+v with the session %v before and %v after", rule, v, prior.Session, st.Session)
 			}
 		default:
-			if wasClosing || isLost {
+			if wasClosing || isClosing || isLost {
 				return fmt.Errorf("%s: %#v with the session %v before and %v after", rule, a, prior.Session, st.Session)
 			}
 		}
@@ -1526,6 +1527,7 @@ func runChaosSeed(seed uint64, steps int, reach *chaosReach) error {
 func TestATMCH49Chaos(t *testing.T) {
 	const seeds, steps = 3000, 400
 	reach := chaosReach{actions: map[string]int{}, stops: map[core.StopReason]int{}}
+
 	for seed := uint64(1); seed <= seeds; seed++ {
 		if err := runChaosSeed(seed, steps, &reach); err != nil {
 			t.Fatal(err)
