@@ -639,6 +639,12 @@ func TestATRUN54RouteBySlot(t *testing.T) {
 			}
 			_, err := other.Local("orders", keyOf(s))
 			wantNotOwner(t, err, "orders", s, ids[slotOwner(2)[s]])
+			key := keyOf(s)
+			for _, n := range []*tenure.Node{n1, n2} {
+				if got := testing.AllocsPerRun(100, func() { _, err = n.Route("orders", key) }); got != 0 || err != nil {
+					t.Errorf("Route(orders/%d) by slot allocates %v times (%v), want 0", s, got, err)
+				}
+			}
 		}
 		closeNode(t, n1)
 		closeNode(t, n2)
