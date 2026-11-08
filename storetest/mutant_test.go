@@ -64,6 +64,9 @@ var mutants = []struct {
 // mutantFailLine is the form of every log line of a mutant run (STO-820).
 var mutantFailLine = regexp.MustCompile(`^\s+\S+\.go:\d+: \w+\(.*\) = .*, want .*$`)
 
+// coverLine matches the line a child test binary built with -cover prints after its results.
+var coverLine = regexp.MustCompile(`^coverage: (\d+\.\d+% of statements|\[no statements\])`)
+
 // TestMutant runs the suite on the virtual fixture over each mutant. It is child-only: every
 // mutant but none fails.
 func TestMutant(t *testing.T) {
@@ -129,11 +132,13 @@ func TestMutants(t *testing.T) {
 				}
 			}
 			// A line that is no "===", "---" or log line, such as the second line of a
-			// message with a newline, would escape the check above.
+			// message with a newline, would escape the check above. A child built with
+			// -cover also prints its coverage line.
 			for line := range strings.Lines(r.out) {
 				line = strings.TrimRight(line, "\r\n")
 				if !runLine.MatchString(line) && !resultLine.MatchString(line) &&
-					!logLine.MatchString(line) && line != "PASS" && line != "FAIL" {
+					!logLine.MatchString(line) && !coverLine.MatchString(line) &&
+					line != "PASS" && line != "FAIL" {
 					t.Errorf("child %s prints %q, want only test, result and log lines", parent, line)
 				}
 			}
