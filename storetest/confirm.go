@@ -83,10 +83,12 @@ func confirmAfterTakeover(e *env) {
 	e.open(h3)
 	t1 := e.acq(h1, "a", 0)
 	e.release(h1, "a", 0, t1)
+	e.rec(h2, "a", 0, "", t1)
 	t2 := e.acq(h2, "a", 0)
 	e.conf(h1, "a", 0, t1, h2, t2)
 
 	t3 := e.acq(h3, "b", 1)
+	e.held(h1, "b", 1, h3)
 	e.expire(h1, h2)
 	t4 := e.acq(h1, "b", 1)
 	e.lostConf(h3, "b", 1, t3)

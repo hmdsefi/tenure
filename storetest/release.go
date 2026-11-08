@@ -4,6 +4,7 @@
 package storetest
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -80,6 +81,8 @@ func releaseLate(e *env) {
 	e.open(h1)
 	e.open(h2)
 	t1 := e.acq(h1, "a", 0)
+	e.rec(h2, "a", 0, h1, t1)
+	e.held(h2, "a", 0, h1)
 
 	e.expire(h2)
 	t2 := e.acq(h2, "a", 0)
@@ -114,6 +117,7 @@ func releaseAbsent(e *env) {
 	t2 := e.acq(h1, "a", 2)
 	e.f.DeleteRecord("a", 2)
 	e.rec(h2, "a", 2, "", 0)
+	e.rec(h1, "a", 2, "", 0)
 	e.release(h1, "a", 2, t2)
 	e.rec(h2, "a", 2, "", 0)
 }
@@ -172,18 +176,24 @@ func closeSessionStale(e *env) {
 	e.open(h2)
 	e.open(h3)
 	t0 := e.acq(h1, "a", 0)
-	e.acq(h1, "a", 1)
+	ta1 := e.acq(h1, "a", 1)
+	e.held(h3, "a", 1, h1)
 	if slots {
 		e.setSlots(2)
 		e.claim(h1, 0)
+		e.slots(h2, h1, "")
 		e.claim(h2, 1)
+		e.slots(h3, h1, h2)
+		e.noSlot(h3)
 	}
+	e.rec(h2, "a", 1, h1, ta1)
 
 	e.expire(h2, h3)
 	t1 := e.acq(h3, "a", 1)
 	if slots {
 		e.claim(h3, 0)
 		e.slots(h2, h3, h2)
+		e.slots(h1, h3, h2)
 	}
 	r0 := e.rec(h2, "a", 0, h1, t0)
 	r1 := e.rec(h2, "a", 1, h3, t1)
@@ -348,6 +358,15 @@ func (e *env) claim(h string, slot int) {
 	got, err := e.slotClient(h).ClaimSlot(e.ctx, h)
 	if err != nil || got != slot {
 		e.t.Fatalf("ClaimSlot(%q) = %d, %s, want %d, nil", h, got, errText(err), slot)
+	}
+}
+
+// noSlot checks that h's ClaimSlot returns -1 and tenure.ErrNoSlot.
+func (e *env) noSlot(h string) {
+	e.t.Helper()
+	got, err := e.slotClient(h).ClaimSlot(e.ctx, h)
+	if got != -1 || !errors.Is(err, tenure.ErrNoSlot) {
+		e.t.Fatalf("ClaimSlot(%q) = %d, %s, want -1, %s", h, got, errText(err), tenure.ErrNoSlot)
 	}
 }
 

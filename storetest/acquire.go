@@ -82,11 +82,13 @@ func acquireAfterRelease(e *env) {
 	t1 := e.acq(h1, "a", 0)
 	e.release(h1, "a", 0, t1)
 
+	e.rec(h2, "a", 0, "", t1)
 	t2 := e.acq(h2, "a", 0)
 	e.rec(h1, "a", 0, h2, t2)
 	e.held(h1, "a", 0, h2)
 	e.release(h2, "a", 0, t2)
 
+	e.rec(h1, "a", 0, "", t2)
 	t3 := e.acq(h1, "a", 0)
 	e.rec(h2, "a", 0, h1, t3)
 }
@@ -104,12 +106,13 @@ func acquireIndependent(e *env) {
 	ta1 := e.acq(h3, "a", 1)
 	tc0 := e.acq(h1, "c", 0)
 
-	e.held(h2, "a", 0, h1)
-	e.held(h1, "b", 0, h2)
-	e.held(h1, "a", 1, h3)
+	e.rec(h2, "a", 0, h1, ta0)
 	rb0 := e.rec(h1, "b", 0, h2, tb0)
 	ra1 := e.rec(h2, "a", 1, h3, ta1)
 	rc0 := e.rec(h2, "c", 0, h1, tc0)
+	e.held(h2, "a", 0, h1)
+	e.held(h1, "b", 0, h2)
+	e.held(h1, "a", 1, h3)
 
 	e.release(h1, "a", 0, ta0)
 	e.rec(h2, "a", 0, "", ta0)
@@ -134,6 +137,7 @@ func termWallAhead(e *env) {
 	e.rec(h2, "a", 0, h1, t2)
 	e.release(h1, "a", 0, t2)
 
+	e.rec(h2, "a", 0, "", t2)
 	w = wallOf(t2).Add(24 * time.Hour)
 	at = e.setWall(w)
 	lo, hi = e.wallTerms(t2, w, at)
@@ -153,6 +157,7 @@ func termWallBehind(e *env) {
 	e.acqIn(h1, "a", 0, t1+1, t1+1)
 	e.acqIn(h1, "a", 0, t1+2, t1+2)
 	e.release(h1, "a", 0, t1+2)
+	e.rec(h2, "a", 0, "", t1+2)
 	e.acqIn(h2, "a", 0, t1+3, t1+3)
 	e.rec(h1, "a", 0, h2, t1+3)
 
@@ -197,6 +202,7 @@ func termLostRecordWallBehind(e *env) {
 	at := e.setWall(w)
 	e.f.DeleteRecord("b", 3)
 	e.rec(h1, "b", 3, "", 0)
+	e.rec(h2, "b", 3, "", 0)
 	lo, hi := e.wallTerms(0, w, at)
 	t2 := e.acqIn(h2, "b", 3, lo, hi)
 	e.rec(h1, "b", 3, h2, t2)
@@ -218,13 +224,16 @@ func termSequence(e *env) {
 	e.acq(h1, "a", 0)
 	t := e.acq(h1, "a", 0)
 	e.release(h1, "a", 0, t)
+	e.rec(h2, "a", 0, "", t)
 	t = e.acq(h2, "a", 0)
 	e.rec(h1, "a", 0, h2, t)
 
 	e.closeSession(h2)
+	e.rec(h3, "a", 0, "", t)
 	t = e.acq(h3, "a", 0)
 	e.rec(h1, "a", 0, h3, t)
 
+	e.held(h5, "a", 0, h3)
 	e.expire(h1, h5)
 	t = e.acq(h5, "a", 0)
 	e.rec(h1, "a", 0, h5, t)
@@ -241,6 +250,7 @@ func termSequence(e *env) {
 	e.release(h1, "a", 0, t)
 	h4 := holder(4, 1)
 	e.open(h4)
+	e.rec(h4, "a", 0, "", t)
 	t = e.acq(h4, "a", 0)
 	e.rec(h1, "a", 0, h4, t)
 }
