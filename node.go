@@ -52,7 +52,7 @@ type Node struct {
 	inbox       *inbox
 	lp          *loop
 	stepMu      sync.Mutex    // held while the loop carries a step out
-	deadline    atomic.Int64  // the session deadline in nanoseconds since epoch; only the loop writes it
+	deadline    atomic.Int64  // the session deadline in ns since epoch; only the loop writes it
 	machineDone chan struct{} // closed when the machine's Status first reports Done
 
 	mu        sync.Mutex
@@ -176,6 +176,11 @@ func (n *Node) openSession(ctx context.Context) error {
 	case <-started:
 		return nil
 	case <-ctx.Done():
+	}
+	select {
+	case <-started: // first steps carried out at the instant ctx ended win
+		return nil
+	default:
 		return fmt.Errorf("tenure: start: %w", ctx.Err())
 	}
 }
@@ -218,8 +223,8 @@ func (n *Node) closeSession(ctx context.Context) {
 }
 
 // Drain hands the member's work over: it marks the member as draining in the group and, with a
-// Store, closes the member's session, and returns nil once both are done. The first call of Drain or Close starts the drain; later and
-// concurrent calls wait for the same drain. When ctx ends first, Drain returns ctx's error and
+// Store, closes the member's session, and returns nil once both are done. The first call of
+// Drain or Close starts the drain; later and concurrent calls wait for the same drain. When ctx ends first, Drain returns ctx's error and
 // the drain goes on. After Close, Drain returns ErrClosed.
 func (n *Node) Drain(ctx context.Context) error {
 	n.mu.Lock()
