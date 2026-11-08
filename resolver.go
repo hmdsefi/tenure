@@ -43,6 +43,7 @@ type Resolver struct {
 	subs    []chan []Member    // every channel Subscribe returned, until Close
 	timer   *time.Timer        // fires at timerAt, the earliest future JoinAt or LeaveAt
 	timerAt time.Time          // zero when no timer is armed
+	timerN  uint64             // counts armLocked's changes; a callback armed before the last does nothing
 	timers  sync.WaitGroup     // timer callbacks armed or running
 	stop    context.CancelFunc // a standalone Resolver's watch context; nil for a node's
 	done    chan struct{}      // closed when a standalone Resolver's watcher returns
@@ -201,6 +202,10 @@ func (r *Resolver) refreshLocked() {
 }
 
 // armLocked makes the timer fire at at, or stops it when at is zero. The caller holds r.mu.
+//
+// A callback that has fired but still waits for r.mu when the timer changes finds timerN moved
+// on and does nothing: the change came from a refresh at or after its instant, and the timer it
+// would replace is the one armLocked just set.
 func (r *Resolver) armLocked(at time.Time) {
 	if at.Equal(r.timerAt) && !at.IsZero() {
 		return
@@ -208,16 +213,18 @@ func (r *Resolver) armLocked(at time.Time) {
 	if r.timer != nil && r.timer.Stop() {
 		r.timers.Done() // the callback will not run
 	}
+	r.timerN++
 	r.timer, r.timerAt = nil, at
 	if at.IsZero() {
 		return
 	}
+	n := r.timerN
 	r.timers.Add(1)
 	r.timer = time.AfterFunc(time.Until(at), func() {
 		defer r.timers.Done()
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		if r.closed {
+		if r.closed || n != r.timerN {
 			return
 		}
 		r.timer, r.timerAt = nil, time.Time{}
