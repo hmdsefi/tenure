@@ -51,7 +51,8 @@ type SessionFailed struct {
 	Cause Cause
 }
 
-// SessionClosed reports that the session has been closed.
+// SessionClosed reports that the session has been closed. It answers a CloseSession action, and it
+// is ignored before the machine has returned one.
 type SessionClosed struct {
 	// Now is the driver's monotonic reading.
 	Now time.Duration
@@ -147,7 +148,9 @@ type SlotReleased struct {
 	Slot int
 }
 
-// Drain asks the member to hand its work over before it leaves.
+// Drain asks the member to hand its work over before it leaves, and then to close its session. It
+// is for good: nothing ends it, and a second Drain changes nothing. It is ignored once the session has
+// ended.
 type Drain struct {
 	// Now is the driver's monotonic reading.
 	Now time.Duration
@@ -269,7 +272,9 @@ type ReleaseSlot struct {
 	Slot int
 }
 
-// CloseSession asks the driver to close the session.
+// CloseSession asks the driver to close the session. Every run has returned by then. The driver
+// answers it with SessionClosed once the session is closed, and also when the store reports the
+// session already lost or gone: while the session is closing, a SessionFailed is ignored.
 type CloseSession struct{}
 
 // Wake asks the driver to call Step again once its monotonic clock reaches a reading.

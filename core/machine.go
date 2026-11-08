@@ -147,6 +147,12 @@ func NewMachine(cfg MachineConfig) *Machine {
 // The step that accepts a lost session returns a StopRun for each run not yet told to stop. Later
 // steps return no action but a Wake, until every shard is idle and Status reports Done.
 //
+// After a Drain the machine wants no shard, so it stops every run and hands each shard over. Once
+// every shard is idle, every run having returned, a stuck one included, it returns CloseSession, and
+// again every RetryPeriod until a SessionClosed. While the session is closing, every input but a Tick
+// and a SessionClosed is ignored, and a step returns nothing but CloseSession and Wake. A lost session
+// is never closed.
+//
 // Once Status reports Done, Step returns nil. Once the session is closed, the clock stops too.
 func (m *Machine) Step(in Input) []Action {
 	if in == nil {
@@ -159,6 +165,9 @@ func (m *Machine) Step(in Input) []Action {
 	// Phase A: the clock, the session and view inputs, the step's one evaluation of live, and what a
 	// session not live does to the Confirms.
 	m.status.Now = min(max(m.status.Now, inputNow(in)), maxReading)
+	if m.status.Session == SessionStateClosing {
+		in = m.closingInput(in)
+	}
 	m.applySessionInput(in)
 	m.applyViewInput(in)
 	m.refreshSession()
@@ -175,8 +184,9 @@ func (m *Machine) Step(in Input) []Action {
 	// Phase D: the shards.
 	m.stepShards(in)
 
-	// Phases E and F (slots and closing) go here. The KeepAlive comes after them because closing
-	// the session ends the cadence.
+	// Phase E (slots) goes here. Phase F: closing. The KeepAlive comes after them because closing
+	// the session ends the cadence, so the step that starts closing returns none.
+	m.closeIfDrained()
 	m.emitKeepAlive()
 	m.status.Done = m.done()
 

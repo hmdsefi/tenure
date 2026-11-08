@@ -309,7 +309,7 @@ func failed(now int64, cause core.Cause, want ...core.Action) mc.Step {
 }
 
 // sessionIs checks the session fields of Status: Now, Session, Deadline and LastFailure, with
-// readings in milliseconds, and that Done means a lost session with every shard idle.
+// readings in milliseconds, and that Done means a closed session, or a lost one with every shard idle.
 func sessionIs(now int64, state core.SessionState, deadline int64, failure core.Cause) func(*testing.T, *core.Machine) {
 	return func(t *testing.T, m *core.Machine) {
 		t.Helper()
@@ -332,8 +332,19 @@ func sessionIs(now int64, state core.SessionState, deadline int64, failure core.
 				want = want && sh.State == core.ShardStateIdle
 			}
 		}
+		want = want || state == core.SessionStateClosed
 		if st.Done != want {
 			t.Errorf("Done = %v, want %v", st.Done, want)
+		}
+	}
+}
+
+// drainingIs checks Draining.
+func drainingIs(want bool) func(*testing.T, *core.Machine) {
+	return func(t *testing.T, m *core.Machine) {
+		t.Helper()
+		if got := m.Status().Draining; got != want {
+			t.Errorf("Draining = %v, want %v", got, want)
 		}
 	}
 }
@@ -391,6 +402,21 @@ func stopS0(term core.Term) core.Action {
 
 // releaseS0 is the Release of shard s/0.
 func releaseS0(term core.Term) core.Action { return core.Release{Space: "s", Term: term} }
+
+// drained is a Drain at ms milliseconds with the given result.
+func drained(ms int64, want ...core.Action) mc.Step {
+	return mc.Step{Input: core.Drain{Now: mc.Ms(ms)}, Want: want}
+}
+
+// sessionClosed is a SessionClosed at ms milliseconds with the given result.
+func sessionClosed(ms int64, want ...core.Action) mc.Step {
+	return mc.Step{Input: core.SessionClosed{Now: mc.Ms(ms)}, Want: want}
+}
+
+// stopDrainingS0 is the StopRun of shard s/0's run of term 7 because the member drains.
+func stopDrainingS0() core.Action {
+	return core.StopRun{Space: "s", Term: 7, Reason: core.StopDraining}
+}
 
 // holderChanged is a HolderChanged for shard s/0 at ms milliseconds with the given result.
 func holderChanged(ms int64, holder string, term core.Term, want ...core.Action) mc.Step {
@@ -809,6 +835,254 @@ func TestATMCH11ConfirmCadenceEndsLate(t *testing.T) {
 	}
 	if n := countActions[core.Restore](c) + countActions[core.StopRun](c); n != 0 {
 		t.Errorf("the case returns %d Restores and StopRuns, want none", n)
+	}
+}
+
+// drainingS0 is the status of an unwanted shard whose run of the given term was told at since
+// milliseconds to stop because the member drains.
+func drainingS0(since int64, term core.Term) core.ShardStatus {
+	sh := stoppingS0(since, term)
+	sh.Reason = core.StopDraining
+	return sh
+}
+
+// releasingDrainedS0 is the status of an unwanted shard whose drained run returned, and which has been
+// releasing its term since since milliseconds.
+func releasingDrainedS0(since int64, term core.Term) core.ShardStatus {
+	sh := releasingS0(since, term)
+	sh.Reason = core.StopDraining
+	return sh
+}
+
+// idleS0 is the status of an idle, unwanted shard that this member last held, since since
+// milliseconds.
+func idleS0(since int64) core.ShardStatus {
+	return core.ShardStatus{Since: mc.Ms(since), Holder: "h1"}
+}
+
+// nextWakeIs checks NextWake: a timer at ms milliseconds, or none for 0.
+func nextWakeIs(ms int64) func(*testing.T, *core.Machine) {
+	return func(t *testing.T, m *core.Machine) {
+		t.Helper()
+		at, armed := m.NextWake()
+		if want := ms != 0; at != mc.Ms(ms) || armed != want {
+			t.Errorf("NextWake() = (%v, %v), want (%v, %v)", at, armed, mc.Ms(ms), want)
+		}
+	}
+}
+
+// closedAt checks a closed machine whose clock stopped at ms milliseconds: Done, with no timer.
+func closedAt(ms, deadline int64) func(*testing.T, *core.Machine) {
+	return all(sessionIs(ms, core.SessionStateClosed, deadline, core.CauseNone), doneIs(true), nextWakeIs(0))
+}
+
+// closeSessionsBefore returns how many CloseSessions the steps of c return before step n, counting
+// from 1.
+func closeSessionsBefore(c mc.Case, n int) int {
+	return countActions[core.CloseSession](mc.Case{Steps: c.Steps[:n-1]})
+}
+
+func TestATMCH12DrainADegradedRun(t *testing.T) {
+	const (
+		late    = core.SessionStateLate
+		live    = core.SessionStateLive
+		closing = core.SessionStateClosing
+		none    = core.CauseNone
+	)
+	t.Run("a", func(t *testing.T) {
+		runCase(t, "AT-MCH-12 (a)", stepChecks{
+			5:  all(sessionIs(10000, late, 10000, none), shardIs(0, degradedS0(10000, 7)), drainingIs(false)),
+			6:  all(sessionIs(10500, late, 10000, none), shardIs(0, drainingS0(10500, 7)), drainingIs(true)),
+			8:  all(sessionIs(12500, late, 10000, none), shardIs(0, releasingDrainedS0(12500, 7))),
+			10: all(sessionIs(14500, late, 10000, none), shardIs(0, releasingDrainedS0(12500, 7))),
+			11: all(sessionIs(15000, closing, 10000, none), shardIs(0, idleS0(15000)), nextWakeIs(17000)),
+			12: all(closedAt(15500, 10000), shardIs(0, idleS0(15000))),
+		})
+		if n := closeSessionsBefore(mc.Get("AT-MCH-12 (a)"), 11); n != 0 {
+			t.Errorf("%d CloseSessions before the Release is answered, want none", n)
+		}
+	})
+	t.Run("b", func(t *testing.T) {
+		runCase(t, "AT-MCH-12 (b)", stepChecks{
+			6:  all(sessionIs(10500, live, 20400, none), shardIs(0, degradedS0(10000, 7)), confirmPendingIs(true)),
+			7:  all(sessionIs(11000, live, 20400, none), shardIs(0, drainingS0(11000, 7)), drainingIs(true)),
+			8:  shardIs(0, drainingS0(11000, 7)),
+			10: all(sessionIs(12100, live, 22000, none), shardIs(0, drainingS0(11000, 7))),
+			11: shardIs(0, releasingDrainedS0(12500, 7)),
+			12: all(sessionIs(12600, closing, 22000, none), shardIs(0, idleS0(12600)), nextWakeIs(14600)),
+			13: closedAt(13000, 22000),
+		})
+		c := mc.Get("AT-MCH-12 (b)")
+		if n := countActions[core.Confirm](c); n != 1 {
+			t.Errorf("the case returns %d Confirms, want 1", n)
+		}
+		if n := countActions[core.Restore](c); n != 0 {
+			t.Errorf("the case returns %d Restores, want none", n)
+		}
+	})
+}
+
+func TestATMCH21StaleInputsWhileClosing(t *testing.T) {
+	const closing = core.SessionStateClosing
+	checks := stepChecks{}
+	// Steps 7 to 18: the step that starts closing at @1.4, then the eleven stale inputs from @1.5 on.
+	for n := 7; n <= 18; n++ {
+		now := int64(1400)
+		if n > 7 {
+			now = 1500 + int64(n-8)*100
+		}
+		checks[n] = all(
+			sessionIs(now, closing, 10000, core.CauseNone),
+			shardIs(0, idleS0(1400)),
+			drainingIs(true),
+			viewVersionIs(1),
+			assignmentIs("s", "m1"),
+			nextWakeIs(3400),
+		)
+	}
+	// Steps 19 to 32: the SessionClosed at @2.5, then every input after it.
+	for n := 19; n <= 32; n++ {
+		checks[n] = all(closedAt(2500, 10000), shardIs(0, idleS0(1400)), drainingIs(true), viewVersionIs(1))
+	}
+	runCase(t, "AT-MCH-21", checks)
+	c := mc.Get("AT-MCH-21")
+	if n := countActions[core.CloseSession](c); n != 1 {
+		t.Errorf("the case returns %d CloseSessions, want 1", n)
+	}
+	for i, s := range c.Steps[7:] {
+		for _, a := range s.Want {
+			if _, ok := a.(core.Wake); !ok {
+				t.Errorf("step %d returns %#v", i+8, a)
+			}
+		}
+	}
+}
+
+func TestATMCH25CloseSessionRepeatsUntilClosed(t *testing.T) {
+	const closing = core.SessionStateClosing
+	runCase(t, "AT-MCH-25", stepChecks{
+		5:  all(sessionIs(1000, core.SessionStateLive, 10000, core.CauseNone), shardIs(0, drainingS0(1000, 7)), drainingIs(true)),
+		7:  all(sessionIs(1400, closing, 10000, core.CauseNone), shardIs(0, idleS0(1400)), nextWakeIs(3400), doneIs(false)),
+		8:  all(sessionIs(2000, closing, 10000, core.CauseNone), nextWakeIs(3400)),
+		9:  all(sessionIs(3400, closing, 10000, core.CauseNone), nextWakeIs(5400)),
+		10: closedAt(3500, 10000),
+		11: closedAt(3500, 10000),
+	})
+	c := mc.Get("AT-MCH-25")
+	if n := countActions[core.CloseSession](c); n != 2 {
+		t.Errorf("the case returns %d CloseSessions, want 2", n)
+	}
+	if n := countActions[core.KeepAlive](mc.Case{Steps: c.Steps[6:]}); n != 0 {
+		t.Errorf("the case returns %d KeepAlives from the step that starts closing on, want none", n)
+	}
+}
+
+func TestATMCH27DrainWithAStuckRun(t *testing.T) {
+	const live = core.SessionStateLive
+	stuck := drainingS0(1000, 7)
+	stuck.Stuck = true
+	runCase(t, "AT-MCH-27", stepChecks{
+		5:  all(sessionIs(1000, live, 10000, core.CauseNone), shardIs(0, drainingS0(1000, 7))),
+		15: all(sessionIs(10100, live, 20000, core.CauseNone), shardIs(0, drainingS0(1000, 7)), nextWakeIs(11000)),
+		16: all(sessionIs(11000, live, 20000, core.CauseNone), shardIs(0, stuck), nextWakeIs(12000)),
+		18: all(sessionIs(12100, live, 22000, core.CauseNone), shardIs(0, stuck)),
+		19: all(sessionIs(13000, live, 22000, core.CauseNone), shardIs(0, releasingDrainedS0(13000, 7))),
+		20: all(sessionIs(13200, core.SessionStateClosing, 22000, core.CauseNone), shardIs(0, idleS0(13200)), nextWakeIs(15200)),
+		21: closedAt(13500, 22000),
+	})
+	if n := closeSessionsBefore(mc.Get("AT-MCH-27"), 20); n != 0 {
+		t.Errorf("%d CloseSessions while the run is going or its Release is out, want none", n)
+	}
+}
+
+func TestATMCH28DrainLateOrLost(t *testing.T) {
+	t.Run("a", func(t *testing.T) {
+		const late = core.SessionStateLate
+		expired := expiredS0(10000, 7)
+		expired.Wanted = false
+		releasing := core.ShardStatus{State: core.ShardStateReleasing, Since: mc.Ms(11000), Term: 7, Reason: core.StopExpired, Holder: "h1"}
+		runCase(t, "AT-MCH-28 (a)", stepChecks{
+			6:  all(sessionIs(10500, late, 10000, core.CauseNone), shardIs(0, expired), drainingIs(true)),
+			7:  all(sessionIs(11000, late, 10000, core.CauseNone), shardIs(0, releasing)),
+			9:  all(sessionIs(13000, late, 10000, core.CauseNone), shardIs(0, releasing)),
+			10: all(sessionIs(13500, core.SessionStateClosing, 10000, core.CauseNone), shardIs(0, idleS0(13500)), nextWakeIs(15500)),
+			11: all(sessionIs(14000, core.SessionStateClosing, 10000, core.CauseNone), nextWakeIs(15500)),
+			12: closedAt(14500, 10000),
+		})
+		c := mc.Get("AT-MCH-28 (a)")
+		if n := countActions[core.StopRun](c); n != 1 {
+			t.Errorf("the case returns %d StopRuns, want 1", n)
+		}
+		if n := closeSessionsBefore(c, 10); n != 0 {
+			t.Errorf("%d CloseSessions before the Release is answered, want none", n)
+		}
+	})
+	t.Run("c", func(t *testing.T) {
+		const lost = core.SessionStateLost
+		idle := idleS0(2000)
+		runCase(t, "AT-MCH-28 (c)", stepChecks{
+			5:  all(sessionIs(1000, core.SessionStateLive, 10000, core.CauseNone), drainingIs(true)),
+			6:  all(sessionIs(1500, lost, 10000, core.CauseLost), shardIs(0, drainingS0(1000, 7)), doneIs(false)),
+			7:  all(sessionIs(2000, lost, 10000, core.CauseLost), shardIs(0, idle), doneIs(true)),
+			8:  all(sessionIs(11000, lost, 10000, core.CauseLost), shardIs(0, idle), doneIs(true)),
+			10: all(sessionIs(12000, lost, 10000, core.CauseLost), shardIs(0, idle), doneIs(true), drainingIs(true)),
+		})
+		c := mc.Get("AT-MCH-28 (c)")
+		if n := countActions[core.CloseSession](c) + countActions[core.Release](c); n != 0 {
+			t.Errorf("the case returns %d CloseSessions and Releases, want none", n)
+		}
+		if n := countActions[core.StopRun](c); n != 1 {
+			t.Errorf("the case returns %d StopRuns, want 1", n)
+		}
+	})
+}
+
+// TestATMCH39SpaceOrderWhileDraining runs AT-MCH-39, with its spaces given as b then a, and its steps
+// again on the spaces given as a then b, and expects equal results, Status, assignments and wakes
+// after every step.
+func TestATMCH39SpaceOrderWhileDraining(t *testing.T) {
+	c := mc.Get("AT-MCH-39")
+	runSteps(t, c, stepChecks{
+		7: all(drainingIs(true), shardsAre(drainingS0(1000, 1), drainingS0(1000, 2), drainingS0(1000, 3))),
+		8: shardsAre(drainingS0(1000, 1), drainingS0(1000, 2), releasingDrainedS0(1100, 3)),
+		10: all(
+			sessionIs(1300, core.SessionStateLive, 10000, core.CauseNone),
+			shardsAre(idleS0(1300), drainingS0(1000, 2), releasingDrainedS0(1100, 3)),
+		),
+		15: all(
+			sessionIs(3300, core.SessionStateClosing, 10000, core.CauseNone),
+			shardsAre(idleS0(1300), idleS0(3300), idleS0(3200)),
+			nextWakeIs(5300),
+		),
+		16: closedAt(3400, 10000),
+	})
+	if n := closeSessionsBefore(c, 15); n != 0 {
+		t.Errorf("%d CloseSessions before the last Release is answered, want none", n)
+	}
+
+	reversed := slices.Clone(c.Config.Spaces)
+	slices.Reverse(reversed)
+	if reversed[0].Name != "a" {
+		t.Fatalf("AT-MCH-39's spaces are %+v, want b then a", c.Config.Spaces)
+	}
+	one, other := core.NewMachine(c.Config), core.NewMachine(mc.C(reversed...))
+	for i, s := range c.Steps {
+		got, gotOther := one.Step(s.Input), other.Step(s.Input)
+		if !reflect.DeepEqual(got, s.Want) || !reflect.DeepEqual(gotOther, s.Want) {
+			t.Fatalf("step %d: Step(%#v) = %#v and %#v, want %#v", i+1, s.Input, got, gotOther, s.Want)
+		}
+		if st, stOther := one.Status(), other.Status(); !reflect.DeepEqual(st, stOther) {
+			t.Fatalf("step %d: Status = %+v and %+v", i+1, st, stOther)
+		}
+		for _, name := range []string{"a", "b"} {
+			if x, y := one.Assignment(name), other.Assignment(name); !slices.Equal(x, y) {
+				t.Fatalf("step %d: Assignment(%s) = %q and %q", i+1, name, x, y)
+			}
+		}
+		at, armed := one.NextWake()
+		if atOther, armedOther := other.NextWake(); at != atOther || armed != armedOther {
+			t.Fatalf("step %d: NextWake = (%v, %v) and (%v, %v)", i+1, at, armed, atOther, armedOther)
+		}
 	}
 }
 
@@ -1416,7 +1690,7 @@ func TestAssignmentRecompute(t *testing.T) {
 		{name: "a renewal", step: renewed(300, 200, extended(10200), wakeAt(2000))},
 		{name: "a failed renewal", step: failed(300, core.CauseUnreachable, wakeAt(2000))},
 		{name: "an answer", step: acquired(300, 7, wakeAt(2000))},
-		{name: "a drain", step: mc.Step{Input: core.Drain{Now: mc.Ms(300)}, Want: []core.Action{wakeAt(2000)}}},
+		{name: "a drain", step: drained(300, core.CloseSession{}, wakeAt(2300))},
 		{name: "an older view", step: viewed(300, mc.Vm(4, "m2"), wakeAt(2000))},
 		{name: "an invalid view", step: viewed(300, core.View{Version: 6, Slots: -1}, wakeAt(2000))},
 		{name: "a view of the same version", step: viewed(300, mc.Vm(5, "m2"), wakeAt(2000)), recompute: true},
@@ -1489,12 +1763,16 @@ func TestGrantThatCannotStart(t *testing.T) {
 		})
 	})
 
+	// The Acquire went out before the Drain, so its answer still comes, and the shard waits for it.
 	t.Run("the member is draining", func(t *testing.T) {
-		wanted := noRunS0(300, 7)
-		wanted.Wanted = true
-		runSteps(t, scenario(append(acquiringS0(), acquired(300, 7, releaseS0(7), wakeAt(2000)))...), stepChecks{
-			3: func(_ *testing.T, m *core.Machine) { core.ForceDraining(m) },
-			4: shardIs(0, wanted),
+		runSteps(t, scenario(append(acquiringS0(),
+			drained(250, wakeAt(2000)),
+			acquired(300, 7, releaseS0(7), wakeAt(2000)),
+			released(400, 7, core.CloseSession{}, wakeAt(2400)),
+		)...), stepChecks{
+			4: all(drainingIs(true), shardIs(0, core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(200)})),
+			5: all(drainingIs(true), shardIs(0, noRunS0(300, 7)), sessionIs(300, core.SessionStateLive, 10000, core.CauseNone)),
+			6: all(shardIs(0, core.ShardStatus{Since: mc.Ms(400), Holder: holder}), sessionIs(400, core.SessionStateClosing, 10000, core.CauseNone)),
 		})
 	})
 
@@ -2050,9 +2328,14 @@ func TestRunStillRunningIsNeverReleased(t *testing.T) {
 // run at all: that is the whole of the exception for a grant's no-run Release. A deadline may pass and
 // the session may fail on any walk, and the same holds through both. Every other walk is on a fenced
 // space, where the deadline degrades a run instead, and a degraded run is a run like any other. After a
-// loss the machine returns
-// only that step's StopRuns and then Wakes, and it is done, with nil results, once every shard is idle.
-// The walks are the same on every run.
+// loss the machine returns only that step's StopRuns and then Wakes, and it is done, with nil results,
+// once every shard is idle.
+//
+// A walk may also drain, and a SessionClosed may come at any time. Once draining, for good, nothing is
+// wanted, started or acquired, and every StopRun says draining unless the run expired or was lost. No
+// CloseSession goes out while any run has not reported its end, stuck or not, nor while any shard is
+// busy, nor after a loss. While closing the machine returns only CloseSession and Wake, and once closed
+// it returns nil and its Status, clock included, never changes. The walks are the same on every run.
 func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 	type run struct {
 		shard int
@@ -2065,6 +2348,8 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 	var noRun, oldTerm, adopted, lostRuns, goneIdle, startedAfterRun, releasedAfterRun int
 	var expiredRuns, lateReleases, losses, sessionLostRuns, stoppedAfterLoss, answeredAfterLoss, doneSteps int
 	var degrades, restores, confirms, stoppedDegraded, lateNoRun int
+	var drains, drainedRuns, stuckWhileDraining, lostWhileDraining, closings, closeRepeats, closingSteps int
+	var closedSteps, earlyClosed, lateClosings int
 	for seed := range uint64(300) {
 		state := seed
 		next := func(n uint64) uint64 {
@@ -2116,14 +2401,90 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 			if st.Done {
 				doneSteps++
 			}
-			// A session goes lost and stays lost, and only a lost one ends in Done here: nothing
-			// closes it yet.
+			// A session goes lost and stays lost, closing goes only to closed, and closed stays. Done
+			// means a closed session, or a lost one with every shard idle.
 			idle := true
 			for _, sh := range st.Spaces[0].Shards {
 				idle = idle && sh.State == core.ShardStateIdle
 			}
-			if st.Done != (isLost && idle) || (wasLost && !isLost) {
+			wasClosing, isClosing := prior.Session == core.SessionStateClosing, st.Session == core.SessionStateClosing
+			wasClosed, isClosed := prior.Session == core.SessionStateClosed, st.Session == core.SessionStateClosed
+			if st.Done != ((isLost && idle) || isClosed) || (wasLost && !isLost) ||
+				(wasClosing && !isClosing && !isClosed) || (wasClosed && !isClosed) || (isClosed && !wasClosing && !wasClosed) {
 				t.Fatalf("seed %d: Status %+v, after %+v", seed, st, history)
+			}
+			if wasClosed {
+				closedSteps++
+				if got != nil || !reflect.DeepEqual(st, prior) {
+					t.Fatalf("seed %d: a closed machine returned %+v and moved to %+v, after %+v", seed, got, st, history)
+				}
+			}
+			if _, ok := in.(core.SessionClosed); ok && !wasClosing && !wasClosed {
+				earlyClosed++
+			}
+			if (isClosing || isClosed) && (!idle || running != ([2]core.Term{}) || !st.Draining) {
+				t.Fatalf("seed %d: Status %+v while %v run, after %+v", seed, st, running, history)
+			}
+			// Draining is for good. Nothing is wanted then, and a Drain after a loss does nothing.
+			if prior.Draining && !st.Draining {
+				t.Fatalf("seed %d: draining ended, after %+v", seed, history)
+			}
+			if !prior.Draining && st.Draining {
+				drains++
+				if wasLost {
+					t.Fatalf("seed %d: a Drain after the loss took effect, after %+v", seed, history)
+				}
+			}
+			if isLost && !wasLost && prior.Draining {
+				lostWhileDraining++
+			}
+			for shard, sh := range st.Spaces[0].Shards {
+				if st.Draining && sh.Wanted {
+					t.Fatalf("seed %d: shard %d is %+v while draining, after %+v", seed, shard, sh, history)
+				}
+				if st.Draining && sh.Stuck {
+					stuckWhileDraining++
+				}
+			}
+			if wasClosing {
+				closingSteps++
+				for _, a := range got {
+					switch a.(type) {
+					case core.CloseSession, core.Wake:
+					default:
+						t.Fatalf("seed %d: %#v while closing, after %+v", seed, a, history)
+					}
+				}
+			}
+			for _, a := range got {
+				switch v := a.(type) {
+				case core.CloseSession:
+					// Closing makes every record takeable, so no run may be going, not even a stuck one.
+					if running != ([2]core.Term{}) || !idle || !isClosing || !st.Draining {
+						t.Fatalf("seed %d: CloseSession while %v run, with Status %+v, after %+v", seed, running, st, history)
+					}
+					closings++
+					if wasClosing {
+						closeRepeats++
+					}
+					if prior.Session == core.SessionStateLate {
+						lateClosings++
+					}
+				case core.StartRun, core.Acquire:
+					if st.Draining {
+						t.Fatalf("seed %d: %#v while draining, after %+v", seed, a, history)
+					}
+				case core.StopRun:
+					if st.Draining && v.Reason == core.StopMoved {
+						t.Fatalf("seed %d: %+v while draining, after %+v", seed, v, history)
+					}
+					if v.Reason == core.StopDraining {
+						drainedRuns++
+						if !st.Draining {
+							t.Fatalf("seed %d: %+v while not draining, after %+v", seed, v, history)
+						}
+					}
+				}
 			}
 			if st.Done && running != ([2]core.Term{}) {
 				t.Fatalf("seed %d: done while %v run, after %+v", seed, running, history)
@@ -2287,9 +2648,19 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 				now += 2 * time.Second
 				step(core.Tick{Now: now})
 			case 2:
-				if next(8) == 0 {
+				// One draw, whose value mod 8 picks the long Tick, so a walk that never drains is the
+				// walk it was before draining existed. A Drain is rare, since a drained walk mostly
+				// closes, and a SessionClosed may come at any time.
+				switch v := next(32); {
+				case v%8 == 0:
 					now += 11 * time.Second
 					step(core.Tick{Now: now})
+				case v == 1:
+					now += time.Millisecond
+					step(core.Drain{Now: now})
+				case v%8 == 3:
+					now += time.Millisecond
+					step(core.SessionClosed{Now: now})
 				}
 			case 3:
 				now += time.Millisecond
@@ -2377,6 +2748,16 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 		{"Confirm", confirms},
 		{"StopRun of a degraded run", stoppedDegraded},
 		{"no-run Release in a fenced space while the session is late", lateNoRun},
+		{"Drain", drains},
+		{"StopRun of a drained run", drainedRuns},
+		{"stuck run while draining", stuckWhileDraining},
+		{"lost session while draining", lostWhileDraining},
+		{"CloseSession", closings},
+		{"CloseSession repeat", closeRepeats},
+		{"CloseSession while the session is late", lateClosings},
+		{"step while closing", closingSteps},
+		{"step after the session closed", closedSteps},
+		{"SessionClosed before closing", earlyClosed},
 	} {
 		if c.count == 0 {
 			t.Errorf("no walk reached a %s", c.name)
@@ -3129,15 +3510,17 @@ func TestGrantAfterRunStopped(t *testing.T) {
 				runSteps(t, scenario(steps...), stepChecks{len(steps): shardIs(0, want)})
 			})
 
+			// The run has its StopRun already, so the Drain stops nothing, and the session closes only
+			// once the term is released.
 			t.Run("draining at the RunStopped releases with no run", func(t *testing.T) {
 				steps := append(start.reach(record("h1", 9)),
+					drained(1450, wakeAt(2000)),
 					runStopped(1500, 7, releaseS0(9), wakeAt(2000)),
+					released(1600, 9, core.CloseSession{}, wakeAt(3600)),
 				)
-				want := noRunS0(1500, 9)
-				want.Wanted = start.wanted
 				runSteps(t, scenario(steps...), stepChecks{
-					len(steps) - 1: func(_ *testing.T, m *core.Machine) { core.ForceDraining(m) },
-					len(steps):     shardIs(0, want),
+					len(steps) - 1: all(drainingIs(true), shardIs(0, noRunS0(1500, 9))),
+					len(steps):     sessionIs(1600, core.SessionStateClosing, 10000, core.CauseNone),
 				})
 			})
 
@@ -3382,15 +3765,16 @@ func TestStopping(t *testing.T) {
 		draining := stoppingS0(1000, 7)
 		draining.Reason = core.StopDraining
 		steps := append(mc.Boot(7, mc.S("s", 1)),
-			viewed(1000, mc.Vm(2, "m2"), core.StopRun{Space: "s", Term: 7, Reason: core.StopDraining}, wakeAt(2000)),
+			drained(1000, stopDrainingS0(), wakeAt(2000)),
+			viewed(1200, mc.Vm(2, "m1"), wakeAt(2000)),
 			runStopped(1500, 7, releaseS0(7), wakeAt(2000)),
 		)
 		releasing := releasingS0(1500, 7)
 		releasing.Reason = core.StopDraining
 		runSteps(t, scenario(steps...), stepChecks{
-			4: func(_ *testing.T, m *core.Machine) { core.ForceDraining(m) },
 			5: shardIs(0, draining),
-			6: shardIs(0, releasing),
+			6: all(shardIs(0, draining), assignmentIs("s", "m1")),
+			7: shardIs(0, releasing),
 		})
 	})
 
@@ -4232,16 +4616,24 @@ func TestFencedDeadline(t *testing.T) {
 
 	t.Run("a move in that step returns the Degrade, then the StopRun", func(t *testing.T) {
 		for _, tc := range []struct {
-			name     string
-			draining bool
-			reason   core.StopReason
+			name   string
+			step   func(want ...core.Action) mc.Step
+			reason core.StopReason
 		}{
-			{name: "moved", reason: core.StopMoved},
-			{name: "draining", draining: true, reason: core.StopDraining},
+			{
+				name:   "moved",
+				step:   func(want ...core.Action) mc.Step { return viewed(10000, mc.Vm(2, "m2"), want...) },
+				reason: core.StopMoved,
+			},
+			{
+				name:   "draining",
+				step:   func(want ...core.Action) mc.Step { return drained(10000, want...) },
+				reason: core.StopDraining,
+			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				steps := append(mc.Boot(7, mc.S("s", 1)),
-					viewed(10000, mc.Vm(2, "m2"),
+					tc.step(
 						core.KeepAlive{},
 						degradeS0(7),
 						core.StopRun{Space: "s", Term: 7, Reason: tc.reason},
@@ -4250,14 +4642,7 @@ func TestFencedDeadline(t *testing.T) {
 				)
 				want := stoppingS0(10000, 7)
 				want.Reason = tc.reason
-				runSteps(t, fencedS0(steps...), stepChecks{
-					4: func(_ *testing.T, m *core.Machine) {
-						if tc.draining {
-							core.ForceDraining(m)
-						}
-					},
-					5: shardIs(0, want),
-				})
+				runSteps(t, fencedS0(steps...), stepChecks{5: shardIs(0, want)})
 			})
 		}
 	})
@@ -4922,13 +5307,8 @@ func TestDegradedMove(t *testing.T) {
 		t.Run("the reason is draining while the member drains, "+tc.name, func(t *testing.T) {
 			draining := stoppingS0(tc.at, 7)
 			draining.Reason = core.StopDraining
-			steps := append(slices.Clone(tc.steps),
-				viewed(tc.at, mc.Vm(2, "m2"), core.StopRun{Space: "s", Term: 7, Reason: core.StopDraining}, wakeAt(12000)),
-			)
-			runSteps(t, fencedS0(steps...), stepChecks{
-				len(tc.steps): func(_ *testing.T, m *core.Machine) { core.ForceDraining(m) },
-				len(steps):    shardIs(0, draining),
-			})
+			steps := append(slices.Clone(tc.steps), drained(tc.at, stopDrainingS0(), wakeAt(12000)))
+			runSteps(t, fencedS0(steps...), stepChecks{len(steps): shardIs(0, draining)})
 		})
 	}
 
@@ -6319,7 +6699,8 @@ func TestSessionFailureCauses(t *testing.T) {
 // TestSessionLostIsFinal checks that nothing brings a lost session back, from wherever it was lost.
 // With no shard busy the machine is done at once. With a run going it first says StopRun, then waits
 // for the run with no action but the Wake of its stuck timer, and is done at the RunStopped. Done, it
-// returns nil for every input, while its clock keeps moving.
+// returns nil for every input, while its clock keeps moving. A Drain after the loss does nothing, and a
+// member that was draining when it lost the session never closes it.
 func TestSessionLostIsFinal(t *testing.T) {
 	const lostAt = 11000
 	starts := []struct {
@@ -6328,6 +6709,7 @@ func TestSessionLostIsFinal(t *testing.T) {
 		deadline int64
 		loss     []core.Action // The loss step's result.
 		last     mc.Step       // Ends what is left of the shard's work, when Input is set.
+		draining bool
 	}{
 		{name: "from opening", steps: []mc.Step{keepAlive(0, 2000)}},
 		{
@@ -6376,11 +6758,31 @@ func TestSessionLostIsFinal(t *testing.T) {
 			steps:    append(movedS0(), runStopped(1500, 7, releaseS0(7), wakeAt(2000))),
 			deadline: 10000,
 		},
+		{
+			// The run is stuck in the loss step itself, so no timer is left.
+			name:     "while draining a run",
+			steps:    append(mc.Boot(7, mc.S("s", 1)), drained(1000, stopDrainingS0(), wakeAt(2000))),
+			deadline: 10000,
+			last:     runStopped(lostAt+15000, 7),
+			draining: true,
+		},
+		{
+			name: "while draining with a Release out",
+			steps: append(mc.Boot(7, mc.S("s", 1)),
+				drained(1000, stopDrainingS0(), wakeAt(2000)),
+				runStopped(1500, 7, releaseS0(7), wakeAt(2000)),
+			),
+			deadline: 10000,
+			draining: true,
+		},
 	}
 	for _, start := range starts {
 		t.Run(start.name, func(t *testing.T) {
 			steps := append(slices.Clone(start.steps), failed(lostAt, core.CauseLost, start.loss...))
-			checks := stepChecks{len(steps): sessionIs(lostAt, core.SessionStateLost, start.deadline, core.CauseLost)}
+			lostIs := func(ms int64) func(*testing.T, *core.Machine) {
+				return all(sessionIs(ms, core.SessionStateLost, start.deadline, core.CauseLost), drainingIs(start.draining))
+			}
+			checks := stepChecks{len(steps): lostIs(lostAt)}
 
 			// Every later input does nothing, at a reading past every old timer, and the clock
 			// keeps moving. Checked after every one of them: a later failure must not replace the
@@ -6404,15 +6806,15 @@ func TestSessionLostIsFinal(t *testing.T) {
 			before := len(steps)
 			for _, in := range inputs(later) {
 				steps = append(steps, mc.Step{Input: in})
-				checks[len(steps)] = sessionIs(later, core.SessionStateLost, start.deadline, core.CauseLost)
+				checks[len(steps)] = lostIs(later)
 			}
 			if start.last.Input != nil {
 				checks[before] = all(checks[before], doneIs(false))
 				steps = append(steps, start.last)
-				checks[len(steps)] = all(sessionIs(later, core.SessionStateLost, start.deadline, core.CauseLost), doneIs(true))
+				checks[len(steps)] = all(lostIs(later), doneIs(true))
 				for _, in := range inputs(later + 1) {
 					steps = append(steps, mc.Step{Input: in})
-					checks[len(steps)] = sessionIs(later+1, core.SessionStateLost, start.deadline, core.CauseLost)
+					checks[len(steps)] = lostIs(later + 1)
 				}
 			}
 			m := runSteps(t, scenario(steps...), checks)
@@ -6426,6 +6828,473 @@ func TestSessionLostIsFinal(t *testing.T) {
 				t.Errorf("Status after the loss = %+v, want Now %v and Done", st, mc.Ms(later+2))
 			}
 		})
+	}
+}
+
+// TestDrain checks what a Drain does before the session closes: it is for good, nothing is wanted or
+// acquired again, a request already out still gets its answer, and the session closes once every shard
+// is idle, from whatever state the session is in.
+func TestDrain(t *testing.T) {
+	const live = core.SessionStateLive
+
+	t.Run("a second Drain changes nothing", func(t *testing.T) {
+		var first core.Status
+		runSteps(t, scenario(append(mc.Boot(7, mc.S("s", 1)),
+			drained(1000, stopDrainingS0(), wakeAt(2000)),
+			drained(1100, wakeAt(2000)),
+			drained(1200, wakeAt(2000)),
+		)...), stepChecks{
+			5: func(_ *testing.T, m *core.Machine) { first = m.Status() },
+			7: func(t *testing.T, m *core.Machine) {
+				t.Helper()
+				st := m.Status()
+				st.Now = first.Now
+				if !reflect.DeepEqual(st, first) {
+					t.Errorf("Status after a second Drain = %+v, want %+v", st, first)
+				}
+			},
+		})
+	})
+
+	t.Run("as the first input it closes at once", func(t *testing.T) {
+		runSteps(t, scenario(
+			mc.Step{Input: core.Drain{}, Want: []core.Action{core.CloseSession{}, wakeAt(2000)}},
+			tick(2000, core.CloseSession{}, wakeAt(4000)),
+			sessionClosed(2100),
+		), stepChecks{
+			1: all(sessionIs(0, core.SessionStateClosing, 0, core.CauseNone), drainingIs(true)),
+			3: closedAt(2100, 0),
+		})
+	})
+
+	// The session never renewed, so there is nothing to hand over, and no KeepAlive is due once it closes.
+	t.Run("while opening, before any renewal, it closes at once", func(t *testing.T) {
+		runSteps(t, scenario(
+			keepAlive(0, 2000),
+			viewed(100, mc.Vm(1, "m1"), wakeAt(2000)),
+			drained(500, core.CloseSession{}, wakeAt(2500)),
+			tick(2000, wakeAt(2500)),
+			renewed(2100, 0, wakeAt(2500)),
+			tick(2500, core.CloseSession{}, wakeAt(4500)),
+			sessionClosed(2600),
+		), stepChecks{
+			2: shardIs(0, core.ShardStatus{Wanted: true}),
+			3: all(sessionIs(500, core.SessionStateClosing, 0, core.CauseNone), shardIs(0, core.ShardStatus{})),
+			5: sessionIs(2100, core.SessionStateClosing, 0, core.CauseNone),
+			7: closedAt(2600, 0),
+		})
+	})
+
+	t.Run("while opening with a Release out, it closes at the answer", func(t *testing.T) {
+		runSteps(t, scenario(
+			keepAlive(0, 2000),
+			viewed(100, mc.Vm(1, "m1"), wakeAt(2000)),
+			holderChanged(200, "h1", 9, releaseS0(9), wakeAt(2000)),
+			drained(300, wakeAt(2000)),
+			keepAlive(2000, 2200),
+			tick(2200, releaseS0(9), wakeAt(4000)),
+			released(2300, 9, core.CloseSession{}, wakeAt(4300)),
+		), stepChecks{
+			4: all(sessionIs(300, core.SessionStateOpening, 0, core.CauseNone), drainingIs(true), shardIs(0, noRunS0(200, 9))),
+			7: all(sessionIs(2300, core.SessionStateClosing, 0, core.CauseNone), shardIs(0, idleS0(2300))),
+		})
+	})
+
+	// A shard that has handed over stays idle while another still hands over: no view, record or answer
+	// makes it wanted or acquires it.
+	t.Run("nothing is wanted or acquired again", func(t *testing.T) {
+		stopS1 := core.StopRun{Space: "s", Shard: 1, Term: 8, Reason: core.StopDraining}
+		steps := append(mc.Boot(7, mc.S("s", 2)),
+			drained(1000, stopDrainingS0(), stopS1, wakeAt(2000)),
+			runStopped(1100, 7, releaseS0(7), wakeAt(2000)),
+			released(1200, 7, wakeAt(2000)),
+			viewed(1300, mc.Vm(2, "m1"), wakeAt(2000)),
+			holderChanged(1400, "", 0, wakeAt(2000)),
+			acquired(1500, 9, wakeAt(2000)),
+			acquireFailed(1600, time.Second, wakeAt(2000)),
+			keepAlive(2000, 4000),
+			renewed(2100, 2000, extended(12000), wakeAt(4000)),
+			keepAlive(4000, 6000),
+			mc.Step{Input: core.RunStopped{Now: mc.Ms(4500), Space: "s", Shard: 1, Term: 8}, Want: []core.Action{
+				core.Release{Space: "s", Shard: 1, Term: 8}, wakeAt(6000),
+			}},
+			mc.Step{Input: core.Released{Now: mc.Ms(4600), Space: "s", Shard: 1, Term: 8}, Want: []core.Action{
+				core.CloseSession{}, wakeAt(6600),
+			}},
+		)
+		idle := core.ShardStatus{Since: mc.Ms(1200), Holder: ""}
+		runSteps(t, scenarioIn(mc.C(mc.S("s", 2)), steps...), stepChecks{
+			8:  all(drainingIs(true), shardIs(0, idleS0(1200)), assignmentIs("s", "m1", "m1")),
+			9:  all(shardIs(0, idleS0(1200)), assignmentIs("s", "m1", "m1")),
+			10: shardIs(0, idle),
+			12: shardIs(0, idle),
+			14: all(sessionIs(2100, live, 12000, core.CauseNone), shardIs(0, idle)),
+			17: all(sessionIs(4600, core.SessionStateClosing, 12000, core.CauseNone), shardIs(0, idle)),
+		})
+	})
+
+	t.Run("a shard waiting to ask again waits no more", func(t *testing.T) {
+		waiting := core.ShardStatus{Since: mc.Ms(400), Holder: "h2", Wanted: true, RetryAt: mc.Ms(2400)}
+		steps := []mc.Step{
+			keepAlive(0, 2000),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			viewed(200, mc.Vm(1, "m1"), acquireS0(), core.Acquire{Space: "s", Shard: 1}, wakeAt(2000)),
+			acquired(300, 7, startedS0(7, 10000), wakeAt(2000)),
+			mc.Step{Input: core.AcquireFailed{Now: mc.Ms(400), Space: "s", Shard: 1, Holder: "h2", RetryAfter: time.Second}, Want: []core.Action{wakeAt(2000)}},
+			drained(500, stopDrainingS0(), wakeAt(2000)),
+			keepAlive(2000, 4000),
+		}
+		gaveUp := waiting
+		gaveUp.Wanted, gaveUp.RetryAt = false, 0
+		runSteps(t, scenarioIn(mc.C(mc.S("s", 2)), steps...), stepChecks{
+			5: shardIs(1, waiting),
+			6: all(shardIs(0, drainingS0(500, 7)), shardIs(1, gaveUp)),
+			7: all(shardIs(1, gaveUp), nextWakeIs(4000)),
+		})
+	})
+
+	// An Acquire that went out before the Drain is answered as usual, and the shard waits for no retry.
+	for _, tc := range []struct {
+		name   string
+		answer []mc.Step
+		idle   core.ShardStatus
+		at     int64
+	}{
+		{
+			name:   "no grant",
+			answer: []mc.Step{acquired(300, 0, core.CloseSession{}, wakeAt(2300))},
+			idle:   core.ShardStatus{Since: mc.Ms(300)},
+			at:     300,
+		},
+		{
+			name:   "another holder",
+			answer: []mc.Step{acquireFailed(300, time.Second, core.CloseSession{}, wakeAt(2300))},
+			idle:   core.ShardStatus{Since: mc.Ms(300), Holder: "h2"},
+			at:     300,
+		},
+		{
+			name:   "a grant, released with no run",
+			answer: []mc.Step{acquired(300, 7, releaseS0(7), wakeAt(2000)), released(400, 7, core.CloseSession{}, wakeAt(2400))},
+			idle:   idleS0(400),
+			at:     400,
+		},
+		{
+			name:   "a grant through a record, released with no run",
+			answer: []mc.Step{holderChanged(300, "h1", 7, releaseS0(7), wakeAt(2000)), released(400, 7, core.CloseSession{}, wakeAt(2400))},
+			idle:   idleS0(400),
+			at:     400,
+		},
+	} {
+		t.Run("an Acquire out at the Drain: "+tc.name, func(t *testing.T) {
+			steps := append(acquiringS0(), drained(250, wakeAt(2000)))
+			steps = append(steps, tc.answer...)
+			runSteps(t, scenario(steps...), stepChecks{
+				4:          all(sessionIs(250, live, 10000, core.CauseNone), shardIs(0, core.ShardStatus{State: core.ShardStateAcquiring, Since: mc.Ms(200)})),
+				len(steps): all(sessionIs(tc.at, core.SessionStateClosing, 10000, core.CauseNone), shardIs(0, tc.idle)),
+			})
+		})
+	}
+}
+
+// TestSessionClosedBeforeClosing checks that a SessionClosed nobody asked for does nothing, whether the
+// member drains or not, and that the session still closes the usual way afterwards.
+func TestSessionClosedBeforeClosing(t *testing.T) {
+	t.Run("opening", func(t *testing.T) {
+		runSteps(t, scenario(keepAlive(0, 2000), sessionClosed(100, wakeAt(2000))), stepChecks{
+			2: all(sessionIs(100, core.SessionStateOpening, 0, core.CauseNone), doneIs(false)),
+		})
+	})
+	t.Run("live", func(t *testing.T) {
+		runSteps(t, scenario(append(bootedOnly(), sessionClosed(300, wakeAt(2000)))...), stepChecks{
+			4: all(sessionIs(300, core.SessionStateLive, 10000, core.CauseNone), doneIs(false)),
+		})
+	})
+	t.Run("late", func(t *testing.T) {
+		runSteps(t, scenario(append(bootedOnly(), keepAlive(10000, 12000), sessionClosed(10100, wakeAt(12000)))...), stepChecks{
+			5: all(sessionIs(10100, core.SessionStateLate, 10000, core.CauseNone), doneIs(false)),
+		})
+	})
+	t.Run("draining with a run going", func(t *testing.T) {
+		runSteps(t, scenario(append(mc.Boot(7, mc.S("s", 1)),
+			drained(1000, stopDrainingS0(), wakeAt(2000)),
+			sessionClosed(1100, wakeAt(2000)),
+			runStopped(1200, 7, releaseS0(7), wakeAt(2000)),
+			sessionClosed(1300, wakeAt(2000)),
+			released(1400, 7, core.CloseSession{}, wakeAt(3400)),
+			sessionClosed(1500),
+		)...), stepChecks{
+			6:  all(sessionIs(1100, core.SessionStateLive, 10000, core.CauseNone), shardIs(0, drainingS0(1000, 7))),
+			8:  all(sessionIs(1300, core.SessionStateLive, 10000, core.CauseNone), shardIs(0, releasingDrainedS0(1200, 7))),
+			9:  sessionIs(1400, core.SessionStateClosing, 10000, core.CauseNone),
+			10: closedAt(1500, 10000),
+		})
+	})
+}
+
+// closingS0 boots a machine of the one shard s/0, whose run has term 7, drains it at @1 and starts
+// closing the session at @1.4: seven steps, with the next CloseSession at @3.4.
+func closingS0() []mc.Step {
+	return append(mc.Boot(7, mc.S("s", 1)),
+		drained(1000, stopDrainingS0(), wakeAt(2000)),
+		runStopped(1200, 7, releaseS0(7), wakeAt(2000)),
+		released(1400, 7, core.CloseSession{}, wakeAt(3400)),
+	)
+}
+
+// TestClosing checks the closing session: only a Tick and a SessionClosed take effect, the CloseSession
+// repeats every RetryPeriod counted from the last one and is the only timer, and the clock ceiling holds.
+func TestClosing(t *testing.T) {
+	const closing = core.SessionStateClosing
+
+	t.Run("every other input is ignored", func(t *testing.T) {
+		now := mc.Ms(2000)
+		inputs := append(allInputs(now),
+			core.SessionFailed{Now: now, Cause: core.CauseLost},
+			core.SessionRenewed{Now: now, SentAt: mc.Ms(1900)},
+			core.ViewChanged{Now: now, View: mc.Vm(5, "m2"), Wall: mc.Wall(now)},
+			core.Acquired{Now: now, Space: "s", Term: 8},
+			core.Released{Now: now, Space: "s", Term: 7},
+			core.RunStopped{Now: now, Space: "s", Term: 7},
+			core.HolderChanged{Now: now, Space: "s", Holder: "h1", Term: 9},
+			core.HolderChanged{Now: now, Space: "s", Holder: "h2", Term: 9},
+			core.AcquireFailed{Now: now, Space: "s", Holder: "h2", RetryAfter: time.Second},
+			&core.SessionClosed{Now: now},
+		)
+		for _, in := range inputs {
+			if _, ok := in.(core.SessionClosed); ok {
+				continue
+			}
+			t.Run(fmt.Sprintf("%T%+v", in, in), func(t *testing.T) {
+				var before core.Status
+				runSteps(t, scenario(append(closingS0(), mc.Step{Input: in, Want: []core.Action{wakeAt(3400)}})...), stepChecks{
+					7: func(_ *testing.T, m *core.Machine) { before = m.Status() },
+					8: func(t *testing.T, m *core.Machine) {
+						t.Helper()
+						want := before
+						if inputNowOf(in) > before.Now {
+							want.Now = inputNowOf(in)
+						}
+						if got := m.Status(); !reflect.DeepEqual(got, want) {
+							t.Errorf("Status = %+v, want %+v", got, want)
+						}
+					},
+				})
+			})
+		}
+	})
+
+	t.Run("a lost session reported while closing is ignored", func(t *testing.T) {
+		runSteps(t, scenario(append(closingS0(),
+			failed(2000, core.CauseLost, wakeAt(3400)),
+			tick(3400, core.CloseSession{}, wakeAt(5400)),
+			sessionClosed(3500),
+		)...), stepChecks{
+			8:  all(sessionIs(2000, closing, 10000, core.CauseNone), doneIs(false)),
+			10: closedAt(3500, 10000),
+		})
+	})
+
+	t.Run("the CloseSession repeats at exactly X + RetryPeriod, counted from the last one", func(t *testing.T) {
+		runSteps(t, scenario(append(closingS0(),
+			tick(3399, wakeAt(3400)),
+			mc.Step{Input: core.Tick{Now: mc.Ms(3400) - 1}, Want: []core.Action{wakeAt(3400)}},
+			tick(3400, core.CloseSession{}, wakeAt(5400)),
+			tick(5399, wakeAt(5400)),
+			tick(5400, core.CloseSession{}, wakeAt(7400)),
+			tick(9000, core.CloseSession{}, wakeAt(11000)),
+			tick(10999, wakeAt(11000)),
+		)...), stepChecks{
+			8:  nextWakeIs(3400),
+			9:  nextWakeIs(3400),
+			10: all(sessionIs(3400, closing, 10000, core.CauseNone), nextWakeIs(5400)),
+			13: all(sessionIs(9000, closing, 10000, core.CauseNone), nextWakeIs(11000)),
+		})
+	})
+
+	// An ignored input skips only its own effect, so the CloseSession due at its reading still goes.
+	t.Run("an ignored input at the repeat still returns the CloseSession", func(t *testing.T) {
+		runSteps(t, scenario(append(closingS0(),
+			runStopped(3400, 7, core.CloseSession{}, wakeAt(5400)),
+			renewed(5400, 5400, core.CloseSession{}, wakeAt(7400)),
+		)...), stepChecks{
+			9: all(sessionIs(5400, closing, 10000, core.CauseNone), nextWakeIs(7400)),
+		})
+	})
+
+	t.Run("the session deadline passing changes nothing", func(t *testing.T) {
+		runSteps(t, scenario(append(closingS0(),
+			tick(9400, core.CloseSession{}, wakeAt(11400)),
+			tick(11400, core.CloseSession{}, wakeAt(13400)),
+		)...), stepChecks{
+			9: all(sessionIs(11400, closing, 10000, core.CauseNone), shardIs(0, idleS0(1400))),
+		})
+	})
+
+	// The clock stops at maxReading, so a CloseSession armed after it never comes due: the driver has
+	// broken its contract to get there. Each timer is still after the clock and fits in a Duration.
+	t.Run("at the clock ceiling", func(t *testing.T) {
+		const retry = 2 * time.Second
+		steps := []mc.Step{
+			{Input: core.Tick{Now: maxReading - time.Second}, Want: []core.Action{core.KeepAlive{}, core.Wake{At: maxReading + time.Second}}},
+			{Input: core.Drain{Now: maxReading - time.Millisecond}, Want: []core.Action{core.CloseSession{}, core.Wake{At: maxReading - time.Millisecond + retry}}},
+			{Input: core.Tick{Now: math.MaxInt64}, Want: []core.Action{core.Wake{At: maxReading - time.Millisecond + retry}}},
+			{Input: core.SessionClosed{Now: math.MaxInt64}},
+			{Input: core.Tick{Now: math.MaxInt64}},
+		}
+		runSteps(t, scenario(steps...), stepChecks{
+			3: func(t *testing.T, m *core.Machine) {
+				t.Helper()
+				if st := m.Status(); st.Now != maxReading || st.Session != closing {
+					t.Errorf("Status = %+v, want Now %v and closing", st, maxReading)
+				}
+			},
+			5: func(t *testing.T, m *core.Machine) {
+				t.Helper()
+				if st := m.Status(); st.Now != maxReading || st.Session != core.SessionStateClosed || !st.Done {
+					t.Errorf("Status = %+v, want Now %v, closed and done", st, maxReading)
+				}
+			},
+		})
+		runSteps(t, scenario(
+			mc.Step{Input: core.Drain{Now: math.MaxInt64}, Want: []core.Action{core.CloseSession{}, core.Wake{At: maxReading + retry}}},
+			mc.Step{Input: core.Tick{Now: math.MaxInt64}, Want: []core.Action{core.Wake{At: maxReading + retry}}},
+		), nil)
+	})
+}
+
+// inputNowOf returns the reading of one of the machine's inputs, or 0 for any other value.
+func inputNowOf(in core.Input) time.Duration {
+	if v := reflect.ValueOf(in); v.Kind() == reflect.Struct {
+		if f := v.FieldByName("Now"); f.IsValid() {
+			return time.Duration(f.Int())
+		}
+	}
+	return 0
+}
+
+// TestCloseSessionWaitsForEveryRun checks the promise that closing rests on: the session closes only once
+// every run has returned, stuck or not, and every request is answered, because closing makes every record
+// of this member's takeable. From each state a shard can be in, the member drains, a record of any kind
+// arrives, and a driver then answers whatever is outstanding, after letting a run go stuck and feeding it
+// every input that must not end it. No StartRun or Acquire goes out after the Drain, no CloseSession while
+// a run is going or a shard is busy, and the session closes in the end.
+func TestCloseSessionWaitsForEveryRun(t *testing.T) {
+	starts := []struct {
+		name    string
+		cfg     core.MachineConfig
+		steps   []mc.Step
+		running core.Term // The run going when the start ends, or 0.
+	}{
+		{name: "owned", cfg: mc.C(mc.S("s", 1)), steps: mc.Boot(7, mc.S("s", 1)), running: 7},
+		{name: "degraded", cfg: mc.CF(mc.S("s", 1)), steps: degradedS0Steps(), running: 7},
+		{name: "degraded with a Confirm out", cfg: mc.CF(mc.S("s", 1)), steps: confirmingS0Steps(), running: 7},
+		{name: "stopping", cfg: mc.C(mc.S("s", 1)), steps: movedS0(), running: 7},
+		{name: "expired", cfg: mc.C(mc.S("s", 1)), steps: expiredS0Steps(), running: 7},
+		{name: "lost", cfg: mc.C(mc.S("s", 1)), steps: ownedAndLostS0(), running: 7},
+		{name: "releasing", cfg: mc.C(mc.S("s", 1)), steps: append(movedS0(), runStopped(1500, 7, releaseS0(7), wakeAt(2000)))},
+		{name: "releasing with no run", cfg: mc.C(mc.S("s", 1)), steps: append(bootedOnly(), holderChanged(300, "h1", 9, releaseS0(9), wakeAt(2000)))},
+		{name: "acquiring", cfg: mc.C(mc.S("s", 1)), steps: acquiringS0()},
+		{name: "idle", cfg: mc.C(mc.S("s", 1)), steps: bootedOnly()},
+	}
+	records := []struct {
+		holder string
+		term   core.Term
+	}{{"h1", 7}, {"h1", 8}, {"h1", 6}, {"h1", 0}, {"h1", 9}, {"h2", 7}, {"h2", 8}, {"h2", 6}, {"h2", 0}, {"", 0}, {"", 8}}
+
+	var stuckRuns, lateClosings int
+	for _, start := range starts {
+		for _, rec := range records {
+			t.Run(fmt.Sprintf("%s, then a record %q term %d", start.name, rec.holder, rec.term), func(t *testing.T) {
+				m := runSteps(t, scenarioIn(start.cfg, start.steps...), nil)
+				now := m.Status().Now
+				running := start.running
+				var history []core.Input
+				step := func(in core.Input) {
+					t.Helper()
+					history = append(history, in)
+					if v, ok := in.(core.RunStopped); ok && v.Shard == 0 && v.Space == "s" && v.Term == running && running != 0 {
+						if sh := m.Status().Spaces[0].Shards[0]; sh.Term == v.Term && (sh.State == core.ShardStateStopping ||
+							sh.State == core.ShardStateExpired || sh.State == core.ShardStateLost) {
+							running = 0
+						}
+					}
+					got := m.Step(in)
+					at, armed := m.NextWake()
+					st := m.Status()
+					for _, v := range wakeViolations(got, st.Now, st.Done, at, armed) {
+						t.Fatalf("%s, after %+v", v, history)
+					}
+					sh := st.Spaces[0].Shards[0]
+					for _, a := range got {
+						switch a.(type) {
+						case core.StartRun, core.Acquire:
+							t.Fatalf("%#v after the Drain, after %+v", a, history)
+						case core.Release:
+							if running != 0 {
+								t.Fatalf("%#v while term %d runs, after %+v", a, running, history)
+							}
+						case core.CloseSession:
+							if running != 0 || sh.State != core.ShardStateIdle || st.Session != core.SessionStateClosing {
+								t.Fatalf("CloseSession while term %d runs, shard %+v, after %+v", running, sh, history)
+							}
+						}
+					}
+					if (st.Session == core.SessionStateClosing || st.Session == core.SessionStateClosed) &&
+						(running != 0 || sh.State != core.ShardStateIdle) {
+						t.Fatalf("session %v while term %d runs, shard %+v, after %+v", st.Session, running, sh, history)
+					}
+				}
+
+				now += time.Millisecond
+				step(core.Drain{Now: now})
+				now += time.Millisecond
+				step(core.HolderChanged{Now: now, Space: "s", Holder: rec.holder, Term: rec.term})
+				for range 10 {
+					st := m.Status()
+					if st.Session == core.SessionStateClosing {
+						break
+					}
+					sh := st.Spaces[0].Shards[0]
+					switch sh.State {
+					case core.ShardStateStopping, core.ShardStateExpired, core.ShardStateLost:
+						// Long enough for the run to go stuck, with every input that must not end it.
+						now += core.DefaultTiming.RenewDeadline + time.Second
+						step(core.Tick{Now: now})
+						if m.Status().Spaces[0].Shards[0].Stuck {
+							stuckRuns++
+						}
+						for _, in := range append(adversaries(now), recordsOfAnotherRun(now)...) {
+							step(in)
+						}
+						now += time.Millisecond
+						step(core.RunStopped{Now: now, Space: "s", Term: m.Status().Spaces[0].Shards[0].Term})
+					case core.ShardStateReleasing:
+						now += time.Millisecond
+						step(core.Released{Now: now, Space: "s", Term: sh.Term})
+					case core.ShardStateAcquiring:
+						now += time.Millisecond
+						step(core.Acquired{Now: now, Space: "s", Term: 0})
+					default:
+						t.Fatalf("shard %+v while draining, after %+v", sh, history)
+					}
+				}
+				st := m.Status()
+				if st.Session != core.SessionStateClosing || running != 0 || !st.Draining {
+					t.Fatalf("Status = %+v with term %d running, want closing, after %+v", st, running, history)
+				}
+				if m.Status().Deadline <= st.Now {
+					lateClosings++
+				}
+				now += time.Millisecond
+				step(core.SessionClosed{Now: now})
+				if st := m.Status(); st.Session != core.SessionStateClosed || !st.Done {
+					t.Fatalf("Status = %+v, want closed and done", st)
+				}
+			})
+		}
+	}
+	if stuckRuns == 0 || lateClosings == 0 {
+		t.Errorf("%d stuck runs and %d closings of a late session, want some of each", stuckRuns, lateClosings)
 	}
 }
 
@@ -6558,13 +7427,14 @@ func TestStepClockOlderInput(t *testing.T) {
 }
 
 // TestStepClockClosedMachine checks that the closed check comes before the clock: a closed machine
-// returns nil for every input and its reading stays where it was. Nothing closes a machine yet, so
-// the test closes it directly.
+// returns nil for every input and its reading stays where it was.
 func TestStepClockClosedMachine(t *testing.T) {
 	const closedAt = time.Second
-	m := core.NewMachine(mc.C(mc.S("s", 1)))
-	m.Step(core.Tick{Now: closedAt})
-	core.ForceSessionClosed(m)
+	m := runSteps(t, scenario(
+		keepAlive(0, 2000),
+		drained(500, core.CloseSession{}, wakeAt(2500)),
+		sessionClosed(1000),
+	), stepChecks{3: all(sessionIs(1000, core.SessionStateClosed, 0, core.CauseNone), doneIs(true))})
 	for _, in := range allInputs(5 * time.Second) {
 		if got := m.Step(in); got != nil {
 			t.Errorf("Step(%T) on a closed machine = %#v, want nil", in, got)
