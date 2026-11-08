@@ -216,7 +216,7 @@ func (m *Machine) stepSlots() {
 func (m *Machine) releaseHeldSlot() {
 	h := m.status.Slot
 	switch {
-	case h < 0 || !(m.slot.retired || m.status.Draining) || !m.shardsReleased():
+	case h < 0 || !m.slot.retired && !m.status.Draining || !m.shardsReleased():
 		return
 	case m.slot.releasing:
 		if m.status.Now < m.slot.releaseAt {
@@ -234,7 +234,7 @@ func (m *Machine) shardsReleased() bool {
 	for i := range m.status.Spaces {
 		for j := range m.status.Spaces[i].Shards {
 			sh := &m.status.Spaces[i].Shards[j]
-			if sh.State != ShardStateIdle && !(runToldToStop(sh) && sh.Stuck) {
+			if sh.State != ShardStateIdle && (!runToldToStop(sh) || !sh.Stuck) {
 				return false
 			}
 		}

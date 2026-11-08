@@ -140,13 +140,17 @@ func (c Cause) String() string
     a name.
 
 type ClaimSlot struct{}
-    ClaimSlot asks the driver to try to claim a slot.
+    ClaimSlot asks the driver to try to claim a slot. It goes again every
+    RetryPeriod while the member holds none, the applied view has slots, the
+    session is live and the member does not drain. The driver answers a claim
+    that finds a slot with SlotClaimed.
 
 type CloseSession struct{}
-    CloseSession asks the driver to close the session. Every run has returned by
-    then. The driver answers it with SessionClosed once the session is closed,
-    and also when the store reports the session already lost or gone: while the
-    session is closing, a SessionFailed is ignored.
+    CloseSession asks the driver to close the session. Every run has returned
+    by then, and the member holds no slot: closing frees any slot it is still
+    giving back. The driver answers it with SessionClosed once the session is
+    closed, and also when the store reports the session already lost or gone:
+    while the session is closing, a SessionFailed is ignored.
 
 type Confirm struct {
 	// Space and Shard name the shard.
@@ -272,12 +276,23 @@ func (m *Machine) Step(in Input) []Action
     told to stop. Later steps return no action but a Wake, until every shard is
     idle and Status reports Done.
 
+    In a view with slots the machine claims a slot every RetryPeriod while it
+    holds none, and runs only the shards of the slot it holds. It holds at most
+    one: it adopts the lowest slot a view lists for its holder and gives back
+    any other it finds it holds, with a ReleaseSlot repeated every RetryPeriod
+    until a SlotReleased answers it. A view that gives the held slot to another
+    holder ends it, and the slot's runs stop as lost and are released once
+    they return. A slot the view retires, or the slot of a draining member,
+    is released once every shard is idle or has a stuck run.
+
     After a Drain the machine wants no shard, so it stops every run and hands
-    each shard over. Once every shard is idle, every run having returned,
-    a stuck one included, it returns CloseSession, and again every RetryPeriod
-    until a SessionClosed. While the session is closing, every input but a Tick
-    and a SessionClosed is ignored, and a step returns nothing but CloseSession
-    and Wake. A lost session is never closed.
+    each shard over, and then its slot. Once every shard is idle, every run
+    having returned, a stuck one included, and it holds no slot, it returns
+    CloseSession, and again every RetryPeriod until a SessionClosed. While the
+    session is closing, every input but a Tick and a SessionClosed is ignored,
+    and a step returns nothing but CloseSession and Wake. A lost session is
+    never closed, and after a loss the machine holds no slot and returns no slot
+    action.
 
     Once Status reports Done, Step returns nil. Once the session is closed,
     the clock stops too.
@@ -390,7 +405,11 @@ type ReleaseSlot struct {
 	// Slot is the slot to release.
 	Slot int
 }
-    ReleaseSlot asks the driver to release a slot.
+    ReleaseSlot asks the driver to release a slot: the held slot, once the
+    member drains or the view retires it and every shard is idle or has a
+    stuck run, or another slot the member holds and gives back. It goes again
+    every RetryPeriod until a SlotReleased for the slot answers it. The driver
+    releases the slot only if the member still holds it.
 
 type Released struct {
 	// Now is the driver's monotonic reading.
@@ -532,7 +551,9 @@ type ShardStatus struct {
 	Holder string
 
 	// Wanted reports that the assignment gives the shard to this member and the member is not
-	// draining.
+	// draining. In a view with slots the assignment gives the member the shards of the slot it holds,
+	// unless the view has retired that slot; without slots, it gives a member that still holds a slot
+	// none.
 	Wanted bool
 
 	// Stuck reports that the run has outlived RenewDeadline since its StopRun action.
@@ -550,7 +571,10 @@ type SlotClaimed struct {
 	// Slot is the slot the member claimed.
 	Slot int
 }
-    SlotClaimed reports that the member now holds a slot.
+    SlotClaimed reports that the member now holds a slot: the answer to a
+    ClaimSlot that found one. A claim that finds no free slot has no answer.
+    A member that holds another slot, drains, or whose applied view has no such
+    slot gives it back with a ReleaseSlot.
 
 type SlotReleased struct {
 	// Now is the driver's monotonic reading.
@@ -559,7 +583,8 @@ type SlotReleased struct {
 	// Slot is the slot the member released.
 	Slot int
 }
-    SlotReleased reports that the member no longer holds a slot.
+    SlotReleased reports that the member no longer holds a slot: the answer to a
+    ReleaseSlot, whether or not the store found the slot held by the member.
 
 type SpaceSpec struct {
 	// Name identifies the space. It is non-empty and distinct within a MachineConfig.
@@ -620,7 +645,8 @@ type Status struct {
 	// Draining reports that the member is handing its work over before it leaves.
 	Draining bool
 
-	// Slot is the slot the member holds, or -1 for none.
+	// Slot is the slot the member holds, or -1 for none. The member holds at most one slot, and in a
+	// view with slots it runs only the shards of that slot.
 	Slot int
 
 	// ViewVersion is the version of the last applied view.

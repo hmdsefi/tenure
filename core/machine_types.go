@@ -130,7 +130,9 @@ type HolderChanged struct {
 	Term Term
 }
 
-// SlotClaimed reports that the member now holds a slot.
+// SlotClaimed reports that the member now holds a slot: the answer to a ClaimSlot that found one. A
+// claim that finds no free slot has no answer. A member that holds another slot, drains, or whose
+// applied view has no such slot gives it back with a ReleaseSlot.
 type SlotClaimed struct {
 	// Now is the driver's monotonic reading.
 	Now time.Duration
@@ -139,7 +141,8 @@ type SlotClaimed struct {
 	Slot int
 }
 
-// SlotReleased reports that the member no longer holds a slot.
+// SlotReleased reports that the member no longer holds a slot: the answer to a ReleaseSlot, whether
+// or not the store found the slot held by the member.
 type SlotReleased struct {
 	// Now is the driver's monotonic reading.
 	Now time.Duration
@@ -263,16 +266,22 @@ type Restore struct {
 	Term Term
 }
 
-// ClaimSlot asks the driver to try to claim a slot.
+// ClaimSlot asks the driver to try to claim a slot. It goes again every RetryPeriod while the member
+// holds none, the applied view has slots, the session is live and the member does not drain. The driver
+// answers a claim that finds a slot with SlotClaimed.
 type ClaimSlot struct{}
 
-// ReleaseSlot asks the driver to release a slot.
+// ReleaseSlot asks the driver to release a slot: the held slot, once the member drains or the view
+// retires it and every shard is idle or has a stuck run, or another slot the member holds and gives
+// back. It goes again every RetryPeriod until a SlotReleased for the slot answers it. The driver
+// releases the slot only if the member still holds it.
 type ReleaseSlot struct {
 	// Slot is the slot to release.
 	Slot int
 }
 
-// CloseSession asks the driver to close the session. Every run has returned by then. The driver
+// CloseSession asks the driver to close the session. Every run has returned by then, and the member
+// holds no slot: closing frees any slot it is still giving back. The driver
 // answers it with SessionClosed once the session is closed, and also when the store reports the
 // session already lost or gone: while the session is closing, a SessionFailed is ignored.
 type CloseSession struct{}
