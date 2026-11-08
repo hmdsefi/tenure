@@ -54,8 +54,10 @@ type routes struct {
 //
 // When the group has slots, shards are placed on slots: the member that serves a slot is the
 // one whose ID is the ID part of the slot's holder, and the Slot of the result is that slot. A
-// vacant slot gives "tenure: no members: orders/3: slot-1 is vacant", and a holder whose member
-// is not in the view gives "tenure: no members: orders/3: n4 is not in the view".
+// node routes the slot it holds to itself from the moment it has claimed it, before its view
+// shows the claim. A vacant slot gives "tenure: no members: orders/3: slot-1 is vacant", and a
+// holder whose member is not in the view gives "tenure: no members: orders/3: n4 is not in the
+// view".
 func (n *Node) Route(space, key string) (Member, error) {
 	r, _, shard, err := n.locate(space, key)
 	if err != nil {
