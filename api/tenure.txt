@@ -62,7 +62,8 @@ type Config struct {
 	Spaces []Space
 
 	// Timing holds the session timings. The zero value means core.DefaultTiming; otherwise a
-	// zero SlotGrace means DefaultSlotGrace.
+	// zero SlotGrace means DefaultSlotGrace, so a LeaseDuration above DefaultSlotGrace needs
+	// SlotGrace set.
 	Timing core.Timing
 
 	// Rand is the source of the 16 random bytes that name each session of this member. nil
@@ -154,9 +155,10 @@ type NameChecker interface {
 	// no spaces ignores spaces.
 	CheckNames(spaces []string, member string) error
 }
-    NameChecker is implemented by a Store or a Membership that cannot hold every
-    name tenure accepts. Start calls CheckNames before any other method of the
-    store or the membership, and fails with its error.
+    NameChecker is implemented by a Store or a Membership that cannot hold
+    every name tenure accepts. Once the rest of the Config is valid, Start
+    calls CheckNames before any other method of the store or the membership,
+    and fails with an error that wraps the one CheckNames returns.
 
 type NotOwnerError struct {
 	// Space and Shard name the shard.
@@ -351,7 +353,8 @@ type TimingChecker interface {
 }
     TimingChecker is implemented by a Store or a Membership that cannot work
     with every valid Timing. Start calls CheckTiming after CheckNames and before
-    any other method of the store or the membership, and fails with its error.
+    any other method of the store or the membership, and fails with an error
+    that wraps the one CheckTiming returns.
 
 type Watcher interface {
 	// WatchHolders returns a channel that receives, in commit order, every write to a shard record
