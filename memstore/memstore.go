@@ -10,6 +10,12 @@
 // seen, so it never moves back, and a step of the wall clock never expires a session. New terms
 // come from core.NextTerm and the Clock's wall time.
 //
+// A Store keeps rules stricter than the tenure.Store contract asks for. Expiry is always judged
+// on the Store's clock, never by the acquirer. Confirm is a plain read and never writes. Each
+// grant, clear and deletion of an existing record takes the next value of one counter shared by
+// every record, so record versions go up by exactly 1 per write. A call that returns an error
+// has changed nothing, whatever the error.
+//
 // Every method takes one lock for the whole Store, so a Store is safe for concurrent use, also
 // inside a testing/synctest bubble.
 package memstore
