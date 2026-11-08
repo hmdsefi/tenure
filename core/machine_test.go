@@ -6831,6 +6831,18 @@ func TestOutputOrder(t *testing.T) {
 			},
 		), nil)
 	})
+
+	// A give-back's repeat falls due with the next claim, and its ReleaseSlot still comes first.
+	t.Run("a ReleaseSlot comes before a ClaimSlot", func(t *testing.T) {
+		runSteps(t, scenario(
+			keepAlive(0, 2000),
+			renewed(100, 0, extended(10000), wakeAt(2000)),
+			viewed(200, mc.Vs(1, []string{"h2"}, "m1", "m2"), core.ClaimSlot{}, wakeAt(2000)),
+			slotClaimed(200, 1, releaseSlot(1), wakeAt(2000)),
+			keepAlive(2000, 2200),
+			tick(2200, releaseSlot(1), core.ClaimSlot{}, wakeAt(4000)),
+		), nil)
+	})
 }
 
 // TestViewPlacementTime checks the time placement reads: exactly W in the step that applies a view,
