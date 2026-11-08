@@ -165,10 +165,12 @@ func (l *loop) run(first []loopInput, started chan<- struct{}) {
 			l.rearm()
 		case <-n.exec.ready():
 			for _, r := range n.exec.take() {
-				for _, in := range r.inputs {
-					l.step(loopInput{in: in, sentWall: r.sentWall, err: r.err})
-				}
+				l.deliver(r)
 				l.slotResult(r)
+			}
+		case <-n.readings.ready:
+			for _, rd := range n.readings.take() {
+				l.observe(rd)
 			}
 		case <-n.inbox.ready:
 			ins, v := n.inbox.take()
@@ -261,8 +263,9 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 
 // execute carries out one action (RUN-130). Store calls go to the executor, which never blocks;
 // ExtendDeadline raises the session deadline that unfenced shards check; StartRun and StopRun
-// start and stop a shard's supervisor; Wake needs nothing, since the timer follows NextWake. Any
-// other action panics.
+// start and stop a shard's supervisor; Degrade and Restore change nothing on the shard, so a
+// fenced run keeps going through an outage; Wake needs nothing, since the timer follows NextWake.
+// Any other action panics.
 func (l *loop) execute(act core.Action) {
 	n := l.n
 	switch a := act.(type) {
@@ -274,7 +277,9 @@ func (l *loop) execute(act core.Action) {
 		n.startRun(a)
 	case core.StopRun:
 		n.stopRun(a)
-	case core.Wake:
+	case core.Confirm:
+		l.confirm(a)
+	case core.Degrade, core.Restore, core.Wake:
 	default:
 		panic(fmt.Sprintf("tenure: unknown action %T", act))
 	}
