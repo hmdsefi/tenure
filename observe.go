@@ -32,13 +32,16 @@ import (
 //     or gives up: "Watch" (also a channel that closed before Leave), "SetDraining" and "Leave";
 //   - draining, once, when the first Drain or Close starts the drain;
 //   - drained, once, when the drain completes;
-//   - closed, last, when Close finishes, with Close's ctx and the reason: "drained" after a
-//     completed drain, "deadline" when ctx ended first.
+//   - shardClosed, for each shard that a Close whose ctx ended first stops with reason "closed"
+//     (RUN-530), under n.stepMu, right after the stop and before its Run is canceled;
+//   - closed, once, with Close's ctx and the reason: "drained" last, when Close finishes after a
+//     completed drain; "deadline" when ctx ended first, once every shard is stopped and before
+//     the node's goroutines are stopped (RUN-530).
 //
-// start, startFailed, slotCountMismatch, closed, membershipFailed("Leave") and the callFailed of
-// Start's cleanup are called from the goroutine of Start or Close, slotsFailed from the slot
-// refresher's goroutine, draining from the first Drain or Close while it
-// holds n.mu, step and a store's view from the loop goroutine, the other callFailed calls from
+// start, startFailed, slotCountMismatch, shardClosed, closed, membershipFailed("Leave") and the
+// callFailed of Start's cleanup are called from the goroutine of Start or Close, slotsFailed
+// from the slot refresher's goroutine, draining from the first Drain or Close while it holds
+// n.mu, step and a store's view from the loop goroutine, the other callFailed calls from
 // the executor's lanes, runReturned from the shard's supervisor goroutine, and the rest from the
 // node's watcher and drain goroutines. No call may block, or call back into the node.
 type observer interface {
@@ -53,6 +56,7 @@ type observer interface {
 	membershipFailed(op string, err error)
 	draining()
 	drained()
+	shardClosed(sh *Shard)
 	closed(ctx context.Context, reason string)
 }
 
@@ -72,4 +76,5 @@ func (nopObserver) slotsFailed(error)                             {}
 func (nopObserver) membershipFailed(string, error)                {}
 func (nopObserver) draining()                                     {}
 func (nopObserver) drained()                                      {}
+func (nopObserver) shardClosed(*Shard)                            {}
 func (nopObserver) closed(context.Context, string)                {}

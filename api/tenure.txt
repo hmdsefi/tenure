@@ -183,10 +183,26 @@ func Start(ctx context.Context, cfg Config) (*Node, error)
 
 func (n *Node) Close(ctx context.Context) error
     Close drains the node as Drain does, leaves the group, and stops every
-    goroutine of the node. It returns nil once all of that is done; later calls
-    return ErrClosed. When ctx ends before the drain completes, Close does not
-    leave the group: it stops the node and returns an error that wraps ctx's
-    error.
+    goroutine of the node. It returns nil once all of that is done. Later calls
+    return ErrClosed, and so do Route, Local, Drain and the lookups of every
+    Resolver the node returned; a Shard the node handed to Run keeps returning
+    its stop error.
+
+    When ctx ends before the drain completes, or is done already when Close is
+    called, Close neither closes the member's session nor leaves the group:
+    the store expires the session, so no other member takes one of the shards
+    while a Run of this member may still act on it. A ctx done at the call does
+    not start the drain at all. Close then stops every shard the member still
+    owns, with a stop error ending in "closed", cancels the shard's Run with
+    that error, stops the node and returns an error that wraps ctx's error
+    and says what the drain had left, as Drain does, such as "tenure: close:
+    context deadline exceeded (not released: orders/3)". It does not wait for
+    a Run that has not returned: that Run's supervisor ends when it returns,
+    and makes no call of its own then.
+
+    No call of the membership or the store starts after Close has returned.
+    Close waits for the calls in flight, whose context it cancels, so a call
+    that does not return once its context is done holds Close up.
 
 func (n *Node) Drain(ctx context.Context) error
     Drain hands the member's work over: it marks the member as draining in
@@ -194,8 +210,14 @@ func (n *Node) Drain(ctx context.Context) error
     releases each shard once its Run has returned, and closes the member's
     session. It returns nil once all of that is done. The first call of Drain or
     Close starts the drain; later and concurrent calls wait for the same drain.
-    When ctx ends first, Drain returns ctx's error and the drain goes on.
-    After Close, Drain returns ErrClosed.
+
+    When ctx ends first, Drain returns an error that wraps ctx's error and says
+    what is left, and the drain goes on: a later Drain waits for it again. The
+    error names the shards not released yet, those whose Run has not returned or
+    whose release is still out, by space and then shard, as in "tenure: drain:
+    context deadline exceeded (not released: orders/3, orders/5)". When every
+    shard is released but the session is not closed yet, it ends in "(session
+    not closed)". After Close, Drain returns ErrClosed.
 
 func (n *Node) Local(space, key string) (*Shard, error)
     Local returns this member's Shard for key in space while the member owns it,

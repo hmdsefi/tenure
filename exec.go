@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -222,6 +223,25 @@ func (e *executor) dropOlder(gen uint64) {
 	}
 	clear(e.results[len(rs):])
 	e.results = rs
+}
+
+// releasing returns the lanes of the shards with a Release queued or in flight, for the account
+// of a drain that has not completed (RUN-510). A Release is in flight from the moment its lane
+// takes it until its result is out.
+func (e *executor) releasing() map[laneKey]bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	isRelease := func(c execCall) bool {
+		_, ok := c.act.(core.Release)
+		return ok
+	}
+	out := make(map[laneKey]bool)
+	for key, l := range e.lanes {
+		if key.kind == laneShard && (l.busy && isRelease(l.cur) || slices.ContainsFunc(l.queue, isRelease)) {
+			out[key] = true
+		}
+	}
+	return out
 }
 
 // ready returns a channel that receives a value when results may be waiting for take.

@@ -218,6 +218,10 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 	l.status = rec.After
 
 	n.stepMu.Lock()
+	if n.halted { // a forced Close: the machine is no longer driven (RUN-530)
+		n.stepMu.Unlock()
+		return
+	}
 	for _, a := range acts {
 		l.execute(a)
 	}
@@ -305,6 +309,9 @@ type spaceShards struct {
 
 	// runs holds each shard's latest supervisor, guarded by n.stepMu.
 	runs []shardRun
+
+	// inRun reports, for each shard, that a Run of it is in progress; guarded by n.runMu.
+	inRun []bool
 }
 
 // shardRun is the latest supervisor of one shard.
@@ -322,6 +329,7 @@ func newShardTable(spaces []Space) map[string]*spaceShards {
 			space: sp,
 			local: make([]atomic.Pointer[Shard], sp.Shards),
 			runs:  make([]shardRun, sp.Shards),
+			inRun: make([]bool, sp.Shards),
 		}
 	}
 	return t
@@ -343,7 +351,7 @@ func (n *Node) startRun(a core.StartRun) {
 	sp.runs[a.Shard] = shardRun{sh: sh, cancel: cancel, done: done}
 	sp.local[a.Shard].Store(sh)
 
-	run, timing := sp.space.Run, n.cfg.Timing
+	run, timing := n.gateRun(sp, a.Shard), n.cfg.Timing
 	onReturn := func(err error, count int, backoff time.Duration) {
 		n.obs.runReturned(sh, err, count, backoff)
 	}
