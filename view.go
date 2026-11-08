@@ -152,12 +152,13 @@ func (n *Node) offer(v core.View) {
 	n.publish(merged)
 }
 
-// publish makes v the node's published view, reports it, and on the first view lets Start
-// return.
+// publish makes v the node's published view, feeds it to every node resolver, reports it, and
+// on the first view lets Start return.
 func (n *Node) publish(v core.View) {
 	if n.view.Swap(&v) == nil {
 		close(n.first)
 	}
+	n.feedResolvers(v)
 	n.obs.view(v)
 }
 
