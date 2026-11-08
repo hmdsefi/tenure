@@ -73,9 +73,11 @@ type propWalk struct {
 // newPropWalk returns a walk of a new machine for cfg.
 func newPropWalk(cfg core.MachineConfig) *propWalk {
 	m := core.NewMachine(cfg)
+	runs := newRunLedger(cfg.Holder, core.MachineTiming(m).LeaseDuration)
+	runs.timing = core.MachineTiming(m)
 	return &propWalk{
 		m:       m,
-		runs:    newRunLedger(cfg.Holder, core.MachineTiming(m).LeaseDuration),
+		runs:    runs,
 		session: &sessionLedger{timing: core.MachineTiming(m)},
 		slots:   newSlotModel(cfg, core.MachineTiming(m)),
 		replay:  newReplay(cfg),
@@ -141,18 +143,31 @@ type runLedger struct {
 	// pending says a Confirm of the shard's run has gone out with the session live at the end of every
 	// step since, and no Restore has answered it.
 	pending map[propShard]bool
+
+	// timing is the machine's Timing, for the checks of when things go out: Stuck, the Confirm and
+	// Release repeats and RetryAt. A ledger with no timing skips them.
+	timing core.Timing
+
+	// stopAt holds the reading of each run's StopRun, and confirmAt and releaseAt the reading of each
+	// shard's last Confirm and Release.
+	stopAt               map[propRun]time.Duration
+	confirmAt, releaseAt map[propShard]time.Duration
 }
 
 // newRunLedger returns an empty record for a machine of the session holder, with LeaseDuration lease.
+// It has no timing until its caller sets it.
 func newRunLedger(holder string, lease time.Duration) *runLedger {
 	return &runLedger{
-		holder:   holder,
-		lease:    lease,
-		running:  map[propShard]core.Term{},
-		started:  map[propRun]bool{},
-		stopSent: map[propRun]bool{},
-		degraded: map[propRun]bool{},
-		pending:  map[propShard]bool{},
+		holder:    holder,
+		lease:     lease,
+		running:   map[propShard]core.Term{},
+		started:   map[propRun]bool{},
+		stopSent:  map[propRun]bool{},
+		degraded:  map[propRun]bool{},
+		pending:   map[propShard]bool{},
+		stopAt:    map[propRun]time.Duration{},
+		confirmAt: map[propShard]time.Duration{},
+		releaseAt: map[propShard]time.Duration{},
 	}
 }
 
@@ -217,12 +232,17 @@ func toldToStop(s core.ShardState) bool {
 // with the session late, for a run going and not degraded. A Confirm goes only while live, for a degraded
 // run, and a Restore only answers one: a record naming this holder in the run's term, with the session
 // live at every step since the Confirm. An Acquire goes only while live and not draining, for a wanted
-// shard with no run. Afterwards every shard's Status must match the record, and only an idle shard of a
-// member that does not drain waits to acquire, for at most LeaseDuration (MCH-430).
+// shard with no run, and not before its RetryAt. Afterwards every shard's Status must match the record:
+// a run with no StopRun has no stop reason and is not stuck, and one told to stop is stuck from
+// RenewDeadline after its StopRun on. Only an idle shard of a member that does not drain waits to
+// acquire, for at most LeaseDuration (MCH-430). With the machine's timing in the record, a Confirm and a
+// Release repeat no sooner than RetryPeriod after the last, and checkShardAnswer checks what the step's
+// input did to each shard.
 func checkStartStop(l *runLedger, s propStep) error {
 	const rule = "one StartRun per term, one StopRun per run (AT-MCH-46)"
 	st := s.st
 	live := st.Session == core.SessionStateLive
+	timed := l.timing.RetryPeriod > 0
 	if !live {
 		clear(l.pending)
 	}
@@ -262,6 +282,7 @@ func checkStartStop(l *runLedger, s propStep) error {
 				return fmt.Errorf("%s: %+v with the session %v, draining %v, fenced %v", rule, v, st.Session, st.Draining, fenced)
 			}
 			l.stopSent[r] = true
+			l.stopAt[r] = st.Now
 			delete(l.pending, k)
 		case core.Degrade:
 			k := propShard{v.Space, v.Shard}
@@ -290,7 +311,12 @@ func checkStartStop(l *runLedger, s propStep) error {
 				return fmt.Errorf("%s: %+v with the session %v, term %d going, degraded %v, stopped %v",
 					rule, v, st.Session, l.running[k], l.degraded[r], l.stopSent[r])
 			}
+			if timed && l.pending[k] && st.Now < l.confirmAt[k]+l.timing.RetryPeriod {
+				// A Confirm repeats every RetryPeriod while the session stays live (MCH-480).
+				return fmt.Errorf("%s: %+v at %v, the last at %v", rule, v, st.Now, l.confirmAt[k])
+			}
 			l.pending[k] = true
+			l.confirmAt[k] = st.Now
 		case core.Acquire:
 			k := propShard{v.Space, v.Shard}
 			sh, ok := shardOf(st, k)
@@ -298,6 +324,22 @@ func checkStartStop(l *runLedger, s propStep) error {
 				return fmt.Errorf("%s: %+v with the session %v, draining %v, shard %+v, term %d going",
 					rule, v, st.Session, st.Draining, sh, l.running[k])
 			}
+			// An Acquire waits for RetryAt, unless a record with no holder has cleared it in this step.
+			rec, isRecord := s.in.(core.HolderChanged)
+			cleared := isRecord && rec.Space == v.Space && rec.Shard == v.Shard && rec.Holder == ""
+			if b, ok := shardOf(s.prior, k); ok && b.State == core.ShardStateIdle && b.RetryAt > st.Now && !cleared {
+				return fmt.Errorf("%s: %+v at %v, before RetryAt %v", rule, v, st.Now, b.RetryAt)
+			}
+		case core.Release:
+			// A Release repeats every RetryPeriod while the shard releases the same term (D6).
+			k := propShard{v.Space, v.Shard}
+			b, ok := shardOf(s.prior, k)
+			last, sent := l.releaseAt[k]
+			if timed && ok && sent && b.State == core.ShardStateReleasing && b.Term == v.Term &&
+				st.Now < last+l.timing.RetryPeriod {
+				return fmt.Errorf("%s: %+v at %v, the last at %v", rule, v, st.Now, last)
+			}
+			l.releaseAt[k] = st.Now
 		}
 	}
 	for _, sp := range st.Spaces {
@@ -307,11 +349,13 @@ func checkStartStop(l *runLedger, s propStep) error {
 			var ok bool
 			switch sh.State {
 			case core.ShardStateOwned, core.ShardStateDegraded:
-				degraded := sh.State == core.ShardStateDegraded
-				ok = l.started[r] && !l.stopSent[r] && l.running[k] == sh.Term && l.degraded[r] == degraded &&
-					(!degraded || sh.Reason == core.StopNone && !sh.Stuck)
+				// A run with no StopRun has no stop reason and is not stuck.
+				ok = l.started[r] && !l.stopSent[r] && l.running[k] == sh.Term &&
+					l.degraded[r] == (sh.State == core.ShardStateDegraded) && sh.Reason == core.StopNone && !sh.Stuck
 			case core.ShardStateStopping, core.ShardStateExpired, core.ShardStateLost:
-				ok = l.stopSent[r] && l.running[k] == sh.Term
+				// A run told to stop is stuck from RenewDeadline after its StopRun on (D7).
+				ok = l.stopSent[r] && l.running[k] == sh.Term &&
+					(!timed || sh.Stuck == (st.Now >= l.stopAt[r]+l.timing.RenewDeadline))
 			default:
 				ok = l.running[k] == 0 && !sh.Stuck
 			}
@@ -323,7 +367,57 @@ func checkStartStop(l *runLedger, s propStep) error {
 				return fmt.Errorf("%s: shard %s/%d is %+v, with term %d going, started %v, stopped %v, degraded %v",
 					rule, sp.Name, shard, sh, l.running[k], l.started[r], l.stopSent[r], l.degraded[r])
 			}
+			if b, ok := shardOf(s.prior, k); ok && timed {
+				if err := checkShardAnswer(l, s, k, b, sh); err != nil {
+					return fmt.Errorf("%s: %w", rule, err)
+				}
+			}
 		}
+	}
+	return nil
+}
+
+// checkShardAnswer checks what the step's input did to shard k, which was b before the step and is sh
+// after it (sections 5 and 6). An answer to an Acquire that grants nothing waits RetryPeriod, and one that
+// names another holder waits its RetryAfter, but at least RetryPeriod and at most LeaseDuration (MCH-430).
+// A record with no holder clears an idle shard's RetryAt, so that it acquires at once. A releasing shard
+// stops releasing only on the Released of its term, a record of another holder or none that is not
+// older, or a lost session.
+func checkShardAnswer(l *runLedger, s propStep, k propShard, b, sh core.ShardStatus) error {
+	st, t := s.st, l.timing
+	lost := st.Session == core.SessionStateLost
+	var term core.Term
+	var holder string
+	named, record, released := false, false, false
+	switch v := s.in.(type) {
+	case core.Acquired:
+		named, term = v.Space == k.space && v.Shard == k.shard, v.Term
+		if named && b.State == core.ShardStateAcquiring && v.Term == 0 && !lost && !st.Draining &&
+			sh.RetryAt != st.Now+t.RetryPeriod {
+			return fmt.Errorf("%#v left shard %s/%d %+v, not waiting RetryPeriod", v, k.space, k.shard, sh)
+		}
+	case core.AcquireFailed:
+		wait := min(max(v.RetryAfter, t.RetryPeriod), t.LeaseDuration)
+		if v.Space == k.space && v.Shard == k.shard && b.State == core.ShardStateAcquiring && !lost && !st.Draining &&
+			sh.RetryAt != st.Now+wait {
+			return fmt.Errorf("%#v left shard %s/%d %+v, not waiting %v", v, k.space, k.shard, sh, wait)
+		}
+	case core.Released:
+		named, term, released = v.Space == k.space && v.Shard == k.shard, v.Term, true
+	case core.HolderChanged:
+		named, term, holder, record = v.Space == k.space && v.Shard == k.shard, v.Term, v.Holder, true
+		if named && b.State == core.ShardStateIdle && v.Holder == "" && sh.RetryAt != 0 {
+			return fmt.Errorf("%#v left shard %s/%d %+v, still waiting", v, k.space, k.shard, sh)
+		}
+	}
+	if b.State != core.ShardStateReleasing || sh.State == core.ShardStateReleasing || lost {
+		return nil
+	}
+	switch {
+	case named && released && term == b.Term:
+	case named && record && holder != l.holder && (term == 0 || term >= b.Term):
+	default:
+		return fmt.Errorf("%#v ended the release of shard %s/%d %+v, now %+v", s.in, k.space, k.shard, b, sh)
 	}
 	return nil
 }
@@ -716,6 +810,14 @@ type slotModel struct {
 	// givingBack holds the other slots a ReleaseSlot has gone out for that no SlotReleased has answered.
 	givingBack map[int]bool
 
+	// retry is RetryPeriod. claimAt, releaseAt and givingBackAt hold the readings of the last ClaimSlot, of
+	// the last ReleaseSlot of the held slot and of each slot given back, and claimSent says a ClaimSlot has
+	// gone out since the member last held a slot.
+	retry              time.Duration
+	claimAt, releaseAt time.Duration
+	claimSent          bool
+	givingBackAt       map[int]time.Duration
+
 	counts slotCounts
 }
 
@@ -756,11 +858,13 @@ func (c *slotCounts) add(o slotCounts) {
 // newSlotModel returns the slot model of a new machine for cfg, which keeps timing.
 func newSlotModel(cfg core.MachineConfig, timing core.Timing) *slotModel {
 	return &slotModel{
-		holder:     cfg.Holder,
-		member:     cfg.Member,
-		spaces:     slices.Clone(cfg.Spaces),
-		vac:        vacancyModel{holder: cfg.Holder, grace: timing.SlotGrace, lease: timing.LeaseDuration},
-		givingBack: map[int]bool{},
+		holder:       cfg.Holder,
+		member:       cfg.Member,
+		spaces:       slices.Clone(cfg.Spaces),
+		vac:          vacancyModel{holder: cfg.Holder, grace: timing.SlotGrace, lease: timing.LeaseDuration},
+		givingBack:   map[int]bool{},
+		retry:        timing.RetryPeriod,
+		givingBackAt: map[int]time.Duration{},
 	}
 }
 
@@ -784,7 +888,9 @@ func viewApplies(prior core.Status, in core.ViewChanged) bool {
 // drains or the slot is retired, and only while every shard is idle or has a stuck run (MCH-720). A
 // ClaimSlot goes only from a live standby that is not draining, under a view with slots. No slot action
 // goes out after a loss, while closing, or in the step that starts closing, and CloseSession needs the
-// held slot -1.
+// held slot -1: given up on the answer to an earlier ReleaseSlot, or lost in that step. A ClaimSlot, the
+// held slot's ReleaseSlot and each give-back repeat no sooner than RetryPeriod after the last, but a
+// member that has given up its slot may claim at once.
 func checkSlots(sm *slotModel, s propStep) error {
 	const rule = "slot rules (MCH-600 to MCH-680, MCH-310)"
 	const lost, closing = core.SessionStateLost, core.SessionStateClosing
@@ -881,8 +987,15 @@ func checkSlots(sm *slotModel, s propStep) error {
 
 	if r, ok := in.(core.SlotReleased); ok && prior.Session != closing && prior.Session != core.SessionStateClosed {
 		delete(sm.givingBack, r.Slot)
+		delete(sm.givingBackAt, r.Slot)
 	}
 	sentBefore := sm.releaseSent
+	lostToOther := isView && was >= 0 && was < sm.applied.Slots && sm.applied.SlotHolders[was] != "" &&
+		sm.applied.SlotHolders[was] != sm.holder
+	if was >= 0 || h >= 0 {
+		// A member that gives up its slot may claim again at once.
+		sm.claimSent = false
+	}
 	closes, slotActions := false, false
 	for _, a := range got {
 		switch a.(type) {
@@ -911,9 +1024,18 @@ func checkSlots(sm *slotModel, s propStep) error {
 		switch v := a.(type) {
 		case core.ReleaseSlot:
 			if v.Slot != h {
+				// A give-back repeats every RetryPeriod until its answer (MCH-680).
+				if at, ok := sm.givingBackAt[v.Slot]; ok && sm.givingBack[v.Slot] && st.Now < at+sm.retry {
+					return fmt.Errorf("%s: %+v at %v, the last at %v", rule, v, st.Now, at)
+				}
 				c.giveBacks++
 				sm.givingBack[v.Slot] = true
+				sm.givingBackAt[v.Slot] = st.Now
 				continue
+			}
+			if sentBefore && st.Now < sm.releaseAt+sm.retry {
+				// The held slot's ReleaseSlot repeats every RetryPeriod until its answer (MCH-660).
+				return fmt.Errorf("%s: %+v at %v, the last at %v", rule, v, st.Now, sm.releaseAt)
 			}
 			if was != h || !st.Draining && !sm.retired {
 				return fmt.Errorf("%s: %+v of a slot taken %d, draining %v, retired %v", rule, v, was, st.Draining, sm.retired)
@@ -931,11 +1053,16 @@ func checkSlots(sm *slotModel, s propStep) error {
 			if over {
 				c.releasesOverStuck++
 			}
-			sm.releaseSent = true
+			sm.releaseSent, sm.releaseAt = true, st.Now
 		case core.ClaimSlot:
 			if h != -1 || sm.applied.Slots == 0 || st.Session != core.SessionStateLive || st.Draining {
 				return fmt.Errorf("%s: %+v with Status %+v", rule, v, st)
 			}
+			if sm.claimSent && st.Now < sm.claimAt+sm.retry {
+				// A standby claims every RetryPeriod (MCH-610).
+				return fmt.Errorf("%s: %+v at %v, the last at %v", rule, v, st.Now, sm.claimAt)
+			}
+			sm.claimSent, sm.claimAt = true, st.Now
 			c.claimsSent++
 		case core.StartRun:
 			var key string
@@ -951,13 +1078,16 @@ func checkSlots(sm *slotModel, s propStep) error {
 				c.slotStarts++
 			}
 		case core.CloseSession:
-			if h != -1 || was != -1 && !sentBefore {
+			// The slot held at the start of the step was released earlier or lost in this step: closing frees
+			// the record of a lost one.
+			if h != -1 || was != -1 && !sentBefore && !vacantLoss && !lostToOther {
 				return fmt.Errorf("%s: %+v while holding slot %d", rule, v, was)
 			}
 		}
 	}
 	if closes || st.Session == lost {
 		clear(sm.givingBack)
+		clear(sm.givingBackAt)
 	}
 	return nil
 }
@@ -1537,6 +1667,15 @@ func TestATMCH49Chaos(t *testing.T) {
 		// the views had shown vacant too long, and with every shard idle the session starts closing in that
 		// step. The step returned the renewal's ExtendDeadline beside CloseSession.
 		{154, "the step that starts closing returns only CloseSession and Wake"},
+		// Past the seeds below. Step 61 is a RunStopped of an owned run, sent before any StopRun, in the
+		// step whose reading loses the held slot the views had shown vacant too long. The slot loss
+		// stopped the run first, so the RunStopped ended it and its record was released.
+		{6769, "a RunStopped in the step that tells its run to stop does not end the run"},
+		// Past the seeds below, and a fault of the slot checker, not of the machine. Step 252 answers the
+		// last Acquire of a draining member whose held slot the views had shown vacant too long: the slot
+		// is lost, every shard is idle, and the session starts closing in that step. Closing frees the
+		// lost slot's record, so no ReleaseSlot of it is owed.
+		{43312, "a slot lost in the step that starts closing needs no ReleaseSlot"},
 	} {
 		t.Run("seed "+strconv.FormatUint(tc.seed, 10), func(t *testing.T) {
 			if err := runChaosSeed(tc.seed, steps, &chaosReach{actions: map[string]int{}, stops: map[core.StopReason]int{}}); err != nil {
@@ -1592,91 +1731,177 @@ func TestATMCH49Chaos(t *testing.T) {
 	}
 }
 
-// TestPropCheckers checks that each checker finds the rule it is about broken, on steps made up for it.
+// TestPropCheckers checks that each checker finds the rule it is about broken, on steps made up for it,
+// and that the rule it names is that one rather than another.
 func TestPropCheckers(t *testing.T) {
 	cfg := chaosConfig()
 	m := core.NewMachine(cfg)
+	timing := core.MachineTiming(m)
 	st := m.Status()
 	live := st
 	live.Session, live.Deadline = core.SessionStateLive, 10*time.Second
-	running := func() *runLedger {
-		l := newRunLedger("h1", 15*time.Second)
-		k := propShard{"b", 0}
-		l.running[k] = 7
-		l.started[propRun{k, 7}] = true
+	// at returns s at the reading now, and with shard b/0 set to sh.
+	at := func(s core.Status, now time.Duration, sh core.ShardStatus) core.Status {
+		s.Now = now
+		s.Spaces = slices.Clone(s.Spaces)
+		s.Spaces[1].Shards = slices.Clone(s.Spaces[1].Shards)
+		s.Spaces[1].Shards[0] = sh
+		return s
+	}
+	// running returns a record with term 7 going on b/0, which keeps timing if timed.
+	b0 := propShard{"b", 0}
+	running := func(timed bool) *runLedger {
+		l := newRunLedger("h1", timing.LeaseDuration)
+		l.running[b0] = 7
+		l.started[propRun{b0, 7}] = true
+		if timed {
+			l.timing = timing
+		}
 		return l
 	}
-	owned := live
-	owned.Spaces = slices.Clone(live.Spaces)
-	owned.Spaces[1].Shards = slices.Clone(live.Spaces[1].Shards)
-	owned.Spaces[1].Shards[0] = core.ShardStatus{State: core.ShardStateOwned, Term: 7, Holder: "h1", Wanted: true}
+	idle := func() *runLedger {
+		l := newRunLedger("h1", timing.LeaseDuration)
+		l.timing = timing
+		return l
+	}
+	ownedB0 := core.ShardStatus{State: core.ShardStateOwned, Term: 7, Holder: "h1", Wanted: true}
+	owned := at(live, 0, ownedB0)
+	releasing := at(live, 0, core.ShardStatus{State: core.ShardStateReleasing, Term: 7, Holder: "h1"})
 
 	tests := []struct {
-		name  string
-		check func() error
+		name, want string
+		check      func() error
 	}{
-		{"Release while running", func() error {
-			return checkNoReleaseWhileRunning(running(), propStep{m: m, st: owned, got: []core.Action{core.Release{Space: "b", Term: 3}}})
+		{"Release while running", "while term 7 runs, before its RunStopped", func() error {
+			return checkNoReleaseWhileRunning(running(false), propStep{m: m, st: owned, got: []core.Action{core.Release{Space: "b", Term: 3}}})
 		}},
-		{"CloseSession while running", func() error {
-			return checkNoReleaseWhileRunning(running(), propStep{m: m, st: owned, got: []core.Action{core.CloseSession{}}})
+		{"CloseSession while running", "CloseSession while", func() error {
+			return checkNoReleaseWhileRunning(running(false), propStep{m: m, st: owned, got: []core.Action{core.CloseSession{}}})
 		}},
-		{"a second StartRun", func() error {
-			return checkStartStop(running(), propStep{m: m, st: owned, got: []core.Action{core.StartRun{Space: "b", Term: 7, Deadline: 10 * time.Second}}})
+		{"done while running", "done while", func() error {
+			done := owned
+			done.Done = true
+			return checkNoReleaseWhileRunning(running(false), propStep{m: m, st: done})
 		}},
-		{"StopRun of a run not going", func() error {
-			return checkStartStop(newRunLedger("h1", 15*time.Second), propStep{m: m, st: live, got: []core.Action{core.StopRun{Space: "b", Term: 7, Reason: core.StopMoved}}})
+		{"a second StartRun", "a second", func() error {
+			return checkStartStop(running(false), propStep{m: m, st: owned, got: []core.Action{core.StartRun{Space: "b", Term: 7, Deadline: 10 * time.Second}}})
 		}},
-		{"two StopRuns of one run", func() error {
-			l := running()
+		{"StopRun of a run not going", "of a run that is not going", func() error {
+			return checkStartStop(idle(), propStep{m: m, st: live, got: []core.Action{core.StopRun{Space: "b", Term: 7, Reason: core.StopMoved}}})
+		}},
+		{"two StopRuns of one run", "of a run that is not going or has its StopRun", func() error {
+			l := running(false)
 			stop := core.StopRun{Space: "b", Term: 7, Reason: core.StopMoved}
-			stopping := owned
-			stopping.Spaces = slices.Clone(owned.Spaces)
-			stopping.Spaces[1].Shards = slices.Clone(owned.Spaces[1].Shards)
-			stopping.Spaces[1].Shards[0].State = core.ShardStateStopping
+			stopping := at(live, 0, core.ShardStatus{State: core.ShardStateStopping, Term: 7, Reason: core.StopMoved, Holder: "h1"})
 			if err := checkStartStop(l, propStep{m: m, st: stopping, got: []core.Action{stop}}); err != nil {
 				return nil
 			}
 			return checkStartStop(l, propStep{m: m, st: stopping, got: []core.Action{stop}})
 		}},
-		{"Restore with no Confirm", func() error {
-			return checkStartStop(running(), propStep{m: m, st: owned, in: core.HolderChanged{Space: "b", Holder: "h1", Term: 7},
+		{"Restore of a degraded run with no Confirm", "Confirm pending false, degraded true", func() error {
+			l := running(false)
+			l.degraded[propRun{b0, 7}] = true
+			return checkStartStop(l, propStep{m: m, st: owned, in: core.HolderChanged{Space: "b", Holder: "h1", Term: 7},
 				got: []core.Action{core.Restore{Space: "b", Term: 7}}})
 		}},
-		{"group order", func() error {
+		{"a stuck owned run", "Stuck:true", func() error {
+			stuck := ownedB0
+			stuck.Stuck = true
+			return checkStartStop(running(false), propStep{m: m, st: at(live, 0, stuck)})
+		}},
+		{"a run stuck before RenewDeadline", "Stuck:true", func() error {
+			l := running(true)
+			l.stopSent[propRun{b0, 7}] = true
+			stopping := core.ShardStatus{State: core.ShardStateStopping, Term: 7, Reason: core.StopMoved, Holder: "h1", Stuck: true}
+			return checkStartStop(l, propStep{m: m, st: at(live, time.Second, stopping)})
+		}},
+		{"Acquire before RetryAt", "before RetryAt", func() error {
+			waiting := at(live, 0, core.ShardStatus{Wanted: true, RetryAt: 5 * time.Second})
+			acquiring := at(live, time.Second, core.ShardStatus{State: core.ShardStateAcquiring, Since: time.Second, Wanted: true})
+			return checkStartStop(idle(), propStep{m: m, prior: waiting, st: acquiring, got: []core.Action{core.Acquire{Space: "b"}}})
+		}},
+		{"Confirm before RetryPeriod", "the last at 0s", func() error {
+			l := running(true)
+			l.degraded[propRun{b0, 7}] = true
+			l.pending[b0] = true
+			degraded := core.ShardStatus{State: core.ShardStateDegraded, Term: 7, Holder: "h1", Wanted: true}
+			return checkStartStop(l, propStep{m: m, st: at(live, time.Second, degraded), got: []core.Action{core.Confirm{Space: "b", Term: 7}}})
+		}},
+		{"Release repeat before RetryPeriod", "the last at 0s", func() error {
+			l := idle()
+			l.releaseAt[b0] = 0
+			return checkStartStop(l, propStep{m: m, prior: releasing, st: at(releasing, time.Second, releasing.Spaces[1].Shards[0]),
+				got: []core.Action{core.Release{Space: "b", Term: 7}}})
+		}},
+		{"no wait after an Acquired with no grant", "not waiting RetryPeriod", func() error {
+			acquiring := at(live, 0, core.ShardStatus{State: core.ShardStateAcquiring, Wanted: true})
+			waiting := at(live, time.Second, core.ShardStatus{Since: time.Second, Wanted: true, RetryAt: time.Second})
+			return checkStartStop(idle(), propStep{m: m, prior: acquiring, st: waiting, in: core.Acquired{Now: time.Second, Space: "b"}})
+		}},
+		{"a release ended by another term's Released", "ended the release", func() error {
+			return checkStartStop(idle(), propStep{m: m, prior: releasing, st: at(live, time.Second, core.ShardStatus{Since: time.Second, Holder: "h1"}),
+				in: core.Released{Now: time.Second, Space: "b", Term: 6}})
+		}},
+		{"group order", "after an action of a later group", func() error {
 			return checkOrder(propStep{st: st, got: []core.Action{core.Acquire{Space: "a"}, core.StartRun{Space: "a"}}})
 		}},
-		{"space order", func() error {
+		{"space order", "after an action of shard b/0", func() error {
 			return checkOrder(propStep{st: st, got: []core.Action{core.Acquire{Space: "b"}, core.Acquire{Space: "a"}}})
 		}},
-		{"shard order", func() error {
+		{"shard order", "after an action of shard a/1", func() error {
 			return checkOrder(propStep{st: st, got: []core.Action{core.Acquire{Space: "a", Shard: 1}, core.Acquire{Space: "a"}}})
 		}},
-		{"give-backs out of order", func() error {
+		{"give-backs out of order", "not in slot order", func() error {
 			return checkOrder(propStep{st: st, got: []core.Action{core.ReleaseSlot{Slot: 2}, core.ReleaseSlot{Slot: 1}}})
 		}},
-		{"ClaimSlot before ReleaseSlot", func() error {
+		{"ClaimSlot before ReleaseSlot", "after the ClaimSlot", func() error {
 			return checkOrder(propStep{st: st, got: []core.Action{core.ClaimSlot{}, core.ReleaseSlot{Slot: 1}}})
 		}},
-		{"empty result", func() error { return checkOrder(propStep{st: st, got: []core.Action{}}) }},
-		{"a replay that differs", func() error {
+		{"empty result", "an empty result", func() error { return checkOrder(propStep{st: st, got: []core.Action{}}) }},
+		{"a replay that differs", "the replay returned", func() error {
 			r := newReplay(cfg)
 			return checkReplay(r, propStep{m: m, in: core.Tick{}, st: core.NewMachine(cfg).Status()})
 		}},
-		{"a closed machine that moves", func() error {
+		{"a closed machine that moves", "a closed machine returned", func() error {
 			closed := st
 			closed.Session = core.SessionStateClosed
-			return checkSession(&sessionLedger{timing: core.DefaultTiming}, propStep{m: m, prior: closed, st: st})
+			return checkSession(&sessionLedger{timing: timing}, propStep{m: m, prior: closed, st: st})
 		}},
-		{"KeepAlive too soon", func() error {
-			l := &sessionLedger{timing: core.DefaultTiming, keepAliveSent: true, keepAliveAt: 0}
+		{"KeepAlive too soon", "KeepAlive at", func() error {
+			l := &sessionLedger{timing: timing, keepAliveSent: true, keepAliveAt: 0}
 			return checkSession(l, propStep{m: m, prior: live, st: live, in: core.Tick{}, got: []core.Action{core.KeepAlive{}}})
+		}},
+		{"ClaimSlot while holding a slot", "{} with Status", func() error {
+			holding := live
+			holding.Slot = 0
+			return checkSlots(newSlotModel(cfg, timing), propStep{m: m, prior: holding, st: holding, in: core.Tick{}, got: []core.Action{core.ClaimSlot{}}})
+		}},
+		{"ClaimSlot before RetryPeriod", "the last at 0s", func() error {
+			sm := newSlotModel(cfg, timing)
+			sm.applied = core.View{Slots: 1, SlotHolders: []string{""}}
+			sm.claimSent = true
+			now := live
+			now.Now = time.Second
+			return checkSlots(sm, propStep{m: m, prior: live, st: now, in: core.Tick{Now: time.Second}, got: []core.Action{core.ClaimSlot{}}})
+		}},
+		{"a slot taken from no answer or view", "took slot 1", func() error {
+			holding := live
+			holding.Slot = 1
+			return checkSlots(newSlotModel(cfg, timing), propStep{m: m, prior: live, st: holding, in: core.Tick{}})
+		}},
+		{"no wake by a streak's expiry", "want a wake by 15s", func() error {
+			sm := newSlotModel(cfg, timing)
+			sm.vac.streaks = []vacancyStreak{{on: true}}
+			return checkSlots(sm, propStep{m: m, prior: live, st: live, in: core.Tick{}})
 		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.check(); err == nil {
+			switch err := tc.check(); {
+			case err == nil:
 				t.Error("the checker found nothing")
+			case !strings.Contains(err.Error(), tc.want):
+				t.Errorf("the checker found %v, want %q", err, tc.want)
 			}
 		})
 	}
