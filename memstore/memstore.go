@@ -1,7 +1,8 @@
 // Copyright 2026 Hamed Yousefi
 // SPDX-License-Identifier: MPL-2.0
 
-// Package memstore is an in-memory tenure.Store for tests, local development and simulations.
+// Package memstore is an in-memory tenure.Store, tenure.SlotStore and tenure.Watcher for tests,
+// local development and simulations.
 //
 // A Store keeps everything in one process and takes its time from a Clock the caller supplies,
 // so a test can drive expiry and terms step by step. Takeover follows the store's own clock: a
@@ -13,8 +14,9 @@
 // A Store keeps rules stricter than the tenure.Store contract asks for. Expiry is always judged
 // on the Store's clock, never by the acquirer. Confirm is a plain read and never writes. Each
 // grant, clear and deletion of an existing record takes the next value of one counter shared by
-// every record, so record versions go up by exactly 1 per write. A call that returns an error
-// has changed nothing, whatever the error.
+// every record, so record versions go up by exactly 1 per write; slot writes take none. Every
+// such write reaches each watch channel before the method that makes it returns. A call that
+// returns an error has changed nothing, whatever the error.
 //
 // Every method takes one lock for the whole Store, so a Store is safe for concurrent use, also
 // inside a testing/synctest bubble.
@@ -35,7 +37,8 @@ import (
 	"github.com/hmdsefi/tenure/core"
 )
 
-// Store is an in-memory tenure.Store. Create one with New; the zero value is not usable.
+// Store is an in-memory tenure.Store, tenure.SlotStore and tenure.Watcher. Create one with New;
+// the zero value is not usable.
 type Store struct {
 	clock Clock
 
@@ -58,6 +61,14 @@ type Store struct {
 
 	// records holds the shard records by space and shard.
 	records map[string]map[int]tenure.Holding
+
+	// slots maps a slot to the holder its record names; a slot with no record has no entry.
+	// Records at or above slotCount are retired slots and stay until released or cleared.
+	slots     map[int]string
+	slotCount int
+
+	// watchers holds the open WatchHolders channels in registration order.
+	watchers []*watcher
 }
 
 // session is one holder's session.
@@ -83,6 +94,7 @@ func New(clock Clock) *Store {
 		sessions: make(map[string]*session),
 		opened:   make(map[string]string),
 		records:  make(map[string]map[int]tenure.Holding),
+		slots:    make(map[int]string),
 	}
 }
 
@@ -204,8 +216,9 @@ func (s *Store) Confirm(ctx context.Context, holder, space string, shard int, te
 }
 
 // CloseSession ends the session of holder for good, also for a holder the Store has never heard
-// of or whose session has already ended, and clears the holder of every shard record that names
-// it, space by space and shard by shard in order, keeping the terms. It returns nil.
+// of or whose session has already ended. It clears the holder of every shard record that names
+// it, space by space and shard by shard in order, keeping the terms, and removes every slot
+// record that names it, also those at or above the slot count. It returns nil.
 func (s *Store) CloseSession(ctx context.Context, holder string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -227,6 +240,11 @@ func (s *Store) CloseSession(ctx context.Context, holder string) error {
 				rec.Holder = ""
 				s.write(rec, false)
 			}
+		}
+	}
+	for slot, h := range s.slots {
+		if h == holder {
+			delete(s.slots, slot)
 		}
 	}
 	return nil
@@ -251,7 +269,9 @@ func (s *Store) Holdings(ctx context.Context, space string) ([]tenure.Holding, e
 
 // DeleteRecord removes the shard's record and with it the shard's term history, as if the
 // backend had lost it: the next grant computes its term from 0. Removing a record counts as a
-// write of it. DeleteRecord of an absent record does nothing. It is meant for tests.
+// write of it and reaches watchers as tenure.Holding{Space: space, Shard: shard, Version: v},
+// v being the deletion's version. DeleteRecord of an absent record does nothing. It is meant for
+// tests.
 func (s *Store) DeleteRecord(space string, shard int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -280,8 +300,8 @@ func (s *Store) live(sess *session, now time.Duration) bool {
 
 // write commits one shard-record write: a grant, a clear or, with remove set, the deletion of
 // an existing record. Every such write goes through here. It takes the next value of the
-// store-wide version and stamps it on rec, then stores rec as the record of (rec.Space,
-// rec.Shard) or removes that record.
+// store-wide version and stamps it on rec, stores rec as the record of (rec.Space, rec.Shard) or
+// removes that record, and delivers rec to the watchers.
 func (s *Store) write(rec tenure.Holding, remove bool) {
 	s.version++
 	rec.Version = s.version
@@ -290,14 +310,15 @@ func (s *Store) write(rec tenure.Holding, remove bool) {
 		if len(s.records[rec.Space]) == 0 {
 			delete(s.records, rec.Space)
 		}
-		return
+	} else {
+		shards := s.records[rec.Space]
+		if shards == nil {
+			shards = make(map[int]tenure.Holding)
+			s.records[rec.Space] = shards
+		}
+		shards[rec.Shard] = rec
 	}
-	shards := s.records[rec.Space]
-	if shards == nil {
-		shards = make(map[int]tenure.Holding)
-		s.records[rec.Space] = shards
-	}
-	shards[rec.Shard] = rec
+	s.deliver(rec)
 }
 
 // memberID returns the member ID of holder: the text before the first "/", or all of holder
