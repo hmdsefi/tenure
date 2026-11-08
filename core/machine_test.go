@@ -7513,6 +7513,7 @@ func TestClosing(t *testing.T) {
 	t.Run("the CloseSession repeats at exactly X + RetryPeriod, counted from the last one", func(t *testing.T) {
 		runSteps(t, scenario(append(closingS0(),
 			tick(3399, wakeAt(3400)),
+			mc.Step{Input: core.Tick{Now: mc.Ms(3400) - 1}, Want: []core.Action{wakeAt(3400)}},
 			tick(3400, core.CloseSession{}, wakeAt(5400)),
 			tick(5399, wakeAt(5400)),
 			tick(5400, core.CloseSession{}, wakeAt(7400)),
@@ -7520,8 +7521,9 @@ func TestClosing(t *testing.T) {
 			tick(10999, wakeAt(11000)),
 		)...), stepChecks{
 			8:  nextWakeIs(3400),
-			9:  all(sessionIs(3400, closing, 10000, core.CauseNone), nextWakeIs(5400)),
-			12: all(sessionIs(9000, closing, 10000, core.CauseNone), nextWakeIs(11000)),
+			9:  nextWakeIs(3400),
+			10: all(sessionIs(3400, closing, 10000, core.CauseNone), nextWakeIs(5400)),
+			13: all(sessionIs(9000, closing, 10000, core.CauseNone), nextWakeIs(11000)),
 		})
 	})
 

@@ -144,7 +144,9 @@ type ClaimSlot struct{}
 
 type CloseSession struct{}
     CloseSession asks the driver to close the session. Every run has returned by
-    then. The driver answers it with SessionClosed once the session is closed.
+    then. The driver answers it with SessionClosed once the session is closed,
+    and also when the store reports the session already lost or gone: while the
+    session is closing, a SessionFailed is ignored.
 
 type Confirm struct {
 	// Space and Shard name the shard.
@@ -529,7 +531,8 @@ type ShardStatus struct {
 	// Holder is the last known holder of the shard's record.
 	Holder string
 
-	// Wanted reports that the assignment gives the shard to this member.
+	// Wanted reports that the assignment gives the shard to this member and the member is not
+	// draining.
 	Wanted bool
 
 	// Stuck reports that the run has outlived RenewDeadline since its StopRun action.

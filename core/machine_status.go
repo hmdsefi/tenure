@@ -67,7 +67,8 @@ type ShardStatus struct {
 	// Holder is the last known holder of the shard's record.
 	Holder string
 
-	// Wanted reports that the assignment gives the shard to this member.
+	// Wanted reports that the assignment gives the shard to this member and the member is not
+	// draining.
 	Wanted bool
 
 	// Stuck reports that the run has outlived RenewDeadline since its StopRun action.
