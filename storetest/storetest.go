@@ -139,6 +139,31 @@ var cases = []testCase{
 	{"Session/CloseUnknown", 0, sessionCloseUnknown},
 	{"Session/HolderLease", 0, sessionHolderLease},
 	{"Session/RetryAfter", 0, sessionRetryAfter},
+	{"Acquire/Fresh", 0, acquireFresh},
+	{"Acquire/Held", 0, acquireHeld},
+	{"Acquire/Reacquire", 0, acquireReacquire},
+	{"Acquire/AfterRelease", 0, acquireAfterRelease},
+	{"Acquire/Independent", 0, acquireIndependent},
+	{"Term/WallAhead", needSetWall, termWallAhead},
+	{"Term/WallBehind", needSetWall, termWallBehind},
+	{"Term/LostRecord", needDeleteRecord, termLostRecord},
+	{"Term/LostRecordWallBehind", needSetWall | needDeleteRecord, termLostRecordWallBehind},
+	{"Term/Sequence", 0, termSequence},
+	{"Release/Match", 0, releaseMatch},
+	{"Release/WrongTerm", 0, releaseWrongTerm},
+	{"Release/WrongHolder", 0, releaseWrongHolder},
+	{"Release/Late", 0, releaseLate},
+	{"Release/Absent", 0, releaseAbsent},
+	{"Release/Twice", 0, releaseTwice},
+	{"Release/EndedSession", 0, releaseEndedSession},
+	{"CloseSession/Stale", 0, closeSessionStale},
+	{"Holdings/Order", 0, holdingsOrder},
+	{"Holdings/Version", 0, holdingsVersion},
+	{"Confirm/Held", 0, confirmHeld},
+	{"Confirm/Other", 0, confirmOther},
+	{"Confirm/WrongTerm", 0, confirmWrongTerm},
+	{"Confirm/AfterTakeover", 0, confirmAfterTakeover},
+	{"Confirm/NoSession", 0, confirmNoSession},
 }
 
 // maxRealTimeLease is the longest LeaseDuration a real-time fixture may have, so that the
@@ -313,6 +338,30 @@ func (e *env) held(h, space string, shard int, by string) {
 	}
 }
 
+// acqIn checks that h is granted the shard at a term in [lo, hi], and returns the term. Unlike
+// acq it allows a term below those the case has seen, as after a lost record.
+func (e *env) acqIn(h, space string, shard int, lo, hi core.Term) core.Term {
+	e.t.Helper()
+	term, err := e.client(h).Acquire(e.ctx, h, space, shard)
+	if err != nil || term < lo || term > hi {
+		want := fmt.Sprintf("a term in [%d, %d]", lo, hi)
+		if lo == hi {
+			want = strconv.FormatUint(uint64(lo), 10)
+		}
+		e.t.Fatalf("Acquire(%q, %q, %d) = %d, %s, want %s, nil", h, space, shard, term, errText(err), want)
+	}
+	e.terms[shardKey{space, shard}] = term
+	return term
+}
+
+// release checks that h's Release of the shard at term returns nil.
+func (e *env) release(h, space string, shard int, term core.Term) {
+	e.t.Helper()
+	if err := e.client(h).Release(e.ctx, h, space, shard, term); err != nil {
+		e.t.Fatalf("Release(%q, %q, %d, %d) = %s, want nil", h, space, shard, term, errText(err))
+	}
+}
+
 // closeSession checks that h's CloseSession returns nil.
 func (e *env) closeSession(h string) {
 	e.t.Helper()
@@ -359,6 +408,16 @@ func (e *env) ver(prev, got tenure.Holding) {
 	}
 }
 
+// same checks that got, the record read after a call that must leave it as it is, equals prev,
+// the same record read before the call, Version included.
+func (e *env) same(prev, got tenure.Holding) {
+	e.t.Helper()
+	if got != prev {
+		e.t.Fatalf("Holdings(%q) = a record %s, nil, want a record %s, nil", got.Space,
+			fmtHolding(got), fmtHolding(prev))
+	}
+}
+
 // conf checks that h's Confirm of the shard at term returns the record naming holder at
 // recTerm. The read is synced.
 func (e *env) conf(h, space string, shard int, term core.Term, holder string, recTerm core.Term) {
@@ -372,6 +431,16 @@ func (e *env) conf(h, space string, shard int, term core.Term, holder string, re
 		}
 		return ""
 	})
+}
+
+// lostConf checks that h's Confirm of the shard at term returns tenure.ErrSessionLost.
+func (e *env) lostConf(h, space string, shard int, term core.Term) {
+	e.t.Helper()
+	got, err := e.client(h).Confirm(e.ctx, h, space, shard, term)
+	if !errors.Is(err, tenure.ErrSessionLost) {
+		e.t.Fatalf("Confirm(%q, %q, %d, %d) = %s, %s, want %s", h, space, shard, term, fmtHolding(got),
+			errText(err), tenure.ErrSessionLost)
+	}
 }
 
 // elapse lets d pass in steps of at most the fixture's RetryPeriod: through Advance in virtual
