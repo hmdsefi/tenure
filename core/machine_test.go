@@ -1655,6 +1655,22 @@ func TestSlotVacancy(t *testing.T) {
 		})
 	})
 
+	// Chaos seed 6769 of TestATMCH49Chaos, past the issue's 3000 seeds, found this: the slot loss stopped
+	// the run before the step's own RunStopped applied, which then released the run's record.
+	t.Run("a RunStopped in the step that loses the slot does not end the run", func(t *testing.T) {
+		lost := core.ShardStatus{State: core.ShardStateLost, Since: mc.Ms(15200), Term: 7, Reason: core.StopLost, Holder: "h1"}
+		steps := append(slices.Clone(mc.Get("AT-MCH-37").Steps[:19]),
+			runStopped(15200, 7, stopLostS0(), core.ClaimSlot{}, wakeAt(16000)),
+			runStopped(15300, 7, releaseS0(7), wakeAt(16000)),
+		)
+		runSteps(t, scenario(steps...), stepChecks{
+			20: all(slotIs(-1), shardIs(0, lost)),
+			21: shardIs(0, core.ShardStatus{
+				State: core.ShardStateReleasing, Since: mc.Ms(15300), Term: 7, Reason: core.StopLost, Holder: "h1",
+			}),
+		})
+	})
+
 	t.Run("a claim answer ends a streak and its mark", func(t *testing.T) {
 		steps := slices.Concat(
 			[]mc.Step{

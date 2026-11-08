@@ -108,6 +108,10 @@ func (m *Machine) forgetConfirms() {
 // the actions of a group come out in that order. After a lost session nothing here returns anything
 // but the StopRuns of the step that accepted the loss: no shard can start, acquire or release, and only
 // a run still going has anything left to do.
+//
+// The shard's input applies before a slot loss stops its run, because the driver sent the input before
+// this step's StopRun: a RunStopped in the step that tells the run to stop does not report that run's
+// end, and must not release it (MCH-750).
 func (m *Machine) stepShards(in Input) {
 	target := m.inputShard(in)
 	for i := range m.status.Spaces {
@@ -117,11 +121,11 @@ func (m *Machine) stepShards(in Input) {
 			if m.sessionLost() {
 				m.applySessionLoss(ref)
 			}
-			if m.slot.lost {
-				m.applySlotLoss(ref)
-			}
 			if ref == target {
 				m.applyShardInput(ref, in)
+			}
+			if m.slot.lost {
+				m.applySlotLoss(ref)
 			}
 			m.expireAtDeadline(ref)
 			m.stopIfUnwanted(ref)
