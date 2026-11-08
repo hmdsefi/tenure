@@ -23,7 +23,8 @@ var (
 	// longer owned, and every *NotOwnerError, matches it with errors.Is.
 	ErrNotOwner = errors.New("tenure: not owner")
 
-	// ErrNoMembers means no member can serve the key: no member of the group is eligible.
+	// ErrNoMembers means no member can serve the key, for example because no member of the
+	// group is eligible.
 	ErrNoMembers = errors.New("tenure: no members")
 
 	// ErrDraining means the node is draining, or has drained, and refuses the call.

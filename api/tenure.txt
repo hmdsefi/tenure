@@ -21,7 +21,8 @@ var (
 	// longer owned, and every *NotOwnerError, matches it with errors.Is.
 	ErrNotOwner = errors.New("tenure: not owner")
 
-	// ErrNoMembers means no member can serve the key: no member of the group is eligible.
+	// ErrNoMembers means no member can serve the key, for example because no member of the
+	// group is eligible.
 	ErrNoMembers = errors.New("tenure: no members")
 
 	// ErrDraining means the node is draining, or has drained, and refuses the call.
@@ -143,8 +144,9 @@ type Shard struct {
     side effect. A Shard stays valid until the member stops owning the shard
     under its Term; a later ownership of the same shard gets a new Shard.
 
-    A Shard is safe for concurrent use. A Shard that the node did not make,
-    such as the zero Shard, is never owned.
+    A Shard is safe for concurrent use, and a copy of a Shard checks the same
+    ownership. A Shard that the node did not make, such as the zero Shard,
+    is never owned.
 
 func (s *Shard) Check() error
     Check returns nil while this member owns the shard. Otherwise it returns

@@ -23,8 +23,12 @@ func TestATRUN32StopError(t *testing.T) {
 		t.Fatalf("Check() of an owned shard = %v, want nil", err)
 	}
 
+	cp := *sh // a copy checks the same ownership
 	err := sh.stop(core.StopMoved.String())
 	const want = "tenure: not owner of orders/3 (term 42): moved"
+	if got := cp.Check(); got != err {
+		t.Errorf("Check() of a copy made before the stop = %v, want the stop error %v", got, err)
+	}
 	if err == nil || err.Error() != want {
 		t.Fatalf("stop(moved) = %v, want %q", err, want)
 	}

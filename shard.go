@@ -17,8 +17,8 @@ import (
 // the member stops owning the shard under its Term; a later ownership of the same shard gets a
 // new Shard.
 //
-// A Shard is safe for concurrent use. A Shard that the node did not make, such as the zero
-// Shard, is never owned.
+// A Shard is safe for concurrent use, and a copy of a Shard checks the same ownership. A Shard
+// that the node did not make, such as the zero Shard, is never owned.
 type Shard struct {
 	// Space is the name of the shard's space.
 	Space string
