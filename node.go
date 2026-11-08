@@ -103,8 +103,13 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		return nil, err
 	}
 	n.ctx, n.cancel = context.WithCancel(context.WithoutCancel(ctx))
+	// Watch runs on the internal context, which outlives ctx; ctx ending during the call cancels
+	// it, so that ctx still bounds Start.
+	stop := context.AfterFunc(ctx, n.cancel)
 	ch, err := cfg.Membership.Watch(n.ctx)
 	switch {
+	case !stop():
+		return nil, n.failStart(ctx, fmt.Errorf("tenure: watch: %w", ctx.Err()))
 	case err != nil:
 		return nil, n.failStart(ctx, fmt.Errorf("tenure: watch: %w", err))
 	case ch == nil:
@@ -117,7 +122,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	case <-n.ended:
 		return nil, n.failStart(ctx, fmt.Errorf("tenure: watch: %w", ErrClosed))
 	case <-ctx.Done():
-		return nil, n.failStart(ctx, fmt.Errorf("tenure: first view: %w", context.Cause(ctx)))
+		return nil, n.failStart(ctx, fmt.Errorf("tenure: first view: %w", ctx.Err()))
 	}
 	if cfg.Store != nil {
 		if err := n.openSession(ctx); err != nil {
