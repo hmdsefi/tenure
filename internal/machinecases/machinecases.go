@@ -225,6 +225,39 @@ func BootF(term core.Term, spaces ...core.SpaceSpec) []Step {
 	})
 }
 
+// SlotBoot takes a new machine of C(spaces...) from nothing to a live session that holds slot 0 of a
+// group of one slot, with every shard owned:
+//
+//	@0    Tick: KeepAlive
+//	@0.1  the renewal sent at @0, which sets the session deadline to @10
+//	@0.2  view version 1 with one vacant slot and m1 as its only member: ClaimSlot
+//	@0.3  SlotClaimed for slot 0: an Acquire per shard
+//	@0.4  a grant per shard: a StartRun per shard
+//
+// Terms count up from term, in the order the machine visits shards: by space name, then by shard.
+// After SlotBoot the next KeepAlive is due at @2, and that is the armed Wake: a member that holds a slot
+// claims none.
+func SlotBoot(term core.Term, spaces ...core.SpaceSpec) []Step {
+	const wake = 2000 * time.Millisecond
+	deadline := core.DefaultTiming.RenewDeadline
+
+	var acquires []core.Action
+	var grants []Step
+	for _, s := range byName(spaces) {
+		for shard := range s.Shards {
+			acquires = append(acquires, core.Acquire{Space: s.Name, Shard: shard})
+			grants = append(grants, Grant(Ms(400), s.Name, shard, term, deadline, wake))
+			term++
+		}
+	}
+	return append([]Step{
+		{Input: core.Tick{Now: Ms(0)}, Want: want(wake, core.KeepAlive{})},
+		Renew(Ms(100), Ms(0), wake),
+		ViewAt(Ms(200), Vs(1, []string{""}, "m1"), wake, core.ClaimSlot{}),
+		{Input: core.SlotClaimed{Now: Ms(300), Slot: 0}, Want: want(wake, acquires...)},
+	}, grants...)
+}
+
 // byName returns a copy of spaces in the order the machine visits them.
 func byName(spaces []core.SpaceSpec) []core.SpaceSpec {
 	sorted := slices.Clone(spaces)

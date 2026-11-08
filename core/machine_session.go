@@ -76,9 +76,9 @@ func (m *Machine) applyDrain() {
 	}
 }
 
-// closeIfDrained is phase F (MCH-710, MCH-730): a draining member whose shards are all idle closes its
-// session, and the CloseSession goes again every RetryPeriod, counted from the last one, until the
-// session is closed. Closing makes every record of this member's takeable, so it must wait for every run
+// closeIfDrained is phase F (MCH-710, MCH-730): a draining member whose shards are all idle, and which
+// holds no slot, closes its session, and the CloseSession goes again every RetryPeriod, counted from the
+// last one, until the session is closed. Closing frees every slot the member is still giving back. Closing makes every record of this member's takeable, so it must wait for every run
 // to return, a stuck one included: a shard is idle only once its run has returned, and its Acquire and
 // Release answered. A lost session never closes: its records are takeable already. The session closes
 // from opening and late too, since the handover needs nothing more from it. The clock is at or below
@@ -89,13 +89,20 @@ func (m *Machine) closeIfDrained() {
 		if m.status.Now < m.session.closeAt {
 			return
 		}
-	case !m.status.Draining || m.sessionEnded() || !m.everyShardIdle():
+	case !m.readyToClose():
 		return
 	default:
 		m.status.Session = SessionStateClosing
 	}
 	m.session.closeAt = m.status.Now + m.cfg.Timing.RetryPeriod
 	m.emit(groupClose, CloseSession{})
+}
+
+// readyToClose reports that phase F starts closing the session in this step: the member drains, the
+// session has not ended, every shard is idle and the member holds no slot, a slot it is releasing
+// included.
+func (m *Machine) readyToClose() bool {
+	return m.status.Draining && !m.sessionEnded() && m.status.Slot < 0 && m.everyShardIdle()
 }
 
 // applyRenewal applies a renewal sent at sentAt. The deadline counts from the send time and

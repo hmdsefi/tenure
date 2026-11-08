@@ -141,6 +141,30 @@ func drainingCases() []Case {
 			),
 		},
 		{
+			// AT-MCH-28 (a) with a slot. The run expires at the deadline, the member drains, and the
+			// Release repeats while the session is late. Once it is answered the ReleaseSlot goes, and
+			// repeats while late too, and the session closes, late, once the slot is released.
+			ID:     "AT-MCH-28 (b)",
+			Config: C(S("s", 1)),
+			Steps: slices.Concat(
+				SlotBoot(7, S("s", 1)),
+				[]Step{
+					{
+						Input: core.Tick{Now: Ms(10000)},
+						Want:  want(Ms(12000), core.KeepAlive{}, core.StopRun{Space: "s", Term: 7, Reason: core.StopExpired}),
+					},
+					{Input: core.Drain{Now: Ms(10500)}, Want: want(Ms(12000))},
+					{Input: core.RunStopped{Now: Ms(11000), Space: "s", Term: 7}, Want: want(Ms(12000), release)},
+					{Input: core.Tick{Now: Ms(12000)}, Want: want(Ms(13000), core.KeepAlive{})},
+					{Input: core.Released{Now: Ms(12500), Space: "s", Term: 7}, Want: want(Ms(14000), core.ReleaseSlot{Slot: 0})},
+					{Input: core.Tick{Now: Ms(14000)}, Want: want(Ms(14500), core.KeepAlive{})},
+					{Input: core.Tick{Now: Ms(14500)}, Want: want(Ms(16000), core.ReleaseSlot{Slot: 0})},
+					{Input: core.SlotReleased{Now: Ms(15000), Slot: 0}, Want: want(Ms(17000), closeSession)},
+					{Input: core.SessionClosed{Now: Ms(15500)}},
+				},
+			),
+		},
+		{
 			// A draining member loses its session. The lost path wins: the run, already told to stop,
 			// gets no second StopRun, its RunStopped releases nothing, and the session is never
 			// closed. The machine is done once the run has returned.

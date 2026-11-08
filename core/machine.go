@@ -43,6 +43,9 @@ type Machine struct {
 	// session holds the session's bookkeeping that Status does not report.
 	session sessionTimers
 
+	// slot holds the slot bookkeeping that Status does not report.
+	slot slotBook
+
 	// live is the step's one evaluation of the session, made in phase A. Every later phase of
 	// the step reads it, so they all agree.
 	live bool
@@ -59,7 +62,6 @@ type Machine struct {
 // order, then shard order, then the order the phases emitted them.
 type outputGroup int
 
-//nolint:unused // Some groups have no actions so far; the phases still to come emit to them.
 const (
 	// groupSession holds ExtendDeadline, then KeepAlive.
 	groupSession outputGroup = iota
@@ -80,7 +82,7 @@ const (
 	groupClose
 
 	// groupReserved stays empty until a later phase of the project adds its action.
-	groupReserved
+	groupReserved //nolint:unused // A later phase of the project emits to it.
 
 	// groupCount is the number of groups. The Wake comes after them all: phase H appends it.
 	groupCount
@@ -170,6 +172,7 @@ func (m *Machine) Step(in Input) []Action {
 	}
 	m.applySessionInput(in)
 	m.applyViewInput(in)
+	m.applySlotInput(in)
 	m.refreshSession()
 	m.live = m.status.Session == SessionStateLive
 	if !m.live {
@@ -184,8 +187,9 @@ func (m *Machine) Step(in Input) []Action {
 	// Phase D: the shards.
 	m.stepShards(in)
 
-	// Phase E (slots) goes here. Phase F: closing. The KeepAlive comes after them because closing
-	// the session ends the cadence, so the step that starts closing returns none.
+	// Phase E: the slots. Phase F: closing. The KeepAlive comes after them because closing the session
+	// ends the cadence, so the step that starts closing returns none.
+	m.stepSlots()
 	m.closeIfDrained()
 	m.emitKeepAlive()
 	m.status.Done = m.done()
@@ -262,6 +266,7 @@ func (m *Machine) armTimers() {
 	m.wake = wakeTimer{}
 	m.armSessionTimers(&m.wake)
 	m.armShardTimers(&m.wake)
+	m.armSlotTimers(&m.wake)
 }
 
 // NextWake returns the reading of the earliest armed timer and true, or 0 and false when no

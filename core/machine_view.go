@@ -10,6 +10,9 @@ type viewState struct {
 	// view is the applied view. Status reports its version.
 	view View
 
+	// applied reports that a view has been applied.
+	applied bool
+
 	// wall is W: the view's wall-clock time, without a monotonic reading.
 	wall time.Time
 
@@ -36,7 +39,8 @@ func (m *Machine) applyView(in ViewChanged) {
 		return
 	}
 	m.status.ViewVersion = in.View.Version
-	m.view = viewState{view: in.View, wall: in.Wall.Round(0), appliedAt: m.status.Now, dirty: true}
+	m.view = viewState{view: in.View, applied: true, wall: in.Wall.Round(0), appliedAt: m.status.Now, dirty: true}
+	m.applyViewSlots()
 }
 
 // recomputeAssignments is phase C: it stores a new assignment for every space, and the Wanted flag
@@ -70,11 +74,15 @@ func (m *Machine) recomputeAssignments() {
 }
 
 // placementKey returns the key under which the applied view gives this member shards, or "" when
-// it gives the member none. Without slots that is the member's ID. With slots it would be the key
-// of the slot the member holds, and the machine cannot hold a slot yet, so nothing is wanted in a
-// view with slots.
+// it gives the member none (MCH-330). With slots that is the key of the held slot, so a standby, or a
+// member whose slot is retired, wants nothing. Without slots it is the member's ID, unless the member
+// still holds a slot: a group that has dropped its slots retires that slot, and the member wants nothing
+// until it has released it.
 func (m *Machine) placementKey() string {
 	if m.view.view.Slots > 0 {
+		return m.slotKey()
+	}
+	if m.status.Slot >= 0 {
 		return ""
 	}
 	return m.cfg.Member
