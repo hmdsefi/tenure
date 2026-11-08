@@ -3542,140 +3542,7 @@ func TestRunStillRunningIsNeverReleased(t *testing.T) {
 // retired, and only while every shard is idle or has a stuck run. A ClaimSlot goes only from a live
 // standby that is not draining, under a view with slots. No slot action goes out after a loss, while
 // closing, or in the step that starts closing, and CloseSession needs the held slot -1.
-// vacancyModel is a test's model of the slots' vacancy streaks and of the timer of a held slot the views
-// show vacant. Its caller updates it in the machine's order from each step's input and result.
-type vacancyModel struct {
-	grace, lease time.Duration
-
-	// streaks holds each slot's streak, by slot of the latest view applied while the session had not
-	// ended.
-	streaks []vacancyStreak
-
-	// heldAt is the reading at which the member took the held slot.
-	heldAt time.Duration
-
-	// shown says the views show the held slot shownFor vacant while the member holds it, since the reading
-	// since.
-	shown    bool
-	shownFor int
-	since    time.Duration
-}
-
-// vacancyStreak is one slot's streak in a vacancyModel.
-type vacancyStreak struct {
-	on, expired bool
-	since       time.Duration
-}
-
-// applyView applies a view at the reading now to the streaks while the member holds held, and returns
-// how many marks it ended by showing their slot held.
-func (v *vacancyModel) applyView(view core.View, held int, now time.Duration) int {
-	if len(v.streaks) > view.Slots {
-		v.streaks = v.streaks[:view.Slots]
-	}
-	for len(v.streaks) < view.Slots {
-		v.streaks = append(v.streaks, vacancyStreak{})
-	}
-	ended := 0
-	for s, holder := range view.SlotHolders {
-		switch {
-		case holder != "" || s == held:
-			if v.end(s) && holder != "" {
-				ended++
-			}
-		default:
-			v.start(s, now, view)
-		}
-	}
-	return ended
-}
-
-// start starts a streak of slot s at the reading at if view shows it vacant and it has none, and reports
-// whether it did.
-func (v *vacancyModel) start(s int, at time.Duration, view core.View) bool {
-	if s < 0 || s >= len(v.streaks) || s >= view.Slots || view.SlotHolders[s] != "" || v.streaks[s].on {
-		return false
-	}
-	v.streaks[s] = vacancyStreak{on: true, since: at}
-	return true
-}
-
-// end ends the streak of slot s and reports whether it had a mark.
-func (v *vacancyModel) end(s int) bool {
-	if s < 0 || s >= len(v.streaks) {
-		return false
-	}
-	marked := v.streaks[s].expired
-	v.streaks[s] = vacancyStreak{}
-	return marked
-}
-
-// display sets the timer of the held slot h after phase A, with view the latest applied view, applied at
-// the reading appliedAt.
-func (v *vacancyModel) display(h int, view core.View, appliedAt time.Duration) {
-	switch {
-	case h < 0 || h >= view.Slots || view.SlotHolders[h] != "":
-		v.shown = false
-	case !v.shown || v.shownFor != h:
-		v.shown, v.shownFor, v.since = true, h, max(appliedAt, v.heldAt)
-	}
-}
-
-// mark marks every streak that has lasted SlotGrace at the reading now, and returns how many it marked.
-func (v *vacancyModel) mark(now time.Duration) int {
-	n := 0
-	for s := range v.streaks {
-		if st := &v.streaks[s]; st.on && !st.expired && now >= st.since+v.grace {
-			st.expired = true
-			n++
-		}
-	}
-	return n
-}
-
-// timers returns the readings by which the machine must wake: each streak's expiry and, while the
-// session is live, the loss of a held slot shown vacant.
-func (v *vacancyModel) timers(live bool) []time.Duration {
-	var due []time.Duration
-	for _, st := range v.streaks {
-		if st.on && !st.expired {
-			due = append(due, st.since+v.grace)
-		}
-	}
-	if v.shown && live {
-		due = append(due, v.since+v.lease)
-	}
-	return due
-}
-
-// assignment returns the assignment of space s with two shards that view gives with the model's marks,
-// or none before a view is applied.
-func (v *vacancyModel) assignment(view core.View, applied bool, now time.Duration) []string {
-	assignment := make([]string, 2)
-	if !applied {
-		return assignment
-	}
-	var expired []bool
-	if view.Slots > 0 {
-		expired = make([]bool, view.Slots)
-		for s := range min(view.Slots, len(v.streaks)) {
-			expired[s] = v.streaks[s].expired
-		}
-	}
-	keys, _ := core.PlacementKeys(view, mc.Wall(now), expired)
-	for shard, k := range core.Balanced("s", 2, keys) {
-		if k >= 0 {
-			assignment[shard] = keys[k]
-		}
-	}
-	return assignment
-}
-
 func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
-	type run struct {
-		shard int
-		term  core.Term
-	}
 	views := [][]string{{"m1"}, {"m1", "m2"}, {"m1", "m4"}, {"m2", "m3"}}
 	holders := []string{"h1", "h1", "h2", ""}
 
@@ -3685,10 +3552,7 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 	var degrades, restores, confirms, stoppedDegraded, lateNoRun int
 	var drains, drainedRuns, stuckWhileDraining, lostWhileDraining, closings, closeRepeats, closingSteps int
 	var closedSteps, earlyClosed, lateClosings int
-	var claimsSent, claimsTaken, adoptions, giveBacks, heldReleases, releasesOverStuck, slotReleases int
-	var slotLosses, slotLostRuns, retirements, slotStarts, drainedSlots int
-	var marksSet, marksEndedByView, marksEndedByClaim, streaksOnLeaving, markMoves, markAcquires int
-	var vacantLosses, vacantLostRuns, vacantLossesAfterWait, vacantStops int
+	var slots slotCounts
 	for seed := range uint64(1200) {
 		state := seed
 		next := func(n uint64) uint64 {
@@ -3707,346 +3571,54 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 			cfg.Timing = core.DefaultTiming
 			cfg.Timing.SlotGrace = 15*time.Second + time.Duration(seed%8/4)*5*time.Second
 		}
-		m := core.NewMachine(cfg)
-		vac := vacancyModel{grace: core.MachineTiming(m).SlotGrace, lease: core.MachineTiming(m).LeaseDuration}
-		var appliedAt time.Duration
-		viewApplied := false
+		// The walk's checkers keep the driver's record of the runs and the model of the slots, and check
+		// every rule after every step; this test only counts the paths the walks reach.
+		w := newPropWalk(cfg)
+		m := w.m
 		var lastHolders []string
-		started, stopSent, stopped := map[run]bool{}, map[run]bool{}, map[run]bool{}
 		runsOf := [2]int{}
-
-		// running holds each shard's run the driver has not reported over, or 0 for none. A run is
-		// over only by a RunStopped of its term after its StopRun.
-		running := [2]core.Term{}
 		var history []core.Input
 		var now time.Duration
 		version := uint64(0)
 		term := core.Term(1)
 
-		// The slot model. applied is the view the machine last applied, releaseSent says a ReleaseSlot of
-		// the held slot has gone out since the machine took it, retired says a view has retired it since,
-		// and givingBack holds the other slots a ReleaseSlot has gone out for that no SlotReleased has
-		// answered.
-		var applied core.View
-		releaseSent, retired := false, false
-		givingBack := map[int]bool{}
-		checkSlots := func(in core.Input, prior, st core.Status, got []core.Action) {
-			t.Helper()
-			const lost, closing = core.SessionStateLost, core.SessionStateClosing
-			view, isView := in.(core.ViewChanged)
-			isView = isView && st.ViewVersion == view.View.Version && prior.Session != closing
-			if isView {
-				applied, appliedAt, viewApplied = view.View, st.Now, true
-			}
-			h, was := st.Slot, prior.Slot
-
-			// The vacancy model, in the machine's order: the view's streaks before its slot rules, then the
-			// held slot's changes in phase A, the timer of a held slot shown vacant, and phase B's marks and
-			// loss. After the session has ended nothing changes. hA is the held slot after phase A: the slot
-			// a loss in phase B gives up, if there is one.
-			endedAtB := prior.Session == lost || prior.Session == closing || prior.Session == core.SessionStateClosed || st.Session == lost
-			vacantLoss := false
-			if !endedAtB {
-				shownBefore := vac.shown
-				if isView {
-					marksEndedByView += vac.applyView(applied, was, st.Now)
-				}
-				hA := h
-				r, isRelease := in.(core.SlotReleased)
-				c, isClaim := in.(core.SlotClaimed)
-				otherHolder := isView && was >= 0 && was < applied.Slots && applied.SlotHolders[was] != "" && applied.SlotHolders[was] != "h1"
-				releasedHeld := isRelease && r.Slot == was && releaseSent
-				countedClaim := !viewApplied || c.Slot < applied.Slots
-				switch {
-				case h != -1:
-				case was >= 0 && !releasedHeld && !otherHolder:
-					hA = was
-				case was == -1 && isClaim && c.Slot >= 0 && !prior.Draining && !givingBack[c.Slot] && countedClaim:
-					hA = c.Slot
-				}
-				if hA != was && was >= 0 && vac.start(was, st.Now, applied) {
-					streaksOnLeaving++
-				}
-				if hA != was && hA >= 0 {
-					vac.heldAt = st.Now
-					if vac.end(hA) {
-						marksEndedByClaim++
-					}
-				}
-				vac.display(hA, applied, appliedAt)
-				if shownBefore && !vac.shown && isView && hA >= 0 && hA < applied.Slots && applied.SlotHolders[hA] == "h1" {
-					vacantStops++
-				}
-				set := vac.mark(st.Now)
-				marksSet += set
-				liveAtB := st.Deadline > 0 && st.Now < st.Deadline
-				if vac.shown && liveAtB && st.Now >= vac.since+vac.lease {
-					vacantLoss = true
-					if prior.Session != core.SessionStateLive && prior.Now >= vac.since+vac.lease {
-						vacantLossesAfterWait++
-					}
-					vac.shown = false
-					if vac.start(hA, st.Now, applied) {
-						streaksOnLeaving++
-					}
-				}
-				if (h == -1 && hA >= 0) != vacantLoss {
-					t.Fatalf("seed %d: slot %d after phase A, %d after the step, model loss %v, after %+v", seed, hA, h, vacantLoss, history)
-				}
-				if set > 0 {
-					for _, a := range got {
-						switch v := a.(type) {
-						case core.StopRun:
-							if v.Reason == core.StopMoved {
-								markMoves++
-							}
-						case core.Acquire:
-							markAcquires++
-						}
-					}
-				}
-			}
-			if got := m.Assignment("s"); !slices.Equal(got, vac.assignment(applied, viewApplied, st.Now)) {
-				t.Fatalf("seed %d: Assignment = %q, want %q with marks %+v, after %+v",
-					seed, got, vac.assignment(applied, viewApplied, st.Now), vac.streaks, history)
-			}
-			if st.Session != lost && st.Session != closing && st.Session != core.SessionStateClosed {
-				at, armed := m.NextWake()
-				for _, due := range vac.timers(st.Session == core.SessionStateLive) {
-					if !armed || at > due {
-						t.Fatalf("seed %d: NextWake = (%v, %v), want a wake by %v, after %+v", seed, at, armed, due, history)
-					}
-				}
-			}
-
-			if r, ok := in.(core.SlotReleased); ok && prior.Session != closing {
-				delete(givingBack, r.Slot)
-			}
-			sentBefore := releaseSent
-			closes, slotActions := false, false
-			for _, a := range got {
-				switch a.(type) {
-				case core.CloseSession:
-					closes = true
-				case core.ClaimSlot, core.ReleaseSlot:
-					slotActions = true
-				}
-			}
-			if slotActions && (st.Session == lost || prior.Session == closing || closes) {
-				t.Fatalf("seed %d: %+v with the session %v, after %+v", seed, got, prior.Session, history)
-			}
-			if st.Session == lost && h != -1 {
-				t.Fatalf("seed %d: slot %d after the loss, after %+v", seed, h, history)
-			}
-			if h != was {
-				if was >= 0 {
-					r, isRelease := in.(core.SlotReleased)
-					switch {
-					case st.Session == lost:
-					case isRelease && r.Slot == was && releaseSent:
-						slotReleases++
-						if prior.Draining {
-							drainedSlots++
-						}
-					case isView && was < view.View.Slots && view.View.SlotHolders[was] != "" && view.View.SlotHolders[was] != "h1":
-						slotLosses++
-						for shard, b := range prior.Spaces[0].Shards {
-							if b.State != core.ShardStateOwned && b.State != core.ShardStateDegraded {
-								continue
-							}
-							if !slices.Contains(got, core.Action(core.StopRun{Space: "s", Shard: shard, Term: b.Term, Reason: core.StopLost})) {
-								t.Fatalf("seed %d: slot %d lost with shard %d %+v, returning %+v, after %+v", seed, was, shard, b, got, history)
-							}
-							slotLostRuns++
-						}
-					case vacantLoss:
-						// The views showed the slot vacant for LeaseDuration: its runs stop as lost, as when
-						// another holder takes it, and the walk's other checks see that each record is released
-						// only after the run's RunStopped.
-						vacantLosses++
-						for shard, b := range prior.Spaces[0].Shards {
-							if b.State != core.ShardStateOwned && b.State != core.ShardStateDegraded {
-								continue
-							}
-							if !slices.Contains(got, core.Action(core.StopRun{Space: "s", Shard: shard, Term: b.Term, Reason: core.StopLost})) {
-								t.Fatalf("seed %d: slot %d shown vacant with shard %d %+v, returning %+v, after %+v", seed, was, shard, b, got, history)
-							}
-							vacantLostRuns++
-						}
-					default:
-						t.Fatalf("seed %d: slot %d became %d, after %+v", seed, was, h, history)
-					}
-				}
-				if h >= 0 {
-					c, isClaim := in.(core.SlotClaimed)
-					lowest := -1
-					if isView {
-						for s, holder := range view.View.SlotHolders {
-							if holder == "h1" && !givingBack[s] && s != was {
-								lowest = s
-								break
-							}
-						}
-					}
-					switch {
-					case st.Draining || givingBack[h]:
-						t.Fatalf("seed %d: took slot %d while draining or giving it back, after %+v", seed, h, history)
-					case isClaim && c.Slot == h && was == -1 && (applied.Slots > h || st.ViewVersion == 0 && len(applied.Members) == 0):
-						claimsTaken++
-					case isView && h == lowest:
-						adoptions++
-					default:
-						t.Fatalf("seed %d: took slot %d, after %+v", seed, h, history)
-					}
-				}
-				releaseSent, retired = false, false
-			}
-			if h >= 0 && isView && applied.Slots <= h {
-				if !retired {
-					retirements++
-				}
-				retired = true
-			}
-			for _, a := range got {
-				switch v := a.(type) {
-				case core.ReleaseSlot:
-					if v.Slot != h {
-						giveBacks++
-						givingBack[v.Slot] = true
-						continue
-					}
-					if was != h || !st.Draining && !retired {
-						t.Fatalf("seed %d: %+v of a slot taken %d, draining %v, retired %v, after %+v", seed, v, was, st.Draining, retired, history)
-					}
-					over := false
-					for shard, sh := range st.Spaces[0].Shards {
-						told := sh.State == core.ShardStateStopping || sh.State == core.ShardStateExpired || sh.State == core.ShardStateLost
-						if sh.State != core.ShardStateIdle && (!told || !sh.Stuck) {
-							t.Fatalf("seed %d: %+v with shard %d %+v, after %+v", seed, v, shard, sh, history)
-						}
-						over = over || sh.Stuck
-					}
-					heldReleases++
-					if over {
-						releasesOverStuck++
-					}
-					releaseSent = true
-				case core.ClaimSlot:
-					if h != -1 || applied.Slots == 0 || st.Session != core.SessionStateLive || st.Draining {
-						t.Fatalf("seed %d: %+v with Status %+v, after %+v", seed, v, st, history)
-					}
-					claimsSent++
-				case core.StartRun:
-					key := m.Assignment("s")[v.Shard]
-					switch {
-					case h >= 0 && (key != "slot-"+strconv.Itoa(h) || applied.Slots <= h || retired || releaseSent):
-						t.Fatalf("seed %d: %+v with slot %d, key %q, after %+v", seed, v, h, key, history)
-					case h < 0 && (applied.Slots != 0 || key != "m1"):
-						t.Fatalf("seed %d: %+v with no slot, key %q, after %+v", seed, v, key, history)
-					case h >= 0:
-						slotStarts++
-					}
-				case core.CloseSession:
-					if h != -1 || was != -1 && !sentBefore {
-						t.Fatalf("seed %d: %+v while holding slot %d, after %+v", seed, v, was, history)
-					}
-				}
-			}
-			if closes || st.Session == lost {
-				clear(givingBack)
-			}
-		}
-
 		step := func(in core.Input) {
 			history = append(history, in)
-			if v, ok := in.(core.RunStopped); ok && v.Shard >= 0 && v.Shard < 2 && stopSent[run{v.Shard, v.Term}] {
-				stopped[run{v.Shard, v.Term}] = true
-				if running[v.Shard] == v.Term {
-					running[v.Shard] = 0
-				}
+			s, err := w.step(in)
+			if err != nil {
+				t.Fatalf("seed %d: %v, after %+v", seed, err, history)
 			}
-			prior := m.Status()
+			prior, st, got := s.prior, s.st, s.got
 			before := prior.Spaces[0].Shards
-			got := m.Step(in)
-			at, armed := m.NextWake()
-			st := m.Status()
-			for _, v := range wakeViolations(got, st.Now, st.Done, at, armed) {
-				t.Fatalf("seed %d: %s, after %+v", seed, v, history)
+			started := func(shard int, term core.Term) bool {
+				return w.runs.started[propRun{propShard{"s", shard}, term}]
 			}
-			checkSlots(in, prior, st, got)
-			wasLost := prior.Session == core.SessionStateLost
-			isLost := st.Session == core.SessionStateLost
+			wasLost, isLost := prior.Session == core.SessionStateLost, st.Session == core.SessionStateLost
+			wasClosing := prior.Session == core.SessionStateClosing
 			if isLost && !wasLost {
 				losses++
-			}
-			if prior.Done && got != nil {
-				t.Fatalf("seed %d: a done machine returned %+v, after %+v", seed, got, history)
+				if prior.Draining {
+					lostWhileDraining++
+				}
 			}
 			if st.Done {
 				doneSteps++
 			}
-			// A session goes lost and stays lost, closing goes only to closed, and closed stays. Done
-			// means a closed session, or a lost one with every shard idle.
-			idle := true
-			for _, sh := range st.Spaces[0].Shards {
-				idle = idle && sh.State == core.ShardStateIdle
-			}
-			wasClosing, isClosing := prior.Session == core.SessionStateClosing, st.Session == core.SessionStateClosing
-			wasClosed, isClosed := prior.Session == core.SessionStateClosed, st.Session == core.SessionStateClosed
-			if st.Done != ((isLost && idle) || isClosed) || (wasLost && !isLost) ||
-				(wasClosing && !isClosing && !isClosed) || (wasClosed && !isClosed) || (isClosed && !wasClosing && !wasClosed) {
-				t.Fatalf("seed %d: Status %+v, after %+v", seed, st, history)
-			}
-			if wasClosed {
+			if prior.Session == core.SessionStateClosed {
 				closedSteps++
-				if got != nil || !reflect.DeepEqual(st, prior) {
-					t.Fatalf("seed %d: a closed machine returned %+v and moved to %+v, after %+v", seed, got, st, history)
-				}
 			}
-			if _, ok := in.(core.SessionClosed); ok && !wasClosing && !wasClosed {
+			if _, ok := in.(core.SessionClosed); ok && !wasClosing && prior.Session != core.SessionStateClosed {
 				earlyClosed++
-			}
-			if (isClosing || isClosed) && (!idle || running != ([2]core.Term{}) || !st.Draining) {
-				t.Fatalf("seed %d: Status %+v while %v run, after %+v", seed, st, running, history)
-			}
-			// Draining is for good. Nothing is wanted then, and a Drain after a loss does nothing.
-			if prior.Draining && !st.Draining {
-				t.Fatalf("seed %d: draining ended, after %+v", seed, history)
 			}
 			if !prior.Draining && st.Draining {
 				drains++
-				if wasLost {
-					t.Fatalf("seed %d: a Drain after the loss took effect, after %+v", seed, history)
-				}
-			}
-			if isLost && !wasLost && prior.Draining {
-				lostWhileDraining++
-			}
-			for shard, sh := range st.Spaces[0].Shards {
-				if st.Draining && sh.Wanted {
-					t.Fatalf("seed %d: shard %d is %+v while draining, after %+v", seed, shard, sh, history)
-				}
-				if st.Draining && sh.Stuck {
-					stuckWhileDraining++
-				}
 			}
 			if wasClosing {
 				closingSteps++
-				for _, a := range got {
-					switch a.(type) {
-					case core.CloseSession, core.Wake:
-					default:
-						t.Fatalf("seed %d: %#v while closing, after %+v", seed, a, history)
-					}
-				}
 			}
 			for _, a := range got {
 				switch v := a.(type) {
 				case core.CloseSession:
-					// Closing makes every record takeable, so no run may be going, not even a stuck one.
-					if running != ([2]core.Term{}) || !idle || !isClosing || !st.Draining {
-						t.Fatalf("seed %d: CloseSession while %v run, with Status %+v, after %+v", seed, running, st, history)
-					}
 					closings++
 					if wasClosing {
 						closeRepeats++
@@ -4054,56 +3626,12 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 					if prior.Session == core.SessionStateLate {
 						lateClosings++
 					}
-				case core.StartRun, core.Acquire:
-					if st.Draining {
-						t.Fatalf("seed %d: %#v while draining, after %+v", seed, a, history)
-					}
-				case core.StopRun:
-					if st.Draining && v.Reason == core.StopMoved {
-						t.Fatalf("seed %d: %+v while draining, after %+v", seed, v, history)
-					}
-					if v.Reason == core.StopDraining {
-						drainedRuns++
-						if !st.Draining {
-							t.Fatalf("seed %d: %+v while not draining, after %+v", seed, v, history)
-						}
-					}
-				}
-			}
-			if st.Done && running != ([2]core.Term{}) {
-				t.Fatalf("seed %d: done while %v run, after %+v", seed, running, history)
-			}
-			if isLost {
-				for _, a := range got {
-					switch v := a.(type) {
-					case core.Wake:
-					case core.StopRun:
-						if wasLost || v.Reason != core.StopLost {
-							t.Fatalf("seed %d: %+v after the session was lost, after %+v", seed, v, history)
-						}
-						sessionLostRuns++
-					default:
-						t.Fatalf("seed %d: %#v after the session was lost, after %+v", seed, a, history)
-					}
-				}
-			}
-			for _, a := range got {
-				switch v := a.(type) {
 				case core.StartRun:
 					starts++
 					runsOf[v.Shard]++
 					if runsOf[v.Shard] > 1 {
 						restarts++
 					}
-					k := run{v.Shard, v.Term}
-					if started[k] {
-						t.Fatalf("seed %d: a second %+v after %+v", seed, v, history)
-					}
-					if running[v.Shard] != 0 {
-						t.Fatalf("seed %d: %+v while term %d runs, after %+v", seed, v, running[v.Shard], history)
-					}
-					started[k] = true
-					running[v.Shard] = v.Term
 					switch in.(type) {
 					case core.HolderChanged:
 						adopted++
@@ -4112,57 +3640,42 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 					}
 				case core.StopRun:
 					stops++
-					k := run{v.Shard, v.Term}
-					if !started[k] || stopSent[k] {
-						t.Fatalf("seed %d: %+v of a run not running, after %+v", seed, v, history)
-					}
-					stopSent[k] = true
 					if before[v.Shard].State == core.ShardStateDegraded {
 						stoppedDegraded++
 					}
 					switch v.Reason {
 					case core.StopLost:
 						lostRuns++
+						if isLost {
+							sessionLostRuns++
+						}
 					case core.StopExpired:
 						expiredRuns++
-						if st.Session != core.SessionStateLate || fenced {
-							t.Fatalf("seed %d: %+v with the session %v, fenced %v, after %+v", seed, v, st.Session, fenced, history)
-						}
+					case core.StopDraining:
+						drainedRuns++
 					}
 				case core.Degrade:
 					degrades++
-					if !fenced || running[v.Shard] != v.Term {
-						t.Fatalf("seed %d: %+v with term %d running, fenced %v, after %+v", seed, v, running[v.Shard], fenced, history)
-					}
 				case core.Restore:
 					restores++
-					if running[v.Shard] != v.Term {
-						t.Fatalf("seed %d: %+v with term %d running, after %+v", seed, v, running[v.Shard], history)
-					}
 				case core.Confirm:
 					confirms++
-					if running[v.Shard] != v.Term {
-						t.Fatalf("seed %d: %+v with term %d running, after %+v", seed, v, running[v.Shard], history)
-					}
 				case core.Release:
 					releases++
 					if st.Session == core.SessionStateLate {
 						lateReleases++
+						if fenced && !started(v.Shard, v.Term) {
+							lateNoRun++
+						}
 					}
-					if running[v.Shard] != 0 {
-						t.Fatalf("seed %d: %+v while term %d runs, before its RunStopped, after %+v",
-							seed, v, running[v.Shard], history)
-					}
-					k := run{v.Shard, v.Term}
-					if fenced && st.Session == core.SessionStateLate && !started[k] {
-						lateNoRun++
-					}
-					if _, ok := in.(core.RunStopped); ok && before[v.Shard].Term != v.Term {
+					_, afterRun := in.(core.RunStopped)
+					if afterRun && before[v.Shard].Term != v.Term {
 						releasedAfterRun++
 					}
-					if !started[k] {
+					switch {
+					case !started(v.Shard, v.Term):
 						noRun++
-					} else if _, ok := in.(core.RunStopped); !ok && before[v.Shard].State != core.ShardStateReleasing {
+					case !afterRun && before[v.Shard].State != core.ShardStateReleasing:
 						oldTerm++
 					}
 					if b := before[v.Shard]; b.State == core.ShardStateReleasing && b.Term == v.Term {
@@ -4170,41 +3683,23 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 					}
 				}
 			}
-			for shard, sh := range m.Status().Spaces[0].Shards {
-				k := run{shard, sh.Term}
-				switch sh.State {
-				case core.ShardStateOwned, core.ShardStateDegraded:
-					if !started[k] || stopSent[k] || running[shard] != sh.Term {
-						t.Fatalf("seed %d: shard %d is %+v, after %+v", seed, shard, sh, history)
-					}
-				case core.ShardStateStopping, core.ShardStateExpired, core.ShardStateLost:
-					if !stopSent[k] || stopped[k] || running[shard] != sh.Term {
-						t.Fatalf("seed %d: shard %d is %+v, after %+v", seed, shard, sh, history)
-					}
-				case core.ShardStateReleasing, core.ShardStateIdle, core.ShardStateAcquiring:
-					if running[shard] != 0 {
-						t.Fatalf("seed %d: shard %d is %+v while term %d runs, after %+v", seed, shard, sh, running[shard], history)
-					}
-				}
+			for shard, sh := range st.Spaces[0].Shards {
 				if sh.Stuck {
 					stuck++
-					if sh.State != core.ShardStateStopping && sh.State != core.ShardStateExpired && sh.State != core.ShardStateLost {
-						t.Fatalf("seed %d: shard %d is %+v, after %+v", seed, shard, sh, history)
+					if st.Draining {
+						stuckWhileDraining++
 					}
 				}
 				b := before[shard]
-				told := b.State == core.ShardStateLost || b.State == core.ShardStateStopping || b.State == core.ShardStateExpired
+				told := toldToStop(b.State)
 				if sh.State == core.ShardStateIdle && told {
 					goneIdle++
 				}
-				if isLost {
-					if sh.RetryAt != 0 || sh.State == core.ShardStateOwned || sh.State == core.ShardStateDegraded || sh.State == core.ShardStateReleasing {
-						t.Fatalf("seed %d: shard %d is %+v after the session was lost, after %+v", seed, shard, sh, history)
-					}
-					if sh.State == core.ShardStateIdle && told && wasLost {
+				if isLost && sh.State == core.ShardStateIdle {
+					if told && wasLost {
 						stoppedAfterLoss++
 					}
-					if sh.State == core.ShardStateIdle && b.State == core.ShardStateAcquiring {
+					if b.State == core.ShardStateAcquiring {
 						answeredAfterLoss++
 					}
 				}
@@ -4342,6 +3837,7 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 				step(core.Acquired{Now: now, Space: "s", Shard: shard, Term: grant})
 			}
 		}
+		slots.add(w.slots.counts)
 	}
 
 	// The walks are only worth something if they reach the paths the promise is about.
@@ -4384,28 +3880,28 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 		{"step while closing", closingSteps},
 		{"step after the session closed", closedSteps},
 		{"SessionClosed before closing", earlyClosed},
-		{"ClaimSlot", claimsSent},
-		{"claim answer taken", claimsTaken},
-		{"slot adopted from a view", adoptions},
-		{"slot given back", giveBacks},
-		{"ReleaseSlot of the held slot", heldReleases},
-		{"ReleaseSlot of the held slot over a stuck run", releasesOverStuck},
-		{"held slot released", slotReleases},
-		{"held slot released while draining", drainedSlots},
-		{"held slot lost to another holder", slotLosses},
-		{"run stopped as lost with its slot", slotLostRuns},
-		{"held slot retired", retirements},
-		{"StartRun of a slot's shard", slotStarts},
-		{"slot marked expired", marksSet},
-		{"mark ended by a view showing the slot held", marksEndedByView},
-		{"mark ended by a claim answer", marksEndedByClaim},
-		{"streak started by leaving a vacant slot", streaksOnLeaving},
-		{"StopRun of a run moved by a mark", markMoves},
-		{"Acquire of a shard a mark gave this member", markAcquires},
-		{"held slot lost to views showing it vacant", vacantLosses},
-		{"run stopped as lost with a slot shown vacant", vacantLostRuns},
-		{"loss of a slot shown vacant that waited for a live session", vacantLossesAfterWait},
-		{"vacant display stopped by a view listing the slot again", vacantStops},
+		{"ClaimSlot", slots.claimsSent},
+		{"claim answer taken", slots.claimsTaken},
+		{"slot adopted from a view", slots.adoptions},
+		{"slot given back", slots.giveBacks},
+		{"ReleaseSlot of the held slot", slots.heldReleases},
+		{"ReleaseSlot of the held slot over a stuck run", slots.releasesOverStuck},
+		{"held slot released", slots.slotReleases},
+		{"held slot released while draining", slots.drainedSlots},
+		{"held slot lost to another holder", slots.slotLosses},
+		{"run stopped as lost with its slot", slots.slotLostRuns},
+		{"held slot retired", slots.retirements},
+		{"StartRun of a slot's shard", slots.slotStarts},
+		{"slot marked expired", slots.marksSet},
+		{"mark ended by a view showing the slot held", slots.marksEndedByView},
+		{"mark ended by a claim answer", slots.marksEndedByClaim},
+		{"streak started by leaving a vacant slot", slots.streaksOnLeaving},
+		{"StopRun of a run moved by a mark", slots.markMoves},
+		{"Acquire of a shard a mark gave this member", slots.markAcquires},
+		{"held slot lost to views showing it vacant", slots.vacantLosses},
+		{"run stopped as lost with a slot shown vacant", slots.vacantLostRuns},
+		{"loss of a slot shown vacant that waited for a live session", slots.vacantLossesAfterWait},
+		{"vacant display stopped by a view listing the slot again", slots.vacantStops},
 	} {
 		if c.count == 0 {
 			t.Errorf("no walk reached a %s", c.name)
