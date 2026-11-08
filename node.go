@@ -44,6 +44,7 @@ type Node struct {
 	wg     sync.WaitGroup // every goroutine of the node
 
 	view  atomic.Pointer[core.View] // the published merged view; nil before the first
+	snap  atomic.Pointer[routes]    // the routing snapshot; never nil once Start has made n
 	first chan struct{}             // closed when the watcher has taken the first view
 	ended chan struct{}             // closed when the watcher returns
 
@@ -115,6 +116,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		machineDone: make(chan struct{}),
 		shards:      newShardTable(cfg.Spaces),
 	}
+	n.snap.Store(newRoutes(nil, nil, nil))
 	n.obs.start(n.holder)
 
 	if err := cfg.Membership.Join(ctx, cfg.Self); err != nil {
@@ -392,6 +394,7 @@ func (n *Node) Close(ctx context.Context) error {
 	n.closeResolvers()
 	n.cancel()
 	n.wait()
+	n.closeRoutes()
 
 	n.mu.Lock()
 	n.closed = true

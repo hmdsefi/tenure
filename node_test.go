@@ -16,6 +16,7 @@ import (
 
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/core"
+	"github.com/hmdsefi/tenure/memstore"
 )
 
 // The tests of a node without a store. Steps carrying an AT-RUN number were written from the
@@ -344,14 +345,22 @@ func TestStartWaitsForValidView(t *testing.T) {
 }
 
 // TestATRUN20WatchRetry checks the watcher: a closed channel and a failing Watch are retried
-// RetryPeriod later, the view after a gap is the latest one, and no Watch follows Close's Leave.
+// RetryPeriod later, the view after a gap is the latest one and reaches Route, and no Watch
+// follows Close's Leave. The node has a store and orders, so that it routes keys.
 func TestATRUN20WatchRetry(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
-		g := newGroup(t, tenure.Member{ID: "n2"})
+		g := newGroup(t, tenure.Member{ID: "n2", Addr: "a2"})
 		m := g.Absent("n1")
 		t0 := time.Now()
-		n := startN1(t, m)
+		n := start(t, context.Background(), nodeConfig("n1", m, newRecStore(memstore.New(nil)), orders((&runLog{}).Run)))
+		routes := func(ids ...string) {
+			t.Helper()
+			owner := ownerOf(bal("orders", 8, ids...))
+			for _, s := range allShards {
+				wantRoute(t, n, "orders", keyOf(s), owner[s])
+			}
+		}
 		at := func(d time.Duration) { time.Sleep(time.Until(t0.Add(d))) }
 
 		at(10 * time.Second)
@@ -366,11 +375,12 @@ func TestATRUN20WatchRetry(t *testing.T) {
 		at(20 * time.Second)
 		m.CloseWatch(1)
 		at(21 * time.Second)
-		g.Join(tenure.Member{ID: "n3"}) // while the node watches nothing
+		g.Join(tenure.Member{ID: "n3", Addr: "a3"}) // while the node watches nothing
 		at(27 * time.Second)
 		if got, want := memberIDs(published(t, n)), []string{"n1", "n2"}; !slices.Equal(got, want) {
 			t.Errorf("published view without a watch has %v, want %v", got, want)
 		}
+		routes("n1", "n2")
 		m.Fail("Watch", nil)
 		at(29 * time.Second)
 		watches := m.Calls("Watch")
@@ -389,6 +399,7 @@ func TestATRUN20WatchRetry(t *testing.T) {
 		if got, want := memberIDs(published(t, n)), []string{"n1", "n2", "n3"}; !slices.Equal(got, want) {
 			t.Errorf("published view after the new Watch has %v, want %v", got, want)
 		}
+		routes("n1", "n2", "n3")
 
 		at(30 * time.Second)
 		closeNode(t, n)

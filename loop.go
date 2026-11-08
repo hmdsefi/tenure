@@ -144,6 +144,12 @@ type loop struct {
 	// first one makes a resync of every space due (RUN-170). Start's machine has none.
 	unrenewed bool
 
+	// assign, when not nil, is the assignment of each space that the loop computed itself for the
+	// latest stepped view, which the machine did not apply: a machine whose session is closing or
+	// closed takes no view, so its Assignment stays with an older one. The routing snapshot then
+	// takes assign instead (RUN-200, the latest view wins).
+	assign map[string][]string
+
 	timer  *time.Timer
 	armed  bool          // the timer is set for wakeAt and its value not yet received
 	wakeAt time.Duration // the reading the timer is set for
@@ -225,11 +231,13 @@ func (l *loop) tickUntil(now time.Duration) {
 }
 
 // apply steps in, whose Now is set to now, and carries the step out (RUN-100): under n.stepMu it
-// executes the actions in order, publishes a stepped view, unpublishes the shard of a stepped
-// RunStopped that is still published, and reports the step to the observer and the hook. After
-// the step that loses the session it runs lose. It then re-arms the timer. The first time the
-// machine is done, it closes n.machineDone, unless the machine is done after a lost session and
-// no drain has been requested: then a new incarnation is due instead.
+// executes the actions in order, publishes a stepped view, computes the view's assignments itself
+// when the machine did not apply the view, publishes the routing snapshot when the view or an
+// assignment changed, unpublishes the shard of a stepped RunStopped that is still published, and
+// reports the step to the observer and the hook. After the step that loses the session it runs
+// lose. It then re-arms the timer. The first time the machine is done, it closes n.machineDone,
+// unless the machine is done after a lost session and no drain has been requested: then a new
+// incarnation is due instead.
 func (l *loop) apply(in loopInput, now time.Duration) {
 	n := l.n
 	acts := l.m.Step(in.in)
@@ -251,7 +259,12 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 	}
 	if v, ok := in.in.(core.ViewChanged); ok {
 		n.publish(v.View)
+		l.assign = nil
+		if !viewApplied(rec, v.View) {
+			l.assign = assignments(v.View, v.Wall, n.cfg.Spaces)
+		}
 	}
+	l.publishRoutes()
 	if in.sh != nil {
 		n.shards[in.sh.Space].local[in.sh.ID].CompareAndSwap(in.sh, nil)
 	}
