@@ -222,8 +222,8 @@ func (n *Node) Close(ctx context.Context) error {
 }
 
 // Resolver returns a Resolver that ranks keys in namespace over the node's views, the same views
-// the node itself follows, with no watch of its own. It holds the node's current view at once. Its
-// default placement is core.NewRendezvous. Close of the node closes it; after Close, Resolver
+// the node itself follows, with no watch of its own. It holds the node's current view at once,
+// and places keys with core.NewRendezvous. Close of the node closes it; after Close, Resolver
 // returns a closed Resolver, whose lookups return ErrClosed.
 func (n *Node) Resolver(namespace string) *Resolver {
 	r := newResolver(namespace, core.NewRendezvous)
