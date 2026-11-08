@@ -1528,6 +1528,23 @@ func TestATMCH49Chaos(t *testing.T) {
 	const seeds, steps = 3000, 400
 	reach := chaosReach{actions: map[string]int{}, stops: map[core.StopReason]int{}}
 
+	// The seeds that once broke a rule, each with the rule, run first so that a regression names it.
+	for _, tc := range []struct {
+		seed uint64
+		rule string
+	}{
+		// Step 345 is a renewal that makes the session live again, which gives up a draining member's slot
+		// the views had shown vacant too long, and with every shard idle the session starts closing in that
+		// step. The step returned the renewal's ExtendDeadline beside CloseSession.
+		{154, "the step that starts closing returns only CloseSession and Wake"},
+	} {
+		t.Run("seed "+strconv.FormatUint(tc.seed, 10), func(t *testing.T) {
+			if err := runChaosSeed(tc.seed, steps, &chaosReach{actions: map[string]int{}, stops: map[core.StopReason]int{}}); err != nil {
+				t.Fatalf("%s: %v", tc.rule, err)
+			}
+		})
+	}
+
 	for seed := uint64(1); seed <= seeds; seed++ {
 		if err := runChaosSeed(seed, steps, &reach); err != nil {
 			t.Fatal(err)
