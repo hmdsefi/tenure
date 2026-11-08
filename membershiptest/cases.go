@@ -51,7 +51,9 @@ func watchVersions(e *env) {
 }
 
 // watchCoalesce: a view not yet received is replaced by the newest one, so once the changes have
-// settled, the next view received is the newest.
+// settled, the next view received is the newest. Like every other wait for a view, the wait for
+// that view lasts at most Settle plus 5s; only the first Settle of it passes before the case
+// looks at the channel.
 func watchCoalesce(e *env) {
 	e.join("a")
 	w := e.watch("a")
@@ -60,6 +62,8 @@ func watchCoalesce(e *env) {
 	e.join("c")
 	time.Sleep(e.f.Settle)
 	want := lists(self(0), self(1), self(2))
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
 	select {
 	case v, ok := <-w.ch:
 		if !ok {
@@ -69,9 +73,9 @@ func watchCoalesce(e *env) {
 		if !want.ok(v) {
 			e.t.Fatalf("view %d on a: %s, want the newest view, with %s", v.Version, fmtMembers(v), want.want)
 		}
-	default:
+	case <-timer.C:
 		e.t.Fatalf("view %d on a: no new view %v after the changes, want the newest view, with %s",
-			w.last.Version, e.f.Settle, want.want)
+			w.last.Version, e.f.Settle+grace, want.want)
 	}
 }
 
