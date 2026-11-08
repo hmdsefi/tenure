@@ -231,3 +231,62 @@ func TestRecoveryFreshness(t *testing.T) {
 			f.answered, f.wait, f.resyncAt)
 	}
 }
+
+// TestRecoveryLossBatch checks that the loss ends the lost machine's results also within the
+// batch the loss came in. The KeepAlive that returns ErrSessionLost and the Acquire of orders/0,
+// which returns a grant right after it, are taken together. The loss answers both acquiring
+// shards with Acquired with no grant, and the Acquire's own result is not stepped, so the machine
+// gets one answer for each Acquire (MCH O3).
+func TestRecoveryLossBatch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := &scriptStore{}
+		var recs []stepRecord
+		l := newRecoveryHarness(t, st, bytes.Repeat([]byte{0xab}, incarnationBytes), &recs)
+		n := l.n
+		v := core.View{Version: 7, Members: []core.Member{{ID: "a", Slot: -1}}}
+		l.step(loopInput{in: core.SessionRenewed{}})
+		l.step(loopInput{in: core.ViewChanged{View: v}})
+		n.exec.do(1, "a/1", core.KeepAlive{})
+		synctest.Wait()
+
+		calls := st.open()
+		if len(calls) != 3 {
+			t.Fatalf("%d calls in flight, want 2 Acquire calls and a KeepAlive", len(calls))
+		}
+		for _, c := range calls {
+			if c.method == "KeepAlive" {
+				c.reply <- scriptReply{err: ErrSessionLost}
+			}
+		}
+		synctest.Wait()
+		for _, c := range calls {
+			if c.method == "Acquire" && c.shard == 0 {
+				c.reply <- scriptReply{term: 5}
+			}
+		}
+		synctest.Wait()
+		rs := n.exec.take()
+		if len(rs) != 2 {
+			t.Fatalf("%d results, want the KeepAlive's and orders/0's Acquire's", len(rs))
+		}
+		for _, r := range rs {
+			l.deliver(r)
+		}
+
+		answers := map[int]int{}
+		for _, r := range recs {
+			if a, ok := r.Input.(core.Acquired); ok {
+				answers[a.Shard]++
+				if a.Term != 0 {
+					t.Errorf("stepped %+v, want no grant after the loss", a)
+				}
+			}
+		}
+		if answers[0] != 1 || answers[1] != 1 {
+			t.Errorf("Acquired answers by shard %v, want one for each", answers)
+		}
+		if !l.status.Done || !l.recoverDue {
+			t.Errorf("Done %t, recoverDue %t; want a new incarnation due", l.status.Done, l.recoverDue)
+		}
+	})
+}

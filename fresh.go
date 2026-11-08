@@ -233,9 +233,12 @@ func (b *readings) take() []reading {
 // grant sets the shard's grant. A renewal that ends a run of failed renewals makes a resync of
 // every space due (RUN-170) once the Confirm calls queued so far have been answered, and so does
 // the first accepted renewal of a new incarnation. The answer to a new incarnation's first
-// KeepAlive opens its machine (open). A result of an earlier generation is not stepped.
+// KeepAlive opens its machine (open). A result of an earlier generation is not stepped, and
+// neither is one that reaches a lost machine: lose has discarded its machine's results in the
+// executor, but those taken in the batch the loss came in are still here, and the machine has
+// had its answers from lose (MCH O3).
 func (l *loop) deliver(r callResult) {
-	if r.gen != l.gen {
+	if r.gen != l.gen || l.status.Session == core.SessionStateLost {
 		return
 	}
 	if l.opening {
