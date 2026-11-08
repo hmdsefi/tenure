@@ -258,6 +258,12 @@ func TestStartCleanup(t *testing.T) {
 	}{
 		{"watch fails", func(m *recMembership) { m.Fail("Watch", errors.New("boom")) }, "tenure: watch: boom", 0},
 		{"watch closed", func(m *recMembership) { m.Fail("Watch", tenure.ErrClosed) }, "tenure: watch: tenure: closed", 0},
+		{"watch blocks", func(m *recMembership) {
+			m.Answer("Watch", func(ctx context.Context, _ []any) ([]any, error) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			})
+		}, "tenure: watch: context deadline exceeded", 5 * time.Second},
 		{"no first view", func(m *recMembership) { m.Pause() }, "tenure: first view: context deadline exceeded", 5 * time.Second},
 	}
 	for _, tt := range tests {
