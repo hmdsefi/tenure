@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"regexp"
 	"runtime"
 	"slices"
@@ -166,7 +167,7 @@ func (s *script) edit(method string, f func(r *callRule)) {
 
 // do records one call of method and runs it by the script, with forward as the real call.
 func (s *script) do(ctx context.Context, method string, args []any, forward func(context.Context) ([]any, error)) ([]any, error) {
-	c := &call{Method: method, Args: args, Start: time.Now()}
+	c := &call{Method: method, Args: snapshot(args), Start: time.Now()}
 	c.Deadline, c.HasDeadline = ctx.Deadline()
 	s.mu.Lock()
 	r := s.rules[method]
@@ -192,9 +193,32 @@ func (s *script) do(ctx context.Context, method string, args []any, forward func
 	}
 
 	s.mu.Lock()
-	c.End, c.EndSeq, c.Done, c.Result, c.Err = time.Now(), seq(), true, res, err
+	c.End, c.EndSeq, c.Done, c.Result, c.Err = time.Now(), seq(), true, snapshot(res), err
 	s.mu.Unlock()
 	return res, err
+}
+
+// snapshot returns a copy of vs for the log, with its own copies of slices and Meta maps, so the
+// log shares no memory with what the caller passed or got, which the caller may change later.
+func snapshot(vs []any) []any {
+	if vs == nil {
+		return nil
+	}
+	out := make([]any, len(vs))
+	for i, v := range vs {
+		switch v := v.(type) {
+		case []string:
+			out[i] = slices.Clone(v)
+		case []tenure.Holding:
+			out[i] = slices.Clone(v)
+		case core.Member:
+			v.Meta = maps.Clone(v.Meta)
+			out[i] = v
+		default:
+			out[i] = v
+		}
+	}
+	return out
 }
 
 // argAt returns args[i] as a T and panics when it is not one.
@@ -225,6 +249,9 @@ func resultAt[T any](res []any, i int) T {
 type recStore struct {
 	script
 	ms *memstore.Store
+
+	injectOnce sync.Once
+	injected   *injectedStore // what Injected returns
 }
 
 var (
@@ -364,8 +391,12 @@ type holdingWatch struct {
 }
 
 // Injected returns s as a tenure.Watcher whose WatchHolders channels receive only what Inject
-// sends, and close at CloseWatch or when their ctx is done.
-func (s *recStore) Injected() *injectedStore { return &injectedStore{recStore: s} }
+// sends, and close at CloseWatch or when their ctx is done. Every call returns the same value, so
+// Inject and CloseWatch reach the channels of the node that was given an earlier result.
+func (s *recStore) Injected() *injectedStore {
+	s.injectOnce.Do(func() { s.injected = &injectedStore{recStore: s} })
+	return s.injected
+}
 
 func (s *injectedStore) WatchHolders(ctx context.Context) (<-chan tenure.Holding, error) {
 	res, err := s.do(ctx, "WatchHolders", nil, s.open)
@@ -436,7 +467,7 @@ func (s *recStore) Checking(names, timing error) *checkingStore {
 }
 
 func (s *checkingStore) CheckNames(spaces []string, member string) error {
-	_, err := s.do(context.Background(), "CheckNames", []any{slices.Clone(spaces), member}, answerErr(s.names))
+	_, err := s.do(context.Background(), "CheckNames", []any{spaces, member}, answerErr(s.names))
 	return err
 }
 
@@ -481,12 +512,18 @@ func (o storeOnly) Holdings(ctx context.Context, space string) ([]tenure.Holding
 	return o.s.Holdings(ctx, space)
 }
 
-// group is one static list that every node of a test shares.
+// group is one static list that every node of a test shares. Every change to the list goes
+// through the group's helpers or its recMemberships, and each of them then moves the new view
+// into the channels of every recMembership of the group: as with static itself, a change reaches
+// every channel inside the call that makes it.
 type group struct {
 	t       testing.TB
 	list    *static.Membership
 	listed  map[string]bool               // IDs newGroup listed
 	helpers map[string]*static.Membership // handles joined by Join, SetDraining or Leave, by ID
+
+	mu    sync.Mutex
+	nodes []*recMembership // every recMembership that Node and Absent returned
 }
 
 // newGroup returns a group over one static.New list of members, failing t on error.
@@ -510,7 +547,7 @@ func (g *group) Node(id string) *recMembership {
 	if !g.listed[id] {
 		g.t.Fatalf("group.Node(%q): not listed; use Absent", id)
 	}
-	return &recMembership{t: g.t, id: id, h: g.list.Share()}
+	return g.membership(id)
 }
 
 // Absent returns a recMembership, over a new Share of the list, for a member id the list does
@@ -520,7 +557,28 @@ func (g *group) Absent(id string) *recMembership {
 	if g.listed[id] {
 		g.t.Fatalf("group.Absent(%q): listed; use Node", id)
 	}
-	return &recMembership{t: g.t, id: id, h: g.list.Share()}
+	return g.membership(id)
+}
+
+// membership returns a new recMembership for id over a new Share of the list.
+func (g *group) membership(id string) *recMembership {
+	m := &recMembership{t: g.t, id: id, g: g, h: g.list.Share()}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.nodes = append(g.nodes, m)
+	return m
+}
+
+// flush moves what static has put in its channels since the last flush, the latest view and the
+// close, into the channels of every recMembership of the group. Every call that may change the
+// list calls it before it returns.
+func (g *group) flush() {
+	g.mu.Lock()
+	nodes := slices.Clone(g.nodes)
+	g.mu.Unlock()
+	for _, m := range nodes {
+		m.flush()
+	}
 }
 
 // View returns the group's current view.
@@ -547,7 +605,9 @@ func (g *group) Join(m core.Member) {
 		g.t.Fatalf("group.Join(%q): already joined by the group", m.ID)
 	}
 	h := g.list.Share()
-	if err := h.Join(context.Background(), m); err != nil {
+	err := h.Join(context.Background(), m)
+	g.flush()
+	if err != nil {
 		g.t.Fatalf("group.Join(%q) = %v, want nil", m.ID, err)
 	}
 	g.helpers[m.ID] = h
@@ -558,7 +618,9 @@ func (g *group) Join(m core.Member) {
 func (g *group) Leave(id string) {
 	g.t.Helper()
 	h := g.helper(id)
-	if err := h.Leave(context.Background()); err != nil {
+	err := h.Leave(context.Background())
+	g.flush()
+	if err != nil {
 		g.t.Fatalf("group.Leave(%q) = %v, want nil", id, err)
 	}
 	delete(g.helpers, id)
@@ -568,7 +630,9 @@ func (g *group) Leave(id string) {
 // or one in the view that no node has joined; that one stays joined by a helper handle.
 func (g *group) SetDraining(id string, draining bool) {
 	g.t.Helper()
-	if err := g.helper(id).SetDraining(context.Background(), draining); err != nil {
+	err := g.helper(id).SetDraining(context.Background(), draining)
+	g.flush()
+	if err != nil {
 		g.t.Fatalf("group.SetDraining(%q, %t) = %v, want nil", id, draining, err)
 	}
 }
@@ -589,12 +653,15 @@ func (g *group) helper(id string) *static.Membership {
 }
 
 // recMembership is RUN §10's sm: a tenure.Membership that records every call and forwards it to
-// its static handle. Views pass through a goroutine per Watch channel, so a change reaches the
-// channel shortly after the call that makes it: after synctest.Wait.
+// its static handle. Each channel Watch returns is a copy of a static channel that the group fills
+// inside every call that changes the list, so a view reaches it as it reaches a static channel:
+// inside the call that makes it. Pause and CloseWatch act on the copy only. A recMembership starts
+// no goroutine.
 type recMembership struct {
 	script
 	t  testing.TB
 	id string
+	g  *group
 	h  *static.Membership
 
 	mu      sync.Mutex
@@ -606,16 +673,19 @@ var _ tenure.Membership = (*recMembership)(nil)
 
 // viewWatch is one channel of a recMembership. Its fields are guarded by the recMembership's mu.
 type viewWatch struct {
-	out     chan core.View // buffer 1; a newer view replaces one not yet received
-	held    core.View      // the latest view held back by Pause
+	in      <-chan core.View // the static channel
+	out     chan core.View   // buffer 1; a newer view replaces one not yet received
+	held    core.View        // the latest view held back by Pause
 	holding bool
 	closed  bool
-	done    chan struct{} // closed when the forwarding goroutine has ended
+	stop    func() bool // unregisters the context.AfterFunc that closes out
 }
 
 func (m *recMembership) Join(ctx context.Context, self core.Member) error {
 	_, err := m.do(ctx, "Join", []any{self}, func(ctx context.Context) ([]any, error) {
-		return nil, m.h.Join(ctx, self)
+		err := m.h.Join(ctx, self)
+		m.g.flush()
+		return nil, err
 	})
 	return err
 }
@@ -627,61 +697,74 @@ func (m *recMembership) Watch(ctx context.Context) (<-chan core.View, error) {
 
 func (m *recMembership) SetDraining(ctx context.Context, draining bool) error {
 	_, err := m.do(ctx, "SetDraining", []any{draining}, func(ctx context.Context) ([]any, error) {
-		return nil, m.h.SetDraining(ctx, draining)
+		err := m.h.SetDraining(ctx, draining)
+		m.g.flush()
+		return nil, err
 	})
 	return err
 }
 
-// Leave forwards to the static handle and, when that succeeds, returns once every channel has
-// received the last view and been closed.
+// Leave forwards to the static handle, which delivers the view without the member and closes
+// every channel of the handle; both reach the copies before Leave returns.
 func (m *recMembership) Leave(ctx context.Context) error {
 	_, err := m.do(ctx, "Leave", nil, func(ctx context.Context) ([]any, error) {
-		if err := m.h.Leave(ctx); err != nil {
-			return nil, err
-		}
-		m.mu.Lock()
-		watches := slices.Clone(m.watches)
-		m.mu.Unlock()
-		for _, w := range watches {
-			<-w.done
-		}
-		return nil, nil
+		err := m.h.Leave(ctx)
+		m.g.flush()
+		return nil, err
 	})
 	return err
 }
 
-// watch opens a static channel and returns its forwarded copy, which holds the current view.
+// watch opens a static channel and returns its copy, which holds the current view (unless
+// paused) and is closed when ctx is done.
 func (m *recMembership) watch(ctx context.Context) ([]any, error) {
 	in, err := m.h.Watch(ctx)
 	if err != nil {
 		return nil, err
 	}
-	w := &viewWatch{out: make(chan core.View, 1), done: make(chan struct{})}
+	w := &viewWatch{in: in, out: make(chan core.View, 1)}
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.watches = append(m.watches, w)
-	m.mu.Unlock()
-	if v, ok := <-in; ok { // static holds the current view at once
-		m.deliver(w, v)
-	}
-	go m.forward(w, in)
+	m.pullLocked(w) // static holds the current view at once
+	w.stop = context.AfterFunc(ctx, func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.pullLocked(w)
+		m.closeLocked(w)
+	})
 	return []any{(<-chan core.View)(w.out)}, nil
 }
 
-// forward passes the views of in to w until in is closed, then closes w.
-func (m *recMembership) forward(w *viewWatch, in <-chan core.View) {
-	defer close(w.done)
-	for v := range in {
-		m.deliver(w, v)
-	}
+// flush moves what static has put in each open channel of m into its copy.
+func (m *recMembership) flush() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.closeLocked(w)
+	for _, w := range m.watches {
+		m.pullLocked(w)
+	}
 }
 
-// deliver sends v to w, replacing a view not yet received, or holds it while paused.
-func (m *recMembership) deliver(w *viewWatch, v core.View) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// pullLocked moves what static has put in w's static channel into w: the latest view, and the
+// close. The caller holds m.mu, so views reach w in the order static made them.
+func (m *recMembership) pullLocked(w *viewWatch) {
+	for !w.closed {
+		select {
+		case v, ok := <-w.in:
+			if !ok {
+				m.closeLocked(w)
+				return
+			}
+			m.deliverLocked(w, v)
+		default:
+			return
+		}
+	}
+}
+
+// deliverLocked sends v to w, replacing a view not yet received, or holds it while paused. The
+// caller holds m.mu.
+func (m *recMembership) deliverLocked(w *viewWatch, v core.View) {
 	switch {
 	case w.closed:
 	case m.paused:
@@ -701,18 +784,26 @@ func sendLatest(ch chan core.View, v core.View) {
 	ch <- v
 }
 
-// closeLocked closes w unless it is closed already. The caller holds m.mu.
+// closeLocked closes w unless it is closed already. A view not yet received stays in it. The
+// caller holds m.mu.
 func (m *recMembership) closeLocked(w *viewWatch) {
 	if !w.closed {
 		w.closed, w.holding = true, false
 		close(w.out)
+		if w.stop != nil {
+			w.stop()
+		}
 	}
 }
 
-// Pause holds every later view back from every channel until Resume.
+// Pause holds every later view back from every channel until Resume. A view made before Pause
+// has been delivered already.
 func (m *recMembership) Pause() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for _, w := range m.watches {
+		m.pullLocked(w)
+	}
 	m.paused = true
 }
 
@@ -720,6 +811,9 @@ func (m *recMembership) Pause() {
 func (m *recMembership) Resume() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for _, w := range m.watches {
+		m.pullLocked(w) // still paused: held back
+	}
 	m.paused = false
 	for _, w := range m.watches {
 		if w.holding && !w.closed {
@@ -730,7 +824,8 @@ func (m *recMembership) Resume() {
 }
 
 // CloseWatch closes the i-th channel Watch returned (from 0), as a membership whose watch broke
-// does. The static channel behind it stays open until its ctx is done or Leave.
+// does; a view not yet received stays in it. The static channel behind it stays open until its
+// ctx is done or Leave, but nothing more reaches the closed copy.
 func (m *recMembership) CloseWatch(i int) {
 	m.t.Helper()
 	m.mu.Lock()
@@ -739,6 +834,7 @@ func (m *recMembership) CloseWatch(i int) {
 		m.t.Errorf("recMembership(%q).CloseWatch(%d): Watch returned %d channels", m.id, i, len(m.watches))
 		return
 	}
+	m.pullLocked(m.watches[i])
 	m.closeLocked(m.watches[i])
 }
 
@@ -746,7 +842,9 @@ func (m *recMembership) CloseWatch(i int) {
 // script, as an operator who marks the member draining behind the node's back.
 func (m *recMembership) SetDrainingQuiet(draining bool) {
 	m.t.Helper()
-	if err := m.h.SetDraining(context.Background(), draining); err != nil {
+	err := m.h.SetDraining(context.Background(), draining)
+	m.g.flush()
+	if err != nil {
 		m.t.Errorf("recMembership(%q).SetDrainingQuiet(%t) = %v, want nil", m.id, draining, err)
 	}
 }
@@ -764,7 +862,7 @@ func (m *recMembership) Checking(names, timing error) *checkingMembership {
 }
 
 func (m *checkingMembership) CheckNames(spaces []string, member string) error {
-	_, err := m.do(context.Background(), "CheckNames", []any{slices.Clone(spaces), member}, answerErr(m.names))
+	_, err := m.do(context.Background(), "CheckNames", []any{spaces, member}, answerErr(m.names))
 	return err
 }
 
@@ -793,6 +891,7 @@ type outside struct {
 
 // newOutside opens session x/1 on st with timing and renews it every RetryPeriod until Stop,
 // which t's cleanup also calls. st is normally the shared memstore, so the calls are not recorded.
+// Its goroutine counts in a baseline check: a test stops it before the check.
 func newOutside(t testing.TB, st tenure.Store, timing core.Timing) *outside {
 	t.Helper()
 	if err := st.KeepAlive(context.Background(), outsideHolder, timing); err != nil {
