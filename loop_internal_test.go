@@ -251,3 +251,79 @@ func TestLoopChainsRuns(t *testing.T) {
 		n.sups.Wait()
 	})
 }
+
+// TestAssignmentsMatchMachine checks that assignments, which routing takes for a view the machine
+// did not apply, gives every space the assignment the machine computes when it applies the same
+// view: with a draining member and members outside their JoinAt/LeaveAt window, and with slots.
+func TestAssignmentsMatchMachine(t *testing.T) {
+	wall := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	spaces := []Space{{Name: "orders", Shards: 8}, {Name: "carts", Shards: 3}}
+	views := []struct {
+		name string
+		v    core.View
+	}{
+		{"members", core.View{Version: 4, Members: []core.Member{
+			{ID: "a", Slot: -1},
+			{ID: "b", Slot: -1, Draining: true},
+			{ID: "c", Slot: -1, JoinAt: wall.Add(time.Second)},
+			{ID: "d", Slot: -1, LeaveAt: wall},
+			{ID: "e", Slot: -1, JoinAt: wall.Add(-time.Second), LeaveAt: wall.Add(time.Second)},
+		}}},
+		{"slots", core.View{Version: 6, Slots: 3, SlotHolders: []string{"a/1", "", "b/2"}, Members: []core.Member{
+			{ID: "a", Slot: 0},
+			{ID: "b", Slot: 2, Draining: true},
+		}}},
+	}
+	for _, c := range views {
+		m := core.NewMachine(core.MachineConfig{Holder: "a/1", Member: "a", Spaces: spaceSpecs(spaces)})
+		m.Step(core.ViewChanged{View: c.v, Now: time.Second, Wall: wall})
+		if got := m.Status().ViewVersion; got != c.v.Version {
+			t.Fatalf("%s: the machine applied version %d, want %d", c.name, got, c.v.Version)
+		}
+		got := assignments(c.v, wall, spaces)
+		for _, sp := range spaces {
+			if want := m.Assignment(sp.Name); !reflect.DeepEqual(got[sp.Name], want) {
+				t.Errorf("%s: assignments(%s) = %q, want the machine's %q", c.name, sp.Name, got[sp.Name], want)
+			}
+		}
+	}
+}
+
+// TestLoopSlotResult checks O8's floor (RUN-210): a stepped SlotClaimed and a stepped
+// SlotReleased each raise the merger's floor to the end stamp of their call, so that slot data
+// read before either is dropped; a failed claim and the results of other calls leave it.
+func TestLoopSlotResult(t *testing.T) {
+	var recs []stepRecord
+	l := newLoopHarness(t, &recs)
+	m := &l.n.merge
+	m.post = func(core.View) {}
+	m.membership(core.View{Version: 1})
+
+	results := []struct {
+		name  string
+		r     callResult
+		floor uint64
+	}{
+		{"SlotClaimed", callResult{act: core.ClaimSlot{}, inputs: []core.Input{core.SlotClaimed{Slot: 0}}, start: 3, end: 10}, 10},
+		{"failed claim", callResult{act: core.ClaimSlot{}, start: 11, end: 12}, 10},
+		{"Released", callResult{act: core.Release{Space: "orders", Shard: 1, Term: 2},
+			inputs: []core.Input{core.Released{Space: "orders", Shard: 1, Term: 2}}, start: 13, end: 14}, 10},
+		{"SlotReleased", callResult{act: core.ReleaseSlot{Slot: 0},
+			inputs: []core.Input{core.SlotReleased{Slot: 0}}, start: 15, end: 20}, 20},
+	}
+	for _, tt := range results {
+		l.slotResult(tt.r)
+		m.mu.Lock()
+		floor := m.floor
+		m.mu.Unlock()
+		if floor != tt.floor {
+			t.Errorf("after %s: floor %d, want %d", tt.name, floor, tt.floor)
+		}
+		if _, stale := m.slots(tt.floor-1, 1, nil); !stale {
+			t.Errorf("after %s: slot data read at %d not dropped", tt.name, tt.floor-1)
+		}
+	}
+	if _, stale := m.slots(20, 1, nil); stale {
+		t.Error("slot data read at the floor dropped")
+	}
+}

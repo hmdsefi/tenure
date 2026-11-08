@@ -712,6 +712,7 @@ func TestATRUN76SetDrainingRetries(t *testing.T) {
 		// Drain posts Drain{} to the loop and makes its first SetDraining attempt at the same
 		// instant, so that attempt and CloseSession, both at T0+1s, may come in either order.
 		// Each double's own order is fixed, and so is the order across them at other instants.
+		// The slot refresher's Slots calls after KeepAlive are left out.
 		if got, want := callMethods(withoutRefreshes(r.fs.Calls())), []string{"Slots", "KeepAlive", "CloseSession"}; !slices.Equal(got, want) {
 			t.Errorf("store calls = %v, want %v", got, want)
 		}

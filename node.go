@@ -209,7 +209,7 @@ func (n *Node) openSession(ctx context.Context) error {
 // and kept. It returns the start of the last read, from which the refresher's period runs.
 func (n *Node) readSlots(ctx context.Context, ss SlotStore) (time.Time, error) {
 	at := time.Now()
-	count, holders, err := ss.Slots(ctx)
+	count, holders, err := readSlotData(ctx, ss)
 	if err != nil {
 		return at, fmt.Errorf("tenure: read slots: %w", err)
 	}
@@ -219,7 +219,7 @@ func (n *Node) readSlots(ctx context.Context, ss SlotStore) (time.Time, error) {
 			return at, fmt.Errorf("tenure: seed slots: %w", err)
 		}
 		at = time.Now()
-		if count, holders, err = ss.Slots(ctx); err != nil {
+		if count, holders, err = readSlotData(ctx, ss); err != nil {
 			return at, fmt.Errorf("tenure: seed slots: %w", err)
 		}
 	}
