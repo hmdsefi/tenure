@@ -128,6 +128,15 @@ func TestMutants(t *testing.T) {
 					}
 				}
 			}
+			// A line that is no "===", "---" or log line, such as the second line of a
+			// message with a newline, would escape the check above.
+			for line := range strings.Lines(r.out) {
+				line = strings.TrimRight(line, "\r\n")
+				if !runLine.MatchString(line) && !resultLine.MatchString(line) &&
+					!logLine.MatchString(line) && line != "PASS" && line != "FAIL" {
+					t.Errorf("child %s prints %q, want only test, result and log lines", parent, line)
+				}
+			}
 		})
 	}
 }
@@ -546,6 +555,9 @@ func (s *mutant) write(rec tenure.Holding, remove bool) {
 	}
 	if remove {
 		delete(s.records[rec.Space], rec.Shard)
+		if len(s.records[rec.Space]) == 0 {
+			delete(s.records, rec.Space)
+		}
 	} else {
 		if s.records[rec.Space] == nil {
 			s.records[rec.Space] = make(map[int]tenure.Holding)
