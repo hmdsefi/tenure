@@ -424,6 +424,49 @@ func TestWatcherStopsAtLeave(t *testing.T) {
 	})
 }
 
+// TestWatchInFlightAtClose checks that Close's Leave waits for a Watch in flight at most
+// RetryPeriod, then still gets a context bounded by RetryPeriod of its own, and that no Watch
+// follows it.
+func TestWatchInFlightAtClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		g := newGroup(t, tenure.Member{ID: "n2"})
+		m := g.Absent("n1")
+		t0 := time.Now()
+		n := startN1(t, m)
+		release := m.Block("Watch")
+		m.CloseWatch(0)             // the next Watch starts at T0+2s and blocks
+		time.Sleep(3 * time.Second) // T0+3s
+		go func() {
+			time.Sleep(7 * time.Second) // T0+10s
+			release()
+		}()
+		closeNode(t, n)
+		if d := time.Since(t0); d != 10*time.Second {
+			t.Errorf("Close returned at T0+%v, want T0+10s", d)
+		}
+		leaves := m.Calls("Leave")
+		if len(leaves) != 1 {
+			t.Fatalf("Leave calls = %v, want one", leaves)
+		}
+		leave := leaves[0]
+		if d := leave.Start.Sub(t0); d != 5*time.Second {
+			t.Errorf("Leave started at T0+%v, want T0+5s", d)
+		}
+		if !leave.HasDeadline || leave.Deadline.Sub(leave.Start) != core.DefaultTiming.RetryPeriod || leave.Err != nil {
+			t.Errorf("Leave = %v with deadline %v after its start, want nil within %v",
+				leave, leave.Deadline.Sub(leave.Start), core.DefaultTiming.RetryPeriod)
+		}
+		if got, want := memberIDs(g.View()), []string{"n2"}; !slices.Equal(got, want) {
+			t.Errorf("group after Close has %v, want %v", got, want)
+		}
+		if got, want := startsAt(m.Calls("Watch"), t0), []time.Duration{0, 2 * time.Second}; !slices.Equal(got, want) {
+			t.Errorf("Watch calls at %v, want %v", got, want)
+		}
+		check()
+	})
+}
+
 // TestATRUN75ConcurrentDrain checks that concurrent Drain calls share one SetDraining.
 func TestATRUN75ConcurrentDrain(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
