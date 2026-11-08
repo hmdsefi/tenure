@@ -111,6 +111,20 @@ func (f *freshness) confirmSent(a core.Confirm, tag uint64, queued bool) {
 	}
 }
 
+// newMachine starts the state of a new incarnation's machine, whose holder is holder (RUN-180):
+// every grant and Confirm tag is cleared, the Confirm counts and a pending resync are dropped,
+// and each shard keeps its floor and last, which hold for the store's records whatever machine
+// reads them.
+func (f *freshness) newMachine(holder string) {
+	f.holder = holder
+	for _, s := range f.shards {
+		for i := range s {
+			s[i].grant, s[i].confirm = 0, 0
+		}
+	}
+	f.issued, f.answered, f.wait, f.resyncAt = 0, 0, false, 0
+}
+
 // granted notes an Acquired with term > 0, from an Acquire call that ended at stamp end.
 func (f *freshness) granted(space string, shard int, term core.Term, end uint64) {
 	if s := f.shard(space, shard); s != nil {
@@ -217,8 +231,18 @@ func (b *readings) take() []reading {
 // deliver steps the inputs of r, a result of the executor (RUN-150). A successful Confirm's
 // answer is a reading and goes through the freshness filter instead (RUN-175). An Acquired with a
 // grant sets the shard's grant. A renewal that ends a run of failed renewals makes a resync of
-// every space due (RUN-170) once the Confirm calls queued so far have been answered.
+// every space due (RUN-170) once the Confirm calls queued so far have been answered, and so does
+// the first accepted renewal of a new incarnation. The answer to a new incarnation's first
+// KeepAlive opens its machine (open). A result of an earlier generation is not stepped.
 func (l *loop) deliver(r callResult) {
+	if r.gen != l.gen {
+		return
+	}
+	if l.opening {
+		l.open(r)
+		l.resyncIfDue()
+		return
+	}
 	f := l.n.fresh
 	if a, ok := r.act.(core.Confirm); ok {
 		f.answered++
@@ -236,8 +260,11 @@ func (l *loop) deliver(r callResult) {
 		}
 		failing := l.status.LastFailure != core.CauseNone
 		l.step(loopInput{in: in, sentWall: r.sentWall, err: r.err})
-		if _, ok := in.(core.SessionRenewed); ok && failing && l.status.LastFailure == core.CauseNone {
-			f.wait, f.resyncAt = true, f.issued
+		if _, ok := in.(core.SessionRenewed); ok {
+			if failing && l.status.LastFailure == core.CauseNone {
+				f.wait, f.resyncAt = true, f.issued
+			}
+			l.renewed()
 		}
 	}
 	l.resyncIfDue()

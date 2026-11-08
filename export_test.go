@@ -16,8 +16,13 @@ import (
 // of its checks.
 var CheckConfig = checkConfig
 
-// Holder returns the node's holder string: Self.ID, "/" and the incarnation in lowercase hex.
-func (n *Node) Holder() string { return n.holder }
+// Holder returns the node's holder string: Self.ID, "/" and the incarnation in lowercase hex. It
+// takes the lock the loop holds while it carries a step out, so a step hook must not call it.
+func (n *Node) Holder() string {
+	n.stepMu.Lock()
+	defer n.stepMu.Unlock()
+	return n.holder
+}
 
 // Epoch returns the node's monotonic origin.
 func (n *Node) Epoch() time.Time { return n.epoch }
