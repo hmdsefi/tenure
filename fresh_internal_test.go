@@ -4,6 +4,7 @@
 package tenure
 
 import (
+	"math/rand/v2"
 	"reflect"
 	"testing"
 	"testing/synctest"
@@ -238,4 +239,261 @@ func TestHoldingReadings(t *testing.T) {
 	if !got[1].absent() || got[0].absent() || !(reading{h: Holding{Space: "f", Version: 3}}).absent() {
 		t.Errorf("absent() wrong for %+v", got)
 	}
+}
+
+// TestFreshConfirmRace drives the hold-back (MCH O5) with the executor's own Confirm marks, in
+// the orders a degraded shard can see. A record of f/0 naming the holder at the run's term is
+// held back when its read started before the latest Confirm call went out: a watch value or a
+// Holdings read from before the first Confirm call, a read that started while an earlier Confirm
+// call was out, and the earlier call's own answer, both before and after the latest call went
+// out. Only a read that started once the latest call was out, and that call's answer, step.
+// Nothing held back moves the floor or last.
+func TestFreshConfirmRace(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newExecHarness(t)
+		defer h.close()
+		f := newFreshness(execHolder, []Space{{Name: "f", Shards: 1, Fenced: true}}, h.e.confirmStarted)
+		s := f.shard("f", 0)
+		s.floor, s.last, s.grant = 10, 1, 50
+		st := core.Status{Spaces: []core.SpaceStatus{{Name: "f", Fenced: true, Shards: []core.ShardStatus{
+			{State: core.ShardStateDegraded, Term: 50, Holder: execHolder},
+		}}}}
+		us := func(version uint64) Holding {
+			return Holding{Space: "f", Shard: 0, Holder: execHolder, Term: 50, Version: version}
+		}
+		confirm := func() uint64 {
+			t.Helper()
+			a := core.Confirm{Space: "f", Shard: 0, Term: 50}
+			tag, queued := h.e.doConfirm(1, execHolder, a)
+			if !queued {
+				t.Fatal("doConfirm() was not queued")
+			}
+			f.confirmSent(a, tag, queued)
+			return tag
+		}
+		heldBack := func(what string, rd reading) {
+			t.Helper()
+			floor, last := s.floor, s.last
+			if hc, ok := f.admit(rd, st); ok {
+				t.Errorf("%s: admit() = %+v, want it held back", what, hc)
+			}
+			if s.floor != floor || s.last != last {
+				t.Errorf("%s: floor, last = %d, %d, want %d, %d unchanged", what, s.floor, s.last, floor, last)
+			}
+		}
+		steps := func(what string, rd reading) {
+			t.Helper()
+			want := core.HolderChanged{Space: "f", Shard: 0, Holder: execHolder, Term: 50}
+			if hc, ok := f.admit(rd, st); !ok || hc != want {
+				t.Errorf("%s: admit() = %+v, %t, want %+v", what, hc, ok, want)
+			}
+		}
+		confirmResult := func() callResult {
+			t.Helper()
+			for _, r := range h.e.take() {
+				if _, ok := r.act.(core.Confirm); ok {
+					return r
+				}
+			}
+			t.Fatal("no Confirm result")
+			return callResult{}
+		}
+
+		// A Release holds the lane, so the first Confirm waits behind it.
+		h.do(core.Release{Space: "f", Shard: 0, Term: 49}, true)
+		synctest.Wait()
+		early := h.e.stamp() // a Holdings read starts
+		tag1 := confirm()
+		w := h.e.stamp() // a watch value arrives
+		heldBack("watch value before the Confirm call went out", reading{h: us(11), start: w, end: w})
+		h.answer("Release", scriptReply{})
+		if tag, _ := h.e.confirmStarted("f", 0); tag != tag1 {
+			t.Fatalf("confirmStarted() tag = %d, want %d once the call is out", tag, tag1)
+		}
+		heldBack("Holdings read that started before the Confirm call",
+			reading{h: us(11), start: early, end: h.e.stamp()})
+
+		// While the first call is out, the machine sends a second Confirm.
+		during := h.e.stamp() // a read starts while the first call is out
+		tag2 := confirm()
+		_, start1 := h.e.confirmStarted("f", 0)
+		heldBack("first Confirm's answer before the second call went out",
+			reading{h: us(10), confirm: true, start: start1, end: h.e.stamp()})
+		heldBack("read that started during the first call, before the second went out",
+			reading{h: us(11), start: during, end: h.e.stamp()})
+
+		h.answer("Confirm", scriptReply{holding: us(10)})
+		tag, start2 := h.e.confirmStarted("f", 0)
+		if tag != tag2 || start2 <= start1 {
+			t.Fatalf("confirmStarted() = %d, %d, want tag %d and a stamp after %d", tag, start2, tag2, start1)
+		}
+		first := confirmResult()
+		if first.start != start1 {
+			t.Fatalf("first Confirm result starts at %d, want %d", first.start, start1)
+		}
+		heldBack("first Confirm's answer once the second call went out",
+			reading{h: first.holding, confirm: true, start: first.start, end: first.end})
+		heldBack("read that started during the first call, once the second went out",
+			reading{h: us(11), start: during, end: h.e.stamp()})
+
+		w = h.e.stamp()
+		steps("watch value once the second call is out", reading{h: us(11), start: w, end: w})
+		if s.floor != 11 || s.last != w {
+			t.Errorf("floor, last = %d, %d, want 11, %d", s.floor, s.last, w)
+		}
+		h.answer("Confirm", scriptReply{holding: us(11)})
+		second := confirmResult()
+		steps("second Confirm's answer, at the floor",
+			reading{h: second.holding, confirm: true, start: second.start, end: second.end})
+		if s.floor != 11 || s.last != second.end {
+			t.Errorf("floor, last = %d, %d, want 11, %d", s.floor, s.last, second.end)
+		}
+		w = h.e.stamp()
+		if hc, ok := f.admit(reading{h: us(11), start: w, end: w}, st); ok {
+			t.Errorf("watch value at the floor after the answer: admit() = %+v, want it dropped", hc)
+		}
+	})
+}
+
+// TestFreshRandom checks the filter's promises against an independent account of what it let
+// through, over random sequences of readings, Confirm actions and calls, grants and changes of
+// the shard's state. Every reading it steps must have:
+//   - a Version above the highest stepped, or equal to it for a Confirm answer (MCH O4);
+//   - no non-zero term below the latest grant;
+//   - when it has no Version, a read that started after the end of every reading stepped and of
+//     every grant;
+//   - while the shard is degraded and the reading names the holder at the run's term, a read
+//     that started at or after the start of the call of the latest Confirm action (MCH O5).
+//
+// A reading not stepped changes nothing.
+func TestFreshRandom(t *testing.T) {
+	const term = 50
+	var reached struct{ restored, heldBack, stepped int }
+	for seed := range uint64(300) {
+		rng := rand.New(rand.NewPCG(seed, 1)) //nolint:gosec // G404: a test's seeded walk.
+		var (
+			stamp    uint64
+			mark     confirmMark // the latest Confirm call that went out
+			pending  []uint64    // tags of the Confirm actions whose call has not gone out, in order
+			calls    []uint64    // start stamps of the Confirm calls that went out
+			reads    []uint64    // start stamps of the Holdings reads started so far
+			latest   uint64      // tag of the latest Confirm action
+			maxV     uint64      // the highest Version stepped
+			lastEnd  uint64      // the latest end of a reading stepped or of a grant
+			grant    core.Term
+			degraded bool
+		)
+		next := func() uint64 { stamp++; return stamp }
+		f := newFreshness(freshHolder, []Space{{Name: "f", Shards: 1, Fenced: true}},
+			func(string, int) (uint64, uint64) { return mark.tag, mark.start })
+		s := f.shard("f", 0)
+		for range 200 {
+			switch k := rng.IntN(10); {
+			case k == 0:
+				degraded = !degraded
+			case k == 1:
+				latest = next()
+				pending = append(pending, latest)
+				f.confirmSent(core.Confirm{Space: "f", Shard: 0, Term: term}, latest, true)
+			case k == 2 && len(pending) > 0:
+				mark = confirmMark{tag: pending[0], start: next()}
+				pending = pending[1:]
+				calls = append(calls, mark.start)
+			case k == 3:
+				g := term - 1 + core.Term(rng.Uint64N(2))
+				end := next()
+				f.granted("f", 0, g, end)
+				grant, lastEnd = g, max(lastEnd, end)
+			case k == 4:
+				reads = append(reads, next())
+			default:
+				rd := randomReading(rng, term, maxV)
+				switch {
+				case rd.confirm && len(calls) > 0:
+					rd.start = calls[rng.IntN(len(calls))] // a Confirm answer, maybe an old one
+				case rd.confirm || len(reads) == 0 || rng.IntN(2) == 0:
+					rd.confirm = false
+					rd.start = next() // a watch value
+				default:
+					rd.start = reads[rng.IntN(len(reads))] // a Holdings answer
+				}
+				rd.end = next()
+				state := core.ShardStateOwned
+				if degraded {
+					state = core.ShardStateDegraded
+				}
+				st := core.Status{Spaces: []core.SpaceStatus{{Name: "f", Fenced: true, Shards: []core.ShardStatus{
+					{State: state, Term: term, Holder: freshHolder},
+				}}}}
+				before := *s
+				hc, ok := f.admit(rd, st)
+				h := rd.h
+				ours := degraded && h.Holder == freshHolder && h.Term == term && h.Version != 0
+				if !ok {
+					if *s != before {
+						t.Fatalf("seed %d: admit(%+v) dropped it but changed %+v to %+v", seed, rd, before, *s)
+					}
+					if ours {
+						reached.heldBack++
+					}
+					continue
+				}
+				reached.stepped++
+				if h.Version != 0 && (h.Version < maxV || h.Version == maxV && !rd.confirm) {
+					t.Fatalf("seed %d: stepped %+v at or below the highest stepped Version %d (O4)", seed, rd, maxV)
+				}
+				if h.Version != 0 && h.Term != 0 && h.Term < grant {
+					t.Fatalf("seed %d: stepped %+v with a term below the grant %d", seed, rd, grant)
+				}
+				if h.Version == 0 && rd.start <= lastEnd {
+					t.Fatalf("seed %d: stepped %+v, absent and read before %d", seed, rd, lastEnd)
+				}
+				if ours {
+					if latest == 0 || mark.tag != latest || rd.start < mark.start {
+						t.Fatalf("seed %d: stepped %+v while degraded, latest Confirm %d, latest call %+v (O5)",
+							seed, rd, latest, mark)
+					}
+					reached.restored++
+				}
+				want := core.HolderChanged{Space: "f", Shard: 0}
+				if h.Version != 0 && h.Term != 0 {
+					want.Holder, want.Term = h.Holder, h.Term
+				}
+				if hc != want {
+					t.Fatalf("seed %d: admit(%+v) = %+v, want %+v", seed, rd, hc, want)
+				}
+				maxV, lastEnd = max(maxV, h.Version), max(lastEnd, rd.end)
+				if s.floor != maxV || s.last != lastEnd {
+					t.Fatalf("seed %d: floor, last = %d, %d, want %d, %d", seed, s.floor, s.last, maxV, lastEnd)
+				}
+			}
+		}
+	}
+	if reached.restored == 0 || reached.heldBack == 0 || reached.stepped == 0 {
+		t.Errorf("reached %+v, want every kind of outcome", reached)
+	}
+}
+
+// randomReading returns a reading of f/0 with a random record near Version v: the holder's or
+// another's at a term near term, a deleted record, or none, marked as a Confirm answer half the
+// time.
+func randomReading(rng *rand.Rand, term core.Term, v uint64) reading {
+	version := v + rng.Uint64N(3)
+	if version > 1 {
+		version -= rng.Uint64N(2)
+	}
+	h := Holding{Space: "f", Shard: 0, Version: version, Term: term - 1 + core.Term(rng.Uint64N(3))}
+	switch rng.IntN(6) {
+	case 0, 1:
+		h.Holder = freshHolder
+	case 2:
+		h.Holder = "x/1"
+	case 3:
+		// a cleared record keeps its term
+	case 4:
+		h.Term = 0 // a deletion
+	default:
+		h = Holding{Space: "f", Shard: 0} // no record
+	}
+	return reading{h: h, confirm: rng.IntN(2) == 0}
 }
