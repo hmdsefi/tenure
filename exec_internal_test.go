@@ -602,6 +602,7 @@ var errFlaky = errors.New("flaky")
 
 func TestExecResults(t *testing.T) {
 	lost := core.SessionFailed{Cause: core.CauseLost}
+	wrappedLost := fmt.Errorf("store: %w", ErrSessionLost)
 	held := Holding{Space: "s", Shard: 3, Holder: "b/2222", Term: 9, Version: 4}
 	rows := []struct {
 		name    string
@@ -627,6 +628,8 @@ func TestExecResults(t *testing.T) {
 			[]core.Input{core.SessionClosed{}}, Holding{}, false},
 		{"CloseSession/lost", core.CloseSession{}, scriptReply{err: ErrSessionLost}, false,
 			[]core.Input{core.SessionClosed{}}, Holding{}, true},
+		{"CloseSession/wrapped-lost", core.CloseSession{}, scriptReply{err: wrappedLost}, false,
+			[]core.Input{core.SessionClosed{}}, Holding{}, true},
 		{"CloseSession/other", core.CloseSession{}, scriptReply{err: errFlaky}, false,
 			nil, Holding{}, true},
 
@@ -636,7 +639,13 @@ func TestExecResults(t *testing.T) {
 			scriptReply{err: &HeldError{Holder: "b/2222", RetryAfter: 2 * time.Second}}, false,
 			[]core.Input{core.AcquireFailed{Space: "s", Shard: 3, Holder: "b/2222", RetryAfter: 2 * time.Second}},
 			Holding{}, false},
+		{"Acquire/wrapped-held", core.Acquire{Space: "s", Shard: 3},
+			scriptReply{err: fmt.Errorf("store: %w", &HeldError{Holder: "b/2222", RetryAfter: time.Second})}, false,
+			[]core.Input{core.AcquireFailed{Space: "s", Shard: 3, Holder: "b/2222", RetryAfter: time.Second}},
+			Holding{}, false},
 		{"Acquire/lost", core.Acquire{Space: "s", Shard: 3}, scriptReply{err: ErrSessionLost}, false,
+			[]core.Input{core.Acquired{Space: "s", Shard: 3}, lost}, Holding{}, false},
+		{"Acquire/wrapped-lost", core.Acquire{Space: "s", Shard: 3}, scriptReply{err: wrappedLost}, false,
 			[]core.Input{core.Acquired{Space: "s", Shard: 3}, lost}, Holding{}, false},
 		{"Acquire/other", core.Acquire{Space: "s", Shard: 3}, scriptReply{err: errFlaky}, false,
 			[]core.Input{core.Acquired{Space: "s", Shard: 3}}, Holding{}, false},
@@ -646,6 +655,8 @@ func TestExecResults(t *testing.T) {
 		{"Release/nil", core.Release{Space: "s", Shard: 3, Term: 7}, scriptReply{}, false,
 			[]core.Input{core.Released{Space: "s", Shard: 3, Term: 7}}, Holding{}, false},
 		{"Release/lost", core.Release{Space: "s", Shard: 3, Term: 7}, scriptReply{err: ErrSessionLost}, false,
+			[]core.Input{lost}, Holding{}, true},
+		{"Release/wrapped-lost", core.Release{Space: "s", Shard: 3, Term: 7}, scriptReply{err: wrappedLost}, false,
 			[]core.Input{lost}, Holding{}, true},
 		{"Release/other", core.Release{Space: "s", Shard: 3, Term: 7}, scriptReply{err: errFlaky}, false,
 			nil, Holding{}, true},
@@ -657,12 +668,16 @@ func TestExecResults(t *testing.T) {
 			[]core.Input{core.HolderChanged{Space: "s", Shard: 3}}, Holding{Space: "s", Shard: 3}, false},
 		{"Confirm/lost", core.Confirm{Space: "s", Shard: 3, Term: 7}, scriptReply{err: ErrSessionLost}, false,
 			[]core.Input{lost}, Holding{}, true},
+		{"Confirm/wrapped-lost", core.Confirm{Space: "s", Shard: 3, Term: 7}, scriptReply{err: wrappedLost}, false,
+			[]core.Input{lost}, Holding{}, true},
 		{"Confirm/other", core.Confirm{Space: "s", Shard: 3, Term: 7}, scriptReply{err: errFlaky}, false,
 			nil, Holding{}, true},
 
 		{"ClaimSlot/slot", core.ClaimSlot{}, scriptReply{slot: 2}, false,
 			[]core.Input{core.SlotClaimed{Slot: 2}}, Holding{}, false},
 		{"ClaimSlot/lost", core.ClaimSlot{}, scriptReply{slot: -1, err: ErrSessionLost}, false,
+			[]core.Input{lost}, Holding{}, true},
+		{"ClaimSlot/wrapped-lost", core.ClaimSlot{}, scriptReply{slot: -1, err: wrappedLost}, false,
 			[]core.Input{lost}, Holding{}, true},
 		{"ClaimSlot/noslot", core.ClaimSlot{}, scriptReply{slot: -1, err: ErrNoSlot}, false,
 			nil, Holding{}, true},
@@ -672,6 +687,8 @@ func TestExecResults(t *testing.T) {
 		{"ReleaseSlot/nil", core.ReleaseSlot{Slot: 1}, scriptReply{}, false,
 			[]core.Input{core.SlotReleased{Slot: 1}}, Holding{}, false},
 		{"ReleaseSlot/lost", core.ReleaseSlot{Slot: 1}, scriptReply{err: ErrSessionLost}, false,
+			[]core.Input{lost}, Holding{}, true},
+		{"ReleaseSlot/wrapped-lost", core.ReleaseSlot{Slot: 1}, scriptReply{err: wrappedLost}, false,
 			[]core.Input{lost}, Holding{}, true},
 		{"ReleaseSlot/other", core.ReleaseSlot{Slot: 1}, scriptReply{err: errFlaky}, false,
 			nil, Holding{}, true},
