@@ -160,6 +160,39 @@ type NameChecker interface {
     calls CheckNames before any other method of the store or the membership,
     and fails with an error that wraps the one CheckNames returns.
 
+type Node struct {
+	// Has unexported fields.
+}
+    Node is a running member of a group, as Start returns it. Its methods are
+    safe for concurrent use.
+
+func Start(ctx context.Context, cfg Config) (*Node, error)
+    Start starts a node for cfg and returns it once the member has joined the
+    group and the node holds a valid view of it. It fails with an error that
+    starts with "tenure: invalid config: " when cfg is not valid, and otherwise
+    with the step that failed, such as "tenure: join: " and the error of Join.
+    A failed Start leaves the group again if it joined, and leaves no goroutine
+    behind.
+
+    ctx bounds Start only: the node keeps running after ctx ends, until Close.
+    Start does not yet run a store: it supports only a Config without a Store,
+    whose node joins the group and follows its views, and returns an error for
+    any other.
+
+func (n *Node) Close(ctx context.Context) error
+    Close drains the node as Drain does, leaves the group, and stops every
+    goroutine of the node. It returns nil once all of that is done; later calls
+    return ErrClosed. When ctx ends before the drain completes, Close does not
+    leave the group: it stops the node and returns an error that wraps ctx's
+    error.
+
+func (n *Node) Drain(ctx context.Context) error
+    Drain hands the member's work over: it marks the member as draining in the
+    group and returns nil once the drain has completed. The first call of Drain
+    or Close starts the drain; later and concurrent calls wait for the same
+    drain. When ctx ends first, Drain returns ctx's error and the drain goes on.
+    After Close, Drain returns ErrClosed.
+
 type NotOwnerError struct {
 	// Space and Shard name the shard.
 	Space string
