@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/hmdsefi/tenure/core"
+	"github.com/hmdsefi/tenure/internal/machinecases"
 )
 
 var update = flag.Bool("update", false, "rewrite golden files")
@@ -34,6 +36,7 @@ var digestCases = []digestCase{
 	{name: "rank", lines: rankLines},
 	{name: "tree", lines: treeLines},
 	{name: "balanced", lines: balancedLines},
+	{name: "machine", lines: machineLines},
 }
 
 // keyshardKeys returns the keys of the keyshard case: six fixed keys, then k0 … k9999.
@@ -147,6 +150,43 @@ func balancedLines(add func(line string)) {
 			}
 		}
 	}
+}
+
+// machineSteps feeds every case of machinecases.Cases(), in order, to a new machine of the case's
+// config, and calls visit after each step with the case, the step number counting from 1, and
+// what Step returned.
+func machineSteps(visit func(c machinecases.Case, n int, got []core.Action)) {
+	for _, c := range machinecases.Cases() {
+		m := core.NewMachine(c.Config)
+		for i, s := range c.Steps {
+			visit(c, i+1, m.Step(s.Input))
+		}
+	}
+}
+
+// machineLines adds the machine case's lines (MCH-170): for each step n of each case, in order,
+// one line per action, the case's bare AT ID, n and the action as %T%+v, or the AT ID, n and nil
+// for a nil result.
+func machineLines(add func(line string)) {
+	machineSteps(func(c machinecases.Case, n int, got []core.Action) {
+		for _, line := range stepLines(c.AT(), n, got) {
+			add(line)
+		}
+	})
+}
+
+// stepLines returns the machine case's lines for step n of the case with bare AT ID at, whose
+// result is actions.
+func stepLines(at string, n int, actions []core.Action) []string {
+	prefix := at + " " + strconv.Itoa(n) + " "
+	if actions == nil {
+		return []string{prefix + "nil"}
+	}
+	lines := make([]string, len(actions))
+	for i, a := range actions {
+		lines[i] = prefix + fmt.Sprintf("%T%+v", a, a)
+	}
+	return lines
 }
 
 // seqStrings returns prefix0 … prefix(n-1).
@@ -443,5 +483,38 @@ func TestATPTR12TreeDigest(t *testing.T) {
 	const want = "3 1 tq/1 0 4,5,6"
 	if !slices.Contains(lines, want) {
 		t.Errorf("tree has no line %q", want)
+	}
+}
+
+// TestATMCH50MachineDigest checks the machine case (AT-MCH-50): its first line, its count, that
+// every step returns the case's Want, so the digest pins only what the step lists expect, and
+// that its lines are those of the Wants.
+func TestATMCH50MachineDigest(t *testing.T) {
+	var count int
+	var want []string
+	for _, c := range machinecases.Cases() {
+		for i, s := range c.Steps {
+			count += max(1, len(s.Want))
+			want = append(want, stepLines(c.AT(), i+1, s.Want)...)
+		}
+	}
+
+	machineSteps(func(c machinecases.Case, n int, got []core.Action) {
+		if w := c.Steps[n-1].Want; !reflect.DeepEqual(got, w) {
+			t.Errorf("%s step %d: Step = %#v, want %#v", c.ID, n, got, w)
+		}
+	})
+
+	lines := caseLines(t, "machine")
+	if len(lines) != count {
+		t.Fatalf("machine has %d lines, want %d", len(lines), count)
+	}
+	if lines[0] != "AT-MCH-01 1 core.KeepAlive{}" {
+		t.Errorf("first machine line = %q, want %q", lines[0], "AT-MCH-01 1 core.KeepAlive{}")
+	}
+	for i := range lines {
+		if lines[i] != want[i] {
+			t.Errorf("machine line %d = %q, want %q from the case's Want", i+1, lines[i], want[i])
+		}
 	}
 }
