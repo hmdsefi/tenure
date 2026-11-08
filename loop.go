@@ -162,13 +162,14 @@ func (l *loop) run(first []loopInput, started chan<- struct{}) {
 				for _, in := range r.inputs {
 					l.step(loopInput{in: in, sentWall: r.sentWall, err: r.err})
 				}
+				l.slotResult(r)
 			}
 		case <-n.inbox.ready:
 			ins, v := n.inbox.take()
 			for _, in := range ins {
 				l.step(in)
 			}
-			if v != nil {
+			if v != nil && !n.merge.stale(v.Version) {
 				l.step(loopInput{in: core.ViewChanged{View: *v}})
 			}
 		}
@@ -247,7 +248,7 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 func (l *loop) execute(act core.Action) {
 	n := l.n
 	switch a := act.(type) {
-	case core.KeepAlive, core.CloseSession, core.Acquire, core.Release:
+	case core.KeepAlive, core.CloseSession, core.Acquire, core.Release, core.ClaimSlot, core.ReleaseSlot:
 		n.exec.do(l.gen, n.holder, act)
 	case core.ExtendDeadline:
 		n.raiseDeadline(a.Deadline)
@@ -258,6 +259,28 @@ func (l *loop) execute(act core.Action) {
 	case core.Wake:
 	default:
 		panic(fmt.Sprintf("tenure: unknown action %T", act))
+	}
+}
+
+// slotResult follows up the result r of a ClaimSlot or ReleaseSlot call once its inputs have been
+// stepped (RUN-210, MCH O8). A SlotClaimed or SlotReleased raises the merger's floor to the end of
+// the call, so that no slot data read before it reaches the machine again, and every result asks
+// for a slot read. Other results need nothing.
+func (l *loop) slotResult(r callResult) {
+	n := l.n
+	switch r.act.(type) {
+	case core.ClaimSlot, core.ReleaseSlot:
+	default:
+		return
+	}
+	for _, in := range r.inputs {
+		switch in.(type) {
+		case core.SlotClaimed, core.SlotReleased:
+			n.merge.raise(r.end)
+		}
+	}
+	if n.refresh != nil {
+		n.refresh.refresh()
 	}
 }
 

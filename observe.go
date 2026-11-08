@@ -24,6 +24,10 @@ import (
 //     CloseSession of Start's cleanup;
 //   - runReturned, for each return of a Run that its supervisor restarts (RUN-330): the Run's
 //     Shard and error, the count of consecutive returns and the backoff before the restart;
+//   - slotCountMismatch, in Start, when the store's slot count is positive and differs from a
+//     positive Config.Slots, with both counts; the node keeps the stored count;
+//   - slotsFailed, for each failed Slots call of the slot refresher, which keeps the slot data
+//     it has and reads again later;
 //   - membershipFailed, for each failed call of the membership after Join that the node retries
 //     or gives up: "Watch" (also a channel that closed before Leave), "SetDraining" and "Leave";
 //   - draining, once, when the first Drain or Close starts the drain;
@@ -31,8 +35,9 @@ import (
 //   - closed, last, when Close finishes, with Close's ctx and the reason: "drained" after a
 //     completed drain, "deadline" when ctx ended first.
 //
-// start, startFailed, closed, membershipFailed("Leave") and the callFailed of Start's cleanup are
-// called from the goroutine of Start or Close, draining from the first Drain or Close while it
+// start, startFailed, slotCountMismatch, closed, membershipFailed("Leave") and the callFailed of
+// Start's cleanup are called from the goroutine of Start or Close, slotsFailed from the slot
+// refresher's goroutine, draining from the first Drain or Close while it
 // holds n.mu, step and a store's view from the loop goroutine, the other callFailed calls from
 // the executor's lanes, runReturned from the shard's supervisor goroutine, and the rest from the
 // node's watcher and drain goroutines. No call may block, or call back into the node.
@@ -43,6 +48,8 @@ type observer interface {
 	step(rec stepRecord)
 	callFailed(r callResult)
 	runReturned(sh *Shard, err error, count int, backoff time.Duration)
+	slotCountMismatch(configured, stored int)
+	slotsFailed(err error)
 	membershipFailed(op string, err error)
 	draining()
 	drained()
@@ -60,6 +67,8 @@ func (nopObserver) view(core.View)                                {}
 func (nopObserver) step(stepRecord)                               {}
 func (nopObserver) callFailed(callResult)                         {}
 func (nopObserver) runReturned(*Shard, error, int, time.Duration) {}
+func (nopObserver) slotCountMismatch(int, int)                    {}
+func (nopObserver) slotsFailed(error)                             {}
 func (nopObserver) membershipFailed(string, error)                {}
 func (nopObserver) draining()                                     {}
 func (nopObserver) drained()                                      {}

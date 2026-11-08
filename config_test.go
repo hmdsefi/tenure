@@ -425,15 +425,16 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 					if err != nil {
 						t.Fatalf("Start = %v, want nil", err)
 					}
-					// After the checkers, Start joins, watches, reads the slots and opens the session.
-					// The loop's Acquire calls, which may start before Start returns, come last and
-					// are left out.
-					want := append(slices.Clone(tc.calls), "membership Join", "membership Watch", "store Slots", "store KeepAlive")
+					// After the checkers, Start joins, watches, reads and seeds the slots and opens
+					// the session. The loop's calls, which may start before Start returns, come
+					// after KeepAlive and are left out.
+					want := append(slices.Clone(tc.calls), "membership Join", "membership Watch",
+						"store Slots", "store SetSlots", "store Slots", "store KeepAlive")
 					for i := len(tc.calls); i < len(got); i++ {
 						got[i], _, _ = strings.Cut(got[i], "(")
 					}
-					for len(got) > len(want) && got[len(got)-1] == "store Acquire" {
-						got = got[:len(got)-1]
+					if i := slices.Index(got, "store KeepAlive"); i >= 0 {
+						got = got[:i+1]
 					}
 					if !reflect.DeepEqual(got, want) {
 						t.Errorf("calls = %q, want %q", got, want)
