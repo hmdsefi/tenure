@@ -71,7 +71,7 @@ func TestLoopTickFirst(t *testing.T) {
 }
 
 // TestLoopExecute checks the actions the loop carries out itself: ExtendDeadline only raises the
-// deadline, Wake does nothing, and an action the loop does not know panics.
+// deadline, Wake, Degrade and Restore do nothing, and an action the loop does not know panics.
 func TestLoopExecute(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var recs []stepRecord
@@ -79,15 +79,17 @@ func TestLoopExecute(t *testing.T) {
 		l.execute(core.ExtendDeadline{Deadline: 10 * time.Second})
 		l.execute(core.ExtendDeadline{Deadline: 5 * time.Second})
 		l.execute(core.Wake{At: time.Second})
+		l.execute(core.Degrade{Space: "orders", Shard: 1, Term: 5})
+		l.execute(core.Restore{Space: "orders", Shard: 1, Term: 5})
 		if got := time.Duration(l.n.deadline.Load()); got != 10*time.Second {
 			t.Errorf("deadline = %v, want 10s", got)
 		}
 		defer func() {
-			if r := recover(); r != "tenure: unknown action core.Confirm" {
-				t.Errorf("execute(Confirm) panicked with %v, want tenure: unknown action core.Confirm", r)
+			if r := recover(); r != "tenure: unknown action core.ClaimSlot" {
+				t.Errorf("execute(ClaimSlot) panicked with %v, want tenure: unknown action core.ClaimSlot", r)
 			}
 		}()
-		l.execute(core.Confirm{Space: "orders", Shard: 1, Term: 5})
+		l.execute(core.ClaimSlot{})
 	})
 }
 

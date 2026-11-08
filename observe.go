@@ -20,8 +20,10 @@ import (
 //   - step, for each step of the loop, under n.stepMu, after the step's actions were executed
 //     and its view published;
 //   - callFailed, for each failed store call other than Acquire and KeepAlive, on the call's
-//     lane (KeepAlive failures reach step as SessionFailed with Err), and for a failed
-//     CloseSession of Start's cleanup;
+//     lane (KeepAlive failures reach step as SessionFailed with Err), for a failed CloseSession
+//     of Start's cleanup, for each failed Holdings call of a resync (op "Holdings" and the space),
+//     and for each failed WatchHolders call or closed store watch (op "WatchHolders", with
+//     errStoreWatchEnded for a closed channel);
 //   - runReturned, for each return of a Run that its supervisor restarts (RUN-330): the Run's
 //     Shard and error, the count of consecutive returns and the backoff before the restart;
 //   - membershipFailed, for each failed call of the membership after Join that the node retries
@@ -33,7 +35,8 @@ import (
 //
 // start, startFailed, closed, membershipFailed("Leave") and the callFailed of Start's cleanup are
 // called from the goroutine of Start or Close, draining from the first Drain or Close while it
-// holds n.mu, step and a store's view from the loop goroutine, the other callFailed calls from
+// holds n.mu, step and a store's view from the loop goroutine, the callFailed calls of Holdings
+// and the store watch from the resync and store-watch goroutines, the other callFailed calls from
 // the executor's lanes, runReturned from the shard's supervisor goroutine, and the rest from the
 // node's watcher and drain goroutines. No call may block, or call back into the node.
 type observer interface {
