@@ -273,7 +273,8 @@ type ReleaseSlot struct {
 }
 
 // CloseSession asks the driver to close the session. Every run has returned by then. The driver
-// answers it with SessionClosed once the session is closed.
+// answers it with SessionClosed once the session is closed, and also when the store reports the
+// session already lost or gone: while the session is closing, a SessionFailed is ignored.
 type CloseSession struct{}
 
 // Wake asks the driver to call Step again once its monotonic clock reaches a reading.
