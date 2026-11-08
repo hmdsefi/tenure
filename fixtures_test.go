@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"regexp"
 	"runtime"
 	"slices"
@@ -166,7 +167,7 @@ func (s *script) edit(method string, f func(r *callRule)) {
 
 // do records one call of method and runs it by the script, with forward as the real call.
 func (s *script) do(ctx context.Context, method string, args []any, forward func(context.Context) ([]any, error)) ([]any, error) {
-	c := &call{Method: method, Args: args, Start: time.Now()}
+	c := &call{Method: method, Args: snapshot(args), Start: time.Now()}
 	c.Deadline, c.HasDeadline = ctx.Deadline()
 	s.mu.Lock()
 	r := s.rules[method]
@@ -192,9 +193,32 @@ func (s *script) do(ctx context.Context, method string, args []any, forward func
 	}
 
 	s.mu.Lock()
-	c.End, c.EndSeq, c.Done, c.Result, c.Err = time.Now(), seq(), true, res, err
+	c.End, c.EndSeq, c.Done, c.Result, c.Err = time.Now(), seq(), true, snapshot(res), err
 	s.mu.Unlock()
 	return res, err
+}
+
+// snapshot returns a copy of vs for the log, with its own copies of slices and Meta maps, so the
+// log shares no memory with what the caller passed or got, which the caller may change later.
+func snapshot(vs []any) []any {
+	if vs == nil {
+		return nil
+	}
+	out := make([]any, len(vs))
+	for i, v := range vs {
+		switch v := v.(type) {
+		case []string:
+			out[i] = slices.Clone(v)
+		case []tenure.Holding:
+			out[i] = slices.Clone(v)
+		case core.Member:
+			v.Meta = maps.Clone(v.Meta)
+			out[i] = v
+		default:
+			out[i] = v
+		}
+	}
+	return out
 }
 
 // argAt returns args[i] as a T and panics when it is not one.
@@ -225,6 +249,9 @@ func resultAt[T any](res []any, i int) T {
 type recStore struct {
 	script
 	ms *memstore.Store
+
+	injectOnce sync.Once
+	injected   *injectedStore // what Injected returns
 }
 
 var (
@@ -364,8 +391,12 @@ type holdingWatch struct {
 }
 
 // Injected returns s as a tenure.Watcher whose WatchHolders channels receive only what Inject
-// sends, and close at CloseWatch or when their ctx is done.
-func (s *recStore) Injected() *injectedStore { return &injectedStore{recStore: s} }
+// sends, and close at CloseWatch or when their ctx is done. Every call returns the same value, so
+// Inject and CloseWatch reach the channels of the node that was given an earlier result.
+func (s *recStore) Injected() *injectedStore {
+	s.injectOnce.Do(func() { s.injected = &injectedStore{recStore: s} })
+	return s.injected
+}
 
 func (s *injectedStore) WatchHolders(ctx context.Context) (<-chan tenure.Holding, error) {
 	res, err := s.do(ctx, "WatchHolders", nil, s.open)
@@ -436,7 +467,7 @@ func (s *recStore) Checking(names, timing error) *checkingStore {
 }
 
 func (s *checkingStore) CheckNames(spaces []string, member string) error {
-	_, err := s.do(context.Background(), "CheckNames", []any{slices.Clone(spaces), member}, answerErr(s.names))
+	_, err := s.do(context.Background(), "CheckNames", []any{spaces, member}, answerErr(s.names))
 	return err
 }
 
@@ -831,7 +862,7 @@ func (m *recMembership) Checking(names, timing error) *checkingMembership {
 }
 
 func (m *checkingMembership) CheckNames(spaces []string, member string) error {
-	_, err := m.do(context.Background(), "CheckNames", []any{slices.Clone(spaces), member}, answerErr(m.names))
+	_, err := m.do(context.Background(), "CheckNames", []any{spaces, member}, answerErr(m.names))
 	return err
 }
 
@@ -860,6 +891,7 @@ type outside struct {
 
 // newOutside opens session x/1 on st with timing and renews it every RetryPeriod until Stop,
 // which t's cleanup also calls. st is normally the shared memstore, so the calls are not recorded.
+// Its goroutine counts in a baseline check: a test stops it before the check.
 func newOutside(t testing.TB, st tenure.Store, timing core.Timing) *outside {
 	t.Helper()
 	if err := st.KeepAlive(context.Background(), outsideHolder, timing); err != nil {

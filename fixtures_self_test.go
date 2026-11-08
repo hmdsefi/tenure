@@ -166,8 +166,13 @@ func TestFixtureStore(t *testing.T) {
 			if slot, err := fs.ClaimSlot(ctx, h); err != nil || slot != 0 {
 				t.Fatalf("ClaimSlot = %d, %v, want 0, nil", slot, err)
 			}
-			if n, holders, err := fs.Slots(ctx); err != nil || n != 2 || !slices.Equal(holders, []string{h, ""}) {
+			n, holders, err := fs.Slots(ctx)
+			if err != nil || n != 2 || !slices.Equal(holders, []string{h, ""}) {
 				t.Fatalf("Slots = %d, %q, %v, want 2, [%s \"\"], nil", n, holders, err, h)
+			}
+			holders[0] = "changed" // the caller's slice: the log keeps its own copy
+			if got := fs.Calls("Slots")[0].Result; !reflect.DeepEqual(got, []any{2, []string{h, ""}}) {
+				t.Fatalf("recorded Slots result = %v, want [2 [%s \"\"]]", got, h)
 			}
 			if err := fs.ReleaseSlot(ctx, h, 0); err != nil {
 				t.Fatalf("ReleaseSlot = %v, want nil", err)
@@ -390,6 +395,9 @@ func TestFixtureStore(t *testing.T) {
 			is := fs.Injected()
 			if _, ok := tenure.Store(is).(tenure.Watcher); !ok {
 				t.Fatal("Injected() is no Watcher")
+			}
+			if fs.Injected() != is {
+				t.Fatal("a second Injected() is another value: its Inject would miss the first one's channels")
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
