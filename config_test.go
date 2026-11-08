@@ -426,12 +426,15 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 						t.Fatalf("Start = %v, want nil", err)
 					}
 					// After the checkers, Start joins, watches, reads the slots and opens the session.
-					// The loop's Acquire calls, which may start before Start returns, are left out.
+					// The loop's Acquire calls, which may start before Start returns, come last and
+					// are left out.
 					want := append(slices.Clone(tc.calls), "membership Join", "membership Watch", "store Slots", "store KeepAlive")
 					for i := len(tc.calls); i < len(got); i++ {
 						got[i], _, _ = strings.Cut(got[i], "(")
 					}
-					got = slices.DeleteFunc(got, func(c string) bool { return strings.HasSuffix(c, " Acquire") })
+					for len(got) > len(want) && got[len(got)-1] == "store Acquire" {
+						got = got[:len(got)-1]
+					}
 					if !reflect.DeepEqual(got, want) {
 						t.Errorf("calls = %q, want %q", got, want)
 					}
@@ -479,11 +482,13 @@ func TestATRUN02NameAndTimingCheckers(t *testing.T) {
 // "membership" followed by the call's method and arguments.
 func checkerCalls(d configDoubles) []string {
 	var out []string
+	// One read of the store's log: a node's loop may still add calls to it.
+	fs := d.fs.Calls()
 	store := map[uint64]bool{}
-	for _, c := range d.fs.Calls() {
+	for _, c := range fs {
 		store[c.Seq] = true
 	}
-	for _, c := range callsInOrder(d.fs.Calls(), d.sm.Calls()) {
+	for _, c := range callsInOrder(fs, d.sm.Calls()) {
 		who := "membership"
 		if store[c.Seq] {
 			who = "store"
