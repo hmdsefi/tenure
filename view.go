@@ -154,6 +154,7 @@ func (n *Node) offer(v core.View) {
 	n.offered, n.offeredVersion = true, merged.Version
 	if n.cfg.Store == nil {
 		n.publish(merged)
+		n.snap.Store(newRoutes(n.view.Load(), nil, nil)) // no spaces: nothing to assign
 	} else {
 		n.inbox.postView(merged)
 	}

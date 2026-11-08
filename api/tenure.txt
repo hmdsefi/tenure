@@ -197,12 +197,37 @@ func (n *Node) Drain(ctx context.Context) error
     When ctx ends first, Drain returns ctx's error and the drain goes on.
     After Close, Drain returns ErrClosed.
 
+func (n *Node) Local(space, key string) (*Shard, error)
+    Local returns this member's Shard for key in space while the member owns it,
+    that is while the Shard's Check returns nil. The shard of key is the one
+    Route takes. Otherwise Local returns a *NotOwnerError for the shard, whose
+    Route is the member Route names for key, or the zero Member when Route finds
+    none. After Close, for an unknown space and for a ShardOf result outside
+    the space's shards, Local fails as Route does. Local takes no lock and never
+    waits for the node.
+
 func (n *Node) Resolver(namespace string) *Resolver
     Resolver returns a Resolver that ranks keys in namespace over the node's
     views, the same views the node itself follows, with no watch of its own.
     It holds the node's current view at once, and places keys with
     core.NewRendezvous. Close of the node closes it; after Close, Resolver
     returns a closed Resolver, whose lookups return ErrClosed.
+
+func (n *Node) Route(space, key string) (Member, error)
+    Route returns the member that serves key in space: the member to which
+    the node's latest view assigns key's shard. The shard is the space's
+    ShardOf(key), or core.KeyShard(key, Shards) when ShardOf is nil. Route
+    answers from the state the node has published and never waits for the node,
+    so right after a view change it may still answer from the view before.
+    The Meta map of the result is shared with the node's view and must not be
+    modified.
+
+    After Close, Route returns ErrClosed. It fails for a space the node does
+    not have, such as `tenure: unknown space "carts"`, and for a ShardOf result
+    outside the space's shards, such as `tenure: orders: ShardOf("k") = 9 is
+    outside [0, 8)`. When no member can serve the shard, it returns an error
+    that matches ErrNoMembers and names the shard, such as "tenure: no members:
+    orders/3: no placement keys" when no member of the view is eligible.
 
 type NotOwnerError struct {
 	// Space and Shard name the shard.
@@ -382,6 +407,13 @@ type Space struct {
 	// Shard and cancels ctx when the ownership ends. When Run returns while the member still
 	// owns the shard, the node calls it again after a backoff. It is required.
 	Run func(ctx context.Context, s *Shard) error
+
+	// ShardOf maps a key to its shard for Node.Route and Node.Local. It must return a shard
+	// from 0 to Shards minus 1, the same one for the same key on every member, and be safe for
+	// concurrent use; Route and Local fail for a key it maps outside. Route and Local call it
+	// on their caller's goroutine, so a panic in it reaches that caller and leaves the node
+	// running. nil means core.KeyShard(key, Shards).
+	ShardOf func(key string) int
 }
     Space is a set of shards that the members of a group divide among
     themselves.
