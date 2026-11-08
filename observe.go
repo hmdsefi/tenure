@@ -28,9 +28,11 @@ import (
 //   - closed, last, when Close finishes, with Close's ctx and the reason: "drained" after a
 //     completed drain, "deadline" when ctx ended first.
 //
-// start, startFailed, closed and membershipFailed("Leave") are called from the goroutine of Start
-// or Close, draining from the first Drain or Close while it holds n.mu, and the rest from the
-// node's watcher and drain goroutines. No call may block, or call back into the node.
+// start, startFailed, closed, membershipFailed("Leave") and the callFailed of Start's cleanup are
+// called from the goroutine of Start or Close, draining from the first Drain or Close while it
+// holds n.mu, step and a store's view from the loop goroutine, the other callFailed calls from
+// the executor's lanes, and the rest from the node's watcher and drain goroutines. No call may
+// block, or call back into the node.
 type observer interface {
 	start(holder string)
 	startFailed(ctx context.Context, err error)

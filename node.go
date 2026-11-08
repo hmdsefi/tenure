@@ -171,7 +171,7 @@ func (n *Node) openSession(ctx context.Context) error {
 	case <-started:
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("tenure: start: %w", context.Cause(ctx))
+		return fmt.Errorf("tenure: start: %w", ctx.Err())
 	}
 }
 
