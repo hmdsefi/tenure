@@ -285,6 +285,15 @@ func (m *Machine) Step(in Input) []Action
     they return. A slot the view retires, or the slot of a draining member,
     is released once every shard is idle or has a stuck run.
 
+    A slot the views have shown vacant for SlotGrace, by the machine's own
+    readings, gives no shard until a view shows it held or the machine claims
+    it, so its shards go to the other slots. A held slot the views have shown
+    vacant for LeaseDuration while the machine held it is given up in the
+    first step the session is live from then on: its runs stop as lost and
+    are released once they return, as when another holder takes it, and no
+    ReleaseSlot goes out for it. Neither happens once the session is lost or
+    closing.
+
     After a Drain the machine wants no shard, so it stops every run and hands
     each shard over, and then its slot. Once every shard is idle, every run
     having returned, a stuck one included, and it holds no slot, it returns

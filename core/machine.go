@@ -156,6 +156,12 @@ func NewMachine(cfg MachineConfig) *Machine {
 // runs stop as lost and are released once they return. A slot the view retires, or the slot of a
 // draining member, is released once every shard is idle or has a stuck run.
 //
+// A slot the views have shown vacant for SlotGrace, by the machine's own readings, gives no shard until a
+// view shows it held or the machine claims it, so its shards go to the other slots. A held slot the views
+// have shown vacant for LeaseDuration while the machine held it is given up in the first step the session
+// is live from then on: its runs stop as lost and are released once they return, as when another holder
+// takes it, and no ReleaseSlot goes out for it. Neither happens once the session is lost or closing.
+//
 // After a Drain the machine wants no shard, so it stops every run and hands each shard over, and then
 // its slot. Once every shard is idle, every run having returned, a stuck one included, and it holds no
 // slot, it returns CloseSession, and again every RetryPeriod until a SessionClosed. While the session
@@ -172,8 +178,8 @@ func (m *Machine) Step(in Input) []Action {
 		return nil
 	}
 
-	// Phase A: the clock, the session and view inputs, the step's one evaluation of live, and what a
-	// session not live does to the Confirms.
+	// Phase A: the clock, the session, view and slot inputs, the timer of a held slot the views show
+	// vacant, the step's one evaluation of live, and what a session not live does to the Confirms.
 	m.status.Now = min(max(m.status.Now, inputNow(in)), maxReading)
 	if m.status.Session == SessionStateClosing {
 		in = m.closingInput(in)
@@ -181,13 +187,15 @@ func (m *Machine) Step(in Input) []Action {
 	m.applySessionInput(in)
 	m.applyViewInput(in)
 	m.applySlotInput(in)
+	m.trackVacantDisplay()
 	m.refreshSession()
 	m.live = m.status.Session == SessionStateLive
 	if !m.live {
 		m.forgetConfirms()
 	}
 
-	// Phase B (slot marks) goes here.
+	// Phase B: the slots' expiry marks, then the loss of a held slot the views keep showing vacant.
+	m.expireVacancies()
 
 	// Phase C: the assignments, if a view has changed them.
 	m.recomputeAssignments()

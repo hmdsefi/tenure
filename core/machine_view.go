@@ -40,24 +40,21 @@ func (m *Machine) applyView(in ViewChanged) {
 	}
 	m.status.ViewVersion = in.View.Version
 	m.view = viewState{view: in.View, applied: true, wall: in.Wall.Round(0), appliedAt: m.status.Now, dirty: true}
+	m.trackVacancy()
 	m.applyViewSlots()
 }
 
 // recomputeAssignments is phase C: it stores a new assignment for every space, and the Wanted flag
-// of every shard, when the applied view has changed since the last time. The assignment follows the
-// view while the member drains, but nothing is wanted then.
+// of every shard, when the applied view, the held slot or a slot's expiry mark has changed since the last
+// time (MCH-320). A vacant slot marked expired is no placement key. The assignment follows the view while
+// the member drains, but nothing is wanted then.
 func (m *Machine) recomputeAssignments() {
 	if !m.view.dirty {
 		return
 	}
 	m.view.dirty = false
 
-	// expired stays all false until the machine tracks how long slots have been vacant.
-	var expired []bool
-	if m.view.view.Slots > 0 {
-		expired = make([]bool, m.view.view.Slots)
-	}
-	keys, _ := PlacementKeys(m.view.view, m.view.wall.Add(m.status.Now-m.view.appliedAt), expired)
+	keys, _ := PlacementKeys(m.view.view, m.view.wall.Add(m.status.Now-m.view.appliedAt), m.expiredSlots())
 
 	own := m.placementKey()
 	for i, s := range m.cfg.Spaces {
