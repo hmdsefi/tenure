@@ -678,9 +678,14 @@ func TestATRUN76SetDrainingRetries(t *testing.T) {
 			t.Errorf("KeepAlive calls = %v, want only Start's: the session closed at T0+1s", ka)
 		}
 		closeNode(t, n)
-		if got, want := callMethods(callsInOrder(r.fs.Calls(), r.sm.Calls())),
-			[]string{"Join", "Watch", "Slots", "KeepAlive", "SetDraining", "CloseSession", "SetDraining", "SetDraining", "Leave"}; !slices.Equal(got, want) {
-			t.Errorf("calls = %v, want %v", got, want)
+		// The drain goroutine's first SetDraining and the lane's CloseSession both start at
+		// T0+1s on different goroutines, so either may come first.
+		got := callMethods(callsInOrder(r.fs.Calls(), r.sm.Calls()))
+		if len(got) > 5 && got[4] == "CloseSession" && got[5] == "SetDraining" {
+			got[4], got[5] = got[5], got[4]
+		}
+		if want := []string{"Join", "Watch", "Slots", "KeepAlive", "SetDraining", "CloseSession", "SetDraining", "SetDraining", "Leave"}; !slices.Equal(got, want) {
+			t.Errorf("calls = %v, want %v, the first SetDraining and CloseSession in either order", got, want)
 		}
 		check()
 	})
