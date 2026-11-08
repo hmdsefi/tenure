@@ -53,6 +53,9 @@ func wantAllClosed(t *testing.T, n *tenure.Node, res *tenure.Resolver) {
 	if err := n.Drain(context.Background()); !errors.Is(err, tenure.ErrClosed) {
 		t.Errorf("Drain() after Close = %v, want ErrClosed", err)
 	}
+	if err := n.SetSlots(context.Background(), 2); !errors.Is(err, tenure.ErrClosed) {
+		t.Errorf("SetSlots() after Close = %v, want ErrClosed", err)
+	}
 	if _, err := res.Lookup("k"); !errors.Is(err, tenure.ErrClosed) {
 		t.Errorf("node resolver's Lookup() after Close = %v, want ErrClosed", err)
 	}
@@ -156,8 +159,8 @@ func TestATRUN72DrainDeadline(t *testing.T) {
 // TestATRUN73CloseSequence closes a member that holds a slot with a ctx that does not end: Close
 // releases every shard, then the slot once the last Release has returned, then closes the
 // session once ReleaseSlot has, as AT-RUN-70 drains, and then leaves once CloseSession has.
-// Afterwards Route, Local, Drain, a node resolver's Lookup and a second Close return ErrClosed,
-// and the Shards that Run got keep their stop error.
+// Afterwards Route, Local, Drain, SetSlots, a node resolver's Lookup and a second Close return
+// ErrClosed, and the Shards that Run got keep their stop error.
 func TestATRUN73CloseSequence(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)

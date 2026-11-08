@@ -4,6 +4,7 @@
 package tenure_test
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/core"
+	"github.com/hmdsefi/tenure/memstore"
 )
 
 // The tests of slots: seeding in Start, slot data merged into the views, the slot refresher,
@@ -700,6 +702,525 @@ func TestATRUN70DrainWithSlot(t *testing.T) {
 		}
 		wantSlots(t, r, 1, []string{""})
 		closeNode(t, n)
+		check()
+	})
+}
+
+// wideOrders returns orders with 12 shards, whose ShardOf maps the key "<s>" to shard s.
+func wideOrders(run func(context.Context, *tenure.Shard) error) tenure.Space {
+	return tenure.Space{
+		Name:   "orders",
+		Shards: 12,
+		ShardOf: func(key string) int {
+			s, err := strconv.Atoi(key)
+			if err != nil {
+				return -1
+			}
+			return s
+		},
+		Run: run,
+	}
+}
+
+// slotNode is one member of a test that runs several nodes on one memstore and one group.
+type slotNode struct {
+	id   string
+	fs   *recStore
+	runs *runLog
+	log  *stepLog
+	n    *tenure.Node
+}
+
+// startSlotNode starts member id on ms and g with Config.Slots slots and the space that space
+// returns for its runLog, recording its store calls, its runs and its steps.
+func startSlotNode(t *testing.T, ms *memstore.Store, g *group, id string, slots int,
+	space func(func(context.Context, *tenure.Shard) error) tenure.Space,
+) *slotNode {
+	t.Helper()
+	sn := &slotNode{id: id, fs: newRecStore(ms), runs: &runLog{}, log: &stepLog{}}
+	cfg := nodeConfig(id, g.Absent(id), sn.fs, space(sn.runs.Run))
+	cfg.Slots = slots
+	sn.n = start(t, sn.log.ctx(context.Background()), cfg)
+	return sn
+}
+
+// holderOf returns the holder of member id whose incarnation is the bytes 0 to 15.
+func holderOf(id string) string { return id + strings.TrimPrefix(holder01, "n1") }
+
+// heldSlot returns the slot that sn's machine holds after its latest step, -1 for none.
+func (sn *slotNode) heldSlot() int {
+	recs, _ := sn.log.records()
+	if len(recs) == 0 {
+		return -1
+	}
+	return recs[len(recs)-1].After.Slot
+}
+
+// claims returns the result of each ClaimSlot call of sn, in order: the slot, or the error.
+func (sn *slotNode) claims() []string {
+	var out []string
+	for _, c := range sn.fs.Calls("ClaimSlot") {
+		if c.Err != nil {
+			out = append(out, c.Err.Error())
+			continue
+		}
+		out = append(out, strconv.Itoa(resultAt[int](c.Result, 0)))
+	}
+	return out
+}
+
+// slotShards returns, for each of k slots, the shards of orders with shards shards that
+// core.Balanced places on it, ascending.
+func slotShards(shards, k int) [][]int {
+	b := bal("orders", shards, slotKeys(k)...)
+	out := make([][]int, k)
+	for s := range out {
+		out[s] = b["slot-"+strconv.Itoa(s)]
+	}
+	return out
+}
+
+// slotIndex returns the slot of k that core.Balanced places shard of orders with shards shards
+// on.
+func slotIndex(shard, shards, k int) int {
+	for s, ids := range slotShards(shards, k) {
+		if slices.Contains(ids, shard) {
+			return s
+		}
+	}
+	return -1
+}
+
+// runHistory returns, for each shard of orders, the ID of the node of each Run call of the shard
+// in start order, and fails t when a Run of a shard, on any node, started before the one before
+// it had returned.
+func runHistory(t *testing.T, nodes ...*slotNode) map[int][]string {
+	t.Helper()
+	type run struct {
+		id string
+		c  runCall
+	}
+	byShard := make(map[int][]run)
+	for _, sn := range nodes {
+		for _, c := range sn.runs.Calls() {
+			byShard[c.Shard.ID] = append(byShard[c.Shard.ID], run{sn.id, c})
+		}
+	}
+	out := make(map[int][]string)
+	for shard, runs := range byShard {
+		slices.SortFunc(runs, func(a, b run) int { return cmp.Compare(a.c.Seq, b.c.Seq) })
+		for i, r := range runs {
+			if prev := runs[max(i-1, 0)]; i > 0 && (!prev.c.Done || r.c.Seq < prev.c.EndSeq) {
+				t.Errorf("orders/%d: %s's %v started before %s's %v returned", shard, r.id, r.c, prev.id, prev.c)
+			}
+			out[shard] = append(out[shard], r.id)
+		}
+	}
+	return out
+}
+
+// wantStoredSlots fails t unless ms holds one slot per entry of holders, held by that holder.
+func wantStoredSlots(t *testing.T, ms *memstore.Store, holders []string) {
+	t.Helper()
+	c, h, err := ms.Slots(context.Background())
+	if err != nil || c != len(holders) || !slices.Equal(h, holders) {
+		t.Errorf("memstore Slots() = %d, %q, %v, want %d, %q", c, h, err, len(holders), holders)
+	}
+}
+
+// TestATRUN23RetireSlot runs n1, n2 and n3 on slots 0, 1 and 2 over 12 shards and lowers the
+// count to 2 through n1 (RUN-240, RUN-250): when SetSlots returns, n1 routes every key over
+// slot-0 and slot-1; within 30 s, n3, whose slot was retired, runs nothing and holds no slot, and
+// n1 and n2 run 6 shards each; no shard ever has two Runs at once.
+func TestATRUN23RetireSlot(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		ms := memstore.New(nil)
+		g := newGroup(t)
+		t0 := time.Now()
+		var nodes []*slotNode
+		for i, id := range []string{"n1", "n2", "n3"} {
+			sleepUntil(t0.Add(time.Duration(i) * time.Second))
+			nodes = append(nodes, startSlotNode(t, ms, g, id, 3, wideOrders))
+		}
+		n1, n3 := nodes[0], nodes[2]
+		sleepUntil(t0.Add(10 * time.Second))
+		synctest.Wait()
+		for s, sn := range nodes {
+			if got, want := running(sn.runs), slotShards(12, 3)[s]; !slices.Equal(got, want) || sn.heldSlot() != s {
+				t.Fatalf("%s holds slot %d and runs %v, want slot %d and %v", sn.id, sn.heldSlot(), got, s, want)
+			}
+		}
+
+		t1 := time.Now()
+		if err := n1.n.SetSlots(context.Background(), 2); err != nil {
+			t.Fatalf("SetSlots(2) = %v, want nil", err)
+		}
+		if d := time.Since(t1); d != 0 {
+			t.Errorf("SetSlots(2) took %v, want 0: no call is delayed", d)
+		}
+		if v := published(t, n1.n); v.Slots != 2 {
+			t.Errorf("n1's published view has %d slots when SetSlots returns, want 2", v.Slots)
+		}
+		ids := []string{"n1", "n2"}
+		for slot, shards := range slotShards(12, 2) {
+			if len(shards) != 6 {
+				t.Errorf("slot-%d has shards %v, want 6", slot, shards)
+			}
+			for _, s := range shards {
+				m, err := n1.n.Route("orders", strconv.Itoa(s))
+				if err != nil || m.ID != ids[slot] || m.Slot != slot {
+					t.Errorf("Route(orders, %d) when SetSlots returns = %+v, %v, want %s on slot %d", s, m, err, ids[slot], slot)
+				}
+			}
+		}
+		holders := []string{holderOf("n1"), holderOf("n2")}
+		wantStoredSlots(t, ms, holders)
+
+		sleepUntil(t1.Add(30 * time.Second))
+		synctest.Wait()
+		for s, sn := range nodes[:2] {
+			if got, want := running(sn.runs), slotShards(12, 2)[s]; !slices.Equal(got, want) || len(got) != 6 || sn.heldSlot() != s {
+				t.Errorf("%s holds slot %d and runs %v 30 s after SetSlots, want slot %d and its 6 shards %v",
+					sn.id, sn.heldSlot(), got, s, want)
+			}
+		}
+		if got := running(n3.runs); len(got) != 0 {
+			t.Errorf("n3 runs %v 30 s after SetSlots, want nothing", got)
+		}
+		if s := n3.heldSlot(); s != -1 {
+			t.Errorf("n3's machine holds slot %d 30 s after SetSlots, want none", s)
+		}
+		if rs := n3.fs.Calls("ReleaseSlot"); len(rs) != 1 || rs[0].Args[1] != 2 || rs[0].Err != nil {
+			t.Errorf("n3's ReleaseSlot calls = %v, want slot 2 released once", rs)
+		}
+		for _, sn := range nodes {
+			if got, want := slotted(published(t, sn.n)), []string{"n1:0", "n2:1"}; !slices.Equal(got, want) {
+				t.Errorf("%s's view: members with a slot = %v, want %v", sn.id, got, want)
+			}
+		}
+		wantStoredSlots(t, ms, holders)
+		// Each shard of slot 2 moved once, to the member of its slot over two slots; no other
+		// shard moved.
+		for shard, ran := range runHistory(t, nodes...) {
+			want := []string{nodes[slotIndex(shard, 12, 3)].id}
+			if to := ids[slotIndex(shard, 12, 2)]; to != want[0] {
+				want = append(want, to)
+			}
+			if !slices.Equal(ran, want) {
+				t.Errorf("orders/%d ran on %v, want %v", shard, ran, want)
+			}
+		}
+		for _, sn := range nodes {
+			closeNode(t, sn.n)
+		}
+		check()
+	})
+}
+
+// TestATRUN24SetSlotsErrors checks SetSlots's checks in order (RUN-240): ErrClosed, ErrDraining,
+// a negative count, a store that is not a SlotStore; then the errors of the write and of the read
+// after it, and of a ctx that ends first. A SetSlots that succeeds returns once the node steps
+// and routes by the new count.
+func TestATRUN24SetSlotsErrors(t *testing.T) {
+	ctx := context.Background()
+	wantText := func(t *testing.T, what string, err error, want string) {
+		t.Helper()
+		if err == nil || err.Error() != want {
+			t.Errorf("%s = %v, want %q", what, err, want)
+		}
+	}
+
+	t.Run("no SlotStore", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			r := newShardRig(t)
+			cfg := r.config()
+			cfg.Store = r.fs.StoreOnly()
+			n := start(t, ctx, cfg)
+			solo := start(t, ctx, tenure.Config{
+				Self: tenure.Member{ID: "n2", Addr: "a2"}, Membership: r.g.Absent("n2"), Rand: countingRand(),
+			})
+			wantText(t, "SetSlots(-1)", n.SetSlots(ctx, -1), "tenure: SetSlots: negative count -1")
+			const noSlots = "tenure: SetSlots: store does not implement SlotStore"
+			wantText(t, "SetSlots(2) over a plain Store", n.SetSlots(ctx, 2), noSlots)
+			wantText(t, "SetSlots(2) without a Store", solo.SetSlots(ctx, 2), noSlots)
+			wantText(t, "SetSlots(-3) without a Store", solo.SetSlots(ctx, -3), "tenure: SetSlots: negative count -3")
+			closeNode(t, n)
+			closeNode(t, solo)
+			check()
+		})
+	})
+
+	t.Run("store errors", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			r := newShardRig(t)
+			n := start(t, ctx, r.slotConfig(1))
+			synctest.Wait()
+			boom := errors.New("boom")
+
+			r.fs.Fail("SetSlots", boom)
+			wantErrText(t, "SetSlots(2) with a failing write", n.SetSlots(ctx, 2), "tenure: SetSlots: boom", boom)
+			wantSlots(t, r, 1, []string{holder01})
+			r.fs.Fail("SetSlots", nil)
+
+			r.fs.Fail("Slots", boom)
+			at := time.Now()
+			wantErrText(t, "SetSlots(2) with a failing read", n.SetSlots(ctx, 2), "tenure: SetSlots: read slots: boom", boom)
+			ss, sl := r.fs.Calls("SetSlots"), r.fs.Calls("Slots")
+			if last := sl[len(sl)-1]; !last.Start.Equal(at) || last.Seq < ss[len(ss)-1].EndSeq {
+				t.Errorf("last Slots call %v at T+%v, want one at once after %v", last, last.Start.Sub(at), ss[len(ss)-1])
+			}
+			wantSlots(t, r, 2, []string{holder01, ""}) // written before the read failed
+			if v := published(t, n); v.Slots != 1 {
+				t.Errorf("published view has %d slots after the failed read, want 1", v.Slots)
+			}
+			r.fs.Fail("Slots", nil)
+
+			at = time.Now()
+			if err := n.SetSlots(ctx, 3); err != nil || time.Since(at) != 0 {
+				t.Errorf("SetSlots(3) = %v after %v, want nil at once", err, time.Since(at))
+			}
+			if v := published(t, n); v.Slots != 3 {
+				t.Errorf("published view has %d slots when SetSlots(3) returns, want 3", v.Slots)
+			}
+			wantSlotRoute(t, n, slotShards(8, 3)[0][0], "n1", 0)
+			wantNoMember(t, n, slotShards(8, 3)[2][0], "slot-2 is vacant")
+
+			release := r.fs.Block("Slots")
+			cctx, cancel := context.WithTimeout(ctx, time.Second)
+			at = time.Now()
+			err := n.SetSlots(cctx, 2)
+			cancel()
+			wantErrText(t, "SetSlots(2) with a held read", err, "tenure: SetSlots: context deadline exceeded", context.DeadlineExceeded)
+			if d := time.Since(at); d != time.Second {
+				t.Errorf("SetSlots(2) with a held read returned after %v, want 1s", d)
+			}
+			release()
+			wantSlots(t, r, 2, []string{holder01, ""})
+			closeNode(t, n)
+			check()
+		})
+	})
+
+	t.Run("draining and closed", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			r := newShardRig(t)
+			n := start(t, ctx, r.slotConfig(1))
+			synctest.Wait()
+			if err := n.Drain(ctx); err != nil {
+				t.Fatalf("Drain() = %v, want nil", err)
+			}
+			for _, count := range []int{2, -1} {
+				if err := n.SetSlots(ctx, count); err != tenure.ErrDraining {
+					t.Errorf("SetSlots(%d) after Drain = %v, want ErrDraining", count, err)
+				}
+			}
+			closeNode(t, n)
+			for _, count := range []int{2, -1} {
+				if err := n.SetSlots(ctx, count); err != tenure.ErrClosed {
+					t.Errorf("SetSlots(%d) after Close = %v, want ErrClosed", count, err)
+				}
+			}
+			if ss := r.fs.Calls("SetSlots"); len(ss) != 1 {
+				t.Errorf("SetSlots calls = %v, want only Start's seeding", ss)
+			}
+			wantSlots(t, r, 1, []string{""})
+			check()
+		})
+	})
+
+	t.Run("closed while waiting", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			r := newShardRig(t)
+			n := start(t, ctx, r.slotConfig(1))
+			synctest.Wait()
+			release := r.fs.Block("Slots")
+			set := make(chan error, 1)
+			go func() { set <- n.SetSlots(ctx, 2) }()
+			synctest.Wait()
+			closed := make(chan error, 1)
+			go func() { closed <- n.Close(ctx) }()
+			synctest.Wait()
+			select {
+			case err := <-set:
+				if err != tenure.ErrClosed {
+					t.Errorf("SetSlots(2) waiting at Close = %v, want ErrClosed", err)
+				}
+			default:
+				t.Error("SetSlots(2) waiting at Close has not returned once Close stopped the node")
+			}
+			release() // Close waits for the refresher's read, which ignores its ctx
+			if err := <-closed; err != nil {
+				t.Errorf("Close() = %v, want nil", err)
+			}
+			wantSlots(t, r, 2, []string{"", ""})
+			check()
+		})
+	})
+}
+
+// TestATRUN25Rollout replaces both pods of a group with two slots, one at a time, as a rolling
+// deploy does: the new pod starts as a standby and runs nothing, the old pod drains, and the
+// standby claims the freed slot and runs the same shards. Each shard moves once per pod
+// replaced, from the old pod to its replacement, and never has two Runs at once.
+func TestATRUN25Rollout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		ms := memstore.New(nil)
+		g := newGroup(t)
+		t0 := time.Now()
+		n1 := startSlotNode(t, ms, g, "n1", 2, orders)
+		sleepUntil(t0.Add(time.Second))
+		n2 := startSlotNode(t, ms, g, "n2", 2, orders)
+		sleepUntil(t0.Add(5 * time.Second))
+		synctest.Wait()
+		for s, sn := range []*slotNode{n1, n2} {
+			if got, want := running(sn.runs), shardsOf(2, s); !slices.Equal(got, want) || sn.heldSlot() != s {
+				t.Fatalf("%s holds slot %d and runs %v, want slot %d and %v", sn.id, sn.heldSlot(), got, s, want)
+			}
+		}
+
+		// replace starts id as the replacement of old, which holds slot, and drains old once the
+		// new pod waits as a standby.
+		replace := func(old *slotNode, id string, slot int) *slotNode {
+			t.Helper()
+			sn := startSlotNode(t, ms, g, id, 2, orders)
+			time.Sleep(5 * time.Second)
+			synctest.Wait()
+			if got := running(sn.runs); len(got) != 0 || sn.heldSlot() != -1 {
+				t.Errorf("standby %s holds slot %d and runs %v, want none", id, sn.heldSlot(), got)
+			}
+			for _, c := range sn.claims() {
+				if c != tenure.ErrNoSlot.Error() {
+					t.Errorf("standby %s's claims %v, want only ErrNoSlot", id, sn.claims())
+					break
+				}
+			}
+			closeNode(t, old.n)
+			time.Sleep(10 * time.Second)
+			synctest.Wait()
+			if got, want := running(sn.runs), shardsOf(2, slot); !slices.Equal(got, want) || sn.heldSlot() != slot {
+				t.Errorf("%s holds slot %d and runs %v, want slot %d and %v", id, sn.heldSlot(), got, slot, want)
+			}
+			return sn
+		}
+		n3 := replace(n1, "n3", 0)
+		if got, want := running(n2.runs), shardsOf(2, 1); !slices.Equal(got, want) {
+			t.Errorf("n2 runs %v once n1 is replaced, want %v", got, want)
+		}
+		for _, s := range shardsOf(2, 0) {
+			wantSlotRoute(t, n2.n, s, "n3", 0)
+		}
+		n4 := replace(n2, "n4", 1)
+		for _, n := range []*tenure.Node{n3.n, n4.n} {
+			for _, s := range allShards {
+				wantSlotRoute(t, n, s, []string{"n3", "n4"}[slotOwner(2)[s]], slotOwner(2)[s])
+			}
+		}
+
+		for shard, ran := range runHistory(t, n1, n2, n3, n4) {
+			want := [][]string{{"n1", "n3"}, {"n2", "n4"}}[slotOwner(2)[shard]]
+			if !slices.Equal(ran, want) {
+				t.Errorf("orders/%d ran on %v, want %v: one move per pod replaced", shard, ran, want)
+			}
+		}
+		closeNode(t, n3.n)
+		closeNode(t, n4.n)
+		check()
+	})
+}
+
+// TestATRUN26CrashedSlotHolder crashes n1, the holder of slot 0 of two, with standby n3 waiting:
+// n1 neither releases its shards nor closes its session, so its slot stays taken until the store
+// expires the session, LeaseDuration after its last renewal. n3 claims the slot at its first claim
+// after that and runs slot 0's shards; n2's shards never move, and no shard has two Runs at once.
+func TestATRUN26CrashedSlotHolder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		ms := memstore.New(nil)
+		g := newGroup(t)
+		t0 := time.Now()
+		var nodes []*slotNode
+		for i, id := range []string{"n1", "n2", "n3"} {
+			sleepUntil(t0.Add(time.Duration(i) * time.Second))
+			nodes = append(nodes, startSlotNode(t, ms, g, id, 2, orders))
+		}
+		n1, n2, n3 := nodes[0], nodes[1], nodes[2]
+		sleepUntil(t0.Add(5 * time.Second))
+		synctest.Wait()
+		for s, sn := range nodes {
+			want := []int(nil)
+			if s < 2 {
+				want = shardsOf(2, s)
+			} else {
+				s = -1
+			}
+			if got := running(sn.runs); !slices.Equal(got, want) || sn.heldSlot() != s {
+				t.Fatalf("%s holds slot %d and runs %v, want slot %d and %v", sn.id, sn.heldSlot(), got, s, want)
+			}
+		}
+
+		// The crash: a Close whose ctx is done already, which neither drains nor closes the
+		// session.
+		dead, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := n1.n.Close(dead); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Close(canceled ctx) = %v, want context.Canceled", err)
+		}
+		if cs := n1.fs.Calls("Release", "ReleaseSlot", "CloseSession"); len(cs) != 0 {
+			t.Fatalf("n1's calls %v, want none: it crashed", cs)
+		}
+		ka := n1.fs.Calls("KeepAlive")
+		expiry := ka[len(ka)-1].End.Add(core.DefaultTiming.LeaseDuration)
+
+		sleepUntil(expiry.Add(-time.Millisecond))
+		synctest.Wait()
+		if got := running(n3.runs); len(got) != 0 || n3.heldSlot() != -1 {
+			t.Errorf("n3 holds slot %d and runs %v before n1's session expired, want none", n3.heldSlot(), got)
+		}
+		wantStoredSlots(t, ms, []string{holder01, holderOf("n2")})
+
+		sleepUntil(expiry.Add(10 * time.Second))
+		synctest.Wait()
+		cs := n3.fs.Calls("ClaimSlot")
+		won := slices.IndexFunc(cs, func(c call) bool { return c.Err == nil })
+		switch {
+		case won < 0:
+			t.Fatalf("n3's claims %v, want slot 0 after n1's session expired", n3.claims())
+		case resultAt[int](cs[won].Result, 0) != 0 || cs[won].Start.Before(expiry) ||
+			!cs[won].Start.Before(expiry.Add(core.DefaultTiming.RetryPeriod)):
+			t.Errorf("n3's winning claim %v at expiry%+v, want slot 0 within RetryPeriod after n1's session expired",
+				cs[won], cs[won].Start.Sub(expiry))
+		}
+		for _, c := range cs[:max(won, 0)] {
+			if !errors.Is(c.Err, tenure.ErrNoSlot) {
+				t.Errorf("n3's %v before the winning claim, want ErrNoSlot", c)
+			}
+		}
+		if got, want := running(n3.runs), shardsOf(2, 0); !slices.Equal(got, want) || n3.heldSlot() != 0 {
+			t.Errorf("n3 holds slot %d and runs %v, want slot 0 and %v", n3.heldSlot(), got, want)
+		}
+		for _, a := range n3.fs.Calls("Acquire") {
+			if a.Start.Before(cs[won].End) {
+				t.Errorf("n3's %v before its claim of slot 0 returned", a)
+			}
+		}
+		for _, s := range allShards {
+			wantSlotRoute(t, n2.n, s, []string{"n3", "n2"}[slotOwner(2)[s]], slotOwner(2)[s])
+		}
+		wantStoredSlots(t, ms, []string{holderOf("n3"), holderOf("n2")})
+		for shard, ran := range runHistory(t, nodes...) {
+			want := [][]string{{"n1", "n3"}, {"n2"}}[slotOwner(2)[shard]]
+			if !slices.Equal(ran, want) {
+				t.Errorf("orders/%d ran on %v, want %v", shard, ran, want)
+			}
+		}
+		closeNode(t, n2.n)
+		closeNode(t, n3.n)
 		check()
 	})
 }

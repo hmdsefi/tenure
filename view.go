@@ -471,3 +471,64 @@ func (r *refresher) serve(upTo uint64, res slotsRead) (more bool) {
 	r.waiters = kept
 	return r.asked > r.served
 }
+
+// awaitSlots is SetSlots's refresh-and-wait (RUN-240): it asks the refresher for a read that
+// starts after the call and waits for it, and then waits until the loop has stepped a merged view
+// that holds the data read: one whose Version is at least that of the view the merger posted for
+// it, or one whose count is count. Later views carry higher Versions, so a view that the loop
+// skips, replaced in the inbox or dropped as stale, is made up for by the next. It returns the
+// read's error, ctx's error, or ErrClosed once the internal context is done.
+func (n *Node) awaitSlots(ctx context.Context, count int) error {
+	version, err := n.refresh.refreshWait(ctx)
+	if err != nil {
+		return err
+	}
+	return n.stepped.await(ctx, n.ctx.Done(), func(v core.View) bool {
+		return v.Version >= version || v.Slots == count
+	})
+}
+
+// steppedViews holds the latest merged view the loop has stepped and carried out, with its
+// routing snapshot published, and lets callers wait for a later one. It is safe for concurrent
+// use.
+type steppedViews struct {
+	mu      sync.Mutex
+	latest  core.View
+	any     bool          // a view has been stepped
+	changed chan struct{} // closed when the next view is stepped; nil while nobody waits
+}
+
+// record makes v, which the loop has just stepped, the latest view and wakes every waiter.
+func (s *steppedViews) record(v core.View) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.latest, s.any = v, true
+	if s.changed != nil {
+		close(s.changed)
+		s.changed = nil
+	}
+}
+
+// await waits until the latest stepped view satisfies ok. It returns ctx's error when ctx ends
+// first, and ErrClosed when stop is closed first.
+func (s *steppedViews) await(ctx context.Context, stop <-chan struct{}, ok func(core.View) bool) error {
+	for {
+		s.mu.Lock()
+		if s.any && ok(s.latest) {
+			s.mu.Unlock()
+			return nil
+		}
+		if s.changed == nil {
+			s.changed = make(chan struct{})
+		}
+		changed := s.changed
+		s.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-stop:
+			return ErrClosed
+		}
+	}
+}

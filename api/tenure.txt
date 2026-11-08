@@ -184,9 +184,9 @@ func Start(ctx context.Context, cfg Config) (*Node, error)
 func (n *Node) Close(ctx context.Context) error
     Close drains the node as Drain does, leaves the group, and stops every
     goroutine of the node. It returns nil once all of that is done. Later calls
-    return ErrClosed, and so do Route, Local, Drain and the lookups of every
-    Resolver the node returned; a Shard the node handed to Run keeps returning
-    its stop error.
+    return ErrClosed, and so do Route, Local, Drain, SetSlots and the lookups
+    of every Resolver the node returned; a Shard the node handed to Run keeps
+    returning its stop error.
 
     When ctx ends before the drain completes, or is done already when Close is
     called, Close neither closes the member's session nor leaves the group:
@@ -258,6 +258,25 @@ func (n *Node) Route(space, key string) (Member, error)
     A vacant slot gives "tenure: no members: orders/3: slot-1 is vacant", and a
     holder whose member is not in the view gives "tenure: no members: orders/3:
     n4 is not in the view".
+
+func (n *Node) SetSlots(ctx context.Context, count int) error
+    SetSlots sets the slot count of the group, which the Store keeps, to count,
+    and returns once this node follows it: once the node has read the slots
+    again after the write and steps, and routes by, a view that holds what it
+    read. Raising the count adds vacant slots, which standby members claim.
+    Lowering it retires the highest slots: their holders hand their shards over
+    to the members of the remaining slots and become standbys. SetSlots does not
+    wait for that hand-over, and it does not need this member to hold a slot.
+    A count of 0 turns slots off.
+
+    SetSlots returns ErrClosed once Close has been called, and ErrDraining
+    once Drain has been called. A negative count fails with "tenure: SetSlots:
+    negative count -1", and a Store that does not implement SlotStore with
+    "tenure: SetSlots: store does not implement SlotStore". Errors of the
+    store's SetSlots, and of the read of the slots after it, start with "tenure:
+    SetSlots: " and wrap the store's error. When ctx ends first, SetSlots
+    returns an error that wraps ctx's error; the count may have been written by
+    then.
 
 type NotOwnerError struct {
 	// Space and Shard name the shard.
