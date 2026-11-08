@@ -11,4 +11,8 @@ var (
 
 	// ErrSessionLost means the holder's session has ended for good.
 	ErrSessionLost = errors.New("tenure: session lost")
+
+	// ErrClosed means the value has been closed, for example a Membership after Leave, and
+	// takes no further calls.
+	ErrClosed = errors.New("tenure: closed")
 )
