@@ -24,6 +24,9 @@ import (
 //     of Start's cleanup, for each failed Holdings call of a resync (op "Holdings" and the space),
 //     and for each failed WatchHolders call or closed store watch (op "WatchHolders", with
 //     errStoreWatchEnded for a closed channel);
+//   - newIncarnation, when the loop starts a new incarnation after a lost session (RUN-180), with
+//     the previous holder: the node's holder is already the new one, and the new incarnation has
+//     made no call and taken no step yet;
 //   - runReturned, for each return of a Run that its supervisor restarts (RUN-330): the Run's
 //     Shard and error, the count of consecutive returns and the backoff before the restart;
 //   - slotCountMismatch, in Start, when the store's slot count is positive and differs from a
@@ -39,9 +42,10 @@ import (
 //
 // start, startFailed, slotCountMismatch, closed, membershipFailed("Leave") and the callFailed of
 // Start's cleanup are called from the goroutine of Start or Close, slotsFailed from the slot
-// refresher's goroutine, draining from the first Drain or Close while it holds n.mu, step and a
-// store's view from the loop goroutine, the callFailed calls of Holdings and the store watch from
-// the resync and store-watch goroutines, the other callFailed calls from the executor's lanes, runReturned from the shard's supervisor goroutine, and the rest from the
+// refresher's goroutine, draining from the first Drain or Close while it holds n.mu, step,
+// newIncarnation and a store's view from the loop goroutine, the callFailed calls of Holdings and
+// the store watch from the resync and store-watch goroutines, the other callFailed calls from the
+// executor's lanes, runReturned from the shard's supervisor goroutine, and the rest from the
 // node's watcher and drain goroutines. No call may block, or call back into the node.
 type observer interface {
 	start(holder string)
@@ -49,6 +53,7 @@ type observer interface {
 	view(v core.View)
 	step(rec stepRecord)
 	callFailed(r callResult)
+	newIncarnation(prev string)
 	runReturned(sh *Shard, err error, count int, backoff time.Duration)
 	slotCountMismatch(configured, stored int)
 	slotsFailed(err error)
@@ -68,6 +73,7 @@ func (nopObserver) startFailed(context.Context, error)            {}
 func (nopObserver) view(core.View)                                {}
 func (nopObserver) step(stepRecord)                               {}
 func (nopObserver) callFailed(callResult)                         {}
+func (nopObserver) newIncarnation(string)                         {}
 func (nopObserver) runReturned(*Shard, error, int, time.Duration) {}
 func (nopObserver) slotCountMismatch(int, int)                    {}
 func (nopObserver) slotsFailed(error)                             {}
