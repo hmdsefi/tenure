@@ -278,7 +278,14 @@ func (e *executor) run(l *lane) {
 		if !ok {
 			return
 		}
-		e.exec(l, c)
+		// failed runs after exec has given the permit back, so a slow callback holds none.
+		if r, ok := e.exec(l, c); ok && r.err != nil {
+			switch c.act.(type) {
+			case core.Acquire, core.KeepAlive:
+			default:
+				e.failed(r)
+			}
+		}
 	}
 }
 
@@ -300,13 +307,14 @@ func (e *executor) next(l *lane) (execCall, bool) {
 }
 
 // exec runs c on its lane: it takes a permit unless c is a session call, runs the store call
-// with a RetryPeriod timeout, and delivers the result.
-func (e *executor) exec(l *lane, c execCall) {
+// with a RetryPeriod timeout, and delivers the result. It returns the result, and false when the
+// call never went out.
+func (e *executor) exec(l *lane, c execCall) (callResult, bool) {
 	if l.key.kind != laneSession {
 		select {
 		case e.permits <- struct{}{}:
 		case <-e.ctx.Done():
-			return
+			return callResult{}, false
 		}
 		defer func() { <-e.permits }()
 	}
@@ -314,7 +322,7 @@ func (e *executor) exec(l *lane, c execCall) {
 	stale := c.gen < e.floor
 	e.mu.Unlock()
 	if stale || e.ctx.Err() != nil {
-		return
+		return callResult{}, false
 	}
 
 	ctx, cancel := context.WithTimeout(e.ctx, e.timing.RetryPeriod)
@@ -343,14 +351,7 @@ func (e *executor) exec(l *lane, c execCall) {
 		}
 	}
 	e.mu.Unlock()
-
-	if r.err != nil {
-		switch c.act.(type) {
-		case core.Acquire, core.KeepAlive:
-		default:
-			e.failed(r)
-		}
-	}
+	return r, true
 }
 
 // outcome is what a store call returned.

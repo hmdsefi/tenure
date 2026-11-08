@@ -396,6 +396,31 @@ func TestExecPermits(t *testing.T) {
 			t.Errorf("%d results, want 43", n)
 		}
 	})
+
+	// A failed call gives its permit back before failed runs for it.
+	synctest.Test(t, func(t *testing.T) {
+		h := newExecHarness(t)
+		h.st.auto = func(c *scriptCall) (scriptReply, bool) {
+			return scriptReply{err: errFlaky}, c.method == "Release"
+		}
+		hold := make(chan struct{})
+		h.holdFailed(hold)
+		for i := range execPermits {
+			h.do(core.Release{Space: "s", Shard: i, Term: 1}, true)
+		}
+		synctest.Wait() // every Release has failed, and failed is running for it
+		h.do(core.Acquire{Space: "s", Shard: 99}, true)
+		synctest.Wait()
+		open := methods(h.st.open())
+		close(hold)
+		h.holdFailed(nil)
+		if want := "Acquire(s/99)"; open != want {
+			t.Errorf("open calls %q while failed runs for %d Releases, want %q", open, execPermits, want)
+		}
+		if n := len(h.failures()); n != execPermits {
+			t.Errorf("failed called %d times, want %d", n, execPermits)
+		}
+	})
 }
 
 func TestExecKeepAliveQueue(t *testing.T) {
