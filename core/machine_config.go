@@ -40,7 +40,8 @@ type MachineConfig struct {
 	// It is non-empty and contains neither '/' nor a zero byte.
 	Member string
 
-	// Spaces lists the spaces the member takes part in, at least one.
+	// Spaces lists the spaces the member takes part in. It may be empty: the machine then runs
+	// only the session and the slot.
 	Spaces []SpaceSpec
 
 	// Timing holds the session timings. The zero value means DefaultTiming.
@@ -48,10 +49,10 @@ type MachineConfig struct {
 }
 
 // Validate reports whether c can configure a Machine: Holder is non-empty, Member is non-empty
-// and contains neither '/' nor a zero byte, there is at least one space, every space has a
-// non-empty, distinct Name and at least one shard, and Timing is valid. It checks in that order
-// and returns the first failure, which wraps ErrInvalidMachineConfig. A failure of Timing is
-// the error of Timing.Validate, unchanged, so it wraps ErrInvalidTiming instead.
+// and contains neither '/' nor a zero byte, every space has a non-empty, distinct Name and at
+// least one shard, and Timing is valid. It checks in that order and returns the first failure,
+// which wraps ErrInvalidMachineConfig. A failure of Timing is the error of Timing.Validate,
+// unchanged, so it wraps ErrInvalidTiming instead. A config with no spaces is valid.
 func (c MachineConfig) Validate() error {
 	switch {
 	case c.Holder == "":
@@ -62,8 +63,6 @@ func (c MachineConfig) Validate() error {
 		return fmt.Errorf("%w: Member %q contains '/'", ErrInvalidMachineConfig, c.Member)
 	case strings.IndexByte(c.Member, 0) >= 0:
 		return fmt.Errorf("%w: Member %q contains a zero byte", ErrInvalidMachineConfig, c.Member)
-	case len(c.Spaces) == 0:
-		return fmt.Errorf("%w: no spaces", ErrInvalidMachineConfig)
 	}
 	seen := make(map[string]bool, len(c.Spaces))
 	for i, s := range c.Spaces {

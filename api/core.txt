@@ -315,7 +315,8 @@ type MachineConfig struct {
 	// It is non-empty and contains neither '/' nor a zero byte.
 	Member string
 
-	// Spaces lists the spaces the member takes part in, at least one.
+	// Spaces lists the spaces the member takes part in. It may be empty: the machine then runs
+	// only the session and the slot.
 	Spaces []SpaceSpec
 
 	// Timing holds the session timings. The zero value means DefaultTiming.
@@ -327,11 +328,12 @@ type MachineConfig struct {
 
 func (c MachineConfig) Validate() error
     Validate reports whether c can configure a Machine: Holder is non-empty,
-    Member is non-empty and contains neither '/' nor a zero byte, there is at
-    least one space, every space has a non-empty, distinct Name and at least one
-    shard, and Timing is valid. It checks in that order and returns the first
-    failure, which wraps ErrInvalidMachineConfig. A failure of Timing is the
-    error of Timing.Validate, unchanged, so it wraps ErrInvalidTiming instead.
+    Member is non-empty and contains neither '/' nor a zero byte,
+    every space has a non-empty, distinct Name and at least one shard,
+    and Timing is valid. It checks in that order and returns the first failure,
+    which wraps ErrInvalidMachineConfig. A failure of Timing is the error of
+    Timing.Validate, unchanged, so it wraps ErrInvalidTiming instead. A config
+    with no spaces is valid.
 
 type Member struct {
 	// ID identifies the member across restarts, for example its pod name. It is non-empty
