@@ -503,6 +503,47 @@ func TestATRUN75ConcurrentDrain(t *testing.T) {
 		}
 		check()
 	})
+
+	// With shards, the shared drain stops each run once with "…: draining" and releases each
+	// shard once, before the session is closed once.
+	t.Run("shards", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			r := newShardRig(t)
+			n := start(t, context.Background(), r.config())
+			synctest.Wait()
+			release := r.sm.Block("SetDraining")
+			errs := make(chan error, 2)
+			for range 2 {
+				go func() { errs <- n.Drain(context.Background()) }()
+			}
+			synctest.Wait()
+			if len(errs) != 0 {
+				t.Fatal("Drain returned while SetDraining was blocked")
+			}
+			release()
+			for range 2 {
+				if err := <-errs; err != nil {
+					t.Errorf("Drain() = %v, want nil", err)
+				}
+			}
+			for _, id := range allShards {
+				runs := r.runs.Of("orders", id)
+				rel := shardCalls(r.fs.Calls("Release"), id)
+				if len(runs) != 1 || runs[0].Cause == nil || runs[0].Cause.Error() != stopText(runs[0].Shard, "draining") || len(rel) != 1 {
+					t.Errorf("orders/%d: runs %v and Release calls %v, want one each, stopped for draining", id, runs, rel)
+				}
+			}
+			if calls := r.sm.Calls("SetDraining"); len(calls) != 1 {
+				t.Errorf("SetDraining calls = %v, want one", calls)
+			}
+			if calls := r.fs.Calls("CloseSession"); len(calls) != 1 {
+				t.Errorf("CloseSession calls = %v, want one", calls)
+			}
+			closeNode(t, n)
+			check()
+		})
+	})
 }
 
 // TestDrainRetriesSetDraining checks that a failed SetDraining is tried again every RetryPeriod,

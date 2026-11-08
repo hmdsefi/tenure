@@ -176,9 +176,10 @@ func Start(ctx context.Context, cfg Config) (*Node, error)
     again if it opened one, leaves the group again if it joined, and leaves no
     goroutine behind.
 
-    ctx bounds Start only: Start's own calls of the membership and the store use
-    it, and the node keeps running after ctx ends, until Close. Start does not
-    yet run shards: it returns an error for a Config with Spaces.
+    ctx bounds Start only: Start's own calls of the membership and the store
+    use it, and the node keeps running after ctx ends, until Close. Start does
+    not wait for the shards of Spaces: the node acquires and runs them in the
+    background, never under ctx.
 
 func (n *Node) Close(ctx context.Context) error
     Close drains the node as Drain does, leaves the group, and stops every
@@ -188,11 +189,13 @@ func (n *Node) Close(ctx context.Context) error
     error.
 
 func (n *Node) Drain(ctx context.Context) error
-    Drain hands the member's work over: it marks the member as draining in the
-    group and, with a Store, closes the member's session, and returns nil once
-    both are done. The first call of Drain or Close starts the drain; later and
-    concurrent calls wait for the same drain. When ctx ends first, Drain returns
-    ctx's error and the drain goes on. After Close, Drain returns ErrClosed.
+    Drain hands the member's work over: it marks the member as draining in
+    the group and, with a Store, stops the Run of every shard the member owns,
+    releases each shard once its Run has returned, and closes the member's
+    session. It returns nil once all of that is done. The first call of Drain or
+    Close starts the drain; later and concurrent calls wait for the same drain.
+    When ctx ends first, Drain returns ctx's error and the drain goes on.
+    After Close, Drain returns ErrClosed.
 
 type NotOwnerError struct {
 	// Space and Shard name the shard.

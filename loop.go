@@ -4,8 +4,10 @@
 package tenure
 
 import (
+	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hmdsefi/tenure/core"
@@ -49,15 +51,19 @@ type loopInput struct {
 	in       core.Input
 	sentWall time.Time
 	err      error
+
+	// sh is the shard whose supervisor ended, for the RunStopped it posted: once the step is
+	// carried out, the loop unpublishes sh if it is still the shard's published one.
+	sh *Shard
 }
 
 // inbox holds the inputs that goroutines other than the loop hand to it: the latest merged view,
-// of which only the latest counts, and posted inputs such as Drain, stepped in post order. It is
-// safe for concurrent use.
+// of which only the latest counts, and posted inputs such as Drain and RunStopped, stepped in
+// post order. It is safe for concurrent use.
 type inbox struct {
 	mu     sync.Mutex
 	view   *core.View
-	inputs []core.Input
+	inputs []loopInput
 	ready  chan struct{} // buffer 1: a value means the inbox may hold something
 }
 
@@ -76,6 +82,16 @@ func (b *inbox) postView(v core.View) {
 
 // post adds in after the inputs waiting in b.
 func (b *inbox) post(in core.Input) {
+	b.postInput(loopInput{in: in})
+}
+
+// postStopped adds RunStopped for sh, whose supervisor has ended, after the inputs waiting in b.
+func (b *inbox) postStopped(sh *Shard) {
+	b.postInput(loopInput{in: core.RunStopped{Space: sh.Space, Shard: sh.ID, Term: sh.Term}, sh: sh})
+}
+
+// postInput adds in after the inputs waiting in b.
+func (b *inbox) postInput(in loopInput) {
 	b.mu.Lock()
 	b.inputs = append(b.inputs, in)
 	b.mu.Unlock()
@@ -92,7 +108,7 @@ func (b *inbox) notify() {
 
 // take empties b and returns the posted inputs in post order and the latest view, nil when none
 // is waiting.
-func (b *inbox) take() ([]core.Input, *core.View) {
+func (b *inbox) take() ([]loopInput, *core.View) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	ins, v := b.inputs, b.view
@@ -150,7 +166,7 @@ func (l *loop) run(first []loopInput, started chan<- struct{}) {
 		case <-n.inbox.ready:
 			ins, v := n.inbox.take()
 			for _, in := range ins {
-				l.step(loopInput{in: in})
+				l.step(in)
 			}
 			if v != nil {
 				l.step(loopInput{in: core.ViewChanged{View: *v}})
@@ -181,8 +197,8 @@ func (l *loop) tickUntil(now time.Duration) {
 }
 
 // apply steps in, whose Now is set to now, and carries the step out (RUN-100): under n.stepMu it
-// executes the actions in order, publishes a stepped view, and reports the step to the
-// observer and the hook. It then re-arms the timer and, the first time the machine is done,
+// executes the actions in order, publishes a stepped view, unpublishes the shard of a stepped
+// RunStopped that is still published, and reports the step to the observer and the hook. It then re-arms the timer and, the first time the machine is done,
 // closes n.machineDone.
 func (l *loop) apply(in loopInput, now time.Duration) {
 	n := l.n
@@ -206,6 +222,9 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 	if v, ok := in.in.(core.ViewChanged); ok {
 		n.publish(v.View)
 	}
+	if in.sh != nil {
+		n.shards[in.sh.Space].local[in.sh.ID].CompareAndSwap(in.sh, nil)
+	}
 	n.obs.step(rec)
 	if l.hook != nil {
 		l.hook(rec)
@@ -220,21 +239,106 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 }
 
 // execute carries out one action (RUN-130). Store calls go to the executor, which never blocks;
-// ExtendDeadline raises the session deadline that unfenced shards check; Wake needs nothing,
-// since the timer follows NextWake. Any other action panics.
+// ExtendDeadline raises the session deadline that unfenced shards check; StartRun and StopRun
+// start and stop a shard's supervisor; Wake needs nothing, since the timer follows NextWake. Any
+// other action panics.
 func (l *loop) execute(act core.Action) {
 	n := l.n
 	switch a := act.(type) {
-	case core.KeepAlive, core.CloseSession:
+	case core.KeepAlive, core.CloseSession, core.Acquire, core.Release:
 		n.exec.do(l.gen, n.holder, act)
 	case core.ExtendDeadline:
-		if d := int64(a.Deadline); d > n.deadline.Load() {
-			n.deadline.Store(d)
-		}
+		n.raiseDeadline(a.Deadline)
+	case core.StartRun:
+		n.startRun(a)
+	case core.StopRun:
+		n.stopRun(a)
 	case core.Wake:
 	default:
 		panic(fmt.Sprintf("tenure: unknown action %T", act))
 	}
+}
+
+// raiseDeadline sets the session deadline that unfenced shards check to d, unless it is later
+// already. Only the loop writes it.
+func (n *Node) raiseDeadline(d time.Duration) {
+	if int64(d) > n.deadline.Load() {
+		n.deadline.Store(int64(d))
+	}
+}
+
+// spaceShards is the node's table of one space's shards. The node keeps it for its whole life,
+// across machines, so that the supervisor a new machine starts for a shard waits for the one an
+// earlier machine started (RUN-300).
+type spaceShards struct {
+	space Space
+
+	// local holds each shard's published Shard, read without a lock: the loop stores the new
+	// Shard when it starts the run, and clears it once it has stepped the RunStopped of that
+	// run, unless a later run of the shard has replaced it.
+	local []atomic.Pointer[Shard]
+
+	// runs holds each shard's latest supervisor, guarded by n.stepMu.
+	runs []shardRun
+}
+
+// shardRun is the latest supervisor of one shard.
+type shardRun struct {
+	sh     *Shard                  // the Shard of its run; nil before the shard's first run
+	cancel context.CancelCauseFunc // cancels its context with a cause
+	done   chan struct{}           // closed when it has returned
+}
+
+// newShardTable returns the shard table of spaces, by name.
+func newShardTable(spaces []Space) map[string]*spaceShards {
+	t := make(map[string]*spaceShards, len(spaces))
+	for _, sp := range spaces {
+		t[sp.Name] = &spaceShards{
+			space: sp,
+			local: make([]atomic.Pointer[Shard], sp.Shards),
+			runs:  make([]shardRun, sp.Shards),
+		}
+	}
+	return t
+}
+
+// startRun carries out a StartRun (RUN-130): it raises the session deadline to the action's,
+// makes the run's Shard, publishes it, and starts its supervisor on a fresh context that StopRun
+// cancels. The supervisor first waits for the shard's previous supervisor, of this machine or of
+// an earlier one (RUN-300). It reports each return of Run to the observer, and posts the run's
+// RunStopped to the loop once it has stopped, so that the machine releases the shard only after
+// Run has returned. The caller holds n.stepMu.
+func (n *Node) startRun(a core.StartRun) {
+	n.raiseDeadline(a.Deadline)
+	sp := n.shards[a.Space]
+	sh := newShard(a.Space, a.Shard, a.Term, sp.space.Fenced, n.epoch, &n.deadline)
+	ctx, cancel := context.WithCancelCause(n.ctx)
+	prev := sp.runs[a.Shard].done
+	done := make(chan struct{})
+	sp.runs[a.Shard] = shardRun{sh: sh, cancel: cancel, done: done}
+	sp.local[a.Shard].Store(sh)
+
+	run, timing := sp.space.Run, n.cfg.Timing
+	onReturn := func(err error, count int, backoff time.Duration) {
+		n.obs.runReturned(sh, err, count, backoff)
+	}
+	n.sups.Go(func() {
+		defer close(done)
+		supervise(ctx, sh, run, prev, timing, onReturn, func() { n.inbox.postStopped(sh) })
+		cancel(nil) // ctx is done already: this only lets it go
+	})
+}
+
+// stopRun carries out a StopRun (RUN-130, RUN-320): it stops the run's Shard with the reason, and
+// only then cancels the run's context with the Shard's stop error, so that a Run that sees its
+// context done gets that error from Check as well. A StopRun for a term the shard does not run
+// changes nothing. The caller holds n.stepMu.
+func (n *Node) stopRun(a core.StopRun) {
+	r := n.shards[a.Space].runs[a.Shard]
+	if r.sh == nil || r.sh.Term != a.Term {
+		return
+	}
+	r.cancel(r.sh.stop(a.Reason.String()))
 }
 
 // rearm sets the timer for the machine's next wake, or stops it when none is armed.
