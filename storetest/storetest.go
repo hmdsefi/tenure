@@ -23,8 +23,9 @@
 //
 // Run starts every case as a parallel subtest named <Group>/<Case>, such as
 // Session/RenewalKeepsRecords. Each case calls newStore once with its own *testing.T, calls
-// Fixture.Peer once when it is set, checks the fixture and then runs against that store alone,
-// so newStore must return a store that shares no records or sessions with any other.
+// Fixture.Peer once when it is set, before any call to the store, checks the fixture and then
+// runs against that store alone, so newStore must return a store that shares no records or
+// sessions with any other.
 //
 // A fixture with Advance runs in virtual time: the cases move the store's clock only through
 // Advance and never sleep, so a store whose clock the test controls runs the suite in a moment.
@@ -36,8 +37,15 @@
 // When Peer is set, the cases act as several clients of one backend: holders with an even member
 // number call through the store Peer returned, all others through Store. In real time a peer may
 // lag behind Store: a read whose result a case checks is retried every 10ms for at most Slack
-// before the case fails. A write that the store refuses with a *tenure.HeldError,
-// tenure.ErrSessionLost or tenure.ErrNoSlot is never retried.
+// before the case fails. In virtual time the case calls Advance(0) before such a read instead, so
+// a fixture can let its clients catch up there. A write that the store refuses with a
+// *tenure.HeldError, tenure.ErrSessionLost or tenure.ErrNoSlot is never retried, so before a
+// holder acts through one client on a record written through the other, the case first reads
+// that record through the acting holder's client until it shows the write.
+//
+// The cases hold for a store that decides expiry on its own clock and for one that lets the
+// acquirer decide it: before a case lets a session expire, the holder that takes the shard over
+// has already been refused it once.
 //
 // The cases use only spaces "a", "b" and "c", shards 0 to 19, slots 0 to 7, and holders
 // "m<i>/<incarnation>" for members m1 to m20, the incarnation being 32 lowercase hex digits.
@@ -72,8 +80,8 @@ type Fixture struct {
 	Timing core.Timing
 
 	// Advance, when set, moves the store's clock forward by d, monotonic and wall time alike;
-	// the suite then runs in virtual time and never sleeps. When nil, the suite runs in real
-	// time.
+	// the suite then runs in virtual time and never sleeps. Advance(0) comes before every read
+	// a case checks and must leave the clock as it is. When nil, the suite runs in real time.
 	Advance func(d time.Duration)
 
 	// Slack is how long, in real time, a read through Peer may lag behind a write through

@@ -4,8 +4,6 @@
 package storetest_test
 
 import (
-	"bufio"
-	"bytes"
 	"errors"
 	"flag"
 	"os"
@@ -13,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // child marks a run of the test binary started by runChild. Child-only tests run the suite on
@@ -52,7 +51,12 @@ var (
 // matches, and parses its output. A log line belongs to the test named by the latest "===" line.
 func runChild(t *testing.T, pattern string) childRun {
 	t.Helper()
-	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run", pattern, "-test.v", "-test.count=1", "-child") //nolint:gosec // re-executes this test binary
+	args := []string{"-test.run", pattern, "-test.v", "-test.count=1", "-child"}
+	if deadline, ok := t.Deadline(); ok {
+		// The child times out before the parent does, so it never outlives the parent.
+		args = append(args, "-test.timeout", time.Until(deadline).String())
+	}
+	cmd := exec.CommandContext(t.Context(), os.Args[0], args...) //nolint:gosec // re-executes this test binary
 	out, err := cmd.CombinedOutput()
 	r := childRun{
 		out:     string(out),
@@ -67,9 +71,9 @@ func runChild(t *testing.T, pattern string) childRun {
 		t.Fatalf("running the child %q: %v\n%s", pattern, err, out)
 	}
 	var current string
-	sc := bufio.NewScanner(bytes.NewReader(out))
-	for sc.Scan() {
-		line := sc.Text()
+	// Split rather than scan, so that no line is too long to parse.
+	for line := range strings.Lines(string(out)) {
+		line = strings.TrimRight(line, "\r\n")
 		if m := runLine.FindStringSubmatch(line); m != nil {
 			current = m[2]
 			if m[1] == "RUN" {
