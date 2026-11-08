@@ -54,6 +54,12 @@ type Node struct {
 	deadline    atomic.Int64  // the session deadline in ns since epoch; only the loop writes it
 	machineDone chan struct{} // closed when the machine's Status first reports Done
 
+	// Holder observations (RUN-170, RUN-175): the freshness filter, which only the loop uses, the
+	// readings that the store watch and the resyncs hand to the loop, and the resync requests.
+	fresh    *freshness
+	readings *readings
+	resync   chan struct{} // buffer 1
+
 	// The shard table: each space's shards by name, kept for the node's life, across machines.
 	// sups counts the supervisor goroutines, which Close and failStart wait for after wg.
 	shards map[string]*spaceShards
@@ -146,7 +152,8 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 // with a new machine and, with a SlotStore, the slot refresher. The loop's first steps are
 // SessionRenewed with KeepAlive's SentAt and ViewChanged with the latest merged view, which holds
 // the slots read; openSession returns once both have been carried out, or when ctx ends first.
-// Every call uses ctx.
+// Every call uses ctx. With spaces it also starts the resync goroutine and, when the store is a
+// Watcher, the store watch (RUN-170).
 func (n *Node) openSession(ctx context.Context) error {
 	ss, slots := n.cfg.Store.(SlotStore)
 	var readAt time.Time
@@ -171,6 +178,9 @@ func (n *Node) openSession(ctx context.Context) error {
 		Timing: n.cfg.Timing,
 	})
 	n.exec = newExecutor(n.ctx, n.cfg.Store, n.cfg.Timing, n.epoch, n.obs.callFailed)
+	n.fresh = newFreshness(n.holder, n.cfg.Spaces, n.exec.confirmStarted)
+	n.readings = newReadings()
+	n.resync = make(chan struct{}, 1)
 	hook, _ := ctx.Value(stepHookKey{}).(func(stepRecord))
 	n.lp = newLoop(n, m, gen, hook)
 	steps := []loopInput{
@@ -184,6 +194,12 @@ func (n *Node) openSession(ctx context.Context) error {
 	n.wg.Go(func() { n.lp.run(steps, started) })
 	if slots {
 		n.wg.Go(func() { n.refresh.run(readAt) })
+	}
+	if len(n.cfg.Spaces) > 0 {
+		n.wg.Go(n.resyncHolders)
+		if w, ok := n.cfg.Store.(Watcher); ok {
+			n.wg.Go(func() { n.watchHolders(w) })
+		}
 	}
 	select {
 	case <-started:
