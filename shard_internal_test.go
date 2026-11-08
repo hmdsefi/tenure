@@ -40,9 +40,13 @@ func TestATRUN32StopError(t *testing.T) {
 	if got := sh.stop("closed"); got != err {
 		t.Errorf("third stop(closed) = %v, want the first stop's error %v", got, err)
 	}
+	reasons := []string{core.StopLost.String(), core.StopDraining.String(), core.StopExpired.String(), "closed"}
 	for i := range 1000 {
 		if got := sh.Check(); got != err {
 			t.Fatalf("Check() call %d = %v (%p), want the stop error %p", i, got, got, err)
+		}
+		if got := sh.stop(reasons[i%len(reasons)]); got != err {
+			t.Fatalf("stop call %d = %v (%p), want the first stop's error %p", i, got, got, err)
 		}
 	}
 	if sh.Valid() {
@@ -252,6 +256,85 @@ func TestSupervisorBackoff(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// TestSupervisorResetBoundary checks that only a call of at least LeaseDuration resets the count.
+func TestSupervisorResetBoundary(t *testing.T) {
+	lease := core.DefaultTiming.LeaseDuration
+	cases := []struct {
+		second time.Duration // how long the second call runs
+		want   []time.Duration
+		counts []int
+	}{
+		// 0 + 2 s backoff; the second call ends at 2 s + its length, then 4 s or 2 s of backoff.
+		{lease - time.Nanosecond, []time.Duration{0, 2 * time.Second, 2*time.Second + lease - time.Nanosecond + 4*time.Second}, []int{1, 2}},
+		{lease, []time.Duration{0, 2 * time.Second, 2*time.Second + lease + 2*time.Second}, []int{1, 1}},
+	}
+	for _, c := range cases {
+		t.Run(c.second.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				l := newSuperLog()
+				ctx, cancel := context.WithCancelCause(context.Background())
+				sh := newShard("orders", 1, 3, true, time.Time{}, nil)
+				run := func(ctx context.Context, _ *Shard) error {
+					l.calls = append(l.calls, l.since())
+					switch len(l.calls) {
+					case 2:
+						time.Sleep(c.second)
+					case 3:
+						<-ctx.Done()
+					}
+					return nil
+				}
+				done := l.start(ctx, sh, run, nil)
+				time.Sleep(time.Minute)
+				cancel(sh.stop("moved"))
+				<-done
+				if !slices.Equal(l.calls, c.want) {
+					t.Errorf("calls at %v, want %v", l.calls, c.want)
+				}
+				if !slices.Equal(l.counts, c.counts) {
+					t.Errorf("onReturn counts %v, want %v", l.counts, c.counts)
+				}
+			})
+		})
+	}
+}
+
+// TestStopConcurrent checks that concurrent stops agree on the first one's error.
+func TestStopConcurrent(t *testing.T) {
+	var deadline atomic.Int64
+	deadline.Store(int64(time.Hour))
+	sh := newShard("orders", 3, 42, false, time.Now(), &deadline)
+	reasons := []string{"moved", "lost", "draining", "expired", "closed"}
+	errs := make([]error, 50)
+	checks := make([]error, 50)
+	start := make(chan struct{})
+	done := make(chan struct{})
+	for i := range errs {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			<-start
+			checks[i] = sh.Check()
+			errs[i] = sh.stop(reasons[i%len(reasons)])
+		}()
+	}
+	close(start)
+	for range errs {
+		<-done
+	}
+	first := sh.Check()
+	if first == nil {
+		t.Fatal("Check() after the stops = nil, want the stop error")
+	}
+	for i, err := range errs {
+		if err != first {
+			t.Errorf("stop %d = %v, want the stored error %v", i, err, first)
+		}
+		if checks[i] != nil && checks[i] != first {
+			t.Errorf("Check() during the stops = %v, want nil or the stored error %v", checks[i], first)
+		}
 	}
 }
 
