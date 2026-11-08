@@ -512,3 +512,69 @@ func TestRouteWhileLoopSteps(t *testing.T) {
 		check()
 	})
 }
+
+// TestRouteLocalAllocs checks that Route and Local allocate nothing when they succeed: a key
+// routed to a member, and the key of a shard this member serves.
+func TestRouteLocalAllocs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		r := newShardRig(t)
+		n := start(t, context.Background(), r.config())
+		synctest.Wait()
+		key := keyOf(3)
+		var err error
+		if got := testing.AllocsPerRun(100, func() { _, err = n.Route("orders", key) }); got != 0 || err != nil {
+			t.Errorf("Route(orders, %q) allocates %v times, error %v, want 0 and nil", key, got, err)
+		}
+		if got := testing.AllocsPerRun(100, func() { _, err = n.Local("orders", key) }); got != 0 || err != nil {
+			t.Errorf("Local(orders, %q) allocates %v times, error %v, want 0 and nil", key, got, err)
+		}
+		closeNode(t, n)
+		check()
+	})
+}
+
+// TestShardOfPanics checks that a ShardOf that panics fails only its caller: the panic reaches the
+// goroutine that called Route or Local, and the node goes on routing keys and closes.
+func TestShardOfPanics(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		runs := &runLog{}
+		bench := tenure.Space{Name: "bench", Shards: 4, Run: runs.Run, ShardOf: func(key string) int {
+			if key == "boom" {
+				panic("boom")
+			}
+			s, _ := strconv.Atoi(key)
+			return s
+		}}
+		n := start(t, context.Background(), nodeConfig("n1", newGroup(t).Absent("n1"), newRecStore(memstore.New(nil)), bench))
+		synctest.Wait()
+
+		calls := []struct {
+			name string
+			f    func()
+		}{
+			{"Route", func() { _, _ = n.Route("bench", "boom") }},
+			{"Local", func() { _, _ = n.Local("bench", "boom") }},
+		}
+		for _, c := range calls {
+			func() {
+				defer func() {
+					if p := recover(); p != "boom" {
+						t.Errorf("%s(bench, boom) panics with %v, want boom", c.name, p)
+					}
+				}()
+				c.f()
+			}()
+		}
+		for s := range 4 {
+			key := strconv.Itoa(s)
+			wantRoute(t, n, "bench", key, "n1")
+			if sh, err := n.Local("bench", key); err != nil || sh.ID != s {
+				t.Errorf("Local(bench, %q) = %v, %v after the panics, want bench/%d", key, sh, err, s)
+			}
+		}
+		closeNode(t, n)
+		check()
+	})
+}

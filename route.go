@@ -12,7 +12,7 @@ import (
 )
 
 // routes is the routing snapshot that Route and Local read (RUN-400): an immutable value that the
-// node replaces as a whole through n.routes, so a reader sees one view and the assignments
+// node replaces as a whole through n.snap, so a reader sees one view and the assignments
 // computed from it, and never waits for the loop.
 type routes struct {
 	// view is the published merged view the assignments come from, the pointer n.view held when
@@ -34,7 +34,8 @@ type routes struct {
 	heldKey string
 	self    string
 
-	// closed reports that Close has returned: Route and Local return ErrClosed.
+	// closed reports that Close has stopped every goroutine of the node, right before it
+	// returns: Route and Local return ErrClosed.
 	closed bool
 }
 

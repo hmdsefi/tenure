@@ -416,8 +416,9 @@ type Space struct {
 
 	// ShardOf maps a key to its shard for Node.Route and Node.Local. It must return a shard
 	// from 0 to Shards minus 1, the same one for the same key on every member, and be safe for
-	// concurrent use; Route and Local fail for a key it maps outside. nil means
-	// core.KeyShard(key, Shards).
+	// concurrent use; Route and Local fail for a key it maps outside. Route and Local call it
+	// on their caller's goroutine, so a panic in it reaches that caller and leaves the node
+	// running. nil means core.KeyShard(key, Shards).
 	ShardOf func(key string) int
 }
     Space is a set of shards that the members of a group divide among
