@@ -355,7 +355,9 @@ func TestSupervisorStopDuringBackoff(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		l := newSuperLog()
 		ctx, cancel := context.WithCancelCause(context.Background())
-		sh := newShard("orders", 2, 5, false, l.t0, new(atomic.Int64))
+		var deadline atomic.Int64
+		deadline.Store(int64(time.Hour)) // owned throughout: a return before then is a restart
+		sh := newShard("orders", 2, 5, false, l.t0, &deadline)
 		run := func(context.Context, *Shard) error {
 			l.calls = append(l.calls, l.since())
 			return nil
