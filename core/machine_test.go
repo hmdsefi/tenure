@@ -1782,6 +1782,34 @@ func TestSlotVacancy(t *testing.T) {
 		runSteps(t, scenario(steps...), checks)
 	})
 
+	t.Run("a renewal that lets the loss of a draining member's slot close the session returns only CloseSession", func(t *testing.T) {
+		steps := append(slotBootS0(),
+			drained(1000, stopDrainingS0(), wakeAt(2000)),
+			runStopped(1200, 7, releaseS0(7), wakeAt(2000)),
+			released(1400, 7, releaseSlot(0), wakeAt(2000)),
+		)
+		// No renewal answers these KeepAlives, so the session is late from @10 on, and the loss that is due
+		// at @15.3 waits for the session to be live again.
+		for now := int64(2000); now < 16000; now += 2000 {
+			steps = append(steps,
+				tick(now, core.KeepAlive{}, wakeAt(now+1400)),
+				tick(now+1400, releaseSlot(0), wakeAt(now+2000)),
+			)
+		}
+		steps = append(steps,
+			tick(16000, core.KeepAlive{}, wakeAt(17400)),
+			// The renewal makes the session live, which gives the slot up, and with every shard idle the
+			// session closes in this step. That step returns only CloseSession and Wake, as any step that
+			// starts closing does, so the renewal's ExtendDeadline is not returned.
+			renewed(16100, 16000, core.CloseSession{}, wakeAt(18100)),
+		)
+		checks := stepChecks{
+			len(steps) - 1: all(slotIs(0), sessionIs(16000, core.SessionStateLate, 10000, none), nextWakeIs(17400)),
+			len(steps):     all(slotIs(-1), sessionIs(16100, core.SessionStateClosing, 26000, none)),
+		}
+		runSteps(t, scenario(steps...), checks)
+	})
+
 	// In these two, s/0 goes to slot-1 or slot-2 of three, but to slot-0 if both of those expired.
 	t.Run("after a lost session no slot expires and no held slot is lost", func(t *testing.T) {
 		c := scenario(append(slotBootS0(),
@@ -3529,8 +3557,9 @@ func TestRunStillRunningIsNeverReleased(t *testing.T) {
 // A walk may also drain, and a SessionClosed may come at any time. Once draining, for good, nothing is
 // wanted, started or acquired, and every StopRun says draining unless the run expired or was lost. No
 // CloseSession goes out while any run has not reported its end, stuck or not, nor while any shard is
-// busy, nor after a loss. While closing the machine returns only CloseSession and Wake, and once closed
-// it returns nil and its Status, clock included, never changes. The walks are the same on every run.
+// busy, nor after a loss. From the step that starts closing the machine returns only CloseSession and
+// Wake, and once closed it returns nil and its Status, clock included, never changes. The walks are the
+// same on every run.
 //
 // Half the walks, the slotted ones, have views with slots, or none, and claim answers and release
 // reports of any slot. On those the machine holds at most one slot, and takes it only from a claim answer
@@ -4032,6 +4061,8 @@ func TestNoReleaseBeforeRunStoppedOnAnyWalk(t *testing.T) {
 			}
 			if wasClosing {
 				closingSteps++
+			}
+			if wasClosing || isClosing {
 				for _, a := range got {
 					switch a.(type) {
 					case core.CloseSession, core.Wake:
