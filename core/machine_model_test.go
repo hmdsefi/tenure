@@ -43,11 +43,19 @@ import (
 //     only when its read started after the shard's latest Confirm; any other is held back until the shard
 //     is no longer degraded. A watch report's read starts at the change it reports, and a Confirm's read
 //     when the Confirm went out, which is all a driver can know of it.
-//   - O6: the driver never repeats a call of its own.
+//   - O6: the driver never repeats a call of its own, and drops a Release, ReleaseSlot, ClaimSlot or
+//     CloseSession while an identical call is out, as #51's executor does: its answer answers both. A
+//     ReleaseSlot names no term, so without the drop a repeat still out when the first answer ends a
+//     give-back could free the slot a later claim takes again.
 //   - A RunStopped follows every StopRun within [0, modelStopMax], so some runs outlive RenewDeadline and
 //     are marked stuck. Every answered claim is followed by a view, and a view comes every
 //     [0, modelViewMax] otherwise. The store's slot count is the latest view's Slots. One Drain comes with
 //     probability 3/10.
+//   - O8: the views of every second seed lag the store. A view is a read of the store, and its slot count
+//     becomes the store's when it is read, but it is stepped after a delay drawn from [0, modelViewLag],
+//     in the order of the reads. A read that started before the latest SlotClaimed or SlotReleased is
+//     discarded and read again, as #57's refresh does, so no view after a slot result shows the slot as it
+//     was before. The views of the other seeds are stepped as they are read.
 //
 // The store follows architecture §9: a session ends LeaseDuration after its last renewal, every grant
 // takes its term from core.NextTerm, a Release is a compare-and-swap on the holder and term, a claim takes
@@ -59,8 +67,7 @@ import (
 // 1/10 outside outages and always inside one; outages last [0, modelOutageMax] and come
 // [modelGoodMin, modelGoodMax] apart; AcquireFailed asks for a RetryAfter of 0, 1 s, 5 s or 20 s; an
 // Acquire the store cannot grant because this member's session has ended answers Acquired with term 0;
-// views are snapshots of the store when they are stepped, so they never lag it; and the Drain comes at a
-// reading drawn from [0, modelDrainMax].
+// a view lags by at most modelViewLag; and the Drain comes at a reading drawn from [0, modelDrainMax].
 
 // The model driver's parameters.
 const (
@@ -72,6 +79,9 @@ const (
 	modelGoodMin   = 10 * time.Second
 	modelGoodMax   = 60 * time.Second
 	modelDrainMax  = 120 * time.Second
+
+	// modelViewLag bounds how long a lagging walk's view takes from its read of the store to its step.
+	modelViewLag = 10 * time.Second
 
 	// modelSlotMax bounds the slot counts of the model's views.
 	modelSlotMax = 3
@@ -146,9 +156,11 @@ const (
 	// modelWatch delivers a record read through the O4 and O5 filters.
 	modelWatch
 
-	// modelView steps a view of the store, and modelPeriodicView does too and schedules the next.
+	// modelView reads a view of the store, and modelPeriodicView does too and schedules the next. A
+	// lagging walk steps the read later, as a modelViewRead.
 	modelView
 	modelPeriodicView
+	modelViewRead
 
 	// modelH2 is h2 acting on the records.
 	modelH2
@@ -177,6 +189,10 @@ type modelEvent struct {
 
 	// read is a modelWatch's read.
 	read recordRead
+
+	// view is a modelViewRead's view, and viewSeq the sequence number of its read.
+	view    core.View
+	viewSeq uint64
 }
 
 // modelStamp is the reading of a call the machine returned, and the term it named.
@@ -219,12 +235,21 @@ type modelDriver struct {
 	heldOK     []bool
 	watchAt    []time.Duration
 
-	// laneAt holds the reading of each lane's latest answer, by lane: see call.
+	// laneAt holds the reading of each lane's latest answer, by lane: see call. out holds the calls
+	// whose answers are not yet due that O6 drops an identical call for.
 	laneAt []time.Duration
+	out    map[core.Action]bool
 
 	slotMode    int
 	viewVersion uint64
 	outage      bool
+
+	// lagging says the walk's views lag the store: each read is stepped after a delay drawn from
+	// [0, modelViewLag], in the order of the reads. viewAt is the reading of the latest view's step, and
+	// slotSeq the sequence number of the latest step of a SlotClaimed or a SlotReleased (O8).
+	lagging bool
+	viewAt  time.Duration
+	slotSeq uint64
 
 	checks modelChecks
 	reach  *modelReach
@@ -241,7 +266,9 @@ func newModelDriver(seed uint64, reach *modelReach) *modelDriver {
 		timing:   core.MachineTiming(w.m),
 		w:        w,
 		st:       w.m.Status(),
+		out:      map[core.Action]bool{},
 		slotMode: int(seed % 3),
+		lagging:  seed%2 == 0,
 		reach:    reach,
 	}
 	for _, sp := range d.st.Spaces {
@@ -351,6 +378,8 @@ func (d *modelDriver) handle(e modelEvent) error {
 		return d.view()
 	case modelView:
 		return d.view()
+	case modelViewRead:
+		return d.stepView(e.view, e.viewSeq)
 	case modelH2:
 		d.schedule(modelEvent{at: d.now + d.within(modelH2Max), kind: modelH2})
 		d.actAsH2()
@@ -427,9 +456,13 @@ func (d *modelDriver) step(in core.Input) error {
 			d.schedule(modelEvent{at: d.now, kind: modelWatch, read: d.held[i]})
 		}
 	}
-	if _, ok := in.(core.SlotClaimed); ok {
+	switch in.(type) {
+	case core.SlotClaimed:
 		// The driver follows every answered claim with a view.
+		d.slotSeq = stepSeq
 		d.schedule(modelEvent{at: d.now, kind: modelView})
+	case core.SlotReleased:
+		d.slotSeq = stepSeq
 	}
 	return nil
 }
@@ -438,6 +471,15 @@ func (d *modelDriver) step(in core.Input) error {
 // Its answer comes due after a delay drawn from [0, modelAnswerMax], and never before an earlier call's
 // on the same lane, so that calls on one record apply in the order they went out (#51).
 func (d *modelDriver) call(a core.Action, lane int) {
+	switch a.(type) {
+	case core.Release, core.ReleaseSlot, core.ClaimSlot, core.CloseSession:
+		// O6: an identical call is out, and its answer answers this one too.
+		if d.out[a] {
+			d.reach.callsDropped++
+			return
+		}
+		d.out[a] = true
+	}
 	at := max(d.now+d.within(modelAnswerMax), d.laneAt[lane])
 	d.laneAt[lane] = at
 	d.schedule(modelEvent{at: at, kind: modelAnswer, call: a, sentAt: d.now, sentSeq: d.stepSeq})
@@ -452,6 +494,7 @@ func (d *modelDriver) dropped() bool {
 // answer's call applies with probability 1/2, and the machine still gets an answer to a KeepAlive or an
 // Acquire: the failure the driver sees.
 func (d *modelDriver) answer(call core.Action, sentAt time.Duration, sentSeq uint64) error {
+	delete(d.out, call)
 	if d.dropped() {
 		applied := d.rng.IntN(2) == 0
 		if applied {
@@ -726,9 +769,12 @@ var modelMembers = [][]core.Member{
 	{{ID: "m1", Slot: -1, Draining: true}, {ID: "m2", Slot: -1}},
 }
 
-// view steps a new view: a membership, and in a group with slots the store's slot holders. Its slot
-// count becomes the store's.
+// view reads a new view: a membership, and in a group with slots the store's slot holders. Its slot
+// count becomes the store's. A walk whose views do not lag steps it at once; a lagging one steps it after
+// a delay, and never before an earlier read.
 func (d *modelDriver) view() error {
+	d.seq++
+	readSeq := d.seq
 	d.viewVersion++
 	v := core.View{Version: d.viewVersion}
 	slotted := d.slotMode == 1 || d.slotMode == 2 && d.rng.IntN(2) == 0
@@ -740,6 +786,25 @@ func (d *modelDriver) view() error {
 		v.Members = slices.Clone(modelMembers[d.rng.IntN(len(modelMembers))])
 	}
 	d.store.slotCount = v.Slots
+	if !d.lagging {
+		return d.stepView(v, readSeq)
+	}
+	d.viewAt = max(d.now+d.within(modelViewLag), d.viewAt)
+	d.schedule(modelEvent{at: d.viewAt, kind: modelViewRead, view: v, viewSeq: readSeq})
+	return nil
+}
+
+// stepView steps view v, read at the sequence number readSeq. O8: a read that started before the latest
+// slot result is discarded and read again, as #57's refresh does, so that no view after a SlotClaimed or
+// SlotReleased shows the slot as it was before.
+func (d *modelDriver) stepView(v core.View, readSeq uint64) error {
+	if readSeq < d.slotSeq {
+		d.reach.staleViews++
+		return d.view()
+	}
+	if d.lagging {
+		d.reach.laggingViews++
+	}
 	return d.step(core.ViewChanged{Now: d.now, View: v, Wall: mc.Wall(d.now)})
 }
 
@@ -1001,7 +1066,8 @@ type modelReach struct {
 	losses, closed, drains, drainedDoneAfterLoss, stuck, outages  int
 	expiries, closedGone, droppedApplied, acquireFailed, h2Grants int
 	releaseMissed, confirmReads, claimsUnanswered, heldBack       int
-	ownedAfterWait, leftoverStarts                                int
+	ownedAfterWait, leftoverStarts, laggingViews, staleViews      int
+	callsDropped                                                  int
 	slots                                                         slotCounts
 }
 
@@ -1079,6 +1145,9 @@ func TestATMCH48ModelDriver(t *testing.T) {
 		{"Drain", reach.drains},
 		{"closed session", reach.closed},
 		{"shard owned after waiting modelOwnBound", reach.ownedAfterWait},
+		{"lagging view", reach.laggingViews},
+		{"view read again for O8", reach.staleViews},
+		{"call dropped for an identical one out", reach.callsDropped},
 		{"slot given back", reach.slots.giveBacks},
 		{"held slot released", reach.slots.slotReleases},
 		{"held slot retired", reach.slots.retirements},
