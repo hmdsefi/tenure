@@ -147,9 +147,11 @@ func (e *stopError) Is(target error) bool { return target == ErrNotOwner }
 // LeaseDuration, then incremented, and the backoff is min(RetryPeriod·2^(c−1), LeaseDuration).
 // onReturn gets run's error, c and the backoff before the wait.
 //
-// A return after sh has stopped is no restart, even while ctx is not done yet: the node stops
-// the shard before it cancels ctx (RUN-320), so a run that sees Check fail can return between
-// the two. supervise then waits for ctx without calling onReturn.
+// A return once sh is no longer owned (Check fails) is no restart, even while ctx is not done
+// yet: the node stops the shard before it cancels ctx (RUN-320), and an unfenced shard's Check
+// fails from the session deadline on, before the node steps that instant and stops it (RUN-310),
+// so a run that sees Check fail can return before ctx is done. supervise then waits for ctx
+// without calling onReturn.
 //
 // Once ctx is done, before a call, after one or during the backoff, supervise calls stopped
 // exactly once and returns. A panic in run is not recovered: it crashes the process, and
@@ -173,7 +175,7 @@ func supervise(
 		if ctx.Err() != nil {
 			break
 		}
-		if sh.st.err.Load() != nil {
+		if sh.Check() != nil {
 			<-ctx.Done()
 			break
 		}

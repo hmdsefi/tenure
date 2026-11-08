@@ -355,7 +355,9 @@ func TestSupervisorStopDuringBackoff(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		l := newSuperLog()
 		ctx, cancel := context.WithCancelCause(context.Background())
-		sh := newShard("orders", 2, 5, false, l.t0, new(atomic.Int64))
+		var deadline atomic.Int64
+		deadline.Store(int64(time.Hour)) // owned throughout: a return before then is a restart
+		sh := newShard("orders", 2, 5, false, l.t0, &deadline)
 		run := func(context.Context, *Shard) error {
 			l.calls = append(l.calls, l.since())
 			return nil
@@ -463,6 +465,38 @@ func TestSupervisorStopsAfterReturn(t *testing.T) {
 			}
 			if !slices.Equal(l.stopped, seconds(65)) {
 				t.Errorf("stopped at %v, want once at 65s, when ctx was canceled", l.stopped)
+			}
+		})
+	})
+	t.Run("run returns at the session deadline", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			l := newSuperLog()
+			ctx, cancel := context.WithCancelCause(context.Background())
+			var deadline atomic.Int64
+			deadline.Store(int64(5 * time.Second))
+			sh := newShard("orders", 3, 6, false, time.Now(), &deadline)
+			run := func(_ context.Context, sh *Shard) error {
+				l.calls = append(l.calls, l.since())
+				for sh.Valid() {
+					time.Sleep(time.Millisecond)
+				}
+				return sh.Check()
+			}
+			done := l.start(ctx, sh, run, nil)
+			time.Sleep(time.Minute) // run returned at 5s, ctx is not done yet
+			if len(l.stopped) != 0 {
+				t.Fatalf("stopped at %v before ctx was canceled, want not yet", l.stopped)
+			}
+			cancel(sh.stop(core.StopExpired.String()))
+			<-done
+			if !slices.Equal(l.calls, seconds(0)) {
+				t.Errorf("calls at %v, want [0s]: a return after the deadline is not a restart", l.calls)
+			}
+			if len(l.counts) != 0 {
+				t.Errorf("onReturn called %d times, want 0: a return after the deadline is not a restart", len(l.counts))
+			}
+			if !slices.Equal(l.stopped, seconds(60)) {
+				t.Errorf("stopped at %v, want once at 60s, when ctx was canceled", l.stopped)
 			}
 		})
 	})
