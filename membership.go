@@ -13,8 +13,8 @@ import (
 // Membership tells a member which members its group has. A member announces itself with Join,
 // follows the group with Watch, marks itself as draining with SetDraining and leaves with Leave.
 //
-// Every method returns ctx.Err() itself when ctx is done, and then changes nothing. After Leave,
-// Join, SetDraining and Watch return ErrClosed.
+// Every method returns ctx.Err() itself when ctx is done, and then changes nothing. Once Leave
+// has returned nil, Join, SetDraining and Watch return ErrClosed.
 type Membership interface {
 	// Join adds self to the group, or replaces the member with the same ID. It returns an error
 	// that wraps core.ErrInvalidMember when self is not valid, and an error when the Membership
@@ -26,15 +26,17 @@ type Membership interface {
 	// lists the members sorted by ID. A new view, with the next Version, comes only when member
 	// data changes: a change of Slot alone, or a Meta with the same content, makes none. The
 	// channel holds one view, and a newer view replaces one not yet received. The channel is
-	// closed when ctx is done and when Leave is called.
+	// closed when ctx is done and when Leave returns nil.
 	Watch(ctx context.Context) (<-chan core.View, error)
 
 	// SetDraining sets Draining of the member that joined. A draining member stays in the views.
-	// Setting the value it already has makes no new view.
+	// Setting the value it already has makes no new view. It returns an error when the
+	// Membership has not joined.
 	SetDraining(ctx context.Context, draining bool) error
 
 	// Leave removes the member that joined from the group, delivers the view without it, and
-	// then closes every channel that Watch returned.
+	// then closes every channel that Watch returned. Calling it before Join or again returns
+	// nil.
 	Leave(ctx context.Context) error
 }
 
