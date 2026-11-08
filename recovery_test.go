@@ -59,11 +59,11 @@ func (r *countingReader) Reads() []time.Time {
 	return slices.Clone(r.reads)
 }
 
-// loseSession makes every later KeepAlive of holder return ErrSessionLost; the other holders'
+// loseSession makes every later KeepAlive of holder01 return ErrSessionLost; the other holders
 // calls go on to the memstore.
-func loseSession(fs *recStore, holder string) {
+func loseSession(fs *recStore) {
 	fs.Answer("KeepAlive", func(ctx context.Context, args []any) ([]any, error) {
-		if argAt[string](args, 0) == holder {
+		if argAt[string](args, 0) == holder01 {
 			return nil, tenure.ErrSessionLost
 		}
 		return fs.Forward(ctx, "KeepAlive", args)
@@ -137,7 +137,7 @@ func TestATRUN19SessionLostRecovery(t *testing.T) {
 			t0 := time.Now()
 			n := start(t, context.Background(), cfg)
 			sleepUntil(t0.Add(9 * time.Second))
-			loseSession(r.fs, holder01)
+			loseSession(r.fs)
 			sleepUntil(t0.Add(20 * time.Second))
 			synctest.Wait()
 
@@ -236,7 +236,7 @@ func TestATRUN19SessionLostRecovery(t *testing.T) {
 				drained <- time.Now()
 			}()
 			sleepUntil(t0.Add(11 * time.Second))
-			loseSession(r.fs, holder01)
+			loseSession(r.fs)
 
 			at := <-drained
 			if drainErr != nil || !at.Equal(t0.Add(40*time.Second)) {
@@ -295,7 +295,7 @@ func TestATRUN40RunAcrossIncarnations(t *testing.T) {
 		t0 := time.Now()
 		n := start(t, context.Background(), cfg)
 		sleepUntil(t0.Add(9 * time.Second))
-		loseSession(r.fs, holder01)
+		loseSession(r.fs)
 		sleepUntil(t0.Add(20 * time.Second))
 		synctest.Wait()
 
@@ -335,7 +335,7 @@ func TestRecoveryRandRetry(t *testing.T) {
 		t0 := time.Now()
 		n := start(t, context.Background(), cfg)
 		sleepUntil(t0.Add(9 * time.Second))
-		loseSession(r.fs, holder01)
+		loseSession(r.fs)
 		sleepUntil(t0.Add(20 * time.Second))
 		synctest.Wait()
 

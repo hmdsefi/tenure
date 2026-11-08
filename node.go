@@ -35,7 +35,7 @@ type Node struct {
 	holder string
 
 	epoch time.Time // the node's monotonic origin, taken after the incarnation is drawn
-	obs    observer
+	obs   observer
 
 	// ctx is the internal context, context.WithCancel(context.WithoutCancel(Start's ctx)):
 	// every goroutine and every call after Start runs under it, and Close cancels it.
