@@ -6,9 +6,11 @@ package tenure_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -358,6 +360,98 @@ func TestRecoveryRandRetry(t *testing.T) {
 				t.Errorf("orders/%d runs started at %v, want the second at T0+14s", id, runStarts(runs, t0))
 			}
 		}
+		closeNode(t, n)
+		check()
+	})
+}
+
+// holder03 is the holder of member n1 whose incarnation is the bytes 32 to 47: its incarnation
+// after holder02 with recoveryRand.
+const holder03 = "n1/202122232425262728292a2b2c2d2e2f"
+
+// TestRecoveryTwice checks a loss while recovering. H1's KeepAlive at T0+10s returns
+// ErrSessionLost, and so does the first KeepAlive of H2, at T0+10s. H3's KeepAlive goes out
+// RetryPeriod after H2's, at T0+12s, and H3 acquires every shard. n2 joins at T0+15s: the new
+// machine takes that view, n1 then runs only the shards Balanced gives it, and Route sends every
+// shard to its owner. Route answers after every step from Start on, so routing keeps the earlier
+// assignment until a new machine has taken a view.
+func TestRecoveryTwice(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		r := newShardRig(t)
+		cfg := r.config()
+		cfg.Rand = recoveryRand()
+
+		var (
+			node    atomic.Pointer[tenure.Node]
+			mu      sync.Mutex
+			unroute []string
+		)
+		ctx := tenure.WithStepHook(context.Background(), func(rec tenure.StepRecord) {
+			n := node.Load()
+			if n == nil {
+				return
+			}
+			for _, id := range allShards {
+				if _, err := n.Route("orders", keyOf(id)); err != nil {
+					mu.Lock()
+					unroute = append(unroute, fmt.Sprintf("generation %d, %T: %v", rec.Gen, rec.Input, err))
+					mu.Unlock()
+				}
+			}
+		})
+		t0 := time.Now()
+		n := start(t, ctx, cfg)
+		node.Store(n)
+		sleepUntil(t0.Add(9 * time.Second))
+		r.fs.Answer("KeepAlive", func(ctx context.Context, args []any) ([]any, error) {
+			if h := argAt[string](args, 0); h == holder01 || h == holder02 {
+				return nil, tenure.ErrSessionLost
+			}
+			return r.fs.Forward(ctx, "KeepAlive", args)
+		})
+		sleepUntil(t0.Add(15 * time.Second))
+		r.g.Join(tenure.Member{ID: "n2", Addr: "a2"})
+		sleepUntil(t0.Add(20 * time.Second))
+		synctest.Wait()
+
+		calls := r.fs.Calls()
+		wantLossAt(t, calls, t0.Add(10*time.Second))
+		h2 := callsOf(calls, holder02)
+		if len(h2) != 1 || h2[0].Method != "KeepAlive" || !h2[0].Start.Equal(t0.Add(10*time.Second)) {
+			t.Errorf("calls of H2 %v at %v, want one KeepAlive at T0+10s", h2, startsAt(h2, t0))
+		}
+		h3 := callsOf(calls, holder03)
+		if len(h3) == 0 || h3[0].Method != "KeepAlive" || !h3[0].Start.Equal(t0.Add(12*time.Second)) {
+			t.Errorf("calls of H3 %v at %v, want KeepAlive first, at T0+12s", h3, startsAt(h3, t0))
+		}
+		if got := n.Holder(); got != holder03 {
+			t.Errorf("Holder() = %q, want %q", got, holder03)
+		}
+
+		owner := ownerOf(bal("orders", 8, "n1", "n2"))
+		var running, want []int
+		for _, c := range r.runs.Calls() {
+			if !c.Done {
+				running = append(running, c.Shard.ID)
+			}
+		}
+		for _, id := range allShards {
+			if owner[id] == "n1" {
+				want = append(want, id)
+			}
+			wantRoute(t, n, "orders", keyOf(id), owner[id])
+		}
+		if slices.Sort(running); !slices.Equal(running, want) {
+			t.Errorf("n1 runs %v after n2 joined, want %v", running, want)
+		}
+		mu.Lock()
+		for _, u := range unroute {
+			t.Errorf("Route failed after a step: %s", u)
+		}
+		mu.Unlock()
+
+		node.Store(nil)
 		closeNode(t, n)
 		check()
 	})

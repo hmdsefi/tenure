@@ -144,6 +144,16 @@ type loop struct {
 	// first one makes a resync of every space due (RUN-170). Start's machine has none.
 	unrenewed bool
 
+	// bump is the number of new incarnations opened so far. Each opening steps the published view
+	// with its Version raised by one (open), and every later merged view is stepped with its
+	// Version raised by bump, so the Versions the loop steps and publishes keep rising across
+	// incarnations, however many come between two views of the membership.
+	bump uint64
+
+	// opened is when the latest new incarnation sent its first KeepAlive, zero before the first:
+	// the next one draws no sooner than RetryPeriod later (draw).
+	opened time.Time
+
 	// assign, when not nil, is the assignment of each space that the loop computed itself for the
 	// latest stepped view, which the machine did not apply: a machine whose session is closing or
 	// closed takes no view, so its Assignment stays with an older one. The routing snapshot then
@@ -203,6 +213,7 @@ func (l *loop) run(first []loopInput, started chan<- struct{}) {
 				l.step(in)
 			}
 			if v != nil {
+				v.Version += l.bump
 				l.step(loopInput{in: core.ViewChanged{View: *v}})
 			}
 		}
@@ -353,20 +364,44 @@ func (l *loop) recover() {
 	n.exec.dropOlder(l.gen) // done at the loss already; repeated, it changes nothing
 	n.deadline.Store(0)
 	n.fresh.newMachine(holder)
+	if l.assign == nil {
+		// Routing keeps the lost machine's assignment until the new machine has taken a view.
+		l.assign = make(map[string][]string, len(n.cfg.Spaces))
+		for _, sp := range n.cfg.Spaces {
+			l.assign[sp.Name] = l.m.Assignment(sp.Name)
+		}
+	}
 	l.m = n.newMachine(holder)
 	l.status = l.m.Status()
 	l.opening, l.unrenewed = true, true
+	l.opened = time.Now()
 	n.exec.do(l.gen, holder, core.KeepAlive{})
 	l.rearm()
 }
 
 // draw returns a new holder drawn from Rand, as Start draws one. After a failed read it reads
-// again RetryPeriod after the start of the failed one. Before each read it checks for a drain
-// request: when there is one, it completes the drain with finish and returns false, as it does
-// when the internal context ends.
+// again RetryPeriod after the start of the failed one. The first read comes no sooner than
+// RetryPeriod after the previous new incarnation's KeepAlive, so a store that ends each new
+// session at once gets at most one KeepAlive per RetryPeriod, as a live session does. Before each
+// read it checks for a drain request: when there is one, it completes the drain with finish and
+// returns false, as it does when the internal context ends.
 func (l *loop) draw() (string, bool) {
 	n := l.n
+	period := n.cfg.Timing.RetryPeriod
+	next := time.Now()
+	if !l.opened.IsZero() {
+		next = l.opened.Add(period)
+	}
 	for {
+		if d := time.Until(next); d > 0 {
+			t := time.NewTimer(d)
+			select {
+			case <-t.C:
+			case <-n.ctx.Done():
+				t.Stop()
+				return "", false
+			}
+		}
 		if n.drainRequested() {
 			l.finish()
 			return "", false
@@ -376,19 +411,14 @@ func (l *loop) draw() (string, bool) {
 		if err == nil {
 			return holder, true
 		}
-		t := time.NewTimer(time.Until(at.Add(n.cfg.Timing.RetryPeriod)))
-		select {
-		case <-t.C:
-		case <-n.ctx.Done():
-			t.Stop()
-			return "", false
-		}
+		next = at.Add(period)
 	}
 }
 
 // open steps r, the answer to the first KeepAlive of a new incarnation's machine, and then the
 // latest merged view with the Version after it, so that the view is newer than every view the
-// node has published. Until then the machine has stepped nothing.
+// node has published; bump grows by one, so that later views stay above it. Until then the
+// machine has stepped nothing. The view's step moves routing to the new machine's assignment.
 func (l *loop) open(r callResult) {
 	l.opening = false
 	for _, in := range r.inputs {
@@ -397,6 +427,7 @@ func (l *loop) open(r callResult) {
 	l.renewed()
 	v := *l.n.view.Load()
 	v.Version++
+	l.bump++
 	l.step(loopInput{in: core.ViewChanged{View: v}})
 }
 
