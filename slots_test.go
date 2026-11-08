@@ -1004,6 +1004,36 @@ func TestATRUN24SetSlotsErrors(t *testing.T) {
 		})
 	})
 
+	t.Run("after a new incarnation", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			r := newShardRig(t)
+			cfg := r.slotConfig(1)
+			cfg.Rand = recoveryRand()
+			t0 := time.Now()
+			n := start(t, ctx, cfg)
+			sleepUntil(t0.Add(9 * time.Second))
+			loseSession(r.fs)
+			sleepUntil(t0.Add(20 * time.Second))
+			synctest.Wait()
+			if got := n.Holder(); got != holder02 {
+				t.Fatalf("Holder() = %q, want %q: a new incarnation", got, holder02)
+			}
+			// The loop steps views with Versions raised once per new incarnation; SetSlots still
+			// waits for the view that holds its read.
+			at := time.Now()
+			if err := n.SetSlots(ctx, 2); err != nil || time.Since(at) != 0 {
+				t.Errorf("SetSlots(2) = %v after %v, want nil at once", err, time.Since(at))
+			}
+			if v := published(t, n); v.Slots != 2 {
+				t.Errorf("published view has %d slots when SetSlots(2) returns, want 2", v.Slots)
+			}
+			wantNoMember(t, n, slotShards(8, 2)[1][0], "slot-1 is vacant")
+			closeNode(t, n)
+			check()
+		})
+	})
+
 	t.Run("draining and closed", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			check := baseline(t)
