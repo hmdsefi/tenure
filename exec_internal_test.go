@@ -148,6 +148,7 @@ type execHarness struct {
 
 	mu     sync.Mutex
 	failed []callResult
+	hold   chan struct{} // when set, failed waits until it is closed
 }
 
 const execHolder = "a/1111"
@@ -160,7 +161,11 @@ func newExecHarness(t *testing.T) *execHarness {
 	h.e = newExecutor(ctx, h.st, core.DefaultTiming, h.epoch, func(r callResult) {
 		h.mu.Lock()
 		h.failed = append(h.failed, r)
+		hold := h.hold
 		h.mu.Unlock()
+		if hold != nil {
+			<-hold
+		}
 	})
 	t.Cleanup(h.close)
 	return h
@@ -173,6 +178,13 @@ func (h *execHarness) close() {
 	if n := laneGoroutines(); n != 0 {
 		h.t.Errorf("%d lane goroutines after wait", n)
 	}
+}
+
+// holdFailed makes failed wait until hold is closed; nil stops that.
+func (h *execHarness) holdFailed(hold chan struct{}) {
+	h.mu.Lock()
+	h.hold = hold
+	h.mu.Unlock()
 }
 
 func (h *execHarness) failures() []callResult {
@@ -492,6 +504,24 @@ func TestExecDropIdentical(t *testing.T) {
 		h.answer("Release", scriptReply{})
 		if n := len(h.st.all()) - before; n != 2 {
 			t.Errorf("%d Release calls after the first returned, want 2", n)
+		}
+
+		// A call whose result is out is no longer in flight, also while failed still runs for it
+		// on the lane.
+		hold := make(chan struct{})
+		h.holdFailed(hold)
+		before = len(h.st.all())
+		h.do(core.Release{Space: "s", Shard: 0, Term: 5}, true)
+		h.answer("Release", scriptReply{err: errFlaky})
+		queued := h.e.do(1, execHolder, core.Release{Space: "s", Shard: 0, Term: 5})
+		close(hold)
+		h.holdFailed(nil)
+		if !queued {
+			t.Fatal("Release dropped while failed ran for an equal one that had returned")
+		}
+		h.answer("Release", scriptReply{})
+		if n := len(h.st.all()) - before; n != 2 {
+			t.Errorf("%d Release calls with failed running for the first, want 2", n)
 		}
 	})
 }

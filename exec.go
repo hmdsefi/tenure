@@ -258,7 +258,10 @@ func (e *executor) withPermit(f func()) bool {
 }
 
 // wait stops do from queuing calls and waits until every lane goroutine has returned. Once the
-// internal context is done, lanes drop their queued calls and return after the call in flight.
+// internal context is done, lanes drop their queued calls, which get no result, and return after
+// the call in flight, so no store call of a lane is out when wait returns. A store call that does
+// not return once its context is done holds wait up, since the executor cannot end it. wait does
+// not wait for withPermit callers.
 func (e *executor) wait() {
 	e.mu.Lock()
 	e.closed = true
@@ -283,7 +286,7 @@ func (e *executor) run(l *lane) {
 func (e *executor) next(l *lane) (execCall, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	l.busy, l.cur = false, execCall{}
+	l.busy, l.cur = false, execCall{} // also after a call that never went out
 	if len(l.queue) == 0 || e.ctx.Err() != nil {
 		l.queue = nil
 		delete(e.lanes, l.key)
@@ -329,6 +332,9 @@ func (e *executor) exec(l *lane, c execCall) {
 	r.inputs = resultInputs(c.act, o, sentAt)
 	e.mu.Lock()
 	r.end = e.stamp()
+	// The call is no longer in flight once its result is out: an equal call queued from here
+	// on, while failed still runs, is not dropped.
+	l.busy, l.cur = false, execCall{}
 	if c.gen >= e.floor {
 		e.results = append(e.results, r)
 		select {
