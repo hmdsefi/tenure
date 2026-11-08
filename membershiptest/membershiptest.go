@@ -21,20 +21,23 @@
 // Run starts every case as a parallel subtest named <Group>/<Case>, such as Join/Visible. Each
 // case calls newMembership once, with its own *testing.T and the IDs "m0" to "m7", checks the
 // fixture and then runs against that group alone, so newMembership must return a group that
-// shares no members with any other.
+// shares no members with any other. Because the cases are parallel subtests, they run only after
+// the test function that calls Run has returned, so release anything the groups share with
+// t.Cleanup, not with defer.
 //
 // A case calls Fixture.New for each instance when it first needs it: instances a, b, c and d,
 // which join as members m0, m1, m2 and m3, and instance x, which never joins. Run makes a while
 // it checks the fixture, before the case starts. Member m<i> has Addr "10.0.0.<i+1>:7000", Meta
 // {"zone": "z<i%2>"} and Slot -1. The suite calls Leave only in the cases about Leave, so a
-// fixture that must stop its instances does so itself, for example with t.Cleanup. The context
-// of every Watch ends when its case ends, and the context of every other call when the case
-// ends, too.
+// fixture that must stop its instances does so itself, for example with t.Cleanup. Every context
+// the suite passes to a method ends when its case ends, at the latest.
 //
 // A change may take up to Fixture.Settle to reach every instance. A case waits for a view that
-// shows a change for at most Settle plus 5s of real time, and before it checks that no new view
-// came, it waits Settle. A membership whose changes reach every view inside the call that makes
-// them sets Settle to 0.
+// shows a change for at most Settle plus 5s of real time. Before it checks that no new view came,
+// it waits Settle, and before it checks that the newest of two quick changes replaced the view
+// not yet received, it waits Settle, too. A membership whose changes reach every view inside the
+// call that makes them sets Settle to 0. A membership that implements tenure.PropagationEstimator
+// must estimate at most Settle.
 //
 // Every view a case receives is checked against the view received before it on the same
 // channel: its Version is at least 1 and above the earlier one, its member data differs (Slot is
