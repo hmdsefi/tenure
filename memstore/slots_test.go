@@ -6,6 +6,7 @@ package memstore_test
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"testing"
 	"time"
@@ -174,10 +175,22 @@ func TestSlotRules(t *testing.T) {
 		if err := s.CloseSession(ctx, h2); err != nil {
 			t.Fatalf("CloseSession(h2) = %v, want nil", err)
 		}
+		// An ended holder's slot reads as free anyway, so look at the records themselves.
+		if got, want := memstore.SlotRecords(s), map[int]string{0: h1}; !maps.Equal(got, want) {
+			t.Fatalf("slot records after CloseSession(h2) = %v, want %v", got, want)
+		}
 		keepAlive(t, s, h3, timing)
 		setSlots(t, s, 2)
 		wantSlots(t, s, 2, []string{h1, ""})
 		claimSlot(t, s, h3, 1)
+
+		setSlots(t, s, 0)
+		if err := s.CloseSession(ctx, h1); err != nil {
+			t.Fatalf("CloseSession(h1) = %v, want nil", err)
+		}
+		if got, want := memstore.SlotRecords(s), map[int]string{1: h3}; !maps.Equal(got, want) {
+			t.Fatalf("slot records after CloseSession(h1) = %v, want %v", got, want)
+		}
 	})
 
 	t.Run("slot writes take no version", func(t *testing.T) {

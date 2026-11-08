@@ -137,6 +137,92 @@ func TestWatchRules(t *testing.T) {
 		g := grant(t, s, h1, "b", 0)
 		wantValues(t, "kept after full", kept, g)
 	})
+
+	t.Run("context end closes and unregisters the channel", func(t *testing.T) {
+		s, _ := newStore(t)
+		keepAlive(t, s, h1, timing)
+		wctx, cancel := context.WithCancel(ctx)
+		ch, err := s.WatchHolders(wctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kept := watch(t, s)
+		g := grant(t, s, h1, "a", 0)
+		cancel()
+		if got := waitClosed(t, ch); !slices.Equal(got, []tenure.Holding{g}) {
+			t.Fatalf("values before close %+v, want %+v", got, []tenure.Holding{g})
+		}
+
+		// A write after the close sends nothing to the closed channel.
+		g2 := grant(t, s, h1, "a", 1)
+		wantValues(t, "kept after cancel", kept, g, g2)
+	})
+
+	// In a bubble, so that every context.AfterFunc goroutine has ended when the subtest does.
+	t.Run("context end racing a full buffer", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s, _ := newStore(t)
+			keepAlive(t, s, h1, timing)
+			for range 8 {
+				wctx, cancel := context.WithCancel(ctx)
+				chans := make([]<-chan tenure.Holding, 32)
+				for i := range chans {
+					ch, err := s.WatchHolders(wctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					chans[i] = ch
+				}
+				for range 1024 {
+					acquire(t, s, h1, "a", 0)
+				}
+
+				// Each channel is now full: the next write and the context's end race to close it,
+				// and it must be closed exactly once.
+				start := make(chan struct{})
+				var wg sync.WaitGroup
+				wg.Go(func() {
+					<-start
+					cancel()
+				})
+				wg.Go(func() {
+					<-start
+					for range 4 {
+						if _, err := s.Acquire(ctx, h1, "a", 0); err != nil {
+							t.Error(err)
+						}
+					}
+				})
+				close(start)
+				wg.Wait()
+				for i, ch := range chans {
+					if got, closed := drain(ch); len(got) != 1024 || !closed {
+						t.Fatalf("channel %d got %d values, closed %v, want 1024, true", i, len(got), closed)
+					}
+				}
+			}
+		})
+	})
+}
+
+// waitClosed receives from ch until it is closed and returns the values received; it fails the
+// test when ch is not closed within 10 seconds.
+func waitClosed(t *testing.T, ch <-chan tenure.Holding) []tenure.Holding {
+	t.Helper()
+	timeout := time.After(10 * time.Second)
+	var got []tenure.Holding
+	for {
+		select {
+		case h, ok := <-ch:
+			if !ok {
+				return got
+			}
+			got = append(got, h)
+		case <-timeout:
+			t.Fatalf("channel not closed after 10s, got %+v", got)
+			return nil
+		}
+	}
 }
 
 // TestATSTO16NoWriteNoValue checks that a call which writes no shard record delivers no value:
