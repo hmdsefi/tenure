@@ -4,6 +4,14 @@ Package tenure shards single-writer services: each shard of a space has one
 owner at a time, and every ownership carries a term that a downstream fence can
 check.
 
+CONSTANTS
+
+const DefaultSlotGrace = 60 * time.Second
+    DefaultSlotGrace is the SlotGrace that Start uses when
+    Config.Timing sets other fields but leaves SlotGrace zero. It equals
+    core.DefaultTiming.SlotGrace.
+
+
 VARIABLES
 
 var (
@@ -30,6 +38,49 @@ var (
 )
 
 TYPES
+
+type Config struct {
+	// Self is this member. Its ID must be valid as core.Member.Validate says, and no key of its
+	// Meta may start with "tenure.", a prefix tenure reserves. Start ignores Slot and Draining:
+	// the member always joins with Slot -1 and Draining false.
+	Self Member
+
+	// Membership tells the node which members its group has. It is required.
+	Membership Membership
+
+	// Store keeps the shard records, the session and, with slots, the slot records. It may be
+	// nil only when Spaces is empty and Slots is 0: the node then only joins the group and
+	// follows its views.
+	Store Store
+
+	// Slots is the slot count this member expects the group to have, or 0 for no slots. A count
+	// above 0 needs a Store that is a SlotStore. Start writes the count when the store holds
+	// none; when the store holds another count, the stored count wins.
+	Slots int
+
+	// Spaces lists the spaces whose shards this member takes part in.
+	Spaces []Space
+
+	// Timing holds the session timings. The zero value means core.DefaultTiming; otherwise a
+	// zero SlotGrace means DefaultSlotGrace, so a LeaseDuration above DefaultSlotGrace needs
+	// SlotGrace set.
+	Timing core.Timing
+
+	// Rand is the source of the 16 random bytes that name each session of this member. nil
+	// means crypto/rand.Reader.
+	Rand io.Reader
+
+	// OnEvent, when not nil, is called with each event of the node, one at a time and in order.
+	OnEvent func(Event)
+}
+    Config configures a node for Start.
+
+    Write Config values with keyed fields: later versions add fields.
+
+type Event struct{}
+    Event is one thing that happened on a node, such as a change of the view,
+    the session or a shard's ownership, as Config.OnEvent receives it. It has no
+    fields yet.
 
 type HeldError struct {
 	// Holder is the holder the record names.
@@ -97,6 +148,17 @@ type Membership interface {
     Every method returns ctx.Err() itself when ctx is done, and then changes
     nothing. Once Leave has returned nil, Join, SetDraining and Watch return
     ErrClosed.
+
+type NameChecker interface {
+	// CheckNames returns an error when the backend cannot hold one of the space names, given in
+	// Config.Spaces order and nil when there are none, or the member ID. A backend that keeps
+	// no spaces ignores spaces.
+	CheckNames(spaces []string, member string) error
+}
+    NameChecker is implemented by a Store or a Membership that cannot hold
+    every name tenure accepts. Once the rest of the Config is valid, Start
+    calls CheckNames before any other method of the store or the membership,
+    and fails with an error that wraps the one CheckNames returns.
 
 type NotOwnerError struct {
 	// Space and Shard name the shard.
@@ -187,6 +249,30 @@ type SlotStore interface {
     the holder of one slot; the holder counts only while its session is live.
     The slot count belongs to the whole group.
 
+type Space struct {
+	// Name identifies the space in the store and in routing. It is non-empty, contains neither
+	// "/" nor a zero byte, differs from the Name of every other space of the Config, and is none
+	// of the names tenure reserves: "generation", "member", "slot", "slots" and "request".
+	Name string
+
+	// Shards is the number of shards in the space, at least 1.
+	Shards int
+
+	// Fenced reports that a downstream fence checks the term of every write to the space's
+	// state. A fenced shard's Run keeps going, degraded, while the session is not live; an
+	// unfenced shard stops at the session deadline.
+	Fenced bool
+
+	// Run serves one shard while this member owns it. The node calls it with the shard's
+	// Shard and cancels ctx when the ownership ends. When Run returns while the member still
+	// owns the shard, the node calls it again after a backoff. It is required.
+	Run func(ctx context.Context, s *Shard) error
+}
+    Space is a set of shards that the members of a group divide among
+    themselves.
+
+    Write Space values with keyed fields: later versions add fields.
+
 type Store interface {
 	// KeepAlive opens a session for a holder that has never had one, or renews the live session
 	// of holder and stores timing as its new Timing. It returns ErrSessionLost when the session
@@ -259,6 +345,16 @@ type Store interface {
     or returns ErrSessionLost, a *HeldError or ErrNoSlot, changes nothing.
     Any other error, such as a failed request or a context that ends during the
     call, leaves the outcome unknown: the call may have taken effect.
+
+type TimingChecker interface {
+	// CheckTiming returns an error when the backend cannot work with t, the timing the node
+	// will use, its defaults applied.
+	CheckTiming(t core.Timing) error
+}
+    TimingChecker is implemented by a Store or a Membership that cannot work
+    with every valid Timing. Start calls CheckTiming after CheckNames and before
+    any other method of the store or the membership, and fails with an error
+    that wraps the one CheckTiming returns.
 
 type Watcher interface {
 	// WatchHolders returns a channel that receives, in commit order, every write to a shard record
