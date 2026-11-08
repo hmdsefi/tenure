@@ -36,7 +36,8 @@ import (
 //   - membershipFailed, for each failed call of the membership after Join that the node retries
 //     or gives up: "Watch" (also a channel that closed before Leave), "SetDraining" and "Leave";
 //   - draining, once, when the first Drain or Close starts the drain;
-//   - drained, once, when the drain completes;
+//   - drained, once, when the drain completes, under n.stepMu, unless a Close whose ctx ended
+//     first has halted the node;
 //   - shardClosed, for each shard that a Close whose ctx ended first stops with reason "closed"
 //     (RUN-530), under n.stepMu, right after the stop and before its Run is canceled;
 //   - closed, once, with Close's ctx and the reason: "drained" last, when Close finishes after a

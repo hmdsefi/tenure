@@ -431,7 +431,7 @@ func (n *Node) undrainedLocked() string {
 // closed n.machineDone: the machine's session is closed, or it was lost and the machine is done
 // with every Run returned. After a loss the loop starts no new incarnation once a drain has been
 // requested, and nothing closes the lost session (RUN-190). It ends early when the internal
-// context is done.
+// context is done or a forced Close has halted the node.
 func (n *Node) drain() {
 	if n.cfg.Store != nil {
 		n.inbox.post(core.Drain{})
@@ -445,6 +445,12 @@ func (n *Node) drain() {
 		case <-n.ctx.Done():
 			return
 		}
+	}
+	// Under stepMu, so that the drain completes either before a forced Close's halt or not at all.
+	n.stepMu.Lock()
+	defer n.stepMu.Unlock()
+	if n.halted {
+		return
 	}
 	n.obs.drained()
 	close(n.drainDone)
@@ -544,17 +550,21 @@ func (n *Node) forceClose(ctx context.Context) error {
 	return fmt.Errorf("tenure: close: %w%s", ctx.Err(), detail)
 }
 
-// halt stops driving the machine: from now on the loop carries out no step. In the same instant
-// it takes what the drain has left (undrainedLocked), which it returns, and stops every published
-// shard: with reason "closed" while the member owns it, reported to observer.shardClosed, and
-// otherwise with the error it already has, or "expired" past the session deadline. It cancels
-// each shard's Run with that error, before the internal context, so that Run sees the stop
-// error as its context's cause (RUN-320).
+// halt stops driving the machine: from now on the loop carries out no step, the executor starts
+// no store call (executor.halt), and the drain does not complete. In the same instant it takes
+// what the drain has left (undrainedLocked), which it returns, and stops every published shard:
+// with reason "closed" while the member owns it, reported to observer.shardClosed, and otherwise
+// with the error it already has, or "expired" past the session deadline. It cancels each shard's
+// Run with that error, before the internal context, so that Run sees the stop error as its
+// context's cause (RUN-320).
 func (n *Node) halt() string {
 	n.stepMu.Lock()
 	defer n.stepMu.Unlock()
 	detail := n.undrainedLocked()
 	n.halted = true
+	if n.exec != nil {
+		n.exec.halt() // no queued call, such as a CloseSession behind a KeepAlive, goes out
+	}
 	for _, sp := range n.shards {
 		for id := range sp.local {
 			sh, r := sp.local[id].Load(), sp.runs[id]
