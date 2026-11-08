@@ -522,8 +522,12 @@ type lagPeer struct {
 	b *lagBackend
 }
 
-// validHolder reports whether memstore accepts holder.
-func validHolder(holder string) bool { return holder != "" && !strings.ContainsRune(holder, 0) }
+// validHolder reports whether memstore accepts holder: not empty, no zero byte, and a member ID
+// before any '/'.
+func validHolder(holder string) bool {
+	id, _, _ := strings.Cut(holder, "/")
+	return id != "" && !strings.ContainsRune(holder, 0)
+}
 
 func (p *lagPeer) KeepAlive(ctx context.Context, holder string, timing core.Timing) error {
 	return p.b.keepAlive(ctx, holder, timing)
@@ -532,10 +536,10 @@ func (p *lagPeer) KeepAlive(ctx context.Context, holder string, timing core.Timi
 func (p *lagPeer) Acquire(ctx context.Context, holder, space string, shard int) (core.Term, error) {
 	if snap, stale := p.b.stale(); stale && ctx.Err() == nil && validHolder(holder) {
 		p.b.mu.Lock()
-		timing, open := p.b.timings[holder]
+		timing := p.b.timings[holder] // zero for a holder never seen open
 		p.b.mu.Unlock()
 		for _, h := range snap.holdings[space] {
-			if open && h.Shard == shard && h.Holder != "" && h.Holder != holder {
+			if h.Shard == shard && h.Holder != "" && h.Holder != holder {
 				p.b.refusals.Add(1)
 				return 0, &tenure.HeldError{Holder: h.Holder, RetryAfter: timing.RetryPeriod}
 			}
@@ -586,11 +590,21 @@ func (p *lagPeer) Slots(ctx context.Context) (int, []string, error) {
 
 // TestATSTO34LaggingPeer: AT-STO-34 (steps written from the text of issue #42). In real time,
 // with a peer that is stale for 50ms after each write through Store and Slack 100ms, every case
-// that runs passes, and the peer did answer reads from a snapshot.
+// that runs passes. Only the four cases a real-time fixture without SetWall lacks skip, and the
+// peer did answer reads from a snapshot and refuse calls while stale.
 func TestATSTO34LaggingPeer(t *testing.T) {
 	var staleReads, refusals atomic.Int64
+	var mu sync.Mutex
+	var skipped []string
 	t.Run("suite", func(t *testing.T) {
-		storetest.Run(t, func(*testing.T) storetest.Fixture {
+		storetest.Run(t, func(t *testing.T) storetest.Fixture {
+			t.Cleanup(func() {
+				if t.Skipped() {
+					mu.Lock()
+					skipped = append(skipped, caseName(t))
+					mu.Unlock()
+				}
+			})
 			b := newLagBackend(&staleReads, &refusals)
 			return storetest.Fixture{
 				Store:        &lagStore{Store: b.mem, b: b},
@@ -601,8 +615,15 @@ func TestATSTO34LaggingPeer(t *testing.T) {
 			}
 		})
 	})
+	want := []string{"Session/ExpiryBoundary", "Term/LostRecordWallBehind", "Term/WallAhead", "Term/WallBehind"}
+	if got := slices.Sorted(slices.Values(skipped)); !slices.Equal(got, want) {
+		t.Errorf("cases skipped: %q, want %q", got, want)
+	}
 	if staleReads.Load() == 0 {
 		t.Error("the peer answered no read from a snapshot, want it to lag")
+	}
+	if refusals.Load() == 0 {
+		t.Error("the peer refused no call while stale, want it to lag")
 	}
 	t.Logf("the peer answered %d reads from a snapshot and refused %d calls while stale",
 		staleReads.Load(), refusals.Load())
