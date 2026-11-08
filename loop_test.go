@@ -868,3 +868,28 @@ func TestStepRecords(t *testing.T) {
 		check()
 	})
 }
+
+// TestLoopFeedsResolvers checks that with a store the views the loop steps and publishes reach
+// the node's resolvers, and that Close closes them.
+func TestLoopFeedsResolvers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		r := newRig(t)
+		n := start(t, context.Background(), r.config())
+		res := n.Resolver("q")
+		if got, want := listIDs(res.Members()), []string{"n1", "n2"}; !slices.Equal(got, want) {
+			t.Errorf("Members() at once = %v, want %v", got, want)
+		}
+		r.g.Join(tenure.Member{ID: "n3", Addr: "a3"})
+		synctest.Wait()
+		want := core.Eligible(published(t, n), time.Now())
+		if got := res.Members(); !reflect.DeepEqual(got, want) || !slices.Equal(listIDs(got), []string{"n1", "n2", "n3"}) {
+			t.Errorf("Members() after n3 joined = %+v, want %+v", got, want)
+		}
+		closeNode(t, n)
+		if _, err := res.Lookup("k"); !errors.Is(err, tenure.ErrClosed) {
+			t.Errorf("Lookup after Close = %v, want ErrClosed", err)
+		}
+		check()
+	})
+}

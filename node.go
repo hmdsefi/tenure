@@ -49,7 +49,7 @@ type Node struct {
 	inbox       *inbox
 	lp          *loop
 	stepMu      sync.Mutex    // held while the loop carries a step out
-	deadline    atomic.Int64  // the session deadline in nanoseconds since epoch; only the loop writes it
+	deadline    atomic.Int64  // the session deadline in ns since epoch; only the loop writes it
 	machineDone chan struct{} // closed when the machine's Status first reports Done
 
 	// The shard table: each space's shards by name, kept for the node's life, across machines.
@@ -176,6 +176,11 @@ func (n *Node) openSession(ctx context.Context) error {
 	case <-started:
 		return nil
 	case <-ctx.Done():
+	}
+	select {
+	case <-started: // first steps carried out at the instant ctx ended win
+		return nil
+	default:
 		return fmt.Errorf("tenure: start: %w", ctx.Err())
 	}
 }

@@ -19,8 +19,8 @@ type stepRecord struct {
 	// Gen is the generation of the machine that took the step.
 	Gen uint64
 
-	// Now is the reading the input carries, time.Since(epoch) when the loop read it, or the
-	// timer's reading for a Tick.
+	// Now is the reading the input carries: time.Since(epoch) when the loop read it, or for a
+	// Tick the reading of the wake it steps.
 	Now time.Duration
 
 	// Input is the input stepped, with Now set.
