@@ -523,20 +523,21 @@ func TestFixtureMembership(t *testing.T) {
 			if v := wantView(t, ch); v.Version != 1 || !slices.Equal(ids(v), []string{"n1", "n2"}) {
 				t.Fatalf("first view = %+v, want version 1 with n1, n2", v)
 			}
+			// As with static, a view reaches the channel inside the call that makes it.
 			self := core.Member{ID: "n1", Addr: "a1", Slot: -1}
 			wantErr(t, "Join", sm.Join(ctx, self), nil)
 			wantErr(t, "KeepAlive", fs.KeepAlive(ctx, "n1/1", core.DefaultTiming), nil)
-			synctest.Wait()
 			if v := wantView(t, ch); v.Version != 2 || v.Members[0].Addr != "a1" {
 				t.Fatalf("view after Join = %+v, want version 2 with n1 at a1", v)
 			}
 			wantErr(t, "SetDraining", sm.SetDraining(ctx, true), nil)
-			synctest.Wait()
 			if v := wantView(t, ch); !v.Members[0].Draining {
 				t.Fatalf("view after SetDraining = %+v, want n1 draining", v)
 			}
 
-			// Leave returns once the last view is delivered and the channel closed.
+			// Leave delivers the last view and closes the channel before it returns. No goroutine
+			// was there for the open channel.
+			check()
 			wantErr(t, "Leave", sm.Leave(ctx), nil)
 			if v := wantView(t, ch); !slices.Equal(ids(v), []string{"n2"}) {
 				t.Fatalf("view after Leave = %+v, want n2 only", v)
@@ -603,20 +604,33 @@ func TestFixtureMembership(t *testing.T) {
 			sm.CloseWatch(1)
 			wantClosed(t, ch1)
 			g.Join(core.Member{ID: "n3", Slot: -1})
-			synctest.Wait()
 			if v := wantView(t, ch0); !slices.Equal(ids(v), []string{"n1", "n2", "n3"}) {
 				t.Fatalf("view on the open channel = %+v, want n1, n2, n3", v)
 			}
 			sm.CloseWatch(1) // again: nothing happens
+
+			// A view not yet received stays in a closed channel, as in a static one.
+			g.Join(core.Member{ID: "n4", Slot: -1})
+			sm.CloseWatch(0)
+			if v := wantView(t, ch0); !slices.Equal(ids(v), []string{"n1", "n2", "n3", "n4"}) {
+				t.Fatalf("view left in the closed channel = %+v, want n1, n2, n3, n4", v)
+			}
+			wantClosed(t, ch0)
 
 			rec := &failRecorder{TB: t}
 			newGroup(rec, listed("n1")...).Node("n1").CloseWatch(0)
 			if f := rec.failures(); len(f) != 1 || !strings.Contains(f[0], "Watch returned 0 channels") {
 				t.Fatalf("CloseWatch(0) without a Watch failed with %q", f)
 			}
+
+			// A channel is closed when its ctx is done, with the view not yet received left in it.
+			ch2, _ := sm.Watch(ctx)
 			cancel()
 			synctest.Wait()
-			wantClosed(t, ch0)
+			if v := wantView(t, ch2); v.Version != 3 {
+				t.Fatalf("view in the channel closed by its ctx = %+v, want version 3", v)
+			}
+			wantClosed(t, ch2)
 			check()
 		})
 	})
@@ -643,15 +657,23 @@ func TestFixtureMembership(t *testing.T) {
 			}
 			wantNoView(t, ch)
 
-			// A view delivered before Pause and not yet received is replaced by the latest.
+			// A view made just before Pause is delivered, not held back.
 			g.Leave("n4")
-			synctest.Wait()
 			sm.Pause()
-			g.Leave("n3")
-			synctest.Wait()
+			if v := wantView(t, ch); v.Version != 5 || !slices.Equal(ids(v), []string{"n1", "n2", "n3"}) {
+				t.Fatalf("view made before Pause = %+v, want version 5 with n1, n2, n3", v)
+			}
 			sm.Resume()
-			if v := wantView(t, ch); v.Version != 6 || !slices.Equal(ids(v), []string{"n1", "n2"}) {
-				t.Fatalf("view after the second Resume = %+v, want version 6 with n1, n2", v)
+			wantNoView(t, ch)
+
+			// A view delivered before Pause and not yet received is replaced by the latest.
+			g.Join(core.Member{ID: "n4", Slot: -1})
+			sm.Pause()
+			g.Leave("n4")
+			g.Leave("n3")
+			sm.Resume()
+			if v := wantView(t, ch); v.Version != 8 || !slices.Equal(ids(v), []string{"n1", "n2"}) {
+				t.Fatalf("view after the third Resume = %+v, want version 8 with n1, n2", v)
 			}
 			wantNoView(t, ch)
 
@@ -661,8 +683,8 @@ func TestFixtureMembership(t *testing.T) {
 			synctest.Wait()
 			wantNoView(t, late)
 			sm.Resume()
-			if v := wantView(t, late); v.Version != 6 {
-				t.Fatalf("late view = %+v, want version 6", v)
+			if v := wantView(t, late); v.Version != 8 {
+				t.Fatalf("late view = %+v, want version 8", v)
 			}
 			sm.Resume() // nothing held: nothing delivered
 			wantNoView(t, ch)
