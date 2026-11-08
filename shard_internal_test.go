@@ -347,6 +347,38 @@ func TestSupervisorStopsAfterReturn(t *testing.T) {
 			}
 		})
 	})
+	t.Run("run returns between the stop and the cancel", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			l := newSuperLog()
+			ctx, cancel := context.WithCancelCause(context.Background())
+			sh := newShard("orders", 3, 6, true, time.Time{}, nil)
+			run := func(_ context.Context, sh *Shard) error {
+				l.calls = append(l.calls, l.since())
+				for sh.Valid() {
+					time.Sleep(time.Millisecond)
+				}
+				return sh.Check()
+			}
+			done := l.start(ctx, sh, run, nil)
+			time.Sleep(5 * time.Second)
+			err := sh.stop("moved")
+			time.Sleep(time.Minute) // run has returned, ctx is not done yet
+			if len(l.stopped) != 0 {
+				t.Fatalf("stopped at %v before ctx was canceled, want not yet", l.stopped)
+			}
+			cancel(err)
+			<-done
+			if !slices.Equal(l.calls, seconds(0)) {
+				t.Errorf("calls at %v, want [0s]: a return after the stop is not a restart", l.calls)
+			}
+			if len(l.counts) != 0 {
+				t.Errorf("onReturn called %d times, want 0: a return after the stop is not a restart", len(l.counts))
+			}
+			if !slices.Equal(l.stopped, seconds(65)) {
+				t.Errorf("stopped at %v, want once at 65s, when ctx was canceled", l.stopped)
+			}
+		})
+	})
 	t.Run("ctx done before the first call", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			l := newSuperLog()
