@@ -244,11 +244,13 @@ func (l *loop) deliver(r callResult) {
 }
 
 // observe steps rd as HolderChanged if the freshness filter admits it. The filter sees the
-// Status after every wake due by now, as the step would.
+// Status after every wake due by now, and the HolderChanged is stepped at that same reading, so
+// no Tick, and no Confirm action, comes between the filter's decision and the step.
 func (l *loop) observe(rd reading) {
-	l.tickUntil(time.Since(l.n.epoch))
+	now := time.Since(l.n.epoch)
+	l.tickUntil(now)
 	if hc, ok := l.n.fresh.admit(rd, l.status); ok {
-		l.step(loopInput{in: hc})
+		l.apply(loopInput{in: l.at(hc, now)}, now)
 	}
 }
 
