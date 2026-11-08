@@ -440,20 +440,25 @@ func TestATRUN84WithPlacement(t *testing.T) {
 }
 
 // TestSubscribeAtLeaveAt checks the timer at the members' JoinAt and LeaveAt: a member enters the
-// list at its JoinAt and leaves it at its LeaveAt, at exactly those instants.
+// list at its JoinAt and leaves it at its LeaveAt, at exactly those instants. A JoinAt equal to
+// the view's arrival counts at once, two bounds at one instant give one list, and Close stops a
+// timer still armed.
 func TestSubscribeAtLeaveAt(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
 		t0 := time.Now()
 		g := newGroup(t,
+			tenure.Member{ID: "n0", Addr: "a0", JoinAt: t0},
 			tenure.Member{ID: "n1", Addr: "a1"},
 			tenure.Member{ID: "n2", Addr: "a2", LeaveAt: t0.Add(10 * time.Second)},
 			tenure.Member{ID: "n3", Addr: "a3", JoinAt: t0.Add(5 * time.Second)},
+			tenure.Member{ID: "n4", Addr: "a4", JoinAt: t0.Add(10 * time.Second)},
+			tenure.Member{ID: "n5", Addr: "a5", LeaveAt: t0.Add(time.Hour)},
 		)
 		r := newResolver(t, g.Absent("r1"))
 		synctest.Wait()
 		ch := r.Subscribe()
-		if got, want := listIDs(receiveList(t, ch)), []string{"n1", "n2"}; !slices.Equal(got, want) {
+		if got, want := listIDs(receiveList(t, ch)), []string{"n0", "n1", "n2", "n5"}; !slices.Equal(got, want) {
 			t.Errorf("list at T0 = %v, want %v", got, want)
 		}
 
@@ -461,8 +466,8 @@ func TestSubscribeAtLeaveAt(t *testing.T) {
 			at   time.Duration
 			want []string
 		}{
-			{5 * time.Second, []string{"n1", "n2", "n3"}},
-			{10 * time.Second, []string{"n1", "n3"}},
+			{5 * time.Second, []string{"n0", "n1", "n2", "n3", "n5"}},
+			{10 * time.Second, []string{"n0", "n1", "n3", "n4", "n5"}}, // n2 leaves as n4 joins
 		}
 		for _, s := range steps {
 			l := <-ch
@@ -479,7 +484,12 @@ func TestSubscribeAtLeaveAt(t *testing.T) {
 		time.Sleep(time.Minute)
 		noList(t, ch)
 
+		start := time.Now() // the timer at n5's LeaveAt is still armed
 		closeResolver(t, r)
+		if d := time.Since(start); d != 0 {
+			t.Errorf("Close returned %v after it was called, want at once", d)
+		}
+		closedList(t, ch)
 		check()
 	})
 }
