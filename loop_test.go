@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -288,8 +289,26 @@ func TestATRUN03Holder(t *testing.T) {
 
 // TestATRUN04StartupOrder checks Start's calls and the loop's first steps: Join, Watch, Slots and
 // KeepAlive, then SessionRenewed with KeepAlive's SentAt and ViewChanged with the first view, all
-// before Start returns.
+// before Start returns. Right after Start returns, Route already names the member alone in its
+// views for every key.
 func TestATRUN04StartupOrder(t *testing.T) {
+	t.Run("order", testStartupOrder)
+	t.Run("route", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			r := newShardRig(t)
+			n := start(t, context.Background(), r.config())
+			for i := range 100 {
+				wantRoute(t, n, "orders", "key-"+strconv.Itoa(i), "n1")
+			}
+			closeNode(t, n)
+			check()
+		})
+	})
+}
+
+// testStartupOrder is AT-RUN-04's order of Start's calls and of the loop's first steps.
+func testStartupOrder(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
 		r := newRig(t)
