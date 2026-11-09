@@ -84,12 +84,13 @@ func TestLoopExecute(t *testing.T) {
 		if got := time.Duration(l.n.deadline.Load()); got != 10*time.Second {
 			t.Errorf("deadline = %v, want 10s", got)
 		}
+		// The loop carries out every action of core, so only a nil action is unknown to it.
 		defer func() {
-			if r := recover(); r != "tenure: unknown action core.ClaimSlot" {
-				t.Errorf("execute(ClaimSlot) panicked with %v, want tenure: unknown action core.ClaimSlot", r)
+			if r := recover(); r != "tenure: unknown action <nil>" {
+				t.Errorf("execute(nil) panicked with %v, want tenure: unknown action <nil>", r)
 			}
 		}()
-		l.execute(core.ClaimSlot{})
+		l.execute(nil)
 	})
 }
 
@@ -288,5 +289,63 @@ func TestAssignmentsMatchMachine(t *testing.T) {
 				t.Errorf("%s: assignments(%s) = %q, want the machine's %q", c.name, sp.Name, got[sp.Name], want)
 			}
 		}
+	}
+}
+
+// TestLoopSlotResult checks O8's floor (RUN-210): a stepped SlotClaimed and a stepped
+// SlotReleased each raise the merger's floor to the end stamp of their call, so that slot data
+// read before either is dropped; a failed claim and the results of other calls leave it.
+func TestLoopSlotResult(t *testing.T) {
+	var recs []stepRecord
+	l := newLoopHarness(t, &recs)
+	m := &l.n.merge
+	m.post = func(core.View) {}
+	m.membership(core.View{Version: 1})
+
+	results := []struct {
+		name  string
+		r     callResult
+		floor uint64
+	}{
+		{"SlotClaimed", callResult{act: core.ClaimSlot{}, inputs: []core.Input{core.SlotClaimed{Slot: 0}}, start: 3, end: 10}, 10},
+		{"failed claim", callResult{act: core.ClaimSlot{}, start: 11, end: 12}, 10},
+		{"Released", callResult{act: core.Release{Space: "orders", Shard: 1, Term: 2},
+			inputs: []core.Input{core.Released{Space: "orders", Shard: 1, Term: 2}}, start: 13, end: 14}, 10},
+		{"SlotReleased", callResult{act: core.ReleaseSlot{Slot: 0},
+			inputs: []core.Input{core.SlotReleased{Slot: 0}}, start: 15, end: 20}, 20},
+	}
+	for _, tt := range results {
+		l.slotResult(tt.r)
+		m.mu.Lock()
+		floor := m.floor
+		m.mu.Unlock()
+		if floor != tt.floor {
+			t.Errorf("after %s: floor %d, want %d", tt.name, floor, tt.floor)
+		}
+		if _, stale := m.slots(tt.floor-1, 1, nil); !stale {
+			t.Errorf("after %s: slot data read at %d not dropped", tt.name, tt.floor-1)
+		}
+	}
+	if _, stale := m.slots(20, 1, nil); stale {
+		t.Error("slot data read at the floor dropped")
+	}
+
+	// deliver steps no result of an earlier generation and none that reaches a lost machine, so
+	// their slot results raise no floor that would hold back the next incarnation's views.
+	claimed := func(gen, end uint64) callResult {
+		return callResult{gen: gen, act: core.ClaimSlot{}, inputs: []core.Input{core.SlotClaimed{Slot: 0}}, start: end - 1, end: end}
+	}
+	l.gen = 2
+	l.deliver(claimed(1, 30))
+	l.status.Session = core.SessionStateLost
+	l.deliver(claimed(2, 40))
+	m.mu.Lock()
+	floor := m.floor
+	m.mu.Unlock()
+	if floor != 20 {
+		t.Errorf("floor %d after slot results that were not stepped, want 20", floor)
+	}
+	if len(recs) != 0 {
+		t.Errorf("stepped %d inputs, want none", len(recs))
 	}
 }

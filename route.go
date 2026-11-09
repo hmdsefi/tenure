@@ -6,6 +6,7 @@ package tenure
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hmdsefi/tenure/core"
@@ -26,6 +27,14 @@ type routes struct {
 	// shard, "" for a shard with none. The machine never changes a slice it has returned.
 	assign map[string][]string
 
+	// held is the slot the machine holds after the step the snapshot was made in, -1 for none,
+	// and heldKey its placement key, "" for none; self is the member's own ID. Route resolves
+	// heldKey to self: the machine holds the slot from a ClaimSlot result, which a view from a
+	// later read is still to show.
+	held    int
+	heldKey string
+	self    string
+
 	// closed reports that Close has stopped every goroutine of the node, right before it
 	// returns: Route and Local return ErrClosed.
 	closed bool
@@ -42,6 +51,13 @@ type routes struct {
 // `tenure: orders: ShardOf("k") = 9 is outside [0, 8)`. When no member can serve the shard, it
 // returns an error that matches ErrNoMembers and names the shard, such as
 // "tenure: no members: orders/3: no placement keys" when no member of the view is eligible.
+//
+// When the group has slots, shards are placed on slots: the member that serves a slot is the
+// one whose ID is the ID part of the slot's holder, and the Slot of the result is that slot. A
+// node routes the slot it holds to itself from the moment it has claimed it, before its view
+// shows the claim. A vacant slot gives "tenure: no members: orders/3: slot-1 is vacant", and a
+// holder whose member is not in the view gives "tenure: no members: orders/3: n4 is not in the
+// view".
 func (n *Node) Route(space, key string) (Member, error) {
 	r, _, shard, err := n.locate(space, key)
 	if err != nil {
@@ -100,7 +116,8 @@ func (sp *spaceShards) shardOf(key string) (int, error) {
 }
 
 // route runs Route's last two steps (RUN-400): the shard's placement key from the assignment, and
-// the member whose ID it is. A failure wraps ErrNoMembers.
+// the member whose ID it is or, for a slot key slot-<i>, the member whose ID is the ID part of
+// the slot's holder, with Slot i. A failure wraps ErrNoMembers.
 func (r *routes) route(space string, shard int) (Member, error) {
 	var key string
 	if a := r.assign[space]; a != nil {
@@ -109,11 +126,44 @@ func (r *routes) route(space string, shard int) (Member, error) {
 	if key == "" {
 		return Member{}, noMembers(space, shard, "no placement keys")
 	}
-	i, ok := r.byID[key]
-	if !ok {
-		return Member{}, noMembers(space, shard, key+" is not in the view")
+	id, slot := key, -1
+	if s, ok := r.slotOf(key); ok {
+		switch h := r.view.SlotHolders[s]; {
+		case key == r.heldKey:
+			id = r.self
+		case h == "":
+			return Member{}, noMembers(space, shard, key+" is vacant")
+		default:
+			id = holderID(h)
+		}
+		slot = s
 	}
-	return r.view.Members[i], nil
+	i, ok := r.byID[id]
+	if !ok {
+		return Member{}, noMembers(space, shard, id+" is not in the view")
+	}
+	m := r.view.Members[i]
+	if slot >= 0 {
+		m.Slot = slot
+	}
+	return m, nil
+}
+
+// slotOf returns the slot that key names, "slot-<i>" with i one of the view's slots, and false
+// for a key that names none: every key without slots.
+func (r *routes) slotOf(key string) (int, bool) {
+	if r.view == nil || r.view.Slots == 0 {
+		return 0, false
+	}
+	digits, ok := strings.CutPrefix(key, "slot-")
+	if !ok {
+		return 0, false
+	}
+	s, err := strconv.Atoi(digits)
+	if err != nil || s < 0 || s >= r.view.Slots {
+		return 0, false
+	}
+	return s, true
 }
 
 // noMembers returns "tenure: no members: <space>/<shard>: <detail>", wrapping ErrNoMembers.
@@ -132,7 +182,7 @@ func newRoutes(v *core.View, byID map[string]int, assign map[string][]string) *r
 			}
 		}
 	}
-	return &routes{view: v, byID: byID, assign: assign}
+	return &routes{view: v, byID: byID, assign: assign, held: -1}
 }
 
 // closeRoutes publishes a closed snapshot, so that Route and Local return ErrClosed from now on.
@@ -142,10 +192,10 @@ func (n *Node) closeRoutes() {
 	n.snap.Store(&r)
 }
 
-// publishRoutes publishes a new routing snapshot after a step that changed the published view or
-// the assignment of any space (RUN-400). A recompute stores a new assignment slice (MCH-340), and
-// so does assignments, so comparing slices by their first element's address finds every change,
-// including the first step of a new machine. Only the loop calls it, under n.stepMu.
+// publishRoutes publishes a new routing snapshot after a step that changed the published view,
+// the assignment of any space or the held slot (RUN-400). A recompute stores a new assignment
+// slice (MCH-340), and so does assignments, so comparing slices by their first element's address
+// finds every change, including the first step of a new machine. Only the loop calls it, under n.stepMu.
 func (l *loop) publishRoutes() {
 	n := l.n
 	cur := n.snap.Load()
@@ -153,7 +203,8 @@ func (l *loop) publishRoutes() {
 		cur = &routes{} // a node made without Start, as the loop's internal tests make one
 	}
 	v := n.view.Load()
-	changed := cur.view != v
+	held := l.status.Slot
+	changed := cur.view != v || cur.held != held
 	for _, sp := range n.cfg.Spaces {
 		if !sameSlice(l.assignment(sp.Name), cur.assign[sp.Name]) {
 			changed = true
@@ -171,7 +222,12 @@ func (l *loop) publishRoutes() {
 	if cur.view == v {
 		byID = cur.byID
 	}
-	n.snap.Store(newRoutes(v, byID, assign))
+	r := newRoutes(v, byID, assign)
+	r.self, r.held = n.cfg.Self.ID, held
+	if held >= 0 {
+		r.heldKey = "slot-" + strconv.Itoa(held)
+	}
+	n.snap.Store(r)
 }
 
 // assignment returns the assignment of space that routing follows: the one the loop computed for

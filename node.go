@@ -48,9 +48,10 @@ type Node struct {
 	first chan struct{}             // closed when the watcher has taken the first view
 	ended chan struct{}             // closed when the watcher returns
 
-	// The watcher's own state: the Version of the latest view it took, once it took one.
-	offered        bool
-	offeredVersion uint64
+	// merge merges the latest membership view and slot data into the views the node steps and
+	// publishes; refresh reads the slot data of a SlotStore once the session is open, else nil.
+	merge   merger
+	refresh *refresher
 
 	// With a store: the session, the executor of the machine's store calls, and the loop that
 	// drives the machine. The loop is the only goroutine that steps the machine.
@@ -116,6 +117,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		machineDone: make(chan struct{}),
 		shards:      newShardTable(cfg.Spaces),
 	}
+	n.merge.post = n.postView
 	n.snap.Store(newRoutes(nil, nil, nil))
 	n.obs.start(n.holder)
 
@@ -154,20 +156,23 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	return n, nil
 }
 
-// openSession runs Start's steps with a store (RUN-060 steps 4, 5 and 7): it reads the slots
-// when the store is a SlotStore, opens the session with KeepAlive, and starts the loop with a new
-// machine. The loop's first steps are SessionRenewed with KeepAlive's SentAt and ViewChanged with
-// the first merged view; openSession returns once both have been carried out, or when ctx ends
-// first. Every call uses ctx. With spaces it also starts the resync goroutine and, when the store
-// is a Watcher, the store watch (RUN-170).
+// openSession runs Start's steps with a store (RUN-060 steps 4, 5 and 7): it reads and seeds
+// the slots when the store is a SlotStore, opens the session with KeepAlive, and starts the loop
+// with a new machine and, with a SlotStore, the slot refresher. The loop's first steps are
+// SessionRenewed with KeepAlive's SentAt and ViewChanged with the latest merged view, which holds
+// the slots read; openSession returns once both have been carried out, or when ctx ends first.
+// Every call uses ctx. With spaces it also starts the resync goroutine and, when the store is a
+// Watcher, the store watch (RUN-170).
 func (n *Node) openSession(ctx context.Context) error {
-	_, first := n.inbox.take()
-	if ss, ok := n.cfg.Store.(SlotStore); ok {
-		// The views get the slot data with slots (1.5-12); this read only checks the store.
-		if _, _, err := ss.Slots(ctx); err != nil {
-			return fmt.Errorf("tenure: read slots: %w", err)
+	ss, slots := n.cfg.Store.(SlotStore)
+	var readAt time.Time
+	if slots {
+		var err error
+		if readAt, err = n.readSlots(ctx, ss); err != nil {
+			return err
 		}
 	}
+	_, first := n.inbox.take()
 	sentAt := time.Since(n.epoch)
 	if err := n.cfg.Store.KeepAlive(ctx, n.holder, n.cfg.Timing); err != nil {
 		return fmt.Errorf("tenure: open session: %w", err)
@@ -187,7 +192,13 @@ func (n *Node) openSession(ctx context.Context) error {
 		{in: core.ViewChanged{View: *first}},
 	}
 	started := make(chan struct{})
+	if slots {
+		n.refresh = newRefresher(n, ss) // before the loop, which asks it for reads
+	}
 	n.wg.Go(func() { n.lp.run(steps, started) })
+	if slots {
+		n.wg.Go(func() { n.refresh.run(readAt) })
+	}
 	if len(n.cfg.Spaces) > 0 {
 		n.wg.Go(n.resyncHolders)
 		if w, ok := n.cfg.Store.(Watcher); ok {
@@ -205,6 +216,35 @@ func (n *Node) openSession(ctx context.Context) error {
 	default:
 		return fmt.Errorf("tenure: start: %w", ctx.Err())
 	}
+}
+
+// readSlots reads the slot count and holders for Start (RUN-060 step 4, RUN-230) and hands them
+// to the merger. When the stored count is 0 and Config.Slots is not, it seeds the count with
+// SetSlots and reads again; a stored count that differs from a positive Config.Slots is reported
+// and kept. It returns the start of the last read, from which the refresher's period runs.
+func (n *Node) readSlots(ctx context.Context, ss SlotStore) (time.Time, error) {
+	at := time.Now()
+	count, holders, err := readSlotData(ctx, ss)
+	if err != nil {
+		return at, fmt.Errorf("tenure: read slots: %w", err)
+	}
+	want := n.cfg.Slots
+	if count == 0 && want > 0 {
+		if err := ss.SetSlots(ctx, want); err != nil {
+			return at, fmt.Errorf("tenure: seed slots: %w", err)
+		}
+		at = time.Now()
+		if count, holders, err = readSlotData(ctx, ss); err != nil {
+			return at, fmt.Errorf("tenure: seed slots: %w", err)
+		}
+	}
+	if want > 0 && count > 0 && count != want {
+		n.obs.slotCountMismatch(want, count)
+	}
+	// Stamp 0: Start's reads come before every call of the executor, and no slot result is
+	// stepped before them.
+	n.merge.slots(0, count, holders)
+	return at, nil
 }
 
 // drawHolder reads an incarnation of incarnationBytes bytes from r and returns the holder of

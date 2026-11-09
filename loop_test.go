@@ -133,20 +133,21 @@ func TestATRUN01ValidConfigStarts(t *testing.T) {
 		mutate func(c *tenure.Config, r rig)
 		timing core.Timing // KeepAlive's
 		slots  bool        // Start reads the slots
+		seeds  bool        // Start seeds the slot count
 	}{
-		{"store and membership", func(*tenure.Config, rig) {}, core.DefaultTiming, true},
-		{"store without slots", func(c *tenure.Config, r rig) { c.Store = r.fs.StoreOnly() }, core.DefaultTiming, false},
+		{"store and membership", func(*tenure.Config, rig) {}, core.DefaultTiming, true, false},
+		{"store without slots", func(c *tenure.Config, r rig) { c.Store = r.fs.StoreOnly() }, core.DefaultTiming, false, false},
 		{"Slot and Draining ignored", func(c *tenure.Config, _ rig) {
 			c.Self.Slot, c.Self.Draining = 5, true
-		}, core.DefaultTiming, true},
+		}, core.DefaultTiming, true, false},
 		{"Meta keys that are not reserved", func(c *tenure.Config, _ rig) {
 			c.Self.Meta = map[string]string{"tenure": "", "Tenure.x": "", "zone": "z1"}
-		}, core.DefaultTiming, true},
-		{"explicit Timing", func(c *tenure.Config, _ rig) { c.Timing = custom }, applied, true},
-		{"slot count before seeding", func(c *tenure.Config, _ rig) { c.Slots = 2 }, core.DefaultTiming, true},
+		}, core.DefaultTiming, true, false},
+		{"explicit Timing", func(c *tenure.Config, _ rig) { c.Timing = custom }, applied, true, false},
+		{"slot count seeded", func(c *tenure.Config, _ rig) { c.Slots = 2 }, core.DefaultTiming, true, true},
 		{"checkers accept", func(c *tenure.Config, r rig) {
 			c.Store, c.Membership = r.fs.Checking(nil, nil), r.sm.Checking(nil, nil)
-		}, core.DefaultTiming, true},
+		}, core.DefaultTiming, true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -157,11 +158,16 @@ func TestATRUN01ValidConfigStarts(t *testing.T) {
 				tt.mutate(&cfg, r)
 				n := start(t, context.Background(), cfg)
 
-				wantStore := []string{"Slots", "KeepAlive"}
-				if !tt.slots {
-					wantStore = wantStore[1:]
+				var wantStore []string
+				switch {
+				case tt.seeds:
+					wantStore = []string{"Slots", "SetSlots", "Slots", "KeepAlive"}
+				case tt.slots:
+					wantStore = []string{"Slots", "KeepAlive"}
+				default:
+					wantStore = []string{"KeepAlive"}
 				}
-				fsCalls := r.fs.Calls("Slots", "KeepAlive", "CloseSession")
+				fsCalls := withoutRefreshes(r.fs.Calls("Slots", "SetSlots", "KeepAlive", "CloseSession"))
 				if got := callMethods(fsCalls); !slices.Equal(got, wantStore) {
 					t.Errorf("store calls after Start = %v, want %v", got, wantStore)
 				}
@@ -182,7 +188,7 @@ func TestATRUN01ValidConfigStarts(t *testing.T) {
 
 				closeNode(t, n)
 				wantStore = append(wantStore, "CloseSession")
-				if got := callMethods(r.fs.Calls("Slots", "KeepAlive", "CloseSession")); !slices.Equal(got, wantStore) {
+				if got := callMethods(withoutRefreshes(r.fs.Calls("Slots", "SetSlots", "KeepAlive", "CloseSession"))); !slices.Equal(got, wantStore) {
 					t.Errorf("store calls after Close = %v, want %v", got, wantStore)
 				}
 				if got, want := callMethods(r.sm.Calls("Join", "Watch", "SetDraining", "Leave")),
@@ -421,7 +427,7 @@ func TestATRUN05StartFailureCleanup(t *testing.T) {
 			if d := time.Since(t0); d != 6*time.Second {
 				t.Errorf("Start returned at T0+%v, want T0+6s, once the loop has stopped", d)
 			}
-			all := callsInOrder(r.fs.Calls(), r.sm.Calls())
+			all := withoutRefreshes(callsInOrder(r.fs.Calls(), r.sm.Calls()))
 			if got, want := callMethods(all), []string{"Join", "Watch", "Slots", "KeepAlive", "CloseSession", "Leave"}; !slices.Equal(got, want) {
 				t.Errorf("calls = %v, want %v", got, want)
 			}
@@ -479,8 +485,14 @@ func TestATRUN06StartContextScope(t *testing.T) {
 				t.Errorf("%v, want nil", c)
 			}
 		}
-		if sl := r.fs.Calls("Slots"); len(sl) != 1 || !sl[0].Deadline.Equal(t0.Add(5*time.Second)) {
-			t.Errorf("Slots calls = %v, want one with Start's ctx", sl)
+		sl := r.fs.Calls("Slots")
+		if len(sl) == 0 || !sl[0].Deadline.Equal(t0.Add(5*time.Second)) {
+			t.Errorf("Slots calls = %v, want Start's first, with Start's ctx", sl)
+		}
+		if got, want := startsAt(sl, t0), secs(0, 2, 4, 6, 8); !slices.Equal(got, want) {
+			t.Errorf("Slots calls at %v, want Start's and then one every RetryPeriod", got)
+		} else {
+			wantDeadlines(t, sl[1:])
 		}
 		if got := n.SessionDeadline(); got != 18*time.Second {
 			t.Errorf("SessionDeadline() = %v, want 18s from the renewal at T0+8s", got)
@@ -700,13 +712,14 @@ func TestATRUN76SetDrainingRetries(t *testing.T) {
 		// Drain posts Drain{} to the loop and makes its first SetDraining attempt at the same
 		// instant, so that attempt and CloseSession, both at T0+1s, may come in either order.
 		// Each double's own order is fixed, and so is the order across them at other instants.
-		if got, want := callMethods(r.fs.Calls()), []string{"Slots", "KeepAlive", "CloseSession"}; !slices.Equal(got, want) {
+		// The slot refresher's Slots calls after KeepAlive are left out.
+		if got, want := callMethods(withoutRefreshes(r.fs.Calls())), []string{"Slots", "KeepAlive", "CloseSession"}; !slices.Equal(got, want) {
 			t.Errorf("store calls = %v, want %v", got, want)
 		}
 		if got, want := callMethods(r.sm.Calls()), []string{"Join", "Watch", "SetDraining", "SetDraining", "SetDraining", "Leave"}; !slices.Equal(got, want) {
 			t.Errorf("membership calls = %v, want %v", got, want)
 		}
-		all := callMethods(callsInOrder(r.fs.Calls(), r.sm.Calls()))
+		all := callMethods(withoutRefreshes(callsInOrder(r.fs.Calls(), r.sm.Calls())))
 		if i := slices.Index(all, "KeepAlive"); i < 0 || slices.Index(all, "SetDraining") < i || slices.Index(all, "CloseSession") < i {
 			t.Errorf("calls = %v, want SetDraining and CloseSession after KeepAlive", all)
 		}
