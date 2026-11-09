@@ -208,9 +208,9 @@ func TestATOBS17Logger(t *testing.T) {
 		// The two shards' lanes may finish their calls of one instant in either order, and the
 		// watcher hands the loop a membership view whenever it reads one, so how the streams of
 		// events interleave depends on scheduling, with a Logger or without. The runs are
-		// compared stream by stream, in order, with times, Seq aside. The views stream holds the
-		// view of Close's SetDraining and never the one Leave publishes: the watcher ends once
-		// Leave has been called (RUN-200).
+		// compared stream by stream, in order, with times, Seq aside. Whether the loop steps the
+		// view of Close's SetDraining before Leave depends on scheduling too, so the views
+		// stream leaves out every view.changed after node.draining.
 		if got, want := streams(a.Events.Events()), streams(logged); logged != nil && !reflect.DeepEqual(got, want) {
 			t.Errorf("events without a Logger =\n%v\nwant those with one:\n%v", got, want)
 		}
@@ -221,12 +221,19 @@ func TestATOBS17Logger(t *testing.T) {
 
 // streams splits events, in Seq order, into the streams whose order does not depend on
 // scheduling, each event without its Seq and formatted, in order: one per shard, one of
-// view.changed, and one of the node's other events.
+// view.changed, and one of the node's other events. It leaves out every view.changed after
+// node.draining: the drain completes without waiting for the loop to step the view of Close's
+// SetDraining, and the watcher drops it once Leave has been called (RUN-200).
 func streams(events []tenure.Event) map[string][]string {
 	out := make(map[string][]string)
+	closing := false
 	for _, e := range events {
 		key := "node"
 		switch {
+		case e.Kind == tenure.EventNodeDraining:
+			closing = true
+		case e.Kind == tenure.EventViewChanged && closing:
+			continue
 		case e.Kind == tenure.EventViewChanged:
 			key = "views"
 		case e.Shard >= 0:
