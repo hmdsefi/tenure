@@ -40,7 +40,8 @@ type session struct {
 	uid types.UID
 	// lease is the member Lease as this Adapter last wrote it.
 	lease *coordinationv1.Lease
-	// timing is the session's Timing, from its latest successful KeepAlive.
+	// timing is the session's Timing, from its latest successful KeepAlive, or from a later
+	// failed one with a shorter LeaseDuration (renew).
 	timing core.Timing
 	// sent is when the latest successful write of the session was sent, on the Adapter's clock.
 	sent time.Time
@@ -48,6 +49,18 @@ type session struct {
 	cleared bool
 	// cache is the informer hold of an active session, nil once it ended.
 	cache *leaseCache
+}
+
+// expired reports whether session s has expired at now: LeaseDuration of its Timing after its
+// latest successful write was sent. A write sent from then on could renew a session that other
+// Adapters may already have seen end.
+func (s *session) expired(now time.Time) bool {
+	return !now.Before(s.sent.Add(s.timing.LeaseDuration))
+}
+
+// expiredError is the error of KeepAlive for holder, whose session has expired.
+func expiredError(holder string) error {
+	return fmt.Errorf("k8s: session %s expired: %w", holder, tenure.ErrSessionLost)
 }
 
 // memberOf returns the member ID of holder: the text before its first "/".
@@ -70,9 +83,9 @@ func (a *Adapter) liveSession(holder string) (s session, ok bool, err error) {
 		return session{}, false, nil
 	case p.ended:
 		return session{}, false, fmt.Errorf("k8s: session %s ended: %w", holder, tenure.ErrSessionLost)
-	case !now.Before(p.sent.Add(p.timing.LeaseDuration)):
+	case p.expired(now):
 		a.endSessionLocked(p)
-		return session{}, false, fmt.Errorf("k8s: session %s expired: %w", holder, tenure.ErrSessionLost)
+		return session{}, false, expiredError(holder)
 	}
 	return *p, true, nil
 }
@@ -168,6 +181,14 @@ func (a *Adapter) openSession(ctx context.Context, holder, name string, timing c
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// The Lease names holder now: a session of another incarnation of the member in this
+	// Adapter has been replaced, and ends at once.
+	for _, p := range a.sessions {
+		if p.name == name && p.holder != holder && !p.ended {
+			p.cleared = true
+			a.endSessionLocked(p)
+		}
+	}
 	a.sessions[holder] = &session{holder: holder, name: name, uid: written.UID, lease: written, timing: timing, sent: sent, cache: c}
 	return nil
 }
@@ -209,9 +230,19 @@ func (a *Adapter) decideOpen(cur *coordinationv1.Lease, holder string, timing co
 
 // renew renews active session s with timing (K8S-220): one update of the member Lease from the
 // latest state the Adapter knows. The caller holds the Lease's lock.
+//
+// No write is sent once s has expired, however long the lock, a conflict or its GET took: such
+// a write could renew a session that other Adapters may already have seen end. A renewal that
+// fails may still have been written, with timing's duration: when that is shorter than the
+// session's, the session's expiry comes forward to match.
 func (a *Adapter) renew(ctx context.Context, s session, timing core.Timing) error {
 	sent := a.now()
+	expired := false
 	written, err := a.writeLease(ctx, "renew", s.name, a.latest(s.name, s.lease), func(cur *coordinationv1.Lease) (change, error) {
+		if s.expired(a.now()) {
+			expired = true
+			return change{}, expiredError(s.holder)
+		}
 		return a.decideRenew(cur, s, timing)
 	})
 	a.mu.Lock()
@@ -219,10 +250,14 @@ func (a *Adapter) renew(ctx context.Context, s session, timing core.Timing) erro
 	p := a.sessions[s.holder]
 	switch {
 	case errors.Is(err, tenure.ErrSessionLost):
-		p.cleared = true
+		// An expired session's Lease may still name the holder, for CloseSession to clear.
+		p.cleared = !expired
 		a.endSessionLocked(p)
 		return err
 	case err != nil:
+		if timing.LeaseDuration < p.timing.LeaseDuration {
+			p.timing = timing
+		}
 		return err
 	}
 	p.lease, p.timing, p.sent = written, timing, sent
@@ -274,16 +309,16 @@ func (a *Adapter) CloseSession(ctx context.Context, holder string) error {
 	name := memberName(a.group, memberOf(holder))
 	unlock, err := a.lockLease(ctx, name)
 	if err != nil {
+		// Step 3 all the same: a write of the Lease in flight cannot undo it.
+		a.mu.Lock()
+		a.endSessionLocked(a.sessionLocked(holder, name))
+		a.mu.Unlock()
 		return err
 	}
 	defer unlock()
 
 	a.mu.Lock()
-	s := a.sessions[holder]
-	if s == nil {
-		s = &session{holder: holder, name: name}
-		a.sessions[holder] = s
-	}
+	s := a.sessionLocked(holder, name)
 	base, cleared := s.lease, s.cleared
 	a.mu.Unlock()
 	// The latest state known, read while the session still holds the informer.
@@ -316,6 +351,17 @@ func (a *Adapter) CloseSession(ctx context.Context, holder string) error {
 	s.cleared = true
 	a.mu.Unlock()
 	return nil
+}
+
+// sessionLocked returns the row of holder, whose member Lease is name, in the session table,
+// adding a row with no session when there is none. The caller holds a.mu.
+func (a *Adapter) sessionLocked(holder, name string) *session {
+	s := a.sessions[holder]
+	if s == nil {
+		s = &session{holder: holder, name: name}
+		a.sessions[holder] = s
+	}
+	return s
 }
 
 // decideClose decides step 2 of closing the session of holder on its member Lease cur (K8S-240):

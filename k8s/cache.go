@@ -197,6 +197,11 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 	o, ok := c.obs[l.Name]
 	switch {
 	case !ok || o.lease.UID != l.UID:
+		if ok {
+			// The Lease was deleted and created again without a deletion event, as a relist
+			// after a gap in the watch shows it: the deleted one leaves its tombstone all the same.
+			c.bury(o.lease, o.tokenSeenAt, now)
+		}
 		c.obs[l.Name] = &observation{lease: l, rvSeenAt: now, tokenSeenAt: now}
 	case l.ResourceVersion == o.lease.ResourceVersion || isOlder(l.ResourceVersion, o.lease.ResourceVersion):
 	default:
@@ -223,6 +228,13 @@ func (c *leaseCache) forget(l *coordinationv1.Lease) {
 		tokenSeenAt = o.tokenSeenAt
 		delete(c.obs, l.Name)
 	}
+	c.bury(l, tokenSeenAt, now)
+}
+
+// bury leaves the tombstone of deleted Lease l, whose session token was first seen at
+// tokenSeenAt, when l is a member Lease and the tombstone has not expired at now; a deleted
+// shard Lease leaves its term with the Adapter. The caller holds c.mu.
+func (c *leaseCache) bury(l *coordinationv1.Lease, tokenSeenAt, now time.Time) {
 	if l.Labels[labelKind] == kindShard {
 		if term, ok := decodeTerm(l.Annotations); ok && term > 0 {
 			c.terms.note(l.Name, term)

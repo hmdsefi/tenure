@@ -81,7 +81,11 @@ func (r *renewer) stop() (renewals int, errs []error) {
 
 // TestK8S200KeepAliveChecks checks what KeepAlive and CloseSession return without a request:
 // ctx.Err(), then the holder's and the timing's errors, the error of an ended holder and of an
-// expired session, which ends it; and that CloseSession never returns ErrSessionLost.
+// expired session, which ends it; and that CloseSession never returns ErrSessionLost. It also
+// checks that a session expiring during its renewal is not renewed, that a failed renewal with
+// a shorter duration brings the expiry forward, that a new incarnation ends the session of the
+// one it replaces in the same Adapter, and that CloseSession ends the holder when its ctx ends
+// while it waits for the member Lease.
 func TestK8S200KeepAliveChecks(t *testing.T) {
 	ctx := t.Context()
 	bad := core.Timing{LeaseDuration: time.Second, RenewDeadline: 2 * time.Second, RetryPeriod: time.Second, SlotGrace: time.Second}
@@ -196,6 +200,134 @@ func TestK8S200KeepAliveChecks(t *testing.T) {
 		}
 		if got := actions(client, "delete"); len(got) != 1 {
 			t.Errorf("deletes %v, want 1", got)
+		}
+	})
+
+	t.Run("expired during the renewal", func(t *testing.T) {
+		// The session expires between KeepAlive's check and the second write of a conflict: no
+		// write is sent once the session has expired.
+		clk := newFakeClock()
+		client := newFake()
+		a := fakeAdapter(t, client, withClock(clk.now))
+		if err := a.KeepAlive(ctx, "pod-0/1", T); err != nil {
+			t.Fatalf("KeepAlive: %v", err)
+		}
+		clk.advance(T.LeaseDuration - time.Millisecond)
+		first := true
+		client.PrependReactor("update", resourceLeases, func(k8stesting.Action) (bool, runtime.Object, error) {
+			if !first {
+				return false, nil, nil
+			}
+			first = false
+			clk.advance(time.Millisecond)
+			return true, nil, apierrors.NewConflict(leasesResource.GroupResource(), memberName("g", "pod-0"), errors.New("injected"))
+		})
+		client.ClearActions()
+		want := "k8s: session pod-0/1 expired: tenure: session lost"
+		if err := a.KeepAlive(ctx, "pod-0/1", T); !errors.Is(err, tenure.ErrSessionLost) || err.Error() != want {
+			t.Errorf("KeepAlive expiring during its conflict = %v, want %s", err, want)
+		}
+		if got := writes(client); len(got) != 1 {
+			t.Errorf("writes %v, want the first update alone", got)
+		}
+		if a.runningCache() != nil {
+			t.Error("the informer still runs after the only session expired")
+		}
+		// The Lease still names the holder: CloseSession deletes it.
+		client.ClearActions()
+		if err := a.CloseSession(ctx, "pod-0/1"); err != nil {
+			t.Fatalf("CloseSession: %v", err)
+		}
+		if got := actions(client, "delete"); len(got) != 1 {
+			t.Errorf("deletes %v, want 1", got)
+		}
+	})
+
+	t.Run("failed renewal with a shorter duration", func(t *testing.T) {
+		// A failed renewal may have been written with its shorter duration, which the session's
+		// expiry then follows.
+		clk := newFakeClock()
+		client := newFake()
+		a := fakeAdapter(t, client, withClock(clk.now))
+		closeAtEnd(t, a, "pod-0/1")
+		if err := a.KeepAlive(ctx, "pod-0/1", core.DefaultTiming); err != nil {
+			t.Fatalf("KeepAlive: %v", err)
+		}
+		failed := false
+		client.PrependReactor("update", resourceLeases, func(k8stesting.Action) (bool, runtime.Object, error) {
+			if failed {
+				return false, nil, nil
+			}
+			failed = true
+			return true, nil, apierrors.NewInternalError(errors.New("injected"))
+		})
+		if err := a.KeepAlive(ctx, "pod-0/1", T); err == nil || errors.Is(err, tenure.ErrSessionLost) {
+			t.Fatalf("KeepAlive with a failing update = %v, want the update's error", err)
+		}
+		clk.advance(T.LeaseDuration)
+		want := "k8s: session pod-0/1 expired: tenure: session lost"
+		if err := a.KeepAlive(ctx, "pod-0/1", T); !errors.Is(err, tenure.ErrSessionLost) || err.Error() != want {
+			t.Errorf("KeepAlive %v after the failed renewal = %v, want %s", T.LeaseDuration, err, want)
+		}
+	})
+
+	t.Run("replaced in this adapter", func(t *testing.T) {
+		client := newFake()
+		a := fakeAdapter(t, client)
+		closeAtEnd(t, a, "pod-0/1", "pod-0/2")
+		if err := a.KeepAlive(ctx, "pod-0/1", T); err != nil {
+			t.Fatalf("KeepAlive pod-0/1: %v", err)
+		}
+		if err := a.KeepAlive(ctx, "pod-0/2", T); err != nil {
+			t.Fatalf("KeepAlive pod-0/2: %v", err)
+		}
+		if c := a.runningCache(); c == nil || c.refs != 1 {
+			t.Errorf("cache %+v, want one with the new incarnation's hold alone", c)
+		}
+		client.ClearActions()
+		const want = "k8s: session pod-0/1 ended: tenure: session lost"
+		if err := a.KeepAlive(ctx, "pod-0/1", T); !errors.Is(err, tenure.ErrSessionLost) || err.Error() != want {
+			t.Errorf("KeepAlive of the replaced incarnation = %v, want %s", err, want)
+		}
+		// Its CloseSession leaves the Lease, which names the new incarnation, alone.
+		if err := a.CloseSession(ctx, "pod-0/1"); err != nil {
+			t.Errorf("CloseSession pod-0/1: %v", err)
+		}
+		if got := client.Actions(); len(got) != 0 {
+			t.Errorf("requests %v, want none", got)
+		}
+	})
+
+	t.Run("close while the lease is busy", func(t *testing.T) {
+		// CloseSession whose ctx ends while another write of the member Lease is in flight ends
+		// the holder all the same.
+		client := newFake()
+		a := fakeAdapter(t, client)
+		closeAtEnd(t, a, "pod-0/1")
+		if err := a.KeepAlive(ctx, "pod-0/1", T); err != nil {
+			t.Fatalf("KeepAlive: %v", err)
+		}
+		unlock, err := a.lockLease(ctx, memberName("g", "pod-0"))
+		if err != nil {
+			t.Fatalf("lockLease: %v", err)
+		}
+		cctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		err = a.CloseSession(cctx, "pod-0/1")
+		unlock()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("CloseSession = %v, want context.DeadlineExceeded", err)
+		}
+		if a.runningCache() != nil {
+			t.Error("the informer still runs after the only session was closed")
+		}
+		client.ClearActions()
+		const want = "k8s: session pod-0/1 ended: tenure: session lost"
+		if err := a.KeepAlive(ctx, "pod-0/1", T); !errors.Is(err, tenure.ErrSessionLost) || err.Error() != want {
+			t.Errorf("KeepAlive after the CloseSession = %v, want %s", err, want)
+		}
+		if got := client.Actions(); len(got) != 0 {
+			t.Errorf("requests %v, want none", got)
 		}
 	})
 
@@ -662,7 +794,7 @@ func TestK8S220RenewOutcomes(t *testing.T) {
 	g := group()
 	ctx := t.Context()
 	a, rec := c.adapter(t, g)
-	closeAtEnd(t, a, "pod-0/1", "pod-4/1")
+	closeAtEnd(t, a, "pod-0/1", "pod-4/1", "pod-5/1", "pod-6/1")
 
 	t.Run("renewal", func(t *testing.T) {
 		name := memberName(g, "pod-0")
@@ -704,6 +836,58 @@ func TestK8S220RenewOutcomes(t *testing.T) {
 			t.Errorf("leaseDurationSeconds %d, want 4", *l.Spec.LeaseDurationSeconds)
 		}
 		mustKeepAlive(t, a, "pod-0/1")
+	})
+
+	t.Run("renewal from the latest state", func(t *testing.T) {
+		// Another writer changed the Lease and the informer saw it: the renewal starts from that
+		// state, in one update that keeps the other writer's change.
+		name := memberName(g, "pod-5")
+		mustKeepAlive(t, a, "pod-5/1")
+		l := rawUpdate(t, c, name, func(l *coordinationv1.Lease) {
+			l.Annotations = map[string]string{"example.com/keep": "1"}
+		})
+		waitObserved(t, a, name, l.ResourceVersion)
+		rec.reset()
+		mustKeepAlive(t, a, "pod-5/1")
+		got := rec.filter(named)
+		if s := requestStrings(got); len(s) != 1 || s[0] != "UPDATE "+name+" 200" {
+			t.Fatalf("requests %v, want [UPDATE %s 200]", s, name)
+		}
+		if rv := got[0].lease().ResourceVersion; rv != l.ResourceVersion {
+			t.Errorf("update sent resourceVersion %s, want the other writer's %s", rv, l.ResourceVersion)
+		}
+		if l := rawGet(t, c, name); l.Annotations["example.com/keep"] != "1" {
+			t.Errorf("annotations %v, want the other writer's kept", l.Annotations)
+		}
+	})
+
+	t.Run("serialized writes", func(t *testing.T) {
+		// Concurrent KeepAlives of one holder write its member Lease one at a time: each update
+		// starts from the one before, and none conflicts.
+		name := memberName(g, "pod-6")
+		mustKeepAlive(t, a, "pod-6/1")
+		rec.reset()
+		off := rec.delay(name, 200*time.Millisecond)
+		defer off()
+		var wg sync.WaitGroup
+		errs := make([]error, 3)
+		for i := range errs {
+			wg.Go(func() { errs[i] = a.KeepAlive(ctx, "pod-6/1", T) })
+		}
+		wg.Wait()
+		off()
+		if err := errors.Join(errs...); err != nil {
+			t.Fatalf("concurrent KeepAlives: %v", err)
+		}
+		updates := on(verbUpdate, name)
+		inFlight := rec.maxInFlight(updates)
+		renewed := rec.count(func(r request) bool { return updates(r) && r.status == 200 })
+		if inFlight != 1 || renewed != 3 {
+			t.Errorf("%d updates in flight at most, %d of them 200; want 1 and 3", inFlight, renewed)
+		}
+		if got := rec.filter(named); len(got) != 3 {
+			t.Errorf("requests %v, want 3 updates", requestStrings(got))
+		}
 	})
 
 	lost := []struct {
