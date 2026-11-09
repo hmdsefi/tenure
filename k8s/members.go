@@ -148,6 +148,7 @@ func (a *Adapter) Join(ctx context.Context, self core.Member) error {
 	defer a.mu.Unlock()
 	a.member.joined, a.member.self, a.member.name, a.member.lease = true, self, name, written
 	a.member.cache, a.member.stop, a.member.done = c, stop, done
+	a.signalFreshLocked()
 	a.runs.Go(func() {
 		defer close(done)
 		a.heartbeat(hctx, name)
@@ -233,6 +234,7 @@ func (a *Adapter) Leave(ctx context.Context) error {
 	defer a.mu.Unlock()
 	a.member.joined, a.member.left, a.member.lease = false, true, nil
 	a.member.cache, a.member.stop, a.member.done = nil, nil, nil
+	a.signalFreshLocked()
 	a.releaseCacheLocked(m.cache)
 	return err
 }

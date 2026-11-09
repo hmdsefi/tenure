@@ -146,7 +146,7 @@ func (a *Adapter) decideAcquire(ctx context.Context, s session, space, name stri
 			return change{}, 0, err
 		}
 		if h := holderOf(cur); h != "" && h != s.holder {
-			live, err := a.holderLive(ctx, "acquire", cur)
+			live, err := a.holderLive(ctx, "acquire", cur, true)
 			if err != nil {
 				return change{}, 0, err
 			}
@@ -209,8 +209,10 @@ func (a *Adapter) grant(s session, space, name string, cur *coordinationv1.Lease
 // that state (K8S-130): a changed session token makes the holder live again. A gone verdict
 // that needs no confirmation (no holder, or the session ended) costs no request, nor does a
 // holder that is not <member ID>/<incarnation>, which has no member Lease to read. op names
-// the operation in errors: "k8s: <op> <member Lease>: <error>".
-func (a *Adapter) holderLive(ctx context.Context, op string, cur *coordinationv1.Lease) (bool, error) {
+// the operation in errors: "k8s: <op> <member Lease>: <error>". fresh is false while the cache
+// is not fresh, for slot records (K8S-150): then time alone turns no holder gone (frozen), and
+// such a verdict needs no confirmation.
+func (a *Adapter) holderLive(ctx context.Context, op string, cur *coordinationv1.Lease, fresh bool) (bool, error) {
 	h := holderOf(cur)
 	rec := a.observed(cur)
 	var mname string
@@ -228,18 +230,18 @@ func (a *Adapter) holderLive(ctx context.Context, op string, cur *coordinationv1
 			tomb = &t
 		}
 	}
-	v := liveness(rec, member, tomb, a.now(), a.timing.LeaseDuration)
+	v := frozen(liveness(rec, member, tomb, a.now(), a.timing.LeaseDuration), fresh)
 	if v.live || !v.get || mname == "" {
 		return v.live, nil
 	}
 
-	fresh, err := a.getLease(ctx, mname)
+	read, err := a.getLease(ctx, mname)
 	if err != nil {
 		return false, fmt.Errorf("k8s: %s %s: %w", op, mname, err)
 	}
 	var next *observation
-	if fresh != nil && isMemberLease(fresh, a.group) {
-		o := a.observed(fresh)
+	if read != nil && isMemberLease(read, a.group) {
+		o := a.observed(read)
 		next = &o
 	}
 	// The member Lease of the record's session is gone, and the informer has not told yet: what
@@ -247,7 +249,7 @@ func (a *Adapter) holderLive(ctx context.Context, op string, cur *coordinationv1
 	if hasSession && tomb == nil && member != nil && member.lease.UID == s && (next == nil || next.lease.UID != s) {
 		tomb = &tombstone{tokenSeenAt: member.tokenSeenAt, wait: leaseWait(member.lease, a.timing.LeaseDuration)}
 	}
-	return liveness(rec, next, tomb, a.now(), a.timing.LeaseDuration).live, nil
+	return frozen(liveness(rec, next, tomb, a.now(), a.timing.LeaseDuration), fresh).live, nil
 }
 
 // isMemberLease reports whether l carries the labels of a member Lease of group.
@@ -379,25 +381,41 @@ func (a *Adapter) recheck(ctx context.Context, op, name string, base *coordinati
 }
 
 // releaseRecordsOf releases every shard record that names holder, each at its own term, in name
-// order (K8S-240, step 1). It finds them with one LIST of the group's Leases, goes on past
-// failures, and returns their errors joined.
+// order, and then every slot record that names holder, in slot order (K8S-240, step 1). It
+// finds them with one LIST of the group's Leases, goes on past failures, and returns their
+// errors joined.
 func (a *Adapter) releaseRecordsOf(ctx context.Context, holder string) error {
 	list, err := a.leases().List(ctx, metav1.ListOptions{LabelSelector: labelGroup + "=" + a.group})
 	if err != nil {
 		return fmt.Errorf("k8s: close %s: list leases: %w", holder, err)
 	}
 	var shards []*coordinationv1.Lease
+	type slot struct {
+		n     int
+		lease *coordinationv1.Lease
+	}
+	var slots []slot
 	for i := range list.Items {
 		l := &list.Items[i]
-		kind, _, _, _, ok := parseName(a.group, l.Name)
-		if ok && kind == kindShard && checkOwned(l, a.group, kindShard) == nil && holderOf(l) == holder {
+		kind, _, _, n, ok := parseName(a.group, l.Name)
+		if !ok || holderOf(l) != holder || checkOwned(l, a.group, kind) != nil {
+			continue
+		}
+		switch kind {
+		case kindShard:
 			shards = append(shards, l)
+		case kindSlot:
+			slots = append(slots, slot{n, l})
 		}
 	}
 	slices.SortFunc(shards, func(x, y *coordinationv1.Lease) int { return strings.Compare(x.Name, y.Name) })
+	slices.SortFunc(slots, func(x, y slot) int { return x.n - y.n })
 	var errs []error
 	for _, l := range shards {
 		errs = append(errs, a.releaseListed(ctx, l, holder))
+	}
+	for _, s := range slots {
+		errs = append(errs, a.releaseListedSlot(ctx, s.lease, holder))
 	}
 	return errors.Join(errs...)
 }

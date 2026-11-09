@@ -62,6 +62,7 @@ func (a *Adapter) writeLease(ctx context.Context, op, name string, cur *coordina
 			written, err = leases.Update(ctx, ch.lease, metav1.UpdateOptions{})
 		}
 		if err == nil {
+			a.noteOwnWrite(cur, written)
 			return written, nil
 		}
 		gone := cur != nil && apierrors.IsNotFound(err)

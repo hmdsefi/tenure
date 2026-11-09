@@ -62,6 +62,17 @@
 // decided on an earlier state of the record fails; CloseSession releases every record of the
 // holder. Holdings lists a space's records as stored, with one request.
 //
+// # Slots
+//
+// SetSlots sets the group's slot count, 0 to 10000. ClaimSlot returns the holder's own slot
+// below the count, or claims the lowest free one: a slot whose Lease is absent, names no holder,
+// or names a holder whose session is gone, judged as for shards. ReleaseSlot clears a slot's
+// holder only when the slot names the caller, and CloseSession releases every slot of the
+// holder. Slots returns the count and each slot's live holder. While the Adapter has joined or
+// holds a session but has not seen one of its own member Lease writes come back from its watch
+// within RenewDeadline, it takes its view of the group to be stale: the passing of time alone
+// then turns no slot's holder gone.
+//
 // # Membership
 //
 // A member that joined has its member record, a small JSON document, in the annotation

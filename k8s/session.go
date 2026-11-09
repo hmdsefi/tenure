@@ -92,6 +92,9 @@ func (a *Adapter) liveSession(holder string) (s session, ok bool, err error) {
 
 // endSessionLocked ends session s and gives back its informer hold. The caller holds a.mu.
 func (a *Adapter) endSessionLocked(s *session) {
+	if !s.ended {
+		a.signalFreshLocked()
+	}
 	s.ended = true
 	if s.cache != nil {
 		a.releaseCacheLocked(s.cache)
@@ -187,6 +190,7 @@ func (a *Adapter) openSession(ctx context.Context, holder, name string, timing c
 		}
 	}
 	a.sessions[holder] = &session{holder: holder, name: name, uid: written.UID, lease: written, timing: timing, sent: sent, cache: c}
+	a.signalFreshLocked()
 	return nil
 }
 
@@ -300,9 +304,10 @@ func (a *Adapter) decideRenew(cur *coordinationv1.Lease, s session, timing core.
 // tenure.ErrSessionLost.
 //
 // First of all, CloseSession clears the holder of every shard record that names holder, keeping
-// its term, as Release at the record's term does. It finds the records with one request that
-// lists the group's Leases, goes on past records it fails to clear, and returns their errors
-// joined with the error of ending the session, if any.
+// its term, as Release at the record's term does, in name order, and then the holder of every
+// slot record that names holder, as ReleaseSlot does, in slot order. It finds the records with
+// one request that lists the group's Leases, goes on past records it fails to clear, and returns
+// their errors joined with the error of ending the session, if any.
 func (a *Adapter) CloseSession(ctx context.Context, holder string) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -313,7 +318,8 @@ func (a *Adapter) CloseSession(ctx context.Context, holder string) (err error) {
 	if err := checkHolder(a.group, holder); err != nil {
 		return fmt.Errorf("k8s: CloseSession: %w", err)
 	}
-	// Step 1: the holder's records (records.go). Steps 2 and 3 follow whatever its outcome.
+	// Step 1: the holder's shard records, then its slot records (records.go, slots.go). Steps 2
+	// and 3 follow whatever its outcome.
 	released := a.releaseRecordsOf(ctx, holder)
 	defer func() { err = errors.Join(released, err) }()
 	name := memberName(a.group, memberOf(holder))

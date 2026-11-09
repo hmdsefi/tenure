@@ -38,6 +38,9 @@ import (
 //
 // No time written in a Lease, renewTime or acquireTime, is ever compared with a clock
 // (K8S-140): only the moments this Adapter first saw a state count.
+//
+// While the cache is not fresh (K8S-150, cache.go), slots and views take the verdict through
+// frozen: time alone never turns a holder from live to gone then.
 
 // The cases of liveness.
 const (
@@ -88,6 +91,21 @@ func liveness(rec observation, member *observation, tomb *tombstone, now time.Ti
 		return liveUntil(tomb.tokenSeenAt.Add(tomb.wait), now, caseTombstone, caseTombstone)
 	}
 	return liveUntil(rec.rvSeenAt.Add(leaseWait(rec.lease, defaultWait)), now, caseMissing, caseMissing)
+}
+
+// frozen returns verdict v as an Adapter whose cache is not fresh takes it (K8S-150): a holder
+// that only the passing of time turned gone (expired, tombstone, missing) stays live, with no
+// end and nothing to confirm, as the cache may just not have seen it renew. A gone verdict that
+// rests on an observed change (vacant, ended, replaced) stands. When fresh, v stands as it is.
+func frozen(v verdict, fresh bool) verdict {
+	if fresh || v.live {
+		return v
+	}
+	switch v.why {
+	case caseExpired, caseTombstone, caseMissing:
+		return verdict{live: true, why: v.why}
+	}
+	return v
 }
 
 // liveUntil is live, case live, before until, and gone, case gone, to be confirmed by a GET, from
