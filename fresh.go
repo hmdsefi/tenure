@@ -167,7 +167,7 @@ func (f *freshness) admit(rd reading, st core.Status) (core.HolderChanged, bool)
 	if absent && h.Version == 0 && rd.start <= s.last {
 		return core.HolderChanged{}, false
 	}
-	if sh, ok := f.status(st, h.Space, h.Shard); ok && sh.State == core.ShardStateDegraded &&
+	if sh, ok := shardIn(st, h.Space, h.Shard); ok && sh.State == core.ShardStateDegraded &&
 		!absent && h.Holder == f.holder && h.Term == sh.Term {
 		tag, start := f.started(h.Space, h.Shard)
 		if s.confirm == 0 || tag != s.confirm || rd.start < start {
@@ -184,8 +184,8 @@ func (f *freshness) admit(rd reading, st core.Status) (core.HolderChanged, bool)
 	return hc, true
 }
 
-// status returns the shard's entry in st.
-func (f *freshness) status(st core.Status, space string, shard int) (core.ShardStatus, bool) {
+// shardIn returns the shard's entry in st, and false when st has no such shard.
+func shardIn(st core.Status, space string, shard int) (core.ShardStatus, bool) {
 	i, ok := slices.BinarySearchFunc(st.Spaces, space, func(s core.SpaceStatus, name string) int {
 		return strings.Compare(s.Name, name)
 	})

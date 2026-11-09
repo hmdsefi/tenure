@@ -231,10 +231,12 @@ func (d *deliverer) record(l *eventLog, q queued) {
 	d.logger.LogAttrs(context.Background(), k.level, k.msg, eventAttrs(q.e)...)
 }
 
-// logObserver is the node's observer: it emits the node's events to its event log. Its methods
-// for events that later tasks add do nothing yet.
+// logObserver is the node's observer: it emits the node's events to its event log, those of the
+// loop's steps through its step collector. Its methods for events that later tasks add do nothing
+// yet.
 type logObserver struct {
-	n *Node
+	n     *Node
+	steps *stepCollector // guarded by n.stepMu
 
 	// drainStart is the monotonic reading at node.draining. draining writes it before it starts
 	// the drain goroutine, which calls drained.
@@ -242,6 +244,11 @@ type logObserver struct {
 }
 
 var _ observer = (*logObserver)(nil)
+
+// newLogObserver returns the observer of n, whose Config and event log are set.
+func newLogObserver(n *Node) *logObserver {
+	return &logObserver{n: n, steps: newStepCollector(n.cfg.Spaces, n.events.emit)}
+}
 
 func (o *logObserver) start(holder string) { o.n.events.start(holder) }
 
@@ -253,14 +260,25 @@ func (o *logObserver) startFailed(ctx context.Context, _ error) {
 	l.stop()
 }
 
-func (o *logObserver) view(core.View)                                {}
-func (o *logObserver) step(stepRecord)                               {}
+// view emits view.changed for a view the node publishes without a store. With a store the loop
+// has stepped the view, and step emits it in the step's order.
+func (o *logObserver) view(v core.View) {
+	if o.n.cfg.Store == nil {
+		o.n.events.emit(viewChanged(v))
+	}
+}
+
+// step emits the events of one step of the loop, in OBS-110's order.
+func (o *logObserver) step(rec stepRecord) { o.steps.collect(rec) }
+
+// shardClosed emits shard.stopping with reason "closed" for a shard that a forced Close stopped.
+func (o *logObserver) shardClosed(sh *Shard) { o.steps.closed(sh, time.Since(o.n.epoch)) }
+
 func (o *logObserver) callFailed(callResult)                         {}
 func (o *logObserver) runReturned(*Shard, error, int, time.Duration) {}
 func (o *logObserver) slotCountMismatch(int, int)                    {}
 func (o *logObserver) slotsFailed(error)                             {}
 func (o *logObserver) membershipFailed(string, error)                {}
-func (o *logObserver) shardClosed(*Shard)                            {}
 
 // newIncarnation notes the node's new holder, which the loop has set, for the events from now on.
 func (o *logObserver) newIncarnation(string) { o.n.events.setHolder(o.n.holder) }
