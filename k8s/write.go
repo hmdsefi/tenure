@@ -49,6 +49,7 @@ func (a *Adapter) writeLease(ctx context.Context, op, name string, cur *coordina
 			return nil, err
 		}
 		var written *coordinationv1.Lease
+		sent := a.now()
 		switch {
 		case ch.del && cur != nil:
 			pre := metav1.Preconditions{UID: &cur.UID, ResourceVersion: &cur.ResourceVersion}
@@ -67,7 +68,7 @@ func (a *Adapter) writeLease(ctx context.Context, op, name string, cur *coordina
 			// cache, such as whether a replaced incarnation still holds its member Lease, must not
 			// meet an older state of a Lease this Adapter wrote.
 			a.noteRead(written)
-			a.noteOwnWrite(cur, written)
+			a.noteOwnWrite(cur, written, sent)
 			return written, nil
 		}
 		gone := cur != nil && apierrors.IsNotFound(err)
