@@ -205,6 +205,9 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 	case ok && isOlder(l.ResourceVersion, o.lease.ResourceVersion):
 		// Older than the state recorded, also of a Lease since deleted: a late delivery after a
 		// read from the API server was noted (noteRead).
+	case c.isGone(l.Name, l.UID):
+		// A state of a Lease seen deleted, noted after the deletion (noteRead): that Lease is
+		// gone for good.
 	case !ok || o.lease.UID != l.UID:
 		if ok {
 			// The Lease was deleted and created again without a deletion event, as a relist
@@ -251,6 +254,12 @@ func (c *leaseCache) noteGone(name string, uid types.UID) {
 		c.gone = map[string]types.UID{}
 	}
 	c.gone[name] = uid
+}
+
+// isGone reports whether uid is the last Lease named name seen deleted. The caller holds c.mu.
+func (c *leaseCache) isGone(name string, uid types.UID) bool {
+	u, ok := c.gone[name]
+	return ok && u == uid
 }
 
 // bury leaves the tombstone of deleted Lease l, whose session token was first seen at
@@ -308,8 +317,7 @@ func (a *Adapter) deleted(name string, uid types.UID) bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	u, ok := c.gone[name]
-	return ok && u == uid
+	return c.isGone(name, uid)
 }
 
 // cachedLeases returns the observations of the Leases of kind, by name. It returns nil when the
