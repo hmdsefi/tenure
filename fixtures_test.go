@@ -49,6 +49,10 @@ type call struct {
 	Seq, EndSeq uint64    // stamps from seq at the start and the end
 	Done        bool      // the call has returned
 
+	// Stamp is the node's own start stamp of the call, from its executor (tenure.CallStamp): it
+	// orders the call against the node's readings and steps, and is 0 for a call made without one.
+	Stamp uint64
+
 	Result []any // the results before the error, in order
 	Err    error
 }
@@ -167,12 +171,19 @@ func (s *script) edit(method string, f func(r *callRule)) {
 
 // do records one call of method and runs it by the script, with forward as the real call.
 func (s *script) do(ctx context.Context, method string, args []any, forward func(context.Context) ([]any, error)) ([]any, error) {
-	c := &call{Method: method, Args: snapshot(args), Start: time.Now()}
+	// The start stamp comes first, before the double's own lock, which other calls may hold: the
+	// call has started once the method is entered.
+	c := &call{Seq: seq(), Method: method, Start: time.Now(), Stamp: tenure.CallStamp(ctx)}
+	c.Args = snapshot(args)
 	c.Deadline, c.HasDeadline = ctx.Deadline()
 	s.mu.Lock()
 	r := s.rules[method]
-	c.Seq = seq()
-	s.log = append(s.log, c)
+	// Keep the log in start order: a call stamped earlier may take the lock later.
+	i := len(s.log)
+	for i > 0 && s.log[i-1].Seq > c.Seq {
+		i--
+	}
+	s.log = slices.Insert(s.log, i, c)
 	s.mu.Unlock()
 
 	if r.gate != nil {

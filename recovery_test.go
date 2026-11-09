@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hmdsefi/tenure"
+	"github.com/hmdsefi/tenure/core"
 )
 
 // The tests of recovery from a lost session (RUN-180, RUN-190). Steps carrying an AT-RUN number
@@ -452,6 +453,55 @@ func TestRecoveryTwice(t *testing.T) {
 		mu.Unlock()
 
 		node.Store(nil)
+		closeNode(t, n)
+		check()
+	})
+}
+
+// TestLossDropsWaitingCalls checks that no call of a lost holder starts once the step of the
+// loss is done (MCH O7), also a call that waited for a permit then: found by
+// TestDriverContractO7Closing, seed 2 of a wider sweep, where a queued Release went out after the
+// loss. n1 serves 17 shards; the first 16 Acquire calls hang in the store and hold every permit,
+// so the 17th waits for one. The KeepAlive at T0+2s loses the session, and the step hook of the
+// loss lets the 16 calls return. The 17th Acquire must not go out.
+func TestLossDropsWaitingCalls(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		r := newShardRig(t)
+		cfg := r.config()
+		cfg.Rand = recoveryRand()
+		cfg.Spaces[0].Shards = 17
+		release := r.fs.Block("Acquire")
+		var lossSeq atomic.Uint64
+		ctx := tenure.WithStepHook(context.Background(), func(rec tenure.StepRecord) {
+			if rec.Before.Session != core.SessionStateLost && rec.After.Session == core.SessionStateLost {
+				lossSeq.Store(seq())
+				release()
+				time.Sleep(time.Millisecond) // the lanes run on meanwhile
+			}
+		})
+		t0 := time.Now()
+		n := start(t, ctx, cfg)
+		loseSession(r.fs)
+		sleepUntil(t0.Add(5 * time.Second))
+		synctest.Wait()
+
+		at := lossSeq.Load()
+		if at == 0 {
+			t.Fatal("the session was not lost")
+		}
+		acquires := 0
+		for _, c := range callsOf(r.fs.Calls(), holder01) {
+			if c.Method == "Acquire" {
+				acquires++
+			}
+			if c.Seq > at {
+				t.Errorf("%v started after the loss", c)
+			}
+		}
+		if acquires != 16 {
+			t.Errorf("%d Acquire calls of %s, want 16: the 17th waits for a permit", acquires, holder01)
+		}
 		closeNode(t, n)
 		check()
 	})
