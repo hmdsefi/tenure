@@ -757,11 +757,18 @@ func TestATK8S25ClaimSlot(t *testing.T) {
 		const h = "pod-8/1"
 		closeAtEnd(t, a, h)
 		mustKeepAlive(t, a, h)
-		rec.failNext(on(verbUpdate, slotName(g, 3)), 1)
-		got, err = a.ClaimSlot(ctx, h)
-		if prefix := "k8s: claim " + slotName(g, 3) + ": "; got != -1 || err == nil || !strings.HasPrefix(err.Error(), prefix) {
-			t.Errorf("ClaimSlot with a failed create = %d, %v; want -1, %s<a server error>", got, err, prefix)
+		// Two claims whose write fails return -1 and the error; the next one claims the slot.
+		rec.failNext(on(verbUpdate, slotName(g, 3)), 2)
+		for range 2 {
+			got, err = a.ClaimSlot(ctx, h)
+			if prefix := "k8s: claim " + slotName(g, 3) + ": "; got != -1 || err == nil || !strings.HasPrefix(err.Error(), prefix) {
+				t.Errorf("ClaimSlot with a failed update = %d, %v; want -1, %s<a server error>", got, err, prefix)
+			}
 		}
+		if l := rawGet(t, c, slotName(g, 3)); holderOf(l) != "" {
+			t.Errorf("slot 3 names %q after failed claims, want no holder", holderOf(l))
+		}
+		mustClaim(t, a, h, 3)
 	})
 }
 
