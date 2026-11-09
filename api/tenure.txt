@@ -183,7 +183,7 @@ const EventSessionClosed EventKind = 8
 const EventSessionExpired EventKind = 6
     EventSessionExpired ("session.expired") is emitted once per session
     deadline, when the node steps an input at or after that deadline without an
-    accepted renewal.
+    accepted renewal, unless the session was lost or is closing by then.
 
 const EventSessionLost EventKind = 7
     EventSessionLost ("session.lost") is emitted at the first sign that a
@@ -248,8 +248,10 @@ const EventShardHandoffCompleted EventKind = 20
 
 const EventShardLost EventKind = 15
     EventShardLost ("shard.lost") is emitted when the node stops a shard's Run
-    because another holder has the shard or the session has ended for good.
-    Space, Shard and Term name the shard and its term.
+    because it no longer holds the shard: another holder has the shard, another
+    holder took the slot the shard belongs to, the node gave up a held slot that
+    the views showed vacant too long, or the session has ended for good. Space,
+    Shard and Term name the shard and its term.
 
 const EventShardRecovered EventKind = 13
     EventShardRecovered ("shard.recovered") is emitted when the store confirms
@@ -258,9 +260,11 @@ const EventShardRecovered EventKind = 13
 
 const EventShardReleased EventKind = 19
     EventShardReleased ("shard.released") is emitted when the node has released
-    a shard's term: Space, Shard and Term name the shard and the term,
-    and Reason is the reason the run that held the term was stopped, or "" when
-    no run held it.
+    a shard's term, or has let go of it without a release once its stopped Run
+    returned because the store no longer names the node for it or the session
+    was lost: Space, Shard and Term name the shard and the term, and Reason is
+    the reason the run that held the term was stopped, or "" when no run held
+    it.
 
 const EventShardReleasing EventKind = 18
     EventShardReleasing ("shard.releasing") is emitted once per term when the

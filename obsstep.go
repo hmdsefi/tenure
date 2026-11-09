@@ -19,16 +19,29 @@ import (
 //
 // The order of one step's events, each group from its own method:
 //
-//  1. session.restarted, for the first step of a new incarnation;
-//  2. the input's events: view.changed and slot.count_changed (viewEvents), session.expired, the
-//     input's own event (inputEvents), and the shards that left releasing (releasedEvents);
+//  1. session.restarted, for the first step of a new incarnation: restarted emits it from
+//     observer.newIncarnation, before the new incarnation's first step;
+//  2. the input's events: view.changed and slot.count_changed (viewEvents), session.expired
+//     (expiredEvents), the input's own events (inputEvents), and the shards that left releasing,
+//     or whose stopped run let go of its term without a release (releasedEvents);
 //  3. one event per executed action, in Step's order (actionEvents);
-//  4. slot.claimed or slot.released;
-//  5. shard.stuck.
+//  4. slot.claimed or slot.released (slotEvents);
+//  5. shard.stuck (stuckEvents).
 //
 // An input the machine ignores emits nothing but its view.changed and slot.count_changed
 // (ignored). slot.standby comes from noSlot, outside the steps.
 type stepCollector struct {
+	// gen is the generation of the machine of the latest step: failures and expired belong to
+	// its incarnation, and a step of the next generation starts them again.
+	gen uint64
+
+	// failures is the number of session.renew_failed events since the incarnation's last
+	// accepted renewal, which session.recovered reports.
+	failures int
+
+	// expired is the session deadline that session.expired was last emitted for, 0 for none.
+	expired time.Duration
+
 	emit   func(Event) uint64
 	shards map[string][]shardTrack // by space name, indexed by shard
 
@@ -74,18 +87,29 @@ func (c *stepCollector) track(space string, shard int) *shardTrack {
 
 // collect emits the events of one step, in the order stepCollector lists.
 func (c *stepCollector) collect(rec stepRecord) {
-	// Slot: session.restarted. A new incarnation's first step follows observer.newIncarnation,
-	// which may emit it there, before this step's events.
+	// session.restarted came from restarted, before a new incarnation's first step.
+	if rec.Gen != c.gen {
+		c.gen, c.failures, c.expired = rec.Gen, 0, 0
+	}
 	c.viewEvents(rec)
 	if ignored(rec) {
 		return
 	}
-	// Slot: session.expired, once per deadline, at the first step at or past it.
+	c.expiredEvents(rec)
 	c.inputEvents(rec)
 	c.releasedEvents(rec)
 	c.actionEvents(rec)
 	c.slotEvents(rec)
-	// Slot: shard.stuck, for each shard whose Stuck turned true.
+	c.stuckEvents(rec)
+}
+
+// restarted emits session.restarted for a new incarnation that follows the lost one of holder
+// prev (RUN-180). observer.newIncarnation calls it on the loop goroutine, without n.stepMu,
+// which it does not need: it keeps no state. That is once the event log has noted the new
+// holder, so the event's log record names the new holder, and before the new incarnation's
+// first step.
+func (c *stepCollector) restarted(prev string) {
+	c.emit(Event{Kind: EventSessionRestarted, Shard: -1, Slot: -1, Holder: prev})
 }
 
 // ignored reports that the machine ignored the input of rec: the step changed nothing that Status
@@ -145,20 +169,37 @@ func viewChanged(v core.View) Event {
 	return Event{Kind: EventViewChanged, Shard: -1, Slot: -1, Version: v.Version, Count: len(v.Members)}
 }
 
-// inputEvents emits the input's own event: session.opened at the incarnation's first accepted
-// renewal, session.closed when the session closes, and shard.acquire_failed when an acquiring
-// shard takes an AcquireFailed.
+// expiredEvents emits session.expired at the first step at or past the session deadline that
+// the step starts with, once per deadline value, while the session can still be renewed.
+func (c *stepCollector) expiredEvents(rec stepRecord) {
+	switch rec.Before.Session {
+	case core.SessionStateLive, core.SessionStateLate:
+	default:
+		return
+	}
+	if d := rec.Before.Deadline; d != 0 && rec.Now >= d && d != c.expired {
+		c.expired = d
+		c.emit(Event{Kind: EventSessionExpired, Shard: -1, Slot: -1})
+	}
+}
+
+// inputEvents emits the input's own events: those of a renewal (renewedEvents);
+// session.renew_failed for a failed KeepAlive the machine accepts, then session.lost when the
+// failure, or the error of any other call, loses the session; session.closed when the session
+// closes; and shard.acquire_failed when an acquiring shard takes an AcquireFailed.
 func (c *stepCollector) inputEvents(rec stepRecord) {
 	switch in := rec.Input.(type) {
 	case core.SessionRenewed:
-		// The deadline is 0 until the first accepted renewal, and each machine is a new
-		// incarnation.
-		if rec.Before.Deadline == 0 && rec.After.Deadline != 0 {
-			c.emit(Event{Kind: EventSessionOpened, Shard: -1, Slot: -1})
-		}
-		// Slot: session.renewed_late and session.recovered.
+		c.renewedEvents(rec)
 	case core.SessionFailed:
-		// Slot: session.renew_failed and session.lost.
+		// Only the answer to a KeepAlive has a SentWall.
+		if !rec.SentWall.IsZero() && acceptsFailure(rec.Before, in.Cause) {
+			c.failures++
+			c.emit(Event{Kind: EventSessionRenewFailed, Shard: -1, Slot: -1, Err: rec.Err})
+		}
+		if rec.Before.Session != core.SessionStateLost && rec.After.Session == core.SessionStateLost {
+			c.emit(Event{Kind: EventSessionLost, Shard: -1, Slot: -1, Err: rec.Err})
+		}
 	case core.SessionClosed:
 		if rec.Before.Session != core.SessionStateClosed && rec.After.Session == core.SessionStateClosed {
 			c.emit(Event{Kind: EventSessionClosed, Shard: -1, Slot: -1})
@@ -175,9 +216,29 @@ func (c *stepCollector) inputEvents(rec stepRecord) {
 	}
 }
 
+// renewedEvents emits the events of a SessionRenewed: session.opened at the incarnation's first
+// accepted renewal; and session.renewed_late, how long after the deadline the renewal came,
+// then session.recovered with the failed renewals since the last accepted one, when the renewal
+// makes a late session live again. Any accepted renewal clears the failures.
+func (c *stepCollector) renewedEvents(rec stepRecord) {
+	// The deadline is 0 until the first accepted renewal, and each machine is a new incarnation.
+	if rec.Before.Deadline == 0 && rec.After.Deadline != 0 {
+		c.emit(Event{Kind: EventSessionOpened, Shard: -1, Slot: -1})
+	}
+	if rec.Before.Session == core.SessionStateLate && rec.After.Session == core.SessionStateLive {
+		c.emit(Event{Kind: EventSessionRenewedLate, Shard: -1, Slot: -1, Duration: rec.Now - rec.Before.Deadline})
+		c.emit(Event{Kind: EventSessionRecovered, Shard: -1, Slot: -1, Count: c.failures})
+	}
+	if rec.After.LastFailure == core.CauseNone {
+		c.failures = 0
+	}
+}
+
 // releasedEvents emits shard.released for each shard that the step moved out of releasing the
-// term it was releasing, by space name and then shard, and shard.handoff_completed after it when
-// the run that held the term was stopped as moved or draining.
+// term it was releasing, and for each shard whose run, told to stop, ended without a Release of
+// its term: the record no longer names the run, or the session is lost, as for a lost run. It
+// goes by space name and then shard, and shard.handoff_completed follows when the run that held
+// the term was stopped as moved or draining.
 func (c *stepCollector) releasedEvents(rec stepRecord) {
 	for i, sp := range rec.Before.Spaces {
 		if i >= len(rec.After.Spaces) {
@@ -185,13 +246,53 @@ func (c *stepCollector) releasedEvents(rec stepRecord) {
 		}
 		after := rec.After.Spaces[i].Shards
 		for id, b := range sp.Shards {
-			if b.State != core.ShardStateReleasing || id >= len(after) {
+			if id >= len(after) {
 				continue
 			}
-			if a := after[id]; a.State == core.ShardStateReleasing && a.Term == b.Term {
+			a := after[id]
+			switch {
+			case b.State == core.ShardStateReleasing:
+				if a.State == core.ShardStateReleasing && a.Term == b.Term {
+					continue
+				}
+			case toldToStop(b.State):
+				// The run keeps its term until its RunStopped, which releases the term or not.
+				if a.Term == b.Term && (a.State == b.State || a.State == core.ShardStateReleasing) {
+					continue
+				}
+			default:
 				continue
 			}
 			c.released(sp.Name, id, b.Term, rec.Now)
+		}
+	}
+}
+
+// toldToStop reports that a shard in state has a run that was told to stop and has not ended.
+func toldToStop(state core.ShardState) bool {
+	switch state {
+	case core.ShardStateStopping, core.ShardStateExpired, core.ShardStateLost:
+		return true
+	}
+	return false
+}
+
+// stuckEvents emits shard.stuck for each shard whose run the step marked stuck, by space name
+// and then shard, with the reason the run was stopped. The machine marks a run stuck once, and
+// the run's RunStopped clears the mark.
+func (c *stepCollector) stuckEvents(rec stepRecord) {
+	for i, sp := range rec.After.Spaces {
+		var before []core.ShardStatus
+		if i < len(rec.Before.Spaces) {
+			before = rec.Before.Spaces[i].Shards
+		}
+		for id, a := range sp.Shards {
+			if !a.Stuck || (id < len(before) && before[id].Stuck) {
+				continue
+			}
+			e := shardEvent(EventShardStuck, sp.Name, id, a.Term)
+			e.Reason = a.Reason.String()
+			c.emit(e)
 		}
 	}
 }
@@ -232,15 +333,16 @@ func (c *stepCollector) actionEvents(rec stepRecord) {
 				c.emit(shardEvent(EventShardReleasing, a.Space, a.Shard, a.Term))
 			}
 		case core.Degrade:
-			// Slot: shard.degraded.
+			c.emit(shardEvent(EventShardDegraded, a.Space, a.Shard, a.Term))
 		case core.Restore:
-			// Slot: shard.recovered.
+			c.emit(shardEvent(EventShardRecovered, a.Space, a.Shard, a.Term))
 		}
 	}
 }
 
 // stopRun notes the StopRun a of a run at the loop's reading now and emits shard.stopping for a
-// run stopped as moved or draining.
+// run stopped as moved or draining, and in its place shard.expired or shard.lost for a run
+// stopped as expired or lost.
 func (c *stepCollector) stopRun(a core.StopRun, now time.Duration) {
 	c.stopped(a.Space, a.Shard, a.Term, a.Reason.String(), now)
 	switch a.Reason {

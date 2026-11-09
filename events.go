@@ -40,7 +40,8 @@ const EventSessionRenewedLate EventKind = 4
 const EventSessionRecovered EventKind = 5
 
 // EventSessionExpired ("session.expired") is emitted once per session deadline, when the
-// node steps an input at or after that deadline without an accepted renewal.
+// node steps an input at or after that deadline without an accepted renewal, unless the
+// session was lost or is closing by then.
 const EventSessionExpired EventKind = 6
 
 // EventSessionLost ("session.lost") is emitted at the first sign that a session incarnation
@@ -80,9 +81,10 @@ const EventShardRecovered EventKind = 13
 // shard and its term.
 const EventShardExpired EventKind = 14
 
-// EventShardLost ("shard.lost") is emitted when the node stops a shard's Run because another
-// holder has the shard or the session has ended for good. Space, Shard and Term name the
-// shard and its term.
+// EventShardLost ("shard.lost") is emitted when the node stops a shard's Run because it no
+// longer holds the shard: another holder has the shard, another holder took the slot the
+// shard belongs to, the node gave up a held slot that the views showed vacant too long, or
+// the session has ended for good. Space, Shard and Term name the shard and its term.
 const EventShardLost EventKind = 15
 
 // EventShardStopping ("shard.stopping") is emitted when the node stops a shard's Run to hand
@@ -102,8 +104,10 @@ const EventShardStuck EventKind = 17
 const EventShardReleasing EventKind = 18
 
 // EventShardReleased ("shard.released") is emitted when the node has released a shard's
-// term: Space, Shard and Term name the shard and the term, and Reason is the reason the run
-// that held the term was stopped, or "" when no run held it.
+// term, or has let go of it without a release once its stopped Run returned because the store
+// no longer names the node for it or the session was lost: Space, Shard and Term name the
+// shard and the term, and Reason is the reason the run that held the term was stopped, or ""
+// when no run held it.
 const EventShardReleased EventKind = 19
 
 // EventShardHandoffCompleted ("shard.handoff_completed") is emitted right after

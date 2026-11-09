@@ -283,8 +283,12 @@ func (o *logObserver) slotCountMismatch(configured, stored int) {
 // noSlot emits slot.standby for a ClaimSlot that found no free slot, once per standby period.
 func (o *logObserver) noSlot() { o.steps.noSlot() }
 
-// newIncarnation notes the node's new holder, which the loop has set, for the events from now on.
-func (o *logObserver) newIncarnation(string) { o.n.events.setHolder(o.n.holder) }
+// newIncarnation notes the node's new holder, which the loop has set, for the events from now on,
+// and then emits session.restarted with the previous holder prev.
+func (o *logObserver) newIncarnation(prev string) {
+	o.n.events.setHolder(o.n.holder)
+	o.steps.restarted(prev)
+}
 
 func (o *logObserver) draining() {
 	o.drainStart = time.Now()

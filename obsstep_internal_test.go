@@ -6,6 +6,7 @@ package tenure
 import (
 	"errors"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -188,6 +189,216 @@ func TestStepCollectorInputs(t *testing.T) {
 	}
 }
 
+// TestStepCollectorOutage checks the outage, loss and stuck events on short runs of steps: one
+// session.renew_failed per failed KeepAlive the machine accepts, none for a loss another call
+// reports, and session.lost once; session.expired once per deadline value, and none once the
+// session is lost; session.renewed_late and session.recovered only for a renewal that makes a
+// late session live, counting the failures since the last accepted renewal, in this generation;
+// shard.expired and shard.lost in place of shard.stopping, and shard.released with their reason
+// and no handoff, also when the run ends without a release; shard.degraded and shard.recovered;
+// and one shard.stuck per run, after the events of the step's actions.
+func TestStepCollectorOutage(t *testing.T) {
+	const deadline = 10 * time.Second
+	live, late, lost := core.SessionStateLive, core.SessionStateLate, core.SessionStateLost
+	none, unr := core.CauseNone, core.CauseUnreachable
+	status := func(now time.Duration, st core.SessionState, d time.Duration, fail core.Cause, sh core.ShardStatus) core.Status {
+		return core.Status{Now: now, Session: st, Deadline: d, LastFailure: fail, Slot: -1,
+			Spaces: []core.SpaceStatus{{Name: "s", Shards: []core.ShardStatus{sh}}}}
+	}
+	shard := func(state core.ShardState, reason core.StopReason, stuck bool) core.ShardStatus {
+		return core.ShardStatus{State: state, Term: 7, Reason: reason, Stuck: stuck}
+	}
+	idle := core.ShardStatus{State: core.ShardStateIdle}
+	owned := shard(core.ShardStateOwned, core.StopNone, false)
+	boom := errors.New("boom")
+	wall := time.Unix(1, 0)
+	unreachable := func(now time.Duration) core.SessionFailed {
+		return core.SessionFailed{Now: now, Cause: core.CauseUnreachable}
+	}
+	renewed := func(now time.Duration) core.SessionRenewed { return core.SessionRenewed{Now: now, SentAt: now} }
+	tick := func(now time.Duration) core.Tick { return core.Tick{Now: now} }
+	keepAlive := []core.Action{core.KeepAlive{}}
+	sess := func(kind EventKind) Event { return Event{Kind: kind, Shard: -1, Slot: -1} }
+	failed := func(err error) Event {
+		e := sess(EventSessionRenewFailed)
+		e.Err = err
+		return e
+	}
+	sessionLost := sess(EventSessionLost)
+	sessionLost.Err = ErrSessionLost
+	renewedLate := func(d time.Duration, failures int) []Event {
+		e, r := sess(EventSessionRenewedLate), sess(EventSessionRecovered)
+		e.Duration, r.Count = d, failures
+		return []Event{e, r}
+	}
+	ev := func(kind EventKind, reason string) Event {
+		return Event{Kind: kind, Space: "s", Shard: 0, Term: 7, Slot: -1, Reason: reason}
+	}
+	stopRun := func(reason core.StopReason) []core.Action {
+		return []core.Action{core.StopRun{Space: "s", Shard: 0, Term: 7, Reason: reason}}
+	}
+	ranStopped := core.RunStopped{Now: 11 * time.Second, Space: "s", Shard: 0, Term: 7}
+
+	for _, tc := range []struct {
+		name string
+		recs []stepRecord
+		want []Event
+	}{
+		{
+			name: "RenewFailedAndLost",
+			recs: []stepRecord{
+				{Now: 2 * time.Second, Input: unreachable(2 * time.Second), SentWall: wall, Err: boom,
+					Before: status(0, live, deadline, none, idle), After: status(2*time.Second, live, deadline, unr, idle)},
+				{Now: 4 * time.Second, Input: unreachable(4 * time.Second), SentWall: wall, Err: boom,
+					Before: status(2*time.Second, live, deadline, unr, idle), After: status(4*time.Second, live, deadline, unr, idle)},
+				// A Release reports the loss: no renewal failed.
+				{Now: 5 * time.Second, Input: core.SessionFailed{Now: 5 * time.Second, Cause: core.CauseLost}, Err: ErrSessionLost,
+					Before: status(4*time.Second, live, deadline, unr, idle), After: status(5*time.Second, lost, deadline, core.CauseLost, idle)},
+				// The session has ended: the machine does not take a later failure.
+				{Now: 6 * time.Second, Input: core.SessionFailed{Now: 6 * time.Second, Cause: core.CauseLost}, SentWall: wall,
+					Err: ErrSessionLost, Before: status(5*time.Second, lost, deadline, core.CauseLost, idle),
+					After: status(6*time.Second, lost, deadline, core.CauseLost, idle)},
+			},
+			want: []Event{failed(boom), failed(boom), sessionLost},
+		},
+		{
+			name: "ExpiredOncePerDeadline",
+			recs: []stepRecord{
+				{Now: deadline, Input: tick(deadline), Actions: keepAlive,
+					Before: status(9*time.Second, live, deadline, none, idle), After: status(deadline, late, deadline, none, idle)},
+				{Now: 12 * time.Second, Input: tick(12 * time.Second), Actions: keepAlive,
+					Before: status(deadline, late, deadline, none, idle), After: status(12*time.Second, late, deadline, none, idle)},
+				// An old renewal raises the deadline to one that has passed already.
+				{Now: 13 * time.Second, Input: core.SessionRenewed{Now: 13 * time.Second, SentAt: 2 * time.Second},
+					Before: status(12*time.Second, late, deadline, none, idle), After: status(13*time.Second, late, 12*time.Second, none, idle)},
+				{Now: 14 * time.Second, Input: tick(14 * time.Second), Actions: keepAlive,
+					Before: status(13*time.Second, late, 12*time.Second, none, idle), After: status(14*time.Second, late, 12*time.Second, none, idle)},
+			},
+			want: []Event{sess(EventSessionExpired), sess(EventSessionExpired)},
+		},
+		{
+			name: "RenewedLate",
+			recs: []stepRecord{
+				{Gen: 1, Now: 2 * time.Second, Input: unreachable(2 * time.Second), SentWall: wall, Err: boom,
+					Before: status(0, live, deadline, none, idle), After: status(2*time.Second, live, deadline, unr, idle)},
+				// Renewed before the deadline: no event, and the count starts again.
+				{Gen: 1, Now: 4 * time.Second, Input: renewed(4 * time.Second),
+					Before: status(2*time.Second, live, deadline, unr, idle), After: status(4*time.Second, live, 14*time.Second, none, idle)},
+				{Gen: 1, Now: 6 * time.Second, Input: unreachable(6 * time.Second), SentWall: wall, Err: boom,
+					Before: status(4*time.Second, live, 14*time.Second, none, idle), After: status(6*time.Second, live, 14*time.Second, unr, idle)},
+				{Gen: 1, Now: 16 * time.Second, Input: renewed(16 * time.Second),
+					Before: status(15*time.Second, late, 14*time.Second, unr, idle), After: status(16*time.Second, live, 26*time.Second, none, idle)},
+				// A failure of generation 1 that no renewal followed does not count in generation 2.
+				{Gen: 1, Now: 28 * time.Second, Input: unreachable(28 * time.Second), SentWall: wall, Err: boom,
+					Before: status(27*time.Second, late, 26*time.Second, none, idle), After: status(28*time.Second, late, 26*time.Second, unr, idle)},
+				{Gen: 2, Now: 40 * time.Second, Input: renewed(40 * time.Second),
+					Before: status(39*time.Second, late, 30*time.Second, none, idle), After: status(40*time.Second, live, 50*time.Second, none, idle)},
+			},
+			want: slices.Concat([]Event{failed(boom), failed(boom), sess(EventSessionExpired)}, renewedLate(2*time.Second, 1),
+				[]Event{sess(EventSessionExpired), failed(boom), sess(EventSessionExpired)}, renewedLate(10*time.Second, 0)),
+		},
+		{
+			name: "ExpiredRunReleased",
+			recs: []stepRecord{
+				{Now: deadline, Input: tick(deadline), Actions: stopRun(core.StopExpired),
+					Before: status(9*time.Second, live, deadline, none, owned),
+					After:  status(deadline, late, deadline, none, shard(core.ShardStateExpired, core.StopExpired, false))},
+				{Now: 11 * time.Second, Input: ranStopped, Actions: []core.Action{core.Release{Space: "s", Shard: 0, Term: 7}},
+					Before: status(deadline, late, deadline, none, shard(core.ShardStateExpired, core.StopExpired, false)),
+					After:  status(11*time.Second, late, deadline, none, shard(core.ShardStateReleasing, core.StopNone, false))},
+				{Now: 12 * time.Second, Input: core.Released{Now: 12 * time.Second, Space: "s", Shard: 0, Term: 7},
+					Before: status(11*time.Second, late, deadline, none, shard(core.ShardStateReleasing, core.StopNone, false)),
+					After:  status(12*time.Second, late, deadline, none, idle)},
+			},
+			want: []Event{sess(EventSessionExpired), ev(EventShardExpired, ""), ev(EventShardReleasing, ""),
+				ev(EventShardReleased, "expired")},
+		},
+		{
+			// The record names another holder: the run ends without a release.
+			name: "LostRunWithoutRelease",
+			recs: []stepRecord{
+				{Now: 2 * time.Second, Input: core.HolderChanged{Now: 2 * time.Second, Space: "s", Shard: 0, Holder: "b/2", Term: 8},
+					Actions: stopRun(core.StopLost), Before: status(time.Second, live, deadline, none, owned),
+					After: status(2*time.Second, live, deadline, none, shard(core.ShardStateLost, core.StopLost, false))},
+				{Now: 11 * time.Second, Input: ranStopped,
+					Before: status(2*time.Second, live, 20*time.Second, none, shard(core.ShardStateLost, core.StopLost, false)),
+					After:  status(11*time.Second, live, 20*time.Second, none, idle)},
+			},
+			want: []Event{ev(EventShardLost, ""), ev(EventShardReleased, "lost")},
+		},
+		{
+			name: "DegradedAndRecovered",
+			recs: []stepRecord{
+				{Now: deadline, Input: tick(deadline), Actions: []core.Action{core.Degrade{Space: "s", Shard: 0, Term: 7}},
+					Before: status(9*time.Second, live, deadline, none, owned),
+					After:  status(deadline, late, deadline, none, shard(core.ShardStateDegraded, core.StopNone, false))},
+				{Now: 13 * time.Second, Input: core.HolderChanged{Now: 13 * time.Second, Space: "s", Shard: 0, Holder: "a/1", Term: 7},
+					Actions: []core.Action{core.Restore{Space: "s", Shard: 0, Term: 7}},
+					Before:  status(12*time.Second, live, 22*time.Second, none, shard(core.ShardStateDegraded, core.StopNone, false)),
+					After:   status(13*time.Second, live, 22*time.Second, none, owned)},
+			},
+			want: []Event{sess(EventSessionExpired), ev(EventShardDegraded, ""), ev(EventShardRecovered, "")},
+		},
+		{
+			name: "StuckOncePerRun",
+			recs: []stepRecord{
+				{Now: 11 * time.Second, Input: tick(11 * time.Second),
+					Before: status(9*time.Second, live, 20*time.Second, none, shard(core.ShardStateStopping, core.StopDraining, false)),
+					After:  status(11*time.Second, live, 20*time.Second, none, shard(core.ShardStateStopping, core.StopDraining, true))},
+				{Now: 12 * time.Second, Input: tick(12 * time.Second), Actions: keepAlive,
+					Before: status(11*time.Second, live, 20*time.Second, none, shard(core.ShardStateStopping, core.StopDraining, true)),
+					After:  status(12*time.Second, live, 20*time.Second, none, shard(core.ShardStateStopping, core.StopDraining, true))},
+			},
+			want: []Event{ev(EventShardStuck, "draining")},
+		},
+		{
+			// A step that marks one run stuck and acquires another shard: shard.stuck comes after
+			// the actions' events.
+			name: "StuckAfterActions",
+			recs: []stepRecord{
+				{Now: 11 * time.Second, Input: tick(11 * time.Second),
+					Actions: []core.Action{core.Acquire{Space: "s", Shard: 1}},
+					Before: core.Status{Now: 9 * time.Second, Session: live, Deadline: 20 * time.Second, Slot: -1,
+						Spaces: []core.SpaceStatus{{Name: "s", Shards: []core.ShardStatus{
+							shard(core.ShardStateStopping, core.StopMoved, false), idle}}}},
+					After: core.Status{Now: 11 * time.Second, Session: live, Deadline: 20 * time.Second, Slot: -1,
+						Spaces: []core.SpaceStatus{{Name: "s", Shards: []core.ShardStatus{
+							shard(core.ShardStateStopping, core.StopMoved, true), {State: core.ShardStateAcquiring}}}}}},
+			},
+			want: []Event{{Kind: EventShardAcquiring, Space: "s", Shard: 1, Slot: -1}, ev(EventShardStuck, "moved")},
+		},
+		{
+			// A loss reported by the KeepAlive, then by a Release, in a step that is not ignored
+			// since a run turns stuck, past the deadline: session.lost comes once, and the
+			// deadline of a lost session emits no session.expired.
+			name: "LostOnceNoExpiry",
+			recs: []stepRecord{
+				{Now: 2 * time.Second, Input: core.SessionFailed{Now: 2 * time.Second, Cause: core.CauseLost}, SentWall: wall,
+					Err: ErrSessionLost, Actions: stopRun(core.StopLost), Before: status(time.Second, live, deadline, none, owned),
+					After: status(2*time.Second, lost, deadline, core.CauseLost, shard(core.ShardStateLost, core.StopLost, false))},
+				{Now: 12 * time.Second, Input: core.SessionFailed{Now: 12 * time.Second, Cause: core.CauseLost}, Err: ErrSessionLost,
+					Before: status(2*time.Second, lost, deadline, core.CauseLost, shard(core.ShardStateLost, core.StopLost, false)),
+					After:  status(12*time.Second, lost, deadline, core.CauseLost, shard(core.ShardStateLost, core.StopLost, true))},
+			},
+			want: []Event{failed(ErrSessionLost), sessionLost, ev(EventShardLost, ""), ev(EventShardStuck, "lost")},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []Event
+			c := newStepCollector([]Space{{Name: "s", Shards: 1}}, func(e Event) uint64 {
+				got = append(got, e)
+				return uint64(len(got))
+			})
+			for _, rec := range tc.recs {
+				c.collect(rec)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("events =\n%+v\nwant\n%+v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestStepCollectorIgnored checks which steps count as ignored: a step that changes nothing but
 // the clock and returns no action but a Wake, except a failed renewal the machine accepts, which
 // may change nothing that Status shows.
@@ -260,6 +471,7 @@ func TestStepCollectorSlots(t *testing.T) {
 	want := []Event{
 		standby,
 		slotEv(EventSlotClaimed, 1, ""),
+		{Kind: EventSessionLost, Shard: -1, Slot: -1}, // the loss comes before the slot events
 		slotEv(EventSlotReleased, 1, "lost"),
 		standby,
 		slotEv(EventSlotClaimed, 0, ""),
