@@ -48,12 +48,12 @@ var errSlotTaken = errors.New("k8s: slot taken")
 // record, no holder, or a holder whose session this Adapter has observed to be gone, which it
 // confirms against the API server just before it writes; and returns it. It returns -1 and an
 // error matching tenure.ErrNoSlot when holder holds a slot only at or above the count, or no slot
-// below the count is free. While the Adapter has not seen its own member Lease writes come back
-// from its watch within RenewDeadline, the passing of time alone frees no slot. ClaimSlot needs
-// an active session of holder in this Adapter, opened by KeepAlive; otherwise it returns an
-// error matching tenure.ErrSessionLost without a request. It returns -1 with every error, and
-// never writes a Lease that lacks the group's slot labels. It runs at most as many record
-// operations at once as WithRecordConcurrency allows.
+// below the count is free. While the Adapter's watch has not delivered one of its own member
+// Lease writes sent within the last RenewDeadline, the passing of time alone frees no slot.
+// ClaimSlot needs an active session of holder in this Adapter, opened by KeepAlive; otherwise it
+// returns an error matching tenure.ErrSessionLost without a request. It returns -1 with every
+// error, and never writes a Lease that lacks the group's slot labels. It runs at most as many
+// record operations at once as WithRecordConcurrency allows.
 func (a *Adapter) ClaimSlot(ctx context.Context, holder string) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return -1, err
@@ -313,8 +313,9 @@ func (a *Adapter) SetSlots(ctx context.Context, count int) error {
 // Slots returns the slot count and one entry per slot below it: the holder the slot's record
 // names while that holder's session is live as this Adapter observes it, else "". When the count
 // is 0 it returns 0, nil, nil. Slots reads what the Adapter's watch has observed while one runs:
-// while the Adapter has joined or holds a session, but has not seen its own member Lease writes
-// come back from the watch within RenewDeadline, the passing of time alone turns no holder gone.
+// while the Adapter has joined or holds a session, but the watch has not delivered one of its own
+// member Lease writes sent within the last RenewDeadline, the passing of time alone turns no
+// holder gone.
 // Otherwise Slots lists the group's Leases with one request, and a holder whose member Lease
 // names it counts as live. It returns an error when the count on the group's Lease is not a
 // number in [0, 10000]; a Lease at the count's name that lacks the group's labels counts as no

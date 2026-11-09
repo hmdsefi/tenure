@@ -546,3 +546,25 @@ func TestK8S110Observation(t *testing.T) {
 		}
 	}
 }
+
+// TestK8S110NotedAfterDeletion checks that a state of a Lease noted after the informer saw it
+// deleted, such as a write that returned late, leaves the Lease gone; a new Lease of that name
+// is observed as usual.
+func TestK8S110NotedAfterDeletion(t *testing.T) {
+	clock := newFakeClock()
+	c := &leaseCache{now: clock.now, defaultWait: T.LeaseDuration, terms: &shardTerms{}, obs: map[string]*observation{}, tombs: map[types.UID]tombstone{}}
+	const name = "g-member-pod-0"
+	lease := func(uid types.UID, rv string) *coordinationv1.Lease {
+		return &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid, ResourceVersion: rv, Labels: leaseLabels("g", kindMember, "")}}
+	}
+	c.observe(lease("u1", "10"))
+	c.forget(lease("u1", "12"), false)
+	c.observe(lease("u1", "11"))
+	if o, ok := c.obs[name]; ok {
+		t.Fatalf("a deleted Lease noted again: %+v", o.lease)
+	}
+	c.observe(lease("u2", "13"))
+	if o, ok := c.obs[name]; !ok || o.lease.UID != "u2" {
+		t.Errorf("observation %+v, want the new Lease u2", o)
+	}
+}

@@ -69,8 +69,8 @@
 // or names a holder whose session is gone, judged as for shards. ReleaseSlot clears a slot's
 // holder only when the slot names the caller, and CloseSession releases every slot of the
 // holder. Slots returns the count and each slot's live holder. While the Adapter has joined or
-// holds a session but has not seen one of its own member Lease writes come back from its watch
-// within RenewDeadline, it takes its view of the group to be stale: the passing of time alone
+// holds a session but its watch has not delivered one of its own member Lease writes sent within
+// the last RenewDeadline, it takes its view of the group to be stale: the passing of time alone
 // then turns no slot's holder gone.
 //
 // # Membership
