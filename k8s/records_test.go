@@ -241,6 +241,16 @@ func TestK8S300TombstoneTerm(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 	waitForgotten(t, a, name)
+	// A later Lease of the shard deleted with a smaller term does not lower it.
+	l, err = leases.Create(ctx, shardLease("g", "markets", 0, "", map[string]string{annotationTerm: "7"}), metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	waitObserved(t, a, name, l.ResourceVersion)
+	if err := leases.Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	waitForgotten(t, a, name)
 	// A Lease deleted with a malformed term leaves no term.
 	l, err = leases.Create(ctx, shardLease("g", "orders", 1, "", map[string]string{annotationTerm: "x"}), metav1.CreateOptions{})
 	if err != nil {
@@ -1144,4 +1154,29 @@ func TestK8S130StaleCache(t *testing.T) {
 			t.Errorf("writes %v, want none", w)
 		}
 	})
+}
+
+// TestK8S300VanishedRecord checks that a record deleted under Acquire, before the informer told,
+// still bounds the term: the update of the cached state finds no Lease, and the record created
+// anew gets the next term after the deleted one.
+func TestK8S300VanishedRecord(t *testing.T) {
+	client := newFake()
+	a := fakeAdapter(t, client)
+	closeAtEnd(t, a, "pod-0/1")
+	mustKeepAlive(t, a, "pod-0/1")
+	const big = core.Term(5_000_000_000_000_000)
+	l := shardLease("g", "markets", 0, "", map[string]string{annotationTerm: encodeTerm(big)})
+	l.UID, l.ResourceVersion = "6f1c1a43-6c55-4f4e-9d0e-2b8f2b0c1d11", "1"
+	staleCache(t, a, l.Name, &observation{lease: l, rvSeenAt: a.now(), tokenSeenAt: a.now()}, "")
+	client.ClearActions()
+	if got := mustAcquire(t, a, "pod-0/1", "markets", 0); got != big+1 {
+		t.Errorf("Acquire = %d, want %d", got, big+1)
+	}
+	var verbs []string
+	for _, x := range writes(client) {
+		verbs = append(verbs, x.GetVerb())
+	}
+	if got := strings.Join(verbs, " "); got != "create update" {
+		t.Errorf("writes %q, want an update, then a create", got)
+	}
 }

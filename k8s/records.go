@@ -71,7 +71,16 @@ func (a *Adapter) Acquire(ctx context.Context, holder, space string, shard int) 
 		return 0, err
 	}
 	var term core.Term
+	last := cur
 	written, err := a.writeLease(ctx, "acquire", name, cur, func(cur *coordinationv1.Lease) (change, error) {
+		if cur == nil && last != nil {
+			// The record decided on before is gone, deleted before the informer told: its term
+			// is the term of a deleted shard Lease all the same.
+			if t, ok := decodeTerm(last.Annotations); ok && t > 0 {
+				a.terms.note(name, t)
+			}
+		}
+		last = cur
 		var ch change
 		var err error
 		ch, term, err = a.decideAcquire(ctx, s, space, name, cur)
