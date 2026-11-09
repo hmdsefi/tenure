@@ -794,7 +794,7 @@ func TestK8S220RenewOutcomes(t *testing.T) {
 	g := group()
 	ctx := t.Context()
 	a, rec := c.adapter(t, g)
-	closeAtEnd(t, a, "pod-0/1", "pod-4/1")
+	closeAtEnd(t, a, "pod-0/1", "pod-4/1", "pod-5/1", "pod-6/1")
 
 	t.Run("renewal", func(t *testing.T) {
 		name := memberName(g, "pod-0")
@@ -836,6 +836,58 @@ func TestK8S220RenewOutcomes(t *testing.T) {
 			t.Errorf("leaseDurationSeconds %d, want 4", *l.Spec.LeaseDurationSeconds)
 		}
 		mustKeepAlive(t, a, "pod-0/1")
+	})
+
+	t.Run("renewal from the latest state", func(t *testing.T) {
+		// Another writer changed the Lease and the informer saw it: the renewal starts from that
+		// state, in one update that keeps the other writer's change.
+		name := memberName(g, "pod-5")
+		mustKeepAlive(t, a, "pod-5/1")
+		l := rawUpdate(t, c, name, func(l *coordinationv1.Lease) {
+			l.Annotations = map[string]string{"example.com/keep": "1"}
+		})
+		waitObserved(t, a, name, l.ResourceVersion)
+		rec.reset()
+		mustKeepAlive(t, a, "pod-5/1")
+		got := rec.filter(named)
+		if s := requestStrings(got); len(s) != 1 || s[0] != "UPDATE "+name+" 200" {
+			t.Fatalf("requests %v, want [UPDATE %s 200]", s, name)
+		}
+		if rv := got[0].lease().ResourceVersion; rv != l.ResourceVersion {
+			t.Errorf("update sent resourceVersion %s, want the other writer's %s", rv, l.ResourceVersion)
+		}
+		if l := rawGet(t, c, name); l.Annotations["example.com/keep"] != "1" {
+			t.Errorf("annotations %v, want the other writer's kept", l.Annotations)
+		}
+	})
+
+	t.Run("serialized writes", func(t *testing.T) {
+		// Concurrent KeepAlives of one holder write its member Lease one at a time: each update
+		// starts from the one before, and none conflicts.
+		name := memberName(g, "pod-6")
+		mustKeepAlive(t, a, "pod-6/1")
+		rec.reset()
+		off := rec.delay(name, 200*time.Millisecond)
+		defer off()
+		var wg sync.WaitGroup
+		errs := make([]error, 3)
+		for i := range errs {
+			wg.Go(func() { errs[i] = a.KeepAlive(ctx, "pod-6/1", T) })
+		}
+		wg.Wait()
+		off()
+		if err := errors.Join(errs...); err != nil {
+			t.Fatalf("concurrent KeepAlives: %v", err)
+		}
+		updates := on(verbUpdate, name)
+		inFlight := rec.maxInFlight(updates)
+		renewed := rec.count(func(r request) bool { return updates(r) && r.status == 200 })
+		if inFlight != 1 || renewed != 3 {
+			t.Errorf("%d updates in flight at most, %d of them 200; want 1 and 3", inFlight, renewed)
+		}
+		if got := rec.filter(named); len(got) != 3 {
+			t.Errorf("requests %v, want 3 updates", requestStrings(got))
+		}
 	})
 
 	lost := []struct {
