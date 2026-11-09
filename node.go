@@ -505,6 +505,10 @@ func (n *Node) setDraining() bool {
 // Errors of the store's SetSlots, and of the read of the slots after it, start with
 // "tenure: SetSlots: " and wrap the store's error. When ctx ends first, SetSlots returns an error
 // that wraps ctx's error; the count may have been written by then.
+//
+// The wait goes on while the node steps no view, for example while it waits for a new session
+// after losing one, until ctx ends or Close stops the node. When Close stops the node first,
+// SetSlots returns ErrClosed.
 func (n *Node) SetSlots(ctx context.Context, count int) error {
 	n.mu.Lock()
 	switch {
