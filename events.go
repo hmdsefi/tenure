@@ -118,7 +118,8 @@ const EventSlotClaimed EventKind = 21
 
 // EventSlotReleased ("slot.released") is emitted when the node stops holding a slot: Slot is
 // the slot, and Reason is "draining" (the node drains), "retired" (the slot count no longer
-// includes the slot) or "lost" (another holder took the slot).
+// includes the slot) or "lost" (the node lost the slot without releasing it, as when another
+// holder took it or the session was lost).
 const EventSlotReleased EventKind = 22
 
 // EventSlotStandby ("slot.standby") is emitted when the node finds no free slot for the first

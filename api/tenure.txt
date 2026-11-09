@@ -298,8 +298,9 @@ const EventSlotCountMismatch EventKind = 25
 const EventSlotReleased EventKind = 22
     EventSlotReleased ("slot.released") is emitted when the node stops holding
     a slot: Slot is the slot, and Reason is "draining" (the node drains),
-    "retired" (the slot count no longer includes the slot) or "lost" (another
-    holder took the slot).
+    "retired" (the slot count no longer includes the slot) or "lost" (the node
+    lost the slot without releasing it, as when another holder took it or the
+    session was lost).
 
 const EventSlotStandby EventKind = 23
     EventSlotStandby ("slot.standby") is emitted when the node finds no free
