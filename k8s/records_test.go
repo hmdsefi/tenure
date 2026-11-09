@@ -199,8 +199,9 @@ func TestK8S300AcquireChecks(t *testing.T) {
 		if errors.Is(err, tenure.ErrSessionLost) != lost {
 			t.Errorf("errors.Is(%v, tenure.ErrSessionLost) = %v, want %v", err, !lost, lost)
 		}
-		if n := len(client.Actions()); n != 0 {
-			t.Errorf("%d requests, want none: %v", n, client.Actions())
+		// The informer's own LIST and WATCH may come at any time: only Acquire's requests count.
+		if got := append(actions(client, "get"), writes(client)...); len(got) != 0 {
+			t.Errorf("requests %v, want none", got)
 		}
 	}
 	for _, tc := range tests {
