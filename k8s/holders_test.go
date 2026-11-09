@@ -6,6 +6,7 @@ package k8s
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -17,6 +18,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes/fake"
+	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/hmdsefi/tenure"
@@ -345,6 +348,9 @@ func TestATK8S27WatchHolders(t *testing.T) {
 				return true, current, nil
 			})
 			a := fakeAdapter(t, client)
+			// A session holds the informer once the channels are closed.
+			closeAtEnd(t, a, "pod-0/1")
+			mustKeepAlive(t, a, "pod-0/1")
 			ch1, ch2 := mustWatch(t, a, ctx), mustWatch(t, a, ctx)
 			if _, err := client.CoordinationV1().Leases("default").Create(ctx, shardLease("g", "markets", 0, "", nil), metav1.CreateOptions{}); err != nil {
 				t.Fatalf("create: %v", err)
@@ -353,7 +359,9 @@ func TestATK8S27WatchHolders(t *testing.T) {
 			nextHolding(t, ch2, tenure.Holding{Space: "markets", Shard: 0})
 
 			// The watch ends after an event and cannot be opened again: the reflector calls its
-			// watch error handler before it lists again.
+			// watch error handler, and lists again only after a back-off of at least 800 ms. A
+			// list closes the channels too, just before it is sent: a close that comes with the
+			// LIST is not the handler's.
 			lists := len(actions(client, "list"))
 			mu.Lock()
 			refuse = true
@@ -361,8 +369,15 @@ func TestATK8S27WatchHolders(t *testing.T) {
 			mu.Unlock()
 			wantClosed(t, ch1, 2*time.Second)
 			wantClosed(t, ch2, time.Second)
-			if n := len(actions(client, "list")); n != lists {
-				t.Errorf("%d LISTs before the channels closed, want %d: the list again, not the handler, closed them", n, lists)
+			closedAt := time.Now()
+			for len(actions(client, "list")) == lists {
+				if time.Since(closedAt) > 5*time.Second {
+					t.Fatal("no LIST in 5s after the channels closed, want the informer's")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if d := time.Since(closedAt); d < 400*time.Millisecond {
+				t.Errorf("LIST %v after the channels closed, want the handler to close them before the list's back-off of 800ms", d)
 			}
 			mu.Lock()
 			refuse = false
@@ -518,4 +533,298 @@ func TestATK8S38Versions(t *testing.T) {
 		}
 		wantClosed(t, ch, 2*time.Second)
 	})
+}
+
+// TestK8S500WatchFrom checks that WatchHolders registers its channel before it lists for R: a
+// change above R that the informer delivers while the list is under way is sent.
+func TestK8S500WatchFrom(t *testing.T) {
+	client := newFake()
+	a := fakeAdapter(t, client)
+	closeAtEnd(t, a, "pod-0/1")
+	mustKeepAlive(t, a, "pod-0/1")
+	tracker := client.Tracker()
+	name := shardName("g", "markets", 0)
+	listed := false
+	client.PrependReactor("list", resourceLeases, func(action k8stesting.Action) (bool, runtime.Object, error) {
+		list, _ := action.(k8stesting.ListActionImpl)
+		if list.ListOptions.Limit != 1 || listed {
+			return false, nil, nil
+		}
+		listed = true
+		// R is 200; a record created at 201 reaches the cache before the list answers.
+		l := shardLease("g", "markets", 0, "", map[string]string{annotationTerm: "3"})
+		l.UID, l.ResourceVersion = "uid-1", "201"
+		if err := tracker.Create(leasesResource, l, "default"); err != nil {
+			return true, nil, err
+		}
+		for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(time.Millisecond) {
+			if o, ok := a.cached(name); ok && o.lease.ResourceVersion == "201" {
+				break
+			}
+			if time.Now().After(deadline) {
+				return true, nil, errors.New("record not observed in 2s")
+			}
+		}
+		return true, &coordinationv1.LeaseList{ListMeta: metav1.ListMeta{ResourceVersion: "200"}}, nil
+	})
+	ch := mustWatch(t, a, t.Context())
+	if got := nextHolding(t, ch, tenure.Holding{Space: "markets", Shard: 0, Term: 3}); got.Version != 201 {
+		t.Errorf("Version %d, want 201", got.Version)
+	}
+}
+
+// listHookClient is a fake clientset whose Lease LISTs call before first, outside the fake's
+// lock, so a list can be held back while other calls go on.
+type listHookClient struct {
+	*fake.Clientset
+	before func(metav1.ListOptions)
+}
+
+func (c listHookClient) CoordinationV1() coordinationv1client.CoordinationV1Interface {
+	return listHookCoordination{c.Clientset.CoordinationV1(), c.before}
+}
+
+type listHookCoordination struct {
+	coordinationv1client.CoordinationV1Interface
+	before func(metav1.ListOptions)
+}
+
+func (c listHookCoordination) Leases(namespace string) coordinationv1client.LeaseInterface {
+	return listHookLeases{c.CoordinationV1Interface.Leases(namespace), c.before}
+}
+
+type listHookLeases struct {
+	coordinationv1client.LeaseInterface
+	before func(metav1.ListOptions)
+}
+
+func (l listHookLeases) List(ctx context.Context, o metav1.ListOptions) (*coordinationv1.LeaseList, error) {
+	l.before(o)
+	return l.LeaseInterface.List(ctx, o)
+}
+
+// TestK8S520ListDuring checks the channels while the informer lists the Leases again after its
+// watch ended with 410 Expired: the list shows only each Lease's latest state, so a channel
+// open when the list starts is closed then, and one opened during the list once it is done; a
+// channel opened later works.
+func TestK8S520ListDuring(t *testing.T) {
+	ctx := t.Context()
+	client := newFake()
+	var mu sync.Mutex
+	var current *watch.RaceFreeFakeWatcher
+	client.PrependWatchReactor(resourceLeases, func(action k8stesting.Action) (bool, watch.Interface, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		w, _ := action.(k8stesting.WatchActionImpl)
+		wi, err := client.Tracker().Watch(leasesResource, action.GetNamespace(), w.ListOptions)
+		current, _ = wi.(*watch.RaceFreeFakeWatcher)
+		return true, wi, err
+	})
+	// Once hold is set, the informer's next list waits for it to close before it is sent.
+	var hold chan struct{}
+	listing := make(chan struct{}, 1)
+	before := func(o metav1.ListOptions) {
+		if o.Limit == 1 {
+			return
+		}
+		mu.Lock()
+		h := hold
+		hold = nil
+		mu.Unlock()
+		if h != nil {
+			listing <- struct{}{}
+			<-h
+		}
+	}
+	a := New(listHookClient{client, before}, "default", "g", WithTiming(T))
+	t.Cleanup(func() { waitStopped(t, a) })
+	closeAtEnd(t, a, "pod-0/1")
+	mustKeepAlive(t, a, "pod-0/1")
+
+	h := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(h) }) }
+	defer release()
+	// The informer has synced; its watch may start a little later.
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(time.Millisecond) {
+		mu.Lock()
+		started := current != nil
+		mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("informer opened no watch in 2s")
+		}
+	}
+	open := mustWatch(t, a, ctx)
+	mu.Lock()
+	hold = h
+	current.Error(&metav1.Status{Status: metav1.StatusFailure, Code: 410, Reason: metav1.StatusReasonExpired, Message: "too old"})
+	mu.Unlock()
+	select {
+	case <-listing:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no LIST in 5s after the watch ended, want the informer's")
+	}
+	// A channel open when the list starts is closed then.
+	wantClosed(t, open, time.Second)
+	ch := mustWatch(t, a, ctx)
+	release()
+	wantClosed(t, ch, 2*time.Second)
+
+	ch = mustWatch(t, a, ctx)
+	if _, err := client.CoordinationV1().Leases("default").Create(ctx, shardLease("g", "markets", 0, "", nil), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	nextHolding(t, ch, tenure.Holding{Space: "markets", Shard: 0})
+}
+
+// watchListClient is a fake clientset that supports watch lists: its informer streams the
+// Leases' state through a watch that a bookmark ends (watchLists), instead of listing them.
+type watchListClient struct{ *fake.Clientset }
+
+func (watchListClient) IsWatchListSemanticsUnSupported() bool { return false }
+
+// streamWatch is a watch of the fake's Leases that a test can also write to.
+type streamWatch struct {
+	*watch.RaceFreeFakeWatcher
+	in watch.Interface
+}
+
+// Stop stops the watch and the tracker's watch it forwards.
+func (w *streamWatch) Stop() {
+	w.RaceFreeFakeWatcher.Stop()
+	w.in.Stop()
+}
+
+// watchLists serves the Lease watches of a fake clientset: a watch that asks for the initial
+// events gets every Lease as ADDED, then the bookmark that ends them, then the changes.
+type watchLists struct {
+	mu sync.Mutex
+	// current is the latest watch; streams counts the watches that asked for initial events.
+	current *streamWatch
+	streams int
+	// hold, when set, keeps the bookmark of the next stream back until it is closed.
+	hold chan struct{}
+}
+
+// serveWatchLists makes client's Lease watches behave as watch lists do.
+func serveWatchLists(client *fake.Clientset) *watchLists {
+	s := &watchLists{}
+	tracker := client.Tracker()
+	client.PrependWatchReactor(resourceLeases, func(action k8stesting.Action) (bool, watch.Interface, error) {
+		wa, _ := action.(k8stesting.WatchActionImpl)
+		initial := wa.ListOptions.SendInitialEvents != nil && *wa.ListOptions.SendInitialEvents
+		in, err := tracker.Watch(leasesResource, action.GetNamespace())
+		if err != nil {
+			return true, nil, err
+		}
+		out := &streamWatch{RaceFreeFakeWatcher: watch.NewRaceFreeFake(), in: in}
+		var bookmark *coordinationv1.Lease
+		if initial {
+			obj, err := tracker.List(leasesResource, coordinationv1.SchemeGroupVersion.WithKind("Lease"), action.GetNamespace())
+			if err != nil {
+				in.Stop()
+				return true, nil, err
+			}
+			list, ok := obj.(*coordinationv1.LeaseList)
+			if !ok {
+				in.Stop()
+				return true, nil, fmt.Errorf("tracker list is a %T", obj)
+			}
+			top := uint64(100)
+			for _, l := range list.Items {
+				out.Add(l.DeepCopy())
+				if v, ok := parseUint(l.ResourceVersion); ok && v > top {
+					top = v
+				}
+			}
+			bookmark = &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+				ResourceVersion: strconv.FormatUint(top, 10),
+				Annotations:     map[string]string{metav1.InitialEventsAnnotationKey: "true"},
+			}}
+		}
+		s.mu.Lock()
+		s.current = out
+		var hold chan struct{}
+		if initial {
+			s.streams++
+			hold, s.hold = s.hold, nil
+		}
+		s.mu.Unlock()
+		go func() {
+			if bookmark != nil {
+				if hold != nil {
+					<-hold
+				}
+				out.Action(watch.Bookmark, bookmark)
+			}
+			for e := range in.ResultChan() {
+				out.Action(e.Type, e.Object)
+			}
+		}()
+		return true, out, nil
+	})
+	return s
+}
+
+// holdNext keeps the bookmark of the next stream back until the returned function is called.
+func (s *watchLists) holdNext() (release func()) {
+	hold := make(chan struct{})
+	s.mu.Lock()
+	s.hold = hold
+	s.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(hold) }) }
+}
+
+// count returns the number of streams so far.
+func (s *watchLists) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streams
+}
+
+// TestK8S520WatchList checks the informer's watch list on a fake client that supports it: when
+// the watch ends with 410 Expired, the informer streams the Leases' state again, which shows
+// only each Lease's latest state. Every channel open when that stream starts is closed then,
+// and one opened while it streams is closed at its bookmark; a channel opened later works.
+func TestK8S520WatchList(t *testing.T) {
+	ctx := t.Context()
+	client := newFake()
+	s := serveWatchLists(client)
+	a := New(watchListClient{client}, "default", "g", WithTiming(T))
+	t.Cleanup(func() { waitStopped(t, a) })
+	closeAtEnd(t, a, "pod-0/1")
+	mustKeepAlive(t, a, "pod-0/1")
+	if n, lists := s.count(), len(actions(client, "list")); n != 1 || lists != 0 {
+		t.Fatalf("informer started with %d streams and %d LISTs, want 1 stream and no LIST", n, lists)
+	}
+	ch := mustWatch(t, a, ctx)
+	leases := client.CoordinationV1().Leases("default")
+	if _, err := leases.Create(ctx, shardLease("g", "markets", 0, "", nil), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	nextHolding(t, ch, tenure.Holding{Space: "markets", Shard: 0})
+
+	release := s.holdNext()
+	defer release()
+	s.mu.Lock()
+	s.current.Error(&metav1.Status{Status: metav1.StatusFailure, Code: 410, Reason: metav1.StatusReasonExpired, Message: "too old"})
+	s.mu.Unlock()
+	// The stream starts after the reflector's back-off, and its bookmark is held back.
+	wantClosed(t, ch, 5*time.Second)
+	during := mustWatch(t, a, ctx)
+	release()
+	wantClosed(t, during, 2*time.Second)
+
+	after := mustWatch(t, a, ctx)
+	if _, err := leases.Create(ctx, shardLease("g", "markets", 1, "", nil), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	nextHolding(t, after, tenure.Holding{Space: "markets", Shard: 1})
+	if n, lists := s.count(), len(actions(client, "list")); n != 2 || lists != 3 {
+		t.Errorf("%d streams and %d LISTs, want 2 streams and the 3 LISTs of WatchHolders", n, lists)
+	}
 }
