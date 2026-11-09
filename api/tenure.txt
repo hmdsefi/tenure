@@ -887,7 +887,7 @@ type TableRow struct {
 	Shard int
 
 	// Route is the ID of the member that Node.Route names for the shard's keys, "" when Route
-	// finds none.
+	// finds none. After Close it is the last such member.
 	Route string
 
 	// Slot is the slot the shard is placed on in a group with slots, -1 without slots or when

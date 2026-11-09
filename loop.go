@@ -395,6 +395,7 @@ func (l *loop) recover() {
 	}
 	prev := n.holder
 	n.holder = holder
+	n.tableHolder(holder)
 	n.stepMu.Unlock()
 	n.obs.newIncarnation(prev)
 

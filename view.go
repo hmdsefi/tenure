@@ -160,16 +160,15 @@ func (n *Node) postView(v core.View) {
 	if n.cfg.Store == nil {
 		n.publish(v)
 		n.snap.Store(newRoutes(n.view.Load(), nil, nil)) // no spaces: nothing to assign
+		n.tableView(n.view.Load())
 		return
 	}
 	n.inbox.postView(v)
 }
 
-// publish makes v the node's published view, also the table's, feeds it to every node resolver,
-// and reports it.
+// publish makes v the node's published view, feeds it to every node resolver, and reports it.
 func (n *Node) publish(v core.View) {
 	n.view.Store(&v)
-	n.tableView(&v)
 	n.feedResolvers(v)
 	n.obs.view(v)
 }
