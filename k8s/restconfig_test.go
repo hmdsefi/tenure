@@ -51,6 +51,14 @@ func TestATK8S30RESTConfig(t *testing.T) {
 			t.Errorf("RESTConfig = %p {QPS %v, Burst %d, UserAgent %q}, want a copy of %p with 5, 7, mine/1",
 				got, got.QPS, got.Burst, got.UserAgent, in)
 		}
+		// A negative QPS turns client-go's rate limiter off: it is a setting, not a default.
+		in = &rest.Config{Host: "https://h", QPS: -1, Burst: -1}
+		if got, err = RESTConfig(in, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got.QPS != -1 || got.Burst != -1 {
+			t.Errorf("RESTConfig with QPS -1, Burst -1 = QPS %v, Burst %d; want -1, -1", got.QPS, got.Burst)
+		}
 	})
 
 	t.Run("error passed through", func(t *testing.T) {
