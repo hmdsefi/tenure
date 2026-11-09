@@ -45,6 +45,10 @@ type stepCollector struct {
 	emit   func(Event) uint64
 	shards map[string][]shardTrack // by space name, indexed by shard
 
+	// retry is the node's Timing.RetryPeriod, the Duration of shard.acquire_failed for a failed
+	// Acquire call.
+	retry time.Duration
+
 	// slots is the slot count of the latest slot.count_changed, 0 before the first.
 	slots int
 
@@ -71,9 +75,10 @@ type shardTrack struct {
 	releasing core.Term
 }
 
-// newStepCollector returns the collector of a node with spaces, which hands each event to emit.
-func newStepCollector(spaces []Space, emit func(Event) uint64) *stepCollector {
-	c := &stepCollector{emit: emit, shards: make(map[string][]shardTrack, len(spaces))}
+// newStepCollector returns the collector of a node with spaces and the retry period retry, which
+// hands each event to emit.
+func newStepCollector(spaces []Space, retry time.Duration, emit func(Event) uint64) *stepCollector {
+	c := &stepCollector{emit: emit, retry: retry, shards: make(map[string][]shardTrack, len(spaces))}
 	for _, sp := range spaces {
 		c.shards[sp.Name] = make([]shardTrack, sp.Shards)
 	}
@@ -186,7 +191,8 @@ func (c *stepCollector) expiredEvents(rec stepRecord) {
 // inputEvents emits the input's own events: those of a renewal (renewedEvents);
 // session.renew_failed for a failed KeepAlive the machine accepts, then session.lost when the
 // failure, or the error of any other call, loses the session; session.closed when the session
-// closes; and shard.acquire_failed when an acquiring shard takes an AcquireFailed.
+// closes; and shard.acquire_failed when an acquiring shard takes an AcquireFailed, or the
+// Acquired with no grant of a failed Acquire call (acquireError).
 func (c *stepCollector) inputEvents(rec stepRecord) {
 	switch in := rec.Input.(type) {
 	case core.SessionRenewed:
@@ -213,7 +219,30 @@ func (c *stepCollector) inputEvents(rec stepRecord) {
 			}
 			c.emit(e)
 		}
+	case core.Acquired:
+		c.acquireError(rec, in)
 	}
+}
+
+// acquireError emits shard.acquire_failed for an acquiring shard whose Acquire call failed with
+// an error that is not a *HeldError. RUN-150 maps such a failure to an Acquired with no grant
+// (MCH O3), and the loop steps it with the call's error, so the error tells it apart from a
+// call that answered with no grant and from the Acquired with no grant that the loop steps for
+// a lost machine's acquiring shards, which carry none. No holder is known, and Duration is the
+// retry period, the wait the failure asks for, as a *HeldError's RetryAfter is for
+// AcquireFailed: it does not say whether the machine makes a next Acquire, which it does not
+// while it drains. An ErrSessionLost is no exception: like every failed call, the Acquire
+// reports its own failure, and session.lost follows from the SessionFailed stepped next.
+func (c *stepCollector) acquireError(rec stepRecord, in core.Acquired) {
+	if in.Term != 0 || rec.Err == nil {
+		return
+	}
+	if sh, ok := shardIn(rec.Before, in.Space, in.Shard); !ok || sh.State != core.ShardStateAcquiring {
+		return
+	}
+	e := shardEvent(EventShardAcquireFailed, in.Space, in.Shard, 0)
+	e.Duration, e.Err = c.retry, rec.Err
+	c.emit(e)
 }
 
 // renewedEvents emits the events of a SessionRenewed: session.opened at the incarnation's first

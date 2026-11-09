@@ -57,9 +57,13 @@ const EventSessionClosed EventKind = 8
 const EventShardAcquiring EventKind = 9
 
 // EventShardAcquireFailed ("shard.acquire_failed") is emitted when an attempt to acquire a
-// shard fails: Space and Shard name the shard, Holder is the holder that has it ("" when not
-// known), Duration is how long the node waits before it tries again, and Err is the error,
-// or nil when the shard is held by another holder (a HeldError).
+// shard fails, either because another holder has it (a HeldError) or because the Acquire call
+// failed with another error, as when the store is unreachable: Space and Shard name the shard,
+// Holder is the holder that has it ("" when not known, as after a failed call), Duration is
+// the wait before the next attempt that the failure asks for, the HeldError's RetryAfter or
+// else the RetryPeriod of Config.Timing, and Err is the call's error, or nil when the shard is
+// held by another holder. A node that drains makes no next attempt. A call that fails with
+// ErrSessionLost emits this event, then EventSessionLost.
 const EventShardAcquireFailed EventKind = 10
 
 // EventShardAcquired ("shard.acquired") is emitted when the node has acquired a shard and

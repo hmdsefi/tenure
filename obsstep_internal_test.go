@@ -16,13 +16,21 @@ import (
 // TestStepCollectorInputs checks the step collector on single steps and short runs of steps: an
 // input the machine ignores emits nothing, but a stepped view still emits view.changed, and a
 // failed renewal the machine accepts is not ignored; shard.acquire_failed carries the step's error
-// unless it is a *HeldError; the input's events come before the actions' events; shard.releasing
-// comes once per releasing term; and shard.released takes the stop reason only of the run that
+// unless it is a *HeldError; an acquiring shard's Acquired with no grant emits shard.acquire_failed,
+// with no holder, the retry period and the error, only when it carries the failed Acquire call's
+// error, ErrSessionLost included, not for an answer with no grant nor for the one the loop owes a
+// lost machine's acquiring shard; the input's events come before the actions' events;
+// shard.releasing comes once per releasing term; and shard.released takes the stop reason only of the run that
 // held its term.
 func TestStepCollectorInputs(t *testing.T) {
 	status := func(now time.Duration, shards ...core.ShardStatus) core.Status {
 		return core.Status{Now: now, Session: core.SessionStateLive, Deadline: time.Minute, Slot: -1,
 			ViewVersion: 3, Spaces: []core.SpaceStatus{{Name: "s", Shards: shards}}}
+	}
+	lost := func(now time.Duration, shards ...core.ShardStatus) core.Status {
+		st := status(now, shards...)
+		st.Session, st.LastFailure = core.SessionStateLost, core.CauseLost
+		return st
 	}
 	idle := core.ShardStatus{State: core.ShardStateIdle}
 	acquiring := core.ShardStatus{State: core.ShardStateAcquiring}
@@ -57,6 +65,12 @@ func TestStepCollectorInputs(t *testing.T) {
 	stop7 := core.StopRun{Space: "s", Shard: 0, Term: 7, Reason: core.StopMoved}
 	release := func(term core.Term) core.Action { return core.Release{Space: "s", Shard: 0, Term: term} }
 	acquire := core.Acquire{Space: "s", Shard: 0}
+	noGrant := core.Acquired{Now: 2 * time.Second, Space: "s", Shard: 0}
+	callFailed := func(err error, retry time.Duration) Event {
+		e := ev(EventShardAcquireFailed, 0, "")
+		e.Duration, e.Err = retry, err
+		return e
+	}
 
 	for _, tc := range []struct {
 		name string
@@ -93,6 +107,66 @@ func TestStepCollectorInputs(t *testing.T) {
 			recs: []stepRecord{{Now: 2 * time.Second, Input: failed, Before: status(time.Second, acquiring),
 				After: status(2*time.Second, waiting), Actions: wake, Err: boom}},
 			want: []Event{acquireFailed(boom)},
+		},
+		{
+			// RUN-150 maps a failed Acquire call to an Acquired with no grant, stepped with the
+			// call's error: no holder is known, and Duration is the retry period (2 s here).
+			name: "AcquireCallFailed",
+			recs: []stepRecord{{Now: 2 * time.Second, Input: noGrant, Before: status(time.Second, acquiring),
+				After: status(2*time.Second, waiting), Actions: wake, Err: boom}},
+			want: []Event{callFailed(boom, 2*time.Second)},
+		},
+		{
+			// A draining machine makes no further Acquire, but Duration is still the retry period,
+			// as a *HeldError's RetryAfter is.
+			name: "AcquireCallFailedDraining",
+			recs: []stepRecord{{Now: 2 * time.Second, Input: noGrant, Before: status(time.Second, acquiring),
+				After: status(2*time.Second, idle), Err: boom}},
+			want: []Event{callFailed(boom, 2*time.Second)},
+		},
+		{
+			// An Acquire that fails with ErrSessionLost answers with no grant, then loses the
+			// session: the failed call's shard.acquire_failed with the error and the retry period,
+			// although no next Acquire comes, then session.lost, as session.renew_failed and
+			// session.lost for a KeepAlive.
+			name: "AcquireCallSessionLost",
+			recs: []stepRecord{
+				{Now: 2 * time.Second, Input: noGrant, Before: status(time.Second, acquiring),
+					After: status(2*time.Second, waiting), Actions: wake, Err: ErrSessionLost},
+				{Now: 2 * time.Second, Input: core.SessionFailed{Now: 2 * time.Second, Cause: core.CauseLost},
+					Before: status(2*time.Second, waiting), After: lost(2*time.Second, idle), Err: ErrSessionLost},
+			},
+			want: []Event{
+				callFailed(ErrSessionLost, 2*time.Second),
+				{Kind: EventSessionLost, Shard: -1, Slot: -1, Err: ErrSessionLost},
+			},
+		},
+		{
+			// A call that answers with no grant and no error did not fail.
+			name: "NoGrantWithoutError",
+			recs: []stepRecord{{Now: 2 * time.Second, Input: noGrant, Before: status(time.Second, acquiring),
+				After: status(2*time.Second, waiting), Actions: wake}},
+		},
+		{
+			// The Acquired with no grant that the loop steps, with no error, for an acquiring
+			// shard of a lost machine, whose call's answer it discarded.
+			name: "OwedAfterLoss",
+			recs: []stepRecord{{Now: 2 * time.Second, Input: noGrant, Before: lost(2*time.Second, acquiring),
+				After: lost(2*time.Second, idle)}},
+		},
+		{
+			// A grant is not a failure, whatever error the record carries.
+			name: "GrantWithError",
+			recs: []stepRecord{{Now: 2 * time.Second, Input: core.Acquired{Now: 2 * time.Second, Space: "s", Shard: 0, Term: 5},
+				Before: status(time.Second, acquiring), After: status(2*time.Second, owned(5)),
+				Actions: []core.Action{core.StartRun{Space: "s", Shard: 0, Term: 5}}, Err: boom}},
+			want: []Event{ev(EventShardAcquired, 5, "")},
+		},
+		{
+			// The shard was not acquiring: the answer is not its.
+			name: "AcquireCallFailedNotAcquiring",
+			recs: []stepRecord{{Now: 2 * time.Second, Input: noGrant, Before: status(time.Second, idle),
+				After: status(2*time.Second, waiting), Actions: wake, Err: boom}},
 		},
 		{
 			// A shard released and acquired again in one step: shard.released and its handoff,
@@ -175,7 +249,7 @@ func TestStepCollectorInputs(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var got []Event
-			c := newStepCollector([]Space{{Name: "s", Shards: 1}}, func(e Event) uint64 {
+			c := newStepCollector([]Space{{Name: "s", Shards: 1}}, 2*time.Second, func(e Event) uint64 {
 				got = append(got, e)
 				return uint64(len(got))
 			})
@@ -385,7 +459,7 @@ func TestStepCollectorOutage(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var got []Event
-			c := newStepCollector([]Space{{Name: "s", Shards: 1}}, func(e Event) uint64 {
+			c := newStepCollector([]Space{{Name: "s", Shards: 1}}, 2*time.Second, func(e Event) uint64 {
 				got = append(got, e)
 				return uint64(len(got))
 			})
@@ -441,7 +515,7 @@ func TestStepCollectorIgnored(t *testing.T) {
 // per standby period, which a claimed slot ends.
 func TestStepCollectorSlots(t *testing.T) {
 	var got []Event
-	c := newStepCollector(nil, func(e Event) uint64 {
+	c := newStepCollector(nil, 2*time.Second, func(e Event) uint64 {
 		got = append(got, e)
 		return uint64(len(got))
 	})

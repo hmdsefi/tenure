@@ -6,8 +6,10 @@ package tenure_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -339,6 +341,164 @@ func TestATOBS04Handoff(t *testing.T) {
 		a.MustClose()
 		wantDelivery(t, a)
 		wantDelivery(t, b)
+		check()
+	})
+}
+
+// TestAcquireCallFailed checks shard.acquire_failed for an Acquire call that fails with an error
+// that is not a *HeldError, as from a store that is unreachable: the first of a's Acquire calls
+// fails with "unreachable" at T0. Its shard gets shard.acquiring, then shard.acquire_failed{Holder:
+// "", Duration: 2s, Err: unreachable} at T0, then shard.acquiring and shard.acquired at T0+2s,
+// when the Acquire repeated after RetryPeriod is granted; the other shard is acquired at once.
+// The event's log record is at DEBUG, with keys space, shard, holder, retry_after and error after
+// member and holder.
+func TestAcquireCallFailed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		unreachable := errors.New("unreachable")
+		t0 := time.Now()
+		a := newObsHarness(t, "a").Node("a")
+		a.Store.Fail("Acquire", unreachable, 1)
+		if err := a.Start(context.Background()); err != nil {
+			t.Fatalf("Start(a) = %v, want nil", err)
+		}
+		time.Sleep(10 * time.Second)
+		events := a.RecentEvents()
+
+		// The log is in start order; the two calls at T0 run on two lanes, and either may take the
+		// injected error.
+		acq := a.FS.Calls("Acquire")
+		if len(acq) != 3 {
+			t.Fatalf("Acquire calls %v, want 3", acq)
+		}
+		if got, want := startsAt(acq, t0), secs(0, 0, 2); !reflect.DeepEqual(got, want) {
+			t.Errorf("Acquire calls at %v, want %v", got, want)
+		}
+		i := slices.IndexFunc(acq, func(c call) bool { return c.Err != nil })
+		if i < 0 || i > 1 || acq[i].Err != unreachable || acq[1-i].Err != nil || acq[2].Err != nil {
+			t.Fatalf("Acquire calls %v, want one at T0 to fail with unreachable and the others granted", acq)
+		}
+		failed := argAt[int](acq[i].Args, 2)
+		other := 1 - failed
+		if argAt[int](acq[1-i].Args, 2) != other || argAt[int](acq[2].Args, 2) != failed {
+			t.Errorf("Acquire calls %v, want one per shard at T0 and the failed one repeated", acq)
+		}
+
+		lifecycleKinds := []tenure.EventKind{tenure.EventShardAcquiring, tenure.EventShardAcquireFailed,
+			tenure.EventShardAcquired}
+		term := func(shard int) core.Term {
+			runs := a.Runs.Of(obsSpace, shard)
+			if len(runs) != 1 {
+				t.Fatalf("s/%d has %d Run calls, want 1", shard, len(runs))
+			}
+			return runs[0].Shard.Term
+		}
+		fail := shardEv(tenure.EventShardAcquireFailed, failed, 0, "")
+		fail.Duration, fail.Err = 2*time.Second, unreachable
+		want := []tenure.Event{
+			shardEv(tenure.EventShardAcquiring, failed, 0, ""),
+			fail,
+			shardEv(tenure.EventShardAcquiring, failed, 0, ""),
+			shardEv(tenure.EventShardAcquired, failed, term(failed), ""),
+		}
+		got := ofKinds(ofShard(events, failed), lifecycleKinds...)
+		if !reflect.DeepEqual(bareAll(got), want) {
+			t.Fatalf("s/%d events =\n%+v\nwant\n%+v", failed, bareAll(got), want)
+		}
+		for i, at := range []time.Duration{0, 0, 2 * time.Second, 2 * time.Second} {
+			if got[i].Time != t0.Add(at).UTC() {
+				t.Errorf("s/%d: %v at %v, want T0+%v", failed, got[i].Kind, got[i].Time, at)
+			}
+		}
+		wantOther := []tenure.Event{
+			shardEv(tenure.EventShardAcquiring, other, 0, ""),
+			shardEv(tenure.EventShardAcquired, other, term(other), ""),
+		}
+		if got := bareAll(ofKinds(ofShard(events, other), lifecycleKinds...)); !reflect.DeepEqual(got, wantOther) {
+			t.Errorf("s/%d events =\n%+v\nwant\n%+v", other, got, wantOther)
+		}
+
+		wantLines := []string{fmt.Sprintf(`{"level":"DEBUG","msg":"tenure: shard acquire failed","member":"a",`+
+			`"holder":"%s","space":"s","shard":%d,"holder":"","retry_after":2000000000,"error":"unreachable"}`,
+			obsHolderA, failed)}
+		if lines := linesWith(a.Log.Lines(), `"msg":"tenure: shard acquire failed"`); !reflect.DeepEqual(lines, wantLines) {
+			t.Errorf("shard.acquire_failed records =\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(wantLines, "\n"))
+		}
+
+		a.MustClose()
+		wantDelivery(t, a)
+		check()
+	})
+}
+
+// TestAcquireCallSessionLost checks an Acquire call that fails with ErrSessionLost: the first of
+// a's Acquire calls to reach the store fails at T0. The call reports its own failure, as a
+// KeepAlive that returns ErrSessionLost does with session.renew_failed: its shard gets
+// shard.acquire_failed{Holder: "", Duration: 2s, Err: ErrSessionLost} at T0, then session.lost
+// with that error, although the lost holder makes no next Acquire. It is the only
+// shard.acquire_failed: the loop discards the answer of the other shard's call when it is still
+// in flight at the loss, and the Acquired with no grant it steps in its place carries no error.
+// The lost holder makes no Acquire after T0, and the new incarnation acquires both shards.
+func TestAcquireCallSessionLost(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		t0 := time.Now()
+		a := newObsHarness(t, "a").Node("a")
+		a.Store.Fail("Acquire", tenure.ErrSessionLost, 1)
+		if err := a.Start(context.Background()); err != nil {
+			t.Fatalf("Start(a) = %v, want nil", err)
+		}
+		time.Sleep(10 * time.Second)
+		events := a.Events.Events()
+
+		// The lost holder sends one Acquire per shard at T0, on two lanes, and either may take the
+		// injected error. The other goes out only when it starts before the loss: it may then reach
+		// the store once the new incarnation has ended the lost holder's session there, and fail
+		// with ErrSessionLost too, but its answer is discarded.
+		fails := ofKinds(events, tenure.EventShardAcquireFailed)
+		if len(fails) != 1 {
+			t.Fatalf("shard.acquire_failed events %+v, want one", bareAll(fails))
+		}
+		failed := fails[0].Shard
+		var shards []int
+		lostCall := false
+		for _, c := range a.FS.Calls("Acquire") {
+			if argAt[string](c.Args, 0) != obsHolderA {
+				continue
+			}
+			shard := argAt[int](c.Args, 2)
+			shards = append(shards, shard)
+			if !c.Start.Equal(t0) {
+				t.Errorf("%v at T0+%v: want the lost holder's Acquire calls at T0", c, c.Start.Sub(t0))
+			}
+			lostCall = lostCall || (shard == failed && c.Err == tenure.ErrSessionLost)
+		}
+		if slices.Sort(shards); len(slices.Compact(shards)) != len(shards) || !lostCall {
+			t.Errorf("Acquire calls %v, want the lost holder's at most one per shard, that of s/%d failing with ErrSessionLost",
+				a.FS.Calls("Acquire"), failed)
+		}
+
+		fail := shardEv(tenure.EventShardAcquireFailed, failed, 0, "")
+		fail.Duration, fail.Err = 2*time.Second, tenure.ErrSessionLost
+		wantOnlyAt(t, "shard.acquire_failed events", fails, []tenure.Event{fail}, t0, 0)
+		wantErrEvents(t, events, tenure.EventSessionLost, tenure.ErrSessionLost, t0, secs(0))
+		if f, l := indexOf(events, tenure.EventShardAcquireFailed, failed), indexOf(events, tenure.EventSessionLost, -1); f < 0 || f > l {
+			t.Errorf("shard.acquire_failed at %d, session.lost at %d: want shard.acquire_failed first", f, l)
+		}
+		wantSession := []tenure.EventKind{tenure.EventSessionOpened, tenure.EventSessionLost,
+			tenure.EventSessionRestarted, tenure.EventSessionOpened}
+		if got := kindsOf(ofKinds(events, sessionKinds...)); !slices.Equal(got, wantSession) {
+			t.Errorf("session events %v, want %v", got, wantSession)
+		}
+		r := indexOf(events, tenure.EventSessionRestarted, -1)
+		for shard := range 2 {
+			if got := ofKinds(ofShard(events[r+1:], shard), tenure.EventShardAcquired); len(got) != 1 {
+				t.Errorf("s/%d: shard.acquired after session.restarted %+v, want one", shard, bareAll(got))
+			}
+		}
+
+		a.MustClose()
+		wantDelivery(t, a)
 		check()
 	})
 }

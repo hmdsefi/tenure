@@ -247,7 +247,7 @@ var _ observer = (*logObserver)(nil)
 
 // newLogObserver returns the observer of n, whose Config and event log are set.
 func newLogObserver(n *Node) *logObserver {
-	return &logObserver{n: n, steps: newStepCollector(n.cfg.Spaces, n.events.emit)}
+	return &logObserver{n: n, steps: newStepCollector(n.cfg.Spaces, n.cfg.Timing.RetryPeriod, n.events.emit)}
 }
 
 func (o *logObserver) start(holder string) { o.n.events.start(holder) }
