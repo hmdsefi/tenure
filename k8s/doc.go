@@ -57,6 +57,15 @@
 // session closed while the member has joined only clears the Lease's holder. Leave deletes the
 // Lease, or removes only the record while a session holds it.
 //
+// # Shard records
+//
+// Acquire grants a shard, with a new term, to a holder with an active session in the Adapter
+// when the shard's Lease is absent, names no holder, names the holder itself, or names a holder
+// whose session is gone: closed, replaced by another incarnation of its member, or observed
+// unchanged for its LeaseDuration. Before it takes a shard from another holder, it reads that
+// holder's member Lease from the API server and decides again. At most WithRecordConcurrency
+// record operations run at once; the others wait in arrival order.
+//
 // # Configuration
 //
 // New never fails and makes no request. It records the first problem it finds with its

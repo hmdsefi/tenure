@@ -47,6 +47,11 @@ type Adapter struct {
 	logger            *slog.Logger
 	watchLatency      time.Duration
 
+	// records limits the record operations in flight to recordConcurrency (records.go).
+	records *semaphore
+	// terms keeps the terms of deleted shard Leases for the Adapter's life (records.go).
+	terms shardTerms
+
 	// now is the Adapter's clock: its readings carry the monotonic clock that observations
 	// rest on, and give the wall times written to Leases. Tests replace it.
 	now func() time.Time
@@ -175,6 +180,7 @@ func New(client kubernetes.Interface, namespace, group string, opts ...Option) *
 			a.err = err
 		}
 	}
+	a.records = newSemaphore(a.recordConcurrency)
 	return a
 }
 
