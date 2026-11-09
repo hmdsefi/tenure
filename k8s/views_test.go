@@ -258,7 +258,7 @@ func TestK8S610Views(t *testing.T) {
 	foreign := memberLease("g", "pod-7", encodeMember(member("pod-7")), "", 3)
 	foreign.Labels = map[string]string{"app": "other"}
 	create(foreign)
-	create(slotsLease("g", "4"))
+	create(slotsLease(a.group, "4"))
 	create(slotLease("g", 1, "pod-1/1", p1.UID))
 	create(slotLease("g", 2, "pod-0/1", p0.UID)) // pod-0's session ended: its Lease names no holder
 	create(slotLease("g", 3, "pod-1/1", p1.UID))
@@ -451,7 +451,7 @@ func TestK8S620Rebuild(t *testing.T) {
 		}
 		create(memberLease("g", "pod-1", encodeMember(member("pod-1")), "", 1))
 		p2 := create(memberLease("g", "pod-2", encodeMember(member("pod-2")), "pod-2/1", 2))
-		create(slotsLease("g", "1"))
+		create(slotsLease(b.group, "1"))
 		create(slotLease("g", 0, "pod-2/1", p2.UID))
 		w := watchView(t, ctx, b, "b")
 		if !listing("pod-1", "pod-2")(w.last) || !slices.Equal(w.last.SlotHolders, []string{"pod-2/1"}) {
