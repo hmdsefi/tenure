@@ -911,12 +911,15 @@ func TestATK8S12RenewalConflict(t *testing.T) {
 	if s := requestStrings(got); !slices.Equal(s, want) {
 		t.Fatalf("requests %v, want %v", s, want)
 	}
-	if !got[0].bumped {
-		t.Error("the first update was not the bumped one")
+	bumped := got[0].bumpedTo
+	if !got[0].bumped || bumped == nil || !bumped.Spec.RenewTime.Time.Equal(raw) {
+		t.Fatalf("the first update was not bumped to renewTime %v: %+v", raw, bumped)
 	}
-	wantTime := raw.Add(time.Microsecond)
-	if rt := got[2].lease().Spec.RenewTime; rt == nil || !rt.Time.Equal(wantTime) {
-		t.Errorf("second update's renewTime %v, want %v", rt, wantTime)
+	// The second update starts from what the GET read: the bumped Lease.
+	wantTime := bumped.Spec.RenewTime.Add(time.Microsecond)
+	second := got[2].lease()
+	if rt := second.Spec.RenewTime; rt == nil || !rt.Time.Equal(wantTime) || second.ResourceVersion != bumped.ResourceVersion {
+		t.Errorf("second update: renewTime %v at resourceVersion %s, want %v at %s", rt, second.ResourceVersion, wantTime, bumped.ResourceVersion)
 	}
 	l := rawGet(t, c, name)
 	if !l.Spec.RenewTime.Time.Equal(wantTime) || l.Annotations[bumpAnnotation] != "1" || holderOf(l) != "pod-0/1" {
