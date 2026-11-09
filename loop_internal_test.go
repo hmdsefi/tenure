@@ -6,6 +6,7 @@ package tenure
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -347,5 +348,46 @@ func TestLoopSlotResult(t *testing.T) {
 	}
 	if len(recs) != 0 {
 		t.Errorf("stepped %d inputs, want none", len(recs))
+	}
+}
+
+// noSlotObserver counts the calls of noSlot.
+type noSlotObserver struct {
+	nopObserver
+	calls int
+}
+
+func (o *noSlotObserver) noSlot() { o.calls++ }
+
+// TestLoopNoSlot checks which ClaimSlot results the loop reports to observer.noSlot: ErrNoSlot
+// while the machine holds no slot, and neither another error, ErrNoSlot while it holds a slot, a
+// ReleaseSlot's ErrNoSlot, nor any result once a forced Close has halted the node.
+func TestLoopNoSlot(t *testing.T) {
+	var recs []stepRecord
+	l := newLoopHarness(t, &recs)
+	obs := &noSlotObserver{}
+	l.n.obs = obs
+	l.n.merge.post = func(core.View) {}
+	noSlot := callResult{act: core.ClaimSlot{}, err: fmt.Errorf("claim: %w", ErrNoSlot)}
+
+	for _, tc := range []struct {
+		name   string
+		slot   int
+		halted bool
+		r      callResult
+		want   int
+	}{
+		{"NoSlot", -1, false, noSlot, 1},
+		{"OtherError", -1, false, callResult{act: core.ClaimSlot{}, err: errors.New("boom")}, 0},
+		{"HoldsSlot", 0, false, noSlot, 0},
+		{"ReleaseSlot", -1, false, callResult{act: core.ReleaseSlot{Slot: 0}, err: ErrNoSlot}, 0},
+		{"Halted", -1, true, noSlot, 0},
+	} {
+		obs.calls = 0
+		l.status.Slot, l.n.halted = tc.slot, tc.halted
+		l.slotResult(tc.r)
+		if obs.calls != tc.want {
+			t.Errorf("%s: %d calls of noSlot, want %d", tc.name, obs.calls, tc.want)
+		}
 	}
 }

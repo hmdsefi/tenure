@@ -120,8 +120,12 @@ func TestATOBS10Slots(t *testing.T) {
 		if closed := indexOf(ae, tenure.EventSessionClosed, -1); rel < 0 || closed < rel {
 			t.Errorf("a: slot.released at %d, session.closed at %d: want the slot released first", rel, closed)
 		}
-		if _, holders, err := h.ms.Slots(context.Background()); err != nil || len(holders) != 2 || holders[0] != c.Holder {
-			t.Errorf("stored slot holders %q (err %v), want c's holder on slot 0", holders, err)
+		if tab := c.Table(); tab.Slot != 0 || tab.Slots != 2 || !slices.Equal(tab.SlotHolders, []string{c.Holder, b.Holder}) {
+			t.Errorf("c: Table() Slot %d, Slots %d, SlotHolders %q; want slot 0 of 2, held by c and b",
+				tab.Slot, tab.Slots, tab.SlotHolders)
+		}
+		if tab := b.Table(); tab.Slot != 1 {
+			t.Errorf("b: Table().Slot = %d, want 1", tab.Slot)
 		}
 
 		b.MustClose()
@@ -208,6 +212,9 @@ func TestATOBS12RetiredAndLostSlots(t *testing.T) {
 			if rs := b.FS.Calls("ReleaseSlot"); len(rs) == 0 || rs[0].Args[1] != 1 || rs[0].Err != nil {
 				t.Errorf("b: ReleaseSlot calls = %v, want ReleaseSlot(1) first", rs)
 			}
+			if tab := b.Table(); tab.Slot != -1 || tab.Slots != 1 {
+				t.Errorf("b: Table() Slot %d, Slots %d; want a standby in a group of 1 slot", tab.Slot, tab.Slots)
+			}
 
 			b.MustClose()
 			a.MustClose()
@@ -278,6 +285,9 @@ func TestATOBS12RetiredAndLostSlots(t *testing.T) {
 			events = a.RecentEvents()
 			wantSlotEvents(t, a, events, countChanged(1), slotEv(tenure.EventSlotClaimed, 0, ""),
 				slotEv(tenure.EventSlotReleased, 0, "lost"), standby)
+			if tab := a.Table(); tab.Slot != -1 || !slices.Equal(tab.SlotHolders, []string{other}) {
+				t.Errorf("a: Table() Slot %d, SlotHolders %q; want a standby, with slot 0 held by %s", tab.Slot, tab.SlotHolders, other)
+			}
 			for shard := range 2 {
 				released := shardEv(tenure.EventShardReleased, shard, terms[shard], "lost")
 				if i := indexOf(events, tenure.EventShardReleased, shard); i < 0 || bare(events[i]) != released {
