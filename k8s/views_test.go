@@ -198,9 +198,9 @@ func (h *logRecorder) logged(level slog.Level, msg string) []map[string]string {
 	return out
 }
 
-// waitDelivered waits up to 2 s for the informer to deliver every own member Lease write of a
+// waitAllDelivered waits up to 2 s for the informer to deliver every own member Lease write of a
 // that freshness waits for.
-func waitDelivered(t testing.TB, a *Adapter) {
+func waitAllDelivered(t testing.TB, a *Adapter) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -602,7 +602,7 @@ func TestK8S260MemberGC(t *testing.T) {
 	if err := a.KeepAlive(ctx, "pod-1/1", long); err != nil {
 		t.Fatalf("KeepAlive: %v", err)
 	}
-	waitDelivered(t, a)
+	waitAllDelivered(t, a)
 	if o, _ := a.cached(memberName("g", "pod-0")); !o.rvSeenAt.Equal(t0) {
 		t.Fatalf("own Lease seen at %v, want unchanged since %v", o.rvSeenAt, t0)
 	}
@@ -616,7 +616,7 @@ func TestK8S260MemberGC(t *testing.T) {
 	if err := a.KeepAlive(ctx, "pod-1/1", long); err != nil {
 		t.Fatalf("KeepAlive: %v", err)
 	}
-	waitDelivered(t, a)
+	waitAllDelivered(t, a)
 	waitFresh(t, a, true)
 	collectAt(111*time.Second, short.Name, slow30.Name)
 	if got := len(logs.logged(slog.LevelInfo, "k8s: deleted member lease")); got != 2 {

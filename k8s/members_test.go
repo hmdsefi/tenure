@@ -74,6 +74,20 @@ func fakeGet(t testing.TB, client *fake.Clientset, name string) *coordinationv1.
 	return l
 }
 
+// waitWatching waits up to 2 s for the informer of a fake client to watch the Leases. The fake
+// client's watch starts with no resourceVersion: a change made before it starts never reaches
+// the informer, whose list came first.
+func waitWatching(t testing.TB, client *fake.Clientset) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(actions(client, "watch")) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no watch of the Leases in 2s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // withoutAnnotation returns the annotations of l without key.
 func withoutAnnotation(l *coordinationv1.Lease, key string) map[string]string {
 	a := maps.Clone(l.Annotations)
@@ -324,6 +338,60 @@ func TestK8S600Join(t *testing.T) {
 		// Not joined: Join may be called again.
 		mustJoin(t, a, member("pod-0"))
 	})
+
+	t.Run("session lease created while joined", func(t *testing.T) {
+		// The member Lease is deleted; KeepAlive creates it again, with the member record. The
+		// heartbeat's creates, which name no holder, fail, so only KeepAlive's goes through.
+		client := newFake()
+		internal := apierrors.NewInternalError(errors.New("injected"))
+		var joined atomic.Bool
+		client.PrependReactor("create", resourceLeases, func(x k8stesting.Action) (bool, runtime.Object, error) {
+			return joined.Load() && sentLease(x).Spec.HolderIdentity == nil, nil, internal
+		})
+		a := fakeAdapter(t, client, WithLogger(slog.New(&logRecorder{})))
+		m := member("pod-0")
+		mustJoin(t, a, m)
+		joined.Store(true)
+		waitWatching(t, client)
+		if err := client.CoordinationV1().Leases("default").Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		waitForgotten(t, a, name)
+		mustKeepAlive(t, a, "pod-0/1")
+		closeAtEnd(t, a, "pod-0/1")
+		l := fakeGet(t, client, name)
+		if l == nil || holderOf(l) != "pod-0/1" || l.Annotations[annotationMember] != encodeMember(m) || *l.Spec.LeaseTransitions != 0 {
+			t.Errorf("Lease created by KeepAlive while joined: %+v, want holder pod-0/1, the record and leaseTransitions 0", l)
+		}
+	})
+
+	t.Run("close while joined", func(t *testing.T) {
+		// The member Lease has lost its record, which another writer removed: CloseSession of
+		// the joined member's holder still only clears the holder.
+		client := newFake()
+		a := fakeAdapter(t, client)
+		mustJoin(t, a, member("pod-0"))
+		mustKeepAlive(t, a, "pod-0/1")
+		waitWatching(t, client)
+		l := fakeGet(t, client, name)
+		delete(l.Annotations, annotationMember)
+		l, err := client.CoordinationV1().Leases("default").Update(ctx, l, metav1.UpdateOptions{})
+		if err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		waitObserved(t, a, name, l.ResourceVersion)
+		client.ClearActions()
+		if err := a.CloseSession(ctx, "pod-0/1"); err != nil {
+			t.Fatalf("CloseSession: %v", err)
+		}
+		got := writes(client)
+		if len(got) != 1 || got[0].GetVerb() != "update" || holderOf(sentLease(got[0])) != "" {
+			t.Errorf("CloseSession: writes %v, want one update clearing the holder", got)
+		}
+		if fakeGet(t, client, name) == nil {
+			t.Error("the member Lease is gone, want it kept while the member has joined")
+		}
+	})
 }
 
 // TestK8S640SetDraining checks SetDraining: its errors without a request, no request when the
@@ -504,6 +572,9 @@ func TestK8S250HeartbeatWrites(t *testing.T) {
 		if len(errs) != 0 || len(got) > renewals+1 {
 			t.Errorf("%d updates for %d renewals, errors %v; want the renewals' updates alone", len(got), renewals, errs)
 		}
+		// The informer sees nothing more: the heartbeat starts from what CloseSession wrote.
+		release := rec.stall(on(verbWatch, ""))
+		defer release()
 		if err := a.CloseSession(ctx, "pod-0/1"); err != nil {
 			t.Fatalf("CloseSession: %v", err)
 		}
@@ -512,13 +583,16 @@ func TestK8S250HeartbeatWrites(t *testing.T) {
 			t.Fatalf("Lease after CloseSession %+v, want the holder cleared and the record kept", l)
 		}
 		rec.reset()
-		u := rec.waitFor(t, 2*T.RetryPeriod, ownUpdates)
-		if u.lease().Spec.HolderIdentity != nil {
-			t.Errorf("first update after CloseSession %+v, want a heartbeat", u.lease().Spec)
+		u := rec.waitFor(t, 2*T.RetryPeriod, func(r request) bool { return on(verbUpdate, name)(r) && !r.done.IsZero() })
+		if u.status != 200 || u.lease().Spec.HolderIdentity != nil {
+			t.Errorf("first update after CloseSession: %v %+v, want a heartbeat with status 200", u, u.lease().Spec)
 		}
 	})
 
 	t.Run("conflict", func(t *testing.T) {
+		// The informer sees nothing: the update after the conflict starts from what the GET read.
+		release := rec.stall(on(verbWatch, ""))
+		defer release()
 		rec.bump(name, time.Time{})
 		rec.reset()
 		rec.waitFor(t, 3*T.RetryPeriod, ownUpdates)
@@ -552,6 +626,38 @@ func TestK8S250HeartbeatWrites(t *testing.T) {
 			l.Annotations[annotationMember] != before.Annotations[annotationMember] || s.HolderIdentity != nil ||
 			s.RenewTime == nil || *s.LeaseDurationSeconds != 3 {
 			t.Errorf("re-created Lease %+v, want labels, the record, renewTime, duration 3 and no holder", l)
+		}
+	})
+
+	t.Run("recreation after a session", func(t *testing.T) {
+		// The last state the Adapter wrote names a holder; the Lease is then deleted and the
+		// session closed, which finds nothing to write. The informer saw the deletion, so the
+		// heartbeat creates the Lease again.
+		mustKeepAlive(t, a, "pod-0/2")
+		if err := a.SetDraining(ctx, true); err != nil {
+			t.Fatalf("SetDraining: %v", err)
+		}
+		deleted := time.Now()
+		if err := c.leases().Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		waitForgotten(t, a, name)
+		if err := a.CloseSession(ctx, "pod-0/2"); err != nil {
+			t.Fatalf("CloseSession: %v", err)
+		}
+		rec.reset()
+		created := rec.waitFor(t, 2*time.Second, func(r request) bool { return on(verbCreate, "")(r) && r.status == 201 })
+		if d := created.done.Sub(deleted); d > time.Second {
+			t.Errorf("Lease created again %v after its deletion, want within 1s", d)
+		}
+		l := rawGet(t, c, name)
+		m := member("pod-0")
+		m.Draining = true
+		if l == nil || holderOf(l) != "" || l.Annotations[annotationMember] != encodeMember(m) {
+			t.Errorf("re-created Lease %+v, want the draining record and no holder", l)
+		}
+		if err := a.SetDraining(ctx, false); err != nil {
+			t.Fatalf("SetDraining: %v", err)
 		}
 	})
 
@@ -647,6 +753,8 @@ func TestK8S650Leave(t *testing.T) {
 		}
 		mustKeepAlive(t, a, "pod-1/1")
 		before := rawGet(t, c, name)
+		// The informer sees nothing until the session has renewed after Leave.
+		release := rec.stall(on(verbWatch, ""))
 		rec.reset()
 		if err := a.Leave(ctx); err != nil {
 			t.Fatalf("Leave: %v", err)
@@ -658,8 +766,14 @@ func TestK8S650Leave(t *testing.T) {
 		if _, ok := l.Annotations[annotationMember]; ok || !equalSpec(before.Spec, l.Spec) || !maps.Equal(before.Labels, l.Labels) {
 			t.Errorf("Lease after Leave %+v, want only the record removed from %+v", l, before)
 		}
-		// The session goes on; closing it now deletes the Lease.
+		// The session goes on, renewing from the Lease Leave wrote; closing it now deletes the
+		// Lease.
+		rec.reset()
 		mustKeepAlive(t, a, "pod-1/1")
+		if s := requestStrings(rec.filter(named)); len(s) != 1 || s[0] != "UPDATE "+name+" 200" {
+			t.Errorf("renewal after Leave: requests %v, want [UPDATE %s 200]", s, name)
+		}
+		release()
 		rec.reset()
 		if err := a.CloseSession(ctx, "pod-1/1"); err != nil {
 			t.Fatalf("CloseSession: %v", err)
