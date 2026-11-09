@@ -58,7 +58,7 @@ var _ tenure.Store = (*Adapter)(nil)
 // group's shard labels. When its write loses to another, it reads the Lease and decides again;
 // after three lost writes it returns "k8s: lease <name>: 3 conflicts: …", unless the record's
 // term has grown meanwhile, other holders having been granted the shard, in which case it goes
-// on. It runs at most as many record operations at once as WithRecordConcurrency allows.
+// on while holder's session is active. It runs at most as many record operations at once as WithRecordConcurrency allows.
 func (a *Adapter) Acquire(ctx context.Context, holder, space string, shard int) (core.Term, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -108,10 +108,17 @@ func (a *Adapter) Acquire(ctx context.Context, holder, space string, shard int) 
 		var conflicts *conflictsError
 		if errors.As(err, &conflicts) && recordTerm(last) > start {
 			// The writes lost to grants of the shard to other holders, which were gone again
-			// each time this call read the record: the shard moves on, so the call tries again,
-			// from the latest state read. Only conflicts that leave the term as it is, such as
-			// renewals or foreign writes, use the attempts up.
-			cur = last
+			// each time this call read the record: the shard moves on, so the call tries again
+			// from the record as it is now, since the last write lost to a state it has not
+			// read. Only conflicts that leave the term as it is, such as renewals or foreign
+			// writes, use the attempts up. The session may have ended or expired over the
+			// attempts: a grant needs it active, as at the start.
+			if s, err = a.activeSession(holder); err != nil {
+				return 0, err
+			}
+			if cur, err = a.getLease(ctx, name); err != nil {
+				return 0, fmt.Errorf("k8s: acquire %s: %w", name, err)
+			}
 			continue
 		}
 		if err != nil {
