@@ -20,9 +20,11 @@ import (
 //
 // A view lists the live members of the group as this Adapter observes them (K8S-610): every
 // member Lease of the group that carries a valid member record and whose resourceVersion this
-// Adapter first saw less than the Lease's wait ago (now − rvSeenAt < leaseDurationSeconds), or
-// every such Lease while the cache is not fresh (K8S-150): the views are frozen then, and only
-// observed changes, a record written or removed or a Lease deleted, change them. A member's
+// Adapter first saw less than the Lease's wait ago (now − rvSeenAt < leaseDurationSeconds).
+// While the cache is not fresh (K8S-150) the views are frozen: a member the latest view lists
+// stays past its wait, one it does not list comes back only by an observed change, and only
+// observed changes, a record written or removed or a Lease deleted, remove members. The first
+// view built while no channel is open has no latest view: it lists every such Lease. A member's
 // fields come from its record; its Slot is the lowest slot whose live holder is one of its
 // incarnations, and the view's Slots and SlotHolders are what Slots would return from the same
 // observations. An invalid member record leaves its Lease out of the views and is logged at Warn
@@ -279,20 +281,32 @@ func (a *Adapter) buildViewLocked(without string) (core.View, time.Time) {
 		}
 	}
 
+	// While the cache is not fresh the views are frozen (K8S-150): time alone removes no member,
+	// and brings none back either. A member Lease that has not changed for its wait stays only
+	// when the latest view lists its member. Without a latest view, as for the first view while
+	// no channel is open, every member Lease with a record is listed.
+	var kept map[string]bool
+	if !fresh && len(a.views.watches) > 0 {
+		kept = map[string]bool{}
+		for _, m := range a.views.view.Members {
+			kept[m.ID] = true
+		}
+	}
 	var members []core.Member
-	seen := map[string]bool{}
 	for name, o := range obs {
 		m, ok := a.viewMemberLocked(name, o)
 		if !ok || m.ID == without {
 			continue
 		}
-		seen[name] = true
-		if fresh {
+		if fresh || kept != nil {
 			until := o.rvSeenAt.Add(leaseWait(o.lease, a.timing.LeaseDuration))
-			if !now.Before(until) {
+			switch {
+			case now.Before(until) && fresh:
+				next = earliest(next, until)
+			case now.Before(until), kept[m.ID]:
+			default:
 				continue
 			}
-			next = earliest(next, until)
 		}
 		m.Slot = -1
 		if n, ok := slotOf[m.ID]; ok {

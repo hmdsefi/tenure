@@ -367,15 +367,22 @@ func TestK8S620Rebuild(t *testing.T) {
 	w.waitFor(time.Second, "pod-0", listing("pod-0"))
 	waitFresh(t, a, true)
 
-	// An informer event: another member joins.
+	// Informer events: two other members join; pod-8, with a wait of 1s, leaves 1s later.
 	leases := client.CoordinationV1().Leases("default")
 	if _, err := leases.Create(ctx, memberLease("g", "pod-9", encodeMember(member("pod-9")), "", 3), metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	if _, err := leases.Create(ctx, memberLease("g", "pod-8", encodeMember(member("pod-8")), "", 1), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	w.waitFor(time.Second, "pod-0, pod-8 and pod-9", listing("pod-0", "pod-8", "pod-9"))
+	clock.advance(time.Second)
+	a.viewsChanged()
 	w.waitFor(time.Second, "pod-0 and pod-9", listing("pod-0", "pod-9"))
 
-	// No own write delivered for RenewDeadline: stale, so pod-9 stays past its wait.
-	clock.advance(slow.RenewDeadline)
+	// No own write delivered for RenewDeadline: stale, so the views are frozen: pod-9 stays past
+	// its wait, and pod-8, which left before, does not come back.
+	clock.advance(slow.RenewDeadline - time.Second)
 	waitFresh(t, a, false)
 	a.viewsChanged()
 	w.quiet(100 * time.Millisecond)
