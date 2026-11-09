@@ -442,11 +442,10 @@ func TestATRUN20WatchRetry(t *testing.T) {
 // TestATRUN20WatchEndsAtLeave checks that the watcher ends once Leave has been called (RUN-200):
 // Close's Leave takes a second, in which another member joins, and neither that view nor the one
 // Leave publishes without n1 reaches the loop or the published view: every view.changed has n1
-// and n2 only, and so has the published view after Close. Without a store the watcher publishes
-// each view itself, and the drain completes once SetDraining returns, so whether the watcher reads
-// the view of Close's SetDraining before Leave depends on scheduling. With a store the loop steps
-// each view, and the drain completes only once the loop has stepped that view: the published
-// view has n1 draining.
+// and n2 only, and so has the published view after Close. The drain completes once SetDraining
+// returns and, with a store, the machine is done, neither of which waits for the view of Close's
+// SetDraining: whether the watcher reads that view, and the loop steps it, before Leave depends on
+// scheduling, so the published view may have n1 draining or not.
 func TestATRUN20WatchEndsAtLeave(t *testing.T) {
 	for _, withStore := range []bool{false, true} {
 		t.Run(fmt.Sprintf("store=%t", withStore), func(t *testing.T) {
@@ -493,11 +492,6 @@ func TestATRUN20WatchEndsAtLeave(t *testing.T) {
 				v := published(t, n)
 				if got, want := memberIDs(v), []string{"n1", "n2"}; !slices.Equal(got, want) {
 					t.Errorf("published view after Close has %v, want %v", got, want)
-				}
-				if withStore {
-					if i := slices.IndexFunc(v.Members, func(m core.Member) bool { return m.ID == "n1" }); i < 0 || !v.Members[i].Draining {
-						t.Errorf("published view after Close = %+v, want n1 draining", v)
-					}
 				}
 				if watches := m.Calls("Watch"); len(watches) != 1 {
 					t.Errorf("Watch calls = %v, want Start's only", watches)

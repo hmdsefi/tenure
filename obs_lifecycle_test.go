@@ -87,8 +87,11 @@ func lifecycle(shard int, term core.Term, reason string, took time.Duration) []t
 // shard.acquiring for s/0 and s/1; per shard exactly acquiring, acquired, stopping{draining},
 // releasing, released{draining}, handoff_completed{draining}; node.draining before both stops,
 // session.closed after both releases, then node.drained, and node.closed{drained} last; no
-// other kinds; and one more view.changed, of Close's SetDraining{Version: 2, Count: 1}, after
-// node.draining and before node.drained, but none of the view Leave publishes (RUN-200).
+// other kinds; and at most one more view.changed, of Close's SetDraining{Version: 2, Count: 1},
+// after node.draining, but none of the view Leave publishes (RUN-200). The drain completes once
+// SetDraining returns and the session is closed, neither of which waits for the loop to step
+// SetDraining's view, so whether the loop steps it before Leave depends on scheduling, and so
+// does whether it comes before node.drained.
 func TestATOBS02SingleNodeLifecycle(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
@@ -170,10 +173,13 @@ func TestATOBS02SingleNodeLifecycle(t *testing.T) {
 			{Kind: tenure.EventViewChanged, Shard: -1, Slot: -1, Version: 1, Count: 1},
 			{Kind: tenure.EventViewChanged, Shard: -1, Slot: -1, Version: 2, Count: 1},
 		}
-		if got := ofKinds(events, tenure.EventViewChanged); !reflect.DeepEqual(bareAll(got), views) {
-			t.Errorf("view.changed events %+v, want %+v", got, views)
-		} else if v := slices.Index(events, got[1]); v < draining || v > drained {
-			t.Errorf("SetDraining's view.changed at %d, want it between node.draining at %d and node.drained at %d", v, draining, drained)
+		got := ofKinds(events, tenure.EventViewChanged)
+		if len(got) == 0 || len(got) > len(views) || !reflect.DeepEqual(bareAll(got), views[:len(got)]) {
+			t.Errorf("view.changed events %+v, want %+v or its first", got, views)
+		} else if len(got) == 2 {
+			if v := slices.Index(events, got[1]); v < draining {
+				t.Errorf("SetDraining's view.changed at %d, want it after node.draining at %d", v, draining)
+			}
 		}
 		check()
 	})
