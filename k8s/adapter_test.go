@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -25,8 +27,8 @@ var T = core.Timing{
 	SlotGrace:     3 * time.Second,
 }
 
-// adapterCalls has one row per exported method of *Adapter: a call with valid arguments that
-// returns the method's error. Each task that adds a method adds its row.
+// adapterCalls has one row per exported method of *Adapter, as TestATK8S01ConfigErrors checks: a
+// call with valid arguments that returns the method's error.
 var adapterCalls = []struct {
 	method string
 	call   func(ctx context.Context, a *Adapter) error
@@ -88,6 +90,22 @@ var adapterCalls = []struct {
 // written from the issue's text: the original text is unavailable.
 func TestATK8S01ConfigErrors(t *testing.T) {
 	ctx := t.Context()
+
+	t.Run("every method", func(t *testing.T) {
+		typ := reflect.TypeFor[*Adapter]()
+		want := make([]string, 0, typ.NumMethod())
+		for m := range typ.Methods() {
+			want = append(want, m.Name)
+		}
+		got := make([]string, 0, len(adapterCalls))
+		for _, c := range adapterCalls {
+			got = append(got, c.method)
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, want) {
+			t.Errorf("adapterCalls has rows for %q, want one row for each exported method of *Adapter: %q", got, want)
+		}
+	})
 
 	t.Run("nil client", func(t *testing.T) {
 		for _, a := range []*Adapter{
