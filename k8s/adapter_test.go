@@ -48,6 +48,13 @@ var adapterCalls = []struct {
 		_, err := a.Holdings(ctx, "markets")
 		return err
 	}},
+	{"WatchHolders", func(ctx context.Context, a *Adapter) error {
+		ch, err := a.WatchHolders(ctx)
+		if ch != nil {
+			return fmt.Errorf("WatchHolders = a channel, want nil with %w", err)
+		}
+		return err
+	}},
 	{"ClaimSlot", func(ctx context.Context, a *Adapter) error {
 		slot, err := a.ClaimSlot(ctx, "pod-0/1")
 		if slot != -1 {
