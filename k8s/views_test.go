@@ -417,6 +417,61 @@ func TestK8S620Rebuild(t *testing.T) {
 	if v.Slots != 2 {
 		t.Errorf("Slots %d, want 2", v.Slots)
 	}
+	// A change of slot data alone makes a new view.
+	if err := a.ReleaseSlot(ctx, "pod-0/1", 0); err != nil {
+		t.Fatalf("ReleaseSlot: %v", err)
+	}
+	w.waitFor(time.Second, "pod-0 without a slot", func(v core.View) bool {
+		return listing("pod-0")(v) && v.Members[0].Slot == -1 && slices.Equal(v.SlotHolders, []string{"", ""})
+	})
+	// So does a slot taken by the session of a member that has not joined.
+	if err := a.KeepAlive(ctx, "pod-7/1", slow); err != nil {
+		t.Fatalf("KeepAlive: %v", err)
+	}
+	closeAtEnd(t, a, "pod-7/1")
+	mustClaim(t, a, "pod-7/1", 0)
+	w.waitFor(time.Second, "slot 0 held by pod-7/1", func(v core.View) bool {
+		return listing("pod-0")(v) && slices.Equal(v.SlotHolders, []string{"pod-7/1", ""})
+	})
+
+	// With no event at all, the timer builds the view again when a member's wait ends and when
+	// a slot holder's session ends by time.
+	t.Run("timer", func(t *testing.T) {
+		ctx := t.Context()
+		client := newFake()
+		b := fakeAdapter(t, client)
+		leases := client.CoordinationV1().Leases("default")
+		create := func(l *coordinationv1.Lease) *coordinationv1.Lease {
+			t.Helper()
+			l, err := leases.Create(ctx, l, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			return l
+		}
+		create(memberLease("g", "pod-1", encodeMember(member("pod-1")), "", 1))
+		p2 := create(memberLease("g", "pod-2", encodeMember(member("pod-2")), "pod-2/1", 2))
+		create(slotsLease("g", "1"))
+		create(slotLease("g", 0, "pod-2/1", p2.UID))
+		w := watchView(t, ctx, b, "b")
+		if !listing("pod-1", "pod-2")(w.last) || !slices.Equal(w.last.SlotHolders, []string{"pod-2/1"}) {
+			t.Fatalf("first view %s, want pod-1 and pod-2 in slot 0", fmtView(w.last))
+		}
+		o1, _ := b.cached(memberName("g", "pod-1"))
+		o2, _ := b.cached(memberName("g", "pod-2"))
+		w.waitFor(2*time.Second, "pod-2 alone", listing("pod-2"))
+		if late := time.Since(o1.rvSeenAt.Add(time.Second)); late < 0 || late > 500*time.Millisecond {
+			t.Errorf("pod-1 left %v after its wait ended, want at once", late)
+		}
+		v := w.waitFor(2*time.Second, "no members", listing())
+		if late := time.Since(o2.rvSeenAt.Add(2 * time.Second)); late < 0 || late > 500*time.Millisecond {
+			t.Errorf("pod-2 left %v after its wait ended, want at once", late)
+		}
+		if !slices.Equal(v.SlotHolders, []string{""}) {
+			t.Errorf("slot holders %q, want slot 0 vacant", v.SlotHolders)
+		}
+		w.quiet(100 * time.Millisecond)
+	})
 }
 
 // TestK8S630Watch checks Watch on a fake client: before Join and repeatedly, each channel
