@@ -272,6 +272,17 @@ func TestStoreFailedReasons(t *testing.T) {
 	fenced := func(c *tenure.Config) { c.Spaces[0].Fenced = true }
 	// failed returns the store.failed events of events.
 	failed := func(events []tenure.Event) []tenure.Event { return ofKinds(events, tenure.EventStoreFailed) }
+	// failedWith returns the number of calls of method that failed with err. Calls on two lanes
+	// may take the injected error in another order than the log's, which is by start.
+	failedWith := func(a *obsNode, method string, err error) int {
+		n := 0
+		for _, c := range a.FS.Calls(method) {
+			if c.Err == err {
+				n++
+			}
+		}
+		return n
+	}
 	// failedShard returns the shard of the first failed call of method.
 	failedShard := func(a *obsNode, method string) int {
 		for _, c := range a.FS.Calls(method) {
@@ -303,8 +314,8 @@ func TestStoreFailedReasons(t *testing.T) {
 			n.Store.Heal("KeepAlive")
 		}, fenced)
 		conf := a.FS.Calls("Confirm")
-		if len(conf) < 3 || conf[0].Err != boom {
-			t.Fatalf("Confirm calls %v, want the first to fail and the confirms to go on", conf)
+		if len(conf) < 3 || failedWith(a, "Confirm", boom) != 1 {
+			t.Fatalf("Confirm calls %v, want one to fail and the confirms to go on", conf)
 		}
 		want := []tenure.Event{storeFailedEv("Confirm", obsSpace, failedShard(a, "Confirm"), -1, boom)}
 		wantEvents(t, "store.failed events", failed(events), want)
@@ -384,6 +395,7 @@ func TestStoreFailedReasons(t *testing.T) {
 			synctest.Wait()
 			b := h.Start("b", slots)
 			time.Sleep(time.Minute)
+			synctest.Wait() // a ClaimSlot that starts at this instant returns
 			claims := b.FS.Calls("ClaimSlot")
 			if len(claims) == 0 {
 				t.Fatal("b made no ClaimSlot call")
@@ -407,8 +419,8 @@ func TestStoreFailedReasons(t *testing.T) {
 	t.Run("Acquire", func(t *testing.T) {
 		var a *obsNode
 		events := run(t, func(t *testing.T, n *obsNode) { a = n; n.Store.Fail("Acquire", boom, 1) })
-		if acq := a.FS.Calls("Acquire"); len(acq) < 3 || acq[0].Err != boom {
-			t.Errorf("Acquire calls %v, want a failed one and then the grants", acq)
+		if acq := a.FS.Calls("Acquire"); len(acq) < 3 || failedWith(a, "Acquire", boom) != 1 {
+			t.Errorf("Acquire calls %v, want one failed and then the grants", acq)
 		}
 		if got := failed(events); len(got) != 0 {
 			t.Errorf("store.failed events %+v, want none", got)
@@ -480,6 +492,44 @@ func TestStoreFailedReasons(t *testing.T) {
 			wantEvents(t, "failure events delivered by Start", got, want)
 			if n := count(a.Events.Events(), tenure.EventNodeClosed); n != 0 {
 				t.Errorf("%d node.closed events, want none", n)
+			}
+			wantDelivery(t, a)
+			check()
+		})
+	})
+
+	t.Run("CutOffByStart", func(t *testing.T) {
+		// The loop's second step, which queues the ClaimSlot, is held until Start's ctx ends at
+		// T0+1s, and the ClaimSlot does not return before its ctx ends: Start's cleanup cancels
+		// it. A call that the node itself cut off is not a failed store call, so it emits no
+		// store.failed. Leave takes a second, in which such an event would be delivered.
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			a := newObsHarness(t).Node("a", slots)
+			a.Store.Answer("ClaimSlot", func(ctx context.Context, args []any) ([]any, error) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			})
+			a.M.Delay("Leave", time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			steps := 0
+			hook := tenure.WithStepHook(ctx, func(tenure.StepRecord) {
+				if steps++; steps == 2 {
+					<-ctx.Done()
+					time.Sleep(time.Second) // Start does not see the step done as ctx ends
+				}
+			})
+			const errText = "tenure: start: context deadline exceeded"
+			if err := a.Start(hook); err == nil || err.Error() != errText {
+				t.Fatalf("Start() = %v, want %q", err, errText)
+			}
+			if cs := a.FS.Calls("ClaimSlot"); len(cs) != 1 || !errors.Is(cs[0].Err, context.Canceled) {
+				t.Errorf("ClaimSlot calls %v, want one that Start's cleanup canceled", cs)
+			}
+			synctest.Wait()
+			if got := ofKinds(a.Events.Events(), failKinds...); len(got) != 0 {
+				t.Errorf("failure events %+v, want none", got)
 			}
 			wantDelivery(t, a)
 			check()
