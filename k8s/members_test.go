@@ -555,6 +555,38 @@ func TestK8S250HeartbeatWrites(t *testing.T) {
 		}
 	})
 
+	t.Run("recreation after a session", func(t *testing.T) {
+		// The last state the Adapter wrote names a holder; the Lease is then deleted and the
+		// session closed, which finds nothing to write. The informer saw the deletion, so the
+		// heartbeat creates the Lease again.
+		mustKeepAlive(t, a, "pod-0/2")
+		if err := a.SetDraining(ctx, true); err != nil {
+			t.Fatalf("SetDraining: %v", err)
+		}
+		deleted := time.Now()
+		if err := c.leases().Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		waitForgotten(t, a, name)
+		if err := a.CloseSession(ctx, "pod-0/2"); err != nil {
+			t.Fatalf("CloseSession: %v", err)
+		}
+		rec.reset()
+		created := rec.waitFor(t, 2*time.Second, func(r request) bool { return on(verbCreate, "")(r) && r.status == 201 })
+		if d := created.done.Sub(deleted); d > time.Second {
+			t.Errorf("Lease created again %v after its deletion, want within 1s", d)
+		}
+		l := rawGet(t, c, name)
+		m := member("pod-0")
+		m.Draining = true
+		if l == nil || holderOf(l) != "" || l.Annotations[annotationMember] != encodeMember(m) {
+			t.Errorf("re-created Lease %+v, want the draining record and no holder", l)
+		}
+		if err := a.SetDraining(ctx, false); err != nil {
+			t.Fatalf("SetDraining: %v", err)
+		}
+	})
+
 	t.Run("other errors", func(t *testing.T) {
 		off := rec.fail(on(verbUpdate, name))
 		time.Sleep(2*T.RetryPeriod + T.RetryPeriod/2)
@@ -647,6 +679,8 @@ func TestK8S650Leave(t *testing.T) {
 		}
 		mustKeepAlive(t, a, "pod-1/1")
 		before := rawGet(t, c, name)
+		// The informer sees nothing until the session has renewed after Leave.
+		release := rec.stall(on(verbWatch, ""))
 		rec.reset()
 		if err := a.Leave(ctx); err != nil {
 			t.Fatalf("Leave: %v", err)
@@ -658,8 +692,14 @@ func TestK8S650Leave(t *testing.T) {
 		if _, ok := l.Annotations[annotationMember]; ok || !equalSpec(before.Spec, l.Spec) || !maps.Equal(before.Labels, l.Labels) {
 			t.Errorf("Lease after Leave %+v, want only the record removed from %+v", l, before)
 		}
-		// The session goes on; closing it now deletes the Lease.
+		// The session goes on, renewing from the Lease Leave wrote; closing it now deletes the
+		// Lease.
+		rec.reset()
 		mustKeepAlive(t, a, "pod-1/1")
+		if s := requestStrings(rec.filter(named)); len(s) != 1 || s[0] != "UPDATE "+name+" 200" {
+			t.Errorf("renewal after Leave: requests %v, want [UPDATE %s 200]", s, name)
+		}
+		release()
 		rec.reset()
 		if err := a.CloseSession(ctx, "pod-1/1"); err != nil {
 			t.Fatalf("CloseSession: %v", err)
