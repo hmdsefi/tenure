@@ -169,42 +169,6 @@ func TestStepCollectorInputs(t *testing.T) {
 	}
 }
 
-// TestStepCollectorIgnored checks which steps count as ignored: a step that changes nothing but
-// the clock and returns no action but a Wake, except a failed renewal the machine accepts, which
-// may change nothing that Status shows.
-func TestStepCollectorIgnored(t *testing.T) {
-	late := core.Status{Now: 2 * time.Second, Session: core.SessionStateLate, Deadline: time.Second,
-		LastFailure: core.CauseUnreachable, Slot: -1}
-	later := late
-	later.Now = 4 * time.Second
-	closing := late
-	closing.Session = core.SessionStateClosing
-	closingLater := closing
-	closingLater.Now = 4 * time.Second
-	unreachable := core.SessionFailed{Now: 4 * time.Second, Cause: core.CauseUnreachable}
-
-	for _, tc := range []struct {
-		name string
-		rec  stepRecord
-		want bool
-	}{
-		{"Tick", stepRecord{Input: core.Tick{Now: 4 * time.Second}, Before: late, After: later,
-			Actions: []core.Action{core.Wake{At: 6 * time.Second}}}, true},
-		{"Action", stepRecord{Input: core.Tick{Now: 4 * time.Second}, Before: late, After: later,
-			Actions: []core.Action{core.KeepAlive{}}}, false},
-		{"StatusChanged", stepRecord{Input: core.Tick{Now: 4 * time.Second}, Before: late, After: closingLater}, false},
-		{"RepeatedFailure", stepRecord{Input: unreachable, Before: late, After: later}, false},
-		{"FailureWhileClosing", stepRecord{Input: unreachable, Before: closing, After: closingLater}, true},
-		{"FailureWithoutCause", stepRecord{Input: core.SessionFailed{Now: 4 * time.Second}, Before: late, After: later}, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := ignored(tc.rec); got != tc.want {
-				t.Errorf("ignored(%+v) = %v, want %v", tc.rec, got, tc.want)
-			}
-		})
-	}
-}
-
 // TestStepCollectorOutage checks the outage, loss and stuck events on short runs of steps: one
 // session.renew_failed per failed KeepAlive the machine accepts, none for a loss another call
 // reports, and session.lost once; session.expired once per deadline value; session.renewed_late
@@ -378,6 +342,42 @@ func TestStepCollectorOutage(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("events =\n%+v\nwant\n%+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStepCollectorIgnored checks which steps count as ignored: a step that changes nothing but
+// the clock and returns no action but a Wake, except a failed renewal the machine accepts, which
+// may change nothing that Status shows.
+func TestStepCollectorIgnored(t *testing.T) {
+	late := core.Status{Now: 2 * time.Second, Session: core.SessionStateLate, Deadline: time.Second,
+		LastFailure: core.CauseUnreachable, Slot: -1}
+	later := late
+	later.Now = 4 * time.Second
+	closing := late
+	closing.Session = core.SessionStateClosing
+	closingLater := closing
+	closingLater.Now = 4 * time.Second
+	unreachable := core.SessionFailed{Now: 4 * time.Second, Cause: core.CauseUnreachable}
+
+	for _, tc := range []struct {
+		name string
+		rec  stepRecord
+		want bool
+	}{
+		{"Tick", stepRecord{Input: core.Tick{Now: 4 * time.Second}, Before: late, After: later,
+			Actions: []core.Action{core.Wake{At: 6 * time.Second}}}, true},
+		{"Action", stepRecord{Input: core.Tick{Now: 4 * time.Second}, Before: late, After: later,
+			Actions: []core.Action{core.KeepAlive{}}}, false},
+		{"StatusChanged", stepRecord{Input: core.Tick{Now: 4 * time.Second}, Before: late, After: closingLater}, false},
+		{"RepeatedFailure", stepRecord{Input: unreachable, Before: late, After: later}, false},
+		{"FailureWhileClosing", stepRecord{Input: unreachable, Before: closing, After: closingLater}, true},
+		{"FailureWithoutCause", stepRecord{Input: core.SessionFailed{Now: 4 * time.Second}, Before: late, After: later}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ignored(tc.rec); got != tc.want {
+				t.Errorf("ignored(%+v) = %v, want %v", tc.rec, got, tc.want)
 			}
 		})
 	}
