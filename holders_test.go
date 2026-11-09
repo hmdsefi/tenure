@@ -368,11 +368,17 @@ func TestATRUN18RecordFreshness(t *testing.T) {
 			t.Errorf("(b) f/1 HolderChanged steps %+v, want none", got)
 		}
 		wantRunning(t, r.runs.Calls())
+		// The table shows the records stepped, not the ones dropped.
+		wantRows(t, n, rowWant{"f", 0, "owned", us, term0}, rowWant{"f", 1, "owned", us, term1})
 
 		// (c) The Confirm hold-back. Renewals fail from T0+4s, so both shards degrade at T0+12s.
 		sleepUntil(t0.Add(3 * time.Second))
 		r.fs.Fail("KeepAlive", errBoom)
 		sleepUntil(t0.Add(13 * time.Second))
+		wantRows(t, n, rowWant{"f", 0, "degraded", us, term0}, rowWant{"f", 1, "degraded", us, term1})
+		if tab := n.Table(); tab.SessionLive {
+			t.Error("(c) Table().SessionLive = true at T0+13s, want false")
+		}
 		st.Inject(tenure.Holding{Space: "f", Shard: 0, Holder: us, Term: term0, Version: 70})
 		r.fs.Fail("KeepAlive", nil)
 		r.fs.Delay("Confirm", time.Second)
@@ -414,6 +420,10 @@ func TestATRUN18RecordFreshness(t *testing.T) {
 			}
 		}
 		r.fs.Delay("Confirm", 0)
+		wantRows(t, n, rowWant{"f", 0, "owned", us, term0}, rowWant{"f", 1, "owned", us, term1})
+		if tab := n.Table(); !tab.SessionLive {
+			t.Error("(c) Table().SessionLive = false at T0+15s, want true")
+		}
 
 		// (d) The absent-record rule: a Holdings read that started before the record of f/1 was
 		// stepped cannot show it gone; a read after can.
@@ -458,6 +468,12 @@ func TestATRUN18RecordFreshness(t *testing.T) {
 			t.Errorf("f/0 HolderChanged steps %+v, want the two of (a) and (c)", got)
 		}
 		wantRunning(t, r.runs.Of("f", 0))
+		wantRows(t, n, rowWant{"f", 0, "owned", us, term0})
+		// f/1's record had no holder, so n1 took it again at once, in a new term.
+		if row := rowOf(t, n.Table(), "f", 1); row.State != "owned" || row.Holder != us || row.Term <= term1 ||
+			!row.Since.Equal(t0.Add(32*time.Second)) || !row.Running || row.Stop != "" {
+			t.Errorf("(d) row f/1 = %+v, want owned again since T0+32s by %s in a term above %d", row, us, term1)
+		}
 		closeNode(t, n)
 		check()
 	})
