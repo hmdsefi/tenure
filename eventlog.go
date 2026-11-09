@@ -42,6 +42,7 @@ type eventLog struct {
 	recording bool            // the delivery goroutine has taken an event and writes its record
 	delivered uint64          // the Seq of the newest event whose delivery has returned
 	started   bool            // start has started the delivery goroutine
+	sealed    bool            // emitLast has emitted the node's last event: emit does nothing more
 	stopped   bool            // stop has been called: emit and the delivery goroutine do nothing more
 }
 
@@ -83,12 +84,27 @@ func (l *eventLog) setHolder(holder string) {
 
 // emit gives e the next Seq and the current wall-clock time in UTC, without a monotonic reading,
 // keeps it in the ring and queues it for delivery with the current holder. It returns e's Seq. It
-// waits for nothing but the log's lock. After stop it does nothing and returns 0, so nothing is
-// emitted once Close has returned.
+// waits for nothing but the log's lock. After emitLast or stop it does nothing and returns 0, so
+// nothing is emitted after node.closed or once Close has returned.
 func (l *eventLog) emit(e Event) uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.stopped {
+	return l.emitLocked(e)
+}
+
+// emitLast emits e as emit does, as the node's last event: later emits do nothing. A forced Close
+// emits node.closed while some of the node's goroutines still run; their events would follow it.
+func (l *eventLog) emitLast(e Event) uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	seq := l.emitLocked(e)
+	l.sealed = true
+	return seq
+}
+
+// emitLocked is emit; the caller holds l.mu.
+func (l *eventLog) emitLocked(e Event) uint64 {
+	if l.stopped || l.sealed {
 		return 0
 	}
 	l.seq++
@@ -139,8 +155,9 @@ func (l *eventLog) waitDelivered(ctx context.Context, seq uint64) {
 // stop ends the delivery: the queued events are dropped, though they stay in the ring, later
 // emits do nothing, and the delivery goroutine returns once a delivery in progress has returned.
 // A delivery is in progress once the goroutine has taken its event from the queue: stop waits
-// while it writes the event's log record, so that no OnEvent call starts once stop has returned,
-// but it does not wait for the OnEvent call. Calling it again does nothing.
+// while it writes the event's log record, but not for the event's OnEvent call. So once stop has
+// returned, the goroutine is waiting, gone, or calling OnEvent with the one event it took before
+// stop was called: no OnEvent call with any other event starts. Calling it again does nothing.
 func (l *eventLog) stop() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -257,12 +274,13 @@ func (o *logObserver) drained() {
 	o.n.events.emit(Event{Kind: EventNodeDrained, Shard: -1, Slot: -1, Duration: time.Since(o.drainStart)})
 }
 
-// closed emits node.closed with reason. After a completed drain it is Close's last step: it waits
+// closed emits node.closed with reason, as the node's last event: the log drops any event emitted
+// after it. After a completed drain it is Close's last step: it waits
 // for node.closed's delivery, or for ctx, and stops the delivery. After a deadline Close stops
 // the delivery itself, once it has stopped the node.
 func (o *logObserver) closed(ctx context.Context, reason string) {
 	l := o.n.events
-	seq := l.emit(Event{Kind: EventNodeClosed, Shard: -1, Slot: -1, Reason: reason})
+	seq := l.emitLast(Event{Kind: EventNodeClosed, Shard: -1, Slot: -1, Reason: reason})
 	if reason == closedDrained {
 		l.waitDelivered(ctx, seq)
 		l.stop()

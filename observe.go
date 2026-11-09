@@ -51,8 +51,9 @@ import (
 // n.mu, step, newIncarnation and a store's view from the loop goroutine, the callFailed calls of
 // Holdings and the store watch from the resync and store-watch goroutines, the other callFailed
 // calls from the executor's lanes, runReturned from the shard's supervisor goroutine, and the
-// rest from the
-// node's watcher and drain goroutines. No call may block, or call back into the node.
+// rest from the node's watcher and drain goroutines. No call may call back into the node, and
+// none may block, but startFailed and closed, which may wait for the delivery of the node's
+// events until their ctx ends.
 type observer interface {
 	start(holder string)
 	startFailed(ctx context.Context, err error)

@@ -287,8 +287,9 @@ func TestEventLogRing(t *testing.T) {
 			t.Errorf("%d OnEvent calls, want 11: stop drops the queued events", len(calls))
 		}
 
-		// A stop while the delivery goroutine writes a record waits for the record, and the
-		// record's OnEvent call starts before stop returns; the queued event is dropped.
+		// A stop while the delivery goroutine writes a record waits for the record; the event's
+		// OnEvent call, which the goroutine took it for, may start as stop returns; the queued
+		// event is dropped.
 		var s2 logSink
 		wgate := make(chan struct{})
 		s2.wgate = wgate
@@ -333,6 +334,7 @@ func TestEventLogHolder(t *testing.T) {
 		l.setHolder("a/2")
 		l.emit(Event{Kind: EventSessionRestarted, Shard: -1, Slot: -1, Holder: "a/1"})
 		l.emit(Event{Kind: EventSessionOpened, Shard: -1, Slot: -1})
+		l.setHolder("a/3") // the holder when the records are written, which none carries
 		release()
 		l.waitDelivered(context.Background(), 4)
 
@@ -406,5 +408,71 @@ func TestEventLogFields(t *testing.T) {
 		if !strings.Contains(buf.String(), "tenure: node draining") {
 			t.Errorf("text log = %q, want a node draining record", buf.String())
 		}
+	})
+}
+
+// TestEventLogEnd checks how the node's observer ends the delivery. A failed Start returns once
+// every event emitted so far is delivered, or when its ctx ends while OnEvent is blocked; then it
+// stops the delivery: the queued events are dropped and emit does nothing. node.closed is the
+// last event: an emit after it does nothing.
+func TestEventLogEnd(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		boom := errors.New("boom")
+		newObserved := func(s *logSink) (*logObserver, *eventLog) {
+			l := newEventLog("a", s.logger(), s.onEvent)
+			o := &logObserver{n: &Node{events: l}}
+			o.start("a/1")
+			return o, l
+		}
+
+		var s logSink
+		o, l := newObserved(&s)
+		for i := range 3 {
+			l.emit(testEvent(i))
+		}
+		o.startFailed(context.Background(), boom)
+		if _, calls := s.snapshot(); len(calls) != 3 || calls[2].end == 0 {
+			t.Errorf("OnEvent calls when startFailed returned = %v, want 3, all returned", calls)
+		}
+		if seq := l.emit(testEvent(3)); seq != 0 {
+			t.Errorf("emit after startFailed returned Seq %d, want 0", seq)
+		}
+		stopLog(t, l)
+
+		var s2 logSink
+		release := s2.hold(1)
+		defer release()
+		o2, l2 := newObserved(&s2)
+		for i := range 3 {
+			l2.emit(testEvent(i))
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		t0 := time.Now()
+		o2.startFailed(ctx, boom)
+		if d := time.Since(t0); d != 5*time.Second {
+			t.Errorf("startFailed returned after %v with OnEvent blocked, want 5s", d)
+		}
+		release()
+		stopLog(t, l2)
+		if _, calls := s2.snapshot(); len(calls) != 2 {
+			t.Errorf("%d OnEvent calls, want 2: the third event was queued when startFailed stopped the delivery", len(calls))
+		}
+
+		var s3 logSink
+		o3, l3 := newObserved(&s3)
+		l3.emit(testEvent(0))
+		o3.closed(context.Background(), closedDeadline)
+		if seq := l3.emit(testEvent(1)); seq != 0 {
+			t.Errorf("emit after node.closed returned Seq %d, want 0", seq)
+		}
+		l3.waitDelivered(context.Background(), 2)
+		if r := l3.recent(); len(r) != 2 || r[1].Kind != EventNodeClosed || r[1].Reason != closedDeadline {
+			t.Errorf("recent() = %+v, want node.closed{deadline} last", r)
+		}
+		if _, calls := s3.snapshot(); len(calls) != 2 || calls[1].e.Kind != EventNodeClosed {
+			t.Errorf("OnEvent calls = %v, want 2 with node.closed last", calls)
+		}
+		stopLog(t, l3)
 	})
 }
