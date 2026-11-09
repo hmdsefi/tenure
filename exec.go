@@ -374,26 +374,27 @@ func (e *executor) exec(l *lane, c execCall) (callResult, bool) {
 		}
 		defer func() { <-e.permits }()
 	}
-	e.mu.Lock()
-	stale := c.gen < e.floor
-	e.mu.Unlock()
-	if stale || e.ctx.Err() != nil {
-		return callResult{}, false
-	}
-
 	ctx, cancel := context.WithTimeout(e.ctx, e.timing.RetryPeriod)
 	r := callResult{gen: c.gen, act: c.act}
 	var sentAt time.Duration
+	// The last look at the generation comes right before the call, in one critical section with
+	// its start stamp: once dropOlder has dropped c's generation, which the loop does in the step
+	// that loses the session, c never goes out (MCH O7).
+	e.mu.Lock()
+	if c.gen < e.floor || e.ctx.Err() != nil {
+		e.mu.Unlock()
+		cancel()
+		return callResult{}, false
+	}
 	if _, ok := c.act.(core.KeepAlive); ok {
 		sentAt = time.Since(e.epoch)
 		r.sentWall = e.epoch.Add(sentAt)
 	}
 	r.start = e.stamp()
 	if c.tag != 0 {
-		e.mu.Lock()
 		e.confirms[l.key] = confirmMark{tag: c.tag, start: r.start}
-		e.mu.Unlock()
 	}
+	e.mu.Unlock()
 	o := e.invoke(ctx, c)
 	cancel()
 

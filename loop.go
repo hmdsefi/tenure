@@ -247,7 +247,8 @@ func (l *loop) tickUntil(now time.Duration) {
 // when the machine did not apply the view, publishes the routing snapshot when the view or an
 // assignment changed, records a stepped view for SetSlots (n.stepped), unpublishes the shard of a
 // stepped RunStopped that is still published, and reports the step to the observer and the hook.
-// After the step that loses the session it runs lose. It then re-arms the timer. The first time
+// A step that loses the session first drops the lost machine's calls in the executor, before any
+// of that, and runs lose once it is carried out. apply then re-arms the timer. The first time
 // the machine is done, it closes n.machineDone, unless the machine is done after a lost session
 // and no drain has been requested: then a new incarnation is due instead.
 func (l *loop) apply(in loopInput, now time.Duration) {
@@ -264,6 +265,12 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 		Err:      in.err,
 	}
 	l.status = rec.After
+	lost := rec.Before.Session != core.SessionStateLost && rec.After.Session == core.SessionStateLost
+	if lost {
+		// Before anything else of the step, so that no call of the lost holder goes out once the
+		// step is done (MCH O7).
+		n.exec.dropOlder(l.gen + 1)
+	}
 
 	n.stepMu.Lock()
 	if n.halted { // a forced Close: the machine is no longer driven (RUN-530)
@@ -295,7 +302,7 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 	}
 	n.stepMu.Unlock()
 
-	if rec.Before.Session != core.SessionStateLost && rec.After.Session == core.SessionStateLost {
+	if lost {
 		l.lose(now)
 	}
 	l.rearm()
@@ -314,15 +321,15 @@ func (l *loop) finish() {
 	close(l.n.machineDone)
 }
 
-// lose runs right after the step that lost the session. One session lane serves every
-// generation, so it first drops the queued calls of this machine and discards the results of its
-// calls in flight: no call of the lost holder, such as a Release or a CloseSession, goes out after
-// the loss. The machine still waits for the answer to each Acquire it sent, and that answer is now
+// lose runs right after the step that lost the session. That step has already dropped the queued
+// calls of this machine and discarded the results of its calls in flight, as soon as the machine
+// returned from it, before its actions and its report: one session lane serves every generation,
+// and no call of the lost holder, such as a Release or a CloseSession, may go out once the step
+// is done. The machine still waits for the answer to each Acquire it sent, and that answer is now
 // discarded, so lose steps Acquired with no grant at now for every acquiring shard in its place;
 // after a loss that only ends the wait. A record that the discarded call granted names the lost
 // holder, so it is takeable.
 func (l *loop) lose(now time.Duration) {
-	l.n.exec.dropOlder(l.gen + 1)
 	var owed []core.Acquired
 	for _, sp := range l.status.Spaces {
 		for i, sh := range sp.Shards {
