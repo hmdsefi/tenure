@@ -18,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -1129,4 +1130,100 @@ func TestATK8S12RenewalConflict(t *testing.T) {
 		t.Errorf("Lease after the renewal: renewTime %v, annotations %v, holder %q; want %v, the bump kept, pod-0/1",
 			l.Spec.RenewTime, l.Annotations, holderOf(l), wantTime)
 	}
+}
+
+// watchGate holds back the events of a fake client's Lease watches while it is shut.
+type watchGate struct {
+	mu sync.RWMutex
+}
+
+// shut holds back every later event until the returned func is called.
+func (g *watchGate) shut() (open func()) {
+	g.mu.Lock()
+	var once sync.Once
+	return func() { once.Do(g.mu.Unlock) }
+}
+
+// gateWatches makes every Lease watch of client deliver its events through gate.
+func gateWatches(client *fake.Clientset, gate *watchGate) {
+	client.PrependWatchReactor(resourceLeases, func(action k8stesting.Action) (bool, watch.Interface, error) {
+		inner, err := client.Tracker().Watch(leasesResource, action.GetNamespace())
+		if err != nil {
+			return true, nil, err
+		}
+		w := &gatedWatch{out: make(chan watch.Event), done: make(chan struct{}), inner: inner}
+		go func() {
+			defer close(w.out)
+			for e := range inner.ResultChan() {
+				gate.mu.RLock()
+				gate.mu.RUnlock() //nolint:staticcheck // SA2001: waits for the gate to open
+				select {
+				case w.out <- e:
+				case <-w.done:
+					return
+				}
+			}
+		}()
+		return true, w, nil
+	})
+}
+
+// gatedWatch is a watch whose events come through a watchGate.
+type gatedWatch struct {
+	out   chan watch.Event
+	done  chan struct{}
+	once  sync.Once
+	inner watch.Interface
+}
+
+func (w *gatedWatch) ResultChan() <-chan watch.Event { return w.out }
+
+func (w *gatedWatch) Stop() {
+	w.once.Do(func() {
+		close(w.done)
+		w.inner.Stop()
+	})
+}
+
+// TestK8S110NotedWrites checks that every write of a Lease reaches the cache with the write,
+// before the informer tells: right after a new incarnation opens, another holder acquires the
+// replaced incarnation's shard at once; renewals and the clearing of the holder by CloseSession
+// are in the cache too.
+func TestK8S110NotedWrites(t *testing.T) {
+	ctx := t.Context()
+	client := newFake()
+	gate := &watchGate{}
+	gateWatches(client, gate)
+	a := fakeAdapter(t, client)
+	name := memberName("g", "pod-1")
+	cached := func(step string) {
+		t.Helper()
+		l := fakeGet(t, client, name)
+		if o, ok := a.cached(name); !ok || o.lease.ResourceVersion != l.ResourceVersion {
+			t.Fatalf("after %s: cache has %v %+v, want resourceVersion %s", step, ok, o.lease, l.ResourceVersion)
+		}
+	}
+
+	mustJoin(t, a, member("pod-1"))
+	mustKeepAlive(t, a, "pod-1/1")
+	mustKeepAlive(t, a, "pod-3/1")
+	closeAtEnd(t, a, "pod-1/2", "pod-3/1")
+	mustAcquire(t, a, "pod-1/1", "markets", 0)
+	waitObserved(t, a, name, fakeGet(t, client, name).ResourceVersion)
+
+	open := gate.shut()
+	t.Cleanup(open)
+	mustKeepAlive(t, a, "pod-1/2")
+	cached("the opening of pod-1/2")
+	mustAcquire(t, a, "pod-3/1", "markets", 0)
+	mustKeepAlive(t, a, "pod-1/2")
+	cached("a renewal")
+	if err := a.CloseSession(ctx, "pod-1/2"); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+	cached("CloseSession")
+	if o, _ := a.cached(name); holderOf(o.lease) != "" {
+		t.Errorf("cache after CloseSession names %q, want no holder", holderOf(o.lease))
+	}
+	open()
 }
