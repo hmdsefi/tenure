@@ -65,8 +65,9 @@ func wantNoSlot(t testing.TB, slot int, err error, want string) {
 func wantSlots(t testing.TB, a *Adapter, holders ...string) {
 	t.Helper()
 	count, got, err := a.Slots(t.Context())
-	if err != nil || count != len(holders) || !slices.Equal(got, holders) {
-		t.Fatalf("Slots = %d, %q, %v; want %d, %q, nil", count, got, err, len(holders), holders)
+	// A count of 0 gives a nil slice, not an empty one.
+	if err != nil || count != len(holders) || !slices.Equal(got, holders) || (got == nil) != (len(holders) == 0) {
+		t.Fatalf("Slots = %d, %#v, %v; want %d, %#v, nil", count, got, err, len(holders), holders)
 	}
 }
 
@@ -322,6 +323,36 @@ func TestK8S150Freshness(t *testing.T) {
 		waitFresh(t, b, true)
 	})
 
+	t.Run("two sessions", func(t *testing.T) {
+		clock := newFakeClock()
+		client := newFake()
+		b := fakeAdapter(t, client, withClock(clock.now))
+		const second = "pod-2/1"
+		closeAtEnd(t, b, own, second)
+		if err := b.KeepAlive(ctx, own, long); err != nil {
+			t.Fatalf("KeepAlive: %v", err)
+		}
+		waitFresh(t, b, true)
+		// A second session opens on a fresh cache: its delivered write signals nothing, its
+		// opening does.
+		short := long
+		short.RenewDeadline = 4 * time.Second
+		opened := b.freshChanged()
+		if err := b.KeepAlive(ctx, second, short); err != nil {
+			t.Fatalf("KeepAlive: %v", err)
+		}
+		signalled(t, opened, "a second session opened")
+		name := memberName("g", "pod-2")
+		waitDelivered(t, b, name, fakeGet(t, client, name).ResourceVersion)
+		// The larger RenewDeadline of the two bounds the age of own writes.
+		clock.advance(5 * time.Second)
+		for range 20 {
+			if fresh, _ := b.freshness(); !fresh {
+				t.Fatal("stale 5 s after own writes, with RenewDeadlines of 8 s and 4 s")
+			}
+		}
+	})
+
 	t.Run("delivered before the response", func(t *testing.T) {
 		clock := newFakeClock()
 		c := &leaseCache{now: clock.now, pending: map[string][]pendingWrite{}, delivered: map[string]uint64{}}
@@ -350,6 +381,37 @@ func TestK8S150Freshness(t *testing.T) {
 			t.Errorf("own write counted at %v, want its send time %v", c.ownSentAt, t1)
 		}
 	})
+}
+
+// TestK8S150Frozen checks the freeze rule: while the cache is not fresh, a holder that the
+// passing of time alone turned gone (expired, tombstone, missing) stays live, with nothing to
+// confirm; a gone verdict that rests on an observed change (vacant, ended, replaced) stands; and
+// on a fresh cache every verdict stands.
+func TestK8S150Frozen(t *testing.T) {
+	at := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+	for _, why := range []string{caseExpired, caseTombstone, caseMissing} {
+		v := verdict{get: true, why: why}
+		if got, want := frozen(v, false), (verdict{live: true, why: why}); got != want {
+			t.Errorf("frozen(%+v, stale) = %+v, want %+v", v, got, want)
+		}
+		if got := frozen(v, true); got != v {
+			t.Errorf("frozen(%+v, fresh) = %+v, want it unchanged", v, got)
+		}
+	}
+	for _, v := range []verdict{
+		{why: caseVacant},
+		{why: caseEnded},
+		{get: true, why: caseReplaced},
+		{live: true, until: at, why: caseCurrent},
+		{live: true, until: at, why: caseTombstone},
+		{live: true, until: at, why: caseMissing},
+	} {
+		for _, fresh := range []bool{false, true} {
+			if got := frozen(v, fresh); got != v {
+				t.Errorf("frozen(%+v, %v) = %+v, want it unchanged", v, fresh, got)
+			}
+		}
+	}
 }
 
 // waitDelivered waits up to 2 s for a's informer to deliver Lease name at resourceVersion rv or
@@ -749,6 +811,19 @@ func TestATK8S25ClaimSlot(t *testing.T) {
 		if got := rec.filter(notRenewal); len(got) != 0 {
 			t.Errorf("ClaimSlot with every slot held sent %v, want nothing", requestStrings(got))
 		}
+	})
+
+	t.Run("own slot above a free one", func(t *testing.T) {
+		if err := a.ReleaseSlot(ctx, h0, 0); err != nil {
+			t.Fatalf("ReleaseSlot: %v", err)
+		}
+		waitSlots(t, b, "", h1, h2)
+		recB.reset()
+		mustClaim(t, b, h1, 1)
+		if got := recB.filter(notRenewal); len(got) != 0 {
+			t.Errorf("ClaimSlot of the own slot above a free one sent %v, want nothing", requestStrings(got))
+		}
+		mustClaim(t, a, h0, 0)
 	})
 
 	t.Run("race", func(t *testing.T) {
