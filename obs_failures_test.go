@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -307,7 +308,20 @@ func TestStoreFailedReasons(t *testing.T) {
 	})
 
 	t.Run("Confirm", func(t *testing.T) {
+		// Both shards are degraded at T0+11s; the session is back at T0+12s, when each sends a
+		// Confirm and one of them fails. The failed shard is restored either by the Confirm
+		// repeated 2 s later or, first, by the resync's Holdings read of the same instant, which
+		// answers its pending Confirm, so a repeated Confirm is not certain: the test checks
+		// that both shards are owned again at T0+30s instead.
 		var a *obsNode
+		var degraded, restored []string
+		states := func(n *obsNode) []string {
+			var out []string
+			for _, r := range n.Table().Spaces[0].Rows {
+				out = append(out, r.State)
+			}
+			return out
+		}
 		events := run(t, func(t *testing.T, n *obsNode) {
 			a = n
 			t0 := time.Now()
@@ -316,12 +330,20 @@ func TestStoreFailedReasons(t *testing.T) {
 			}
 			n.Store.Fail("KeepAlive", boom, 0)
 			sleepUntil(t0.Add(11 * time.Second)) // degraded at the deadline, T0+10s
+			degraded = states(n)
 			n.Store.Fail("Confirm", boom, 1)
 			n.Store.Heal("KeepAlive")
+			sleepUntil(t0.Add(30 * time.Second))
+			restored = states(n)
 		}, fenced)
-		conf := a.FS.Calls("Confirm")
-		if len(conf) < 3 || failedWith(a, "Confirm", boom) != 1 {
-			t.Fatalf("Confirm calls %v, want one to fail and the confirms to go on", conf)
+		if want := []string{"degraded", "degraded"}; !slices.Equal(degraded, want) {
+			t.Errorf("states at T0+11s %v, want %v", degraded, want)
+		}
+		if want := []string{"owned", "owned"}; !slices.Equal(restored, want) {
+			t.Errorf("states at T0+30s %v, want %v", restored, want)
+		}
+		if conf := a.FS.Calls("Confirm"); len(conf) < 2 || failedWith(a, "Confirm", boom) != 1 {
+			t.Fatalf("Confirm calls %v, want one per shard, one of them failed with boom", conf)
 		}
 		want := []tenure.Event{storeFailedEv("Confirm", obsSpace, failedShard(a, "Confirm"), -1, boom)}
 		wantEvents(t, "store.failed events", failed(events), want)
