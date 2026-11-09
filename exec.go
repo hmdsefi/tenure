@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -109,7 +110,7 @@ type executor struct {
 	lanes    map[laneKey]*lane
 	results  []callResult
 	floor    uint64                  // calls and results of older generations are dropped
-	closed   bool                    // wait was called: do queues nothing more
+	closed   bool                    // wait or halt was called: no call is queued or starts any more
 	confirms map[laneKey]confirmMark // the latest Confirm call that went out, by shard lane
 }
 
@@ -260,6 +261,25 @@ func (e *executor) dropOlder(gen uint64) {
 	e.results = rs
 }
 
+// releasing returns the lanes of the shards with a Release queued or in flight, for the account
+// of a drain that has not completed (RUN-510). A Release is in flight from the moment its lane
+// takes it until its result is out.
+func (e *executor) releasing() map[laneKey]bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	isRelease := func(c execCall) bool {
+		_, ok := c.act.(core.Release)
+		return ok
+	}
+	out := make(map[laneKey]bool)
+	for key, l := range e.lanes {
+		if key.kind == laneShard && (l.busy && isRelease(l.cur) || slices.ContainsFunc(l.queue, isRelease)) {
+			out[key] = true
+		}
+	}
+	return out
+}
+
 // ready returns a channel that receives a value when results may be waiting for take.
 func (e *executor) ready() <-chan struct{} { return e.readyc }
 
@@ -278,7 +298,7 @@ func (e *executor) stamp() uint64 { return e.stamps.Add(1) }
 
 // withPermit runs f while holding one of the permits the lanes' non-session calls share, for
 // store reads such as Holdings and Slots. It waits for a free permit, and returns false without
-// running f when the internal context ends first.
+// running f when the internal context ends first or halt has been called.
 func (e *executor) withPermit(f func()) bool {
 	select {
 	case e.permits <- struct{}{}:
@@ -286,11 +306,28 @@ func (e *executor) withPermit(f func()) bool {
 		return false
 	}
 	defer func() { <-e.permits }()
-	if e.ctx.Err() != nil {
+	e.mu.Lock()
+	closed := e.closed
+	e.mu.Unlock()
+	if closed || e.ctx.Err() != nil {
 		return false
 	}
 	f()
 	return true
+}
+
+// halt stops the executor from starting calls, for a Close whose ctx ended first (RUN-530): it
+// drops every queued call, which gets no result, and from now on do queues nothing, a lane starts
+// no call it has taken, and withPermit runs nothing. The calls in flight go on, and their results
+// are still delivered; wait still waits for them.
+func (e *executor) halt() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.closed = true
+	for _, l := range e.lanes {
+		clear(l.queue)
+		l.queue = l.queue[:0]
+	}
 }
 
 // wait stops do from queuing calls and waits until every lane goroutine has returned. Once the
@@ -355,7 +392,7 @@ func (e *executor) exec(l *lane, c execCall) (callResult, bool) {
 		defer func() { <-e.permits }()
 	}
 	e.mu.Lock()
-	stale := c.gen < e.floor
+	stale := c.gen < e.floor || e.closed
 	e.mu.Unlock()
 	if stale || e.ctx.Err() != nil {
 		return callResult{}, false

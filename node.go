@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,6 +62,7 @@ type Node struct {
 	inbox       *inbox
 	lp          *loop
 	stepMu      sync.Mutex    // held while the loop carries a step out
+	halted      bool          // a forced Close stopped driving the machine; guarded by stepMu
 	deadline    atomic.Int64  // the session deadline in ns since epoch; only the loop writes it
 	machineDone chan struct{} // closed when a machine is done and no new incarnation follows it
 
@@ -70,9 +73,11 @@ type Node struct {
 	resync   chan struct{} // buffer 1
 
 	// The shard table: each space's shards by name, kept for the node's life, across machines.
-	// sups counts the supervisor goroutines, which Close and failStart wait for after wg.
+	// sups counts the supervisor goroutines, which Close and failStart wait for after wg. runMu
+	// guards each space's inRun.
 	shards map[string]*spaceShards
 	sups   sync.WaitGroup
+	runMu  sync.Mutex
 
 	mu        sync.Mutex
 	left      bool          // leave has been called: the watcher calls Watch no more
@@ -318,38 +323,107 @@ func (n *Node) closeSession(ctx context.Context) {
 // session is lost during the drain, there is nothing left to release or close: Drain returns nil
 // once every Run has returned, and the node starts no new incarnation. The first call of Drain
 // or Close starts the drain; later and concurrent calls wait for the same drain.
-// When ctx ends first, Drain returns ctx's error and the drain goes on. After Close, Drain
-// returns ErrClosed.
+//
+// When ctx ends first, Drain returns an error that wraps ctx's error and says what is left, and
+// the drain goes on: a later Drain waits for it again. The error names the shards not released
+// yet, those whose Run has not returned or whose release is still out, by space and then shard,
+// as in "tenure: drain: context deadline exceeded (not released: orders/3, orders/5)". When every
+// shard is released but the session is not closed yet, it ends in "(session not closed)".
+//
+// Drain returns ErrClosed after Close, during a Close whose ctx was done when it was called and
+// that so skipped the drain, and when a Close stops the node before the drain completes.
 func (n *Node) Drain(ctx context.Context) error {
 	n.mu.Lock()
-	if n.closed {
+	if n.closed || (n.closing && n.drainDone == nil) {
+		// After Close, or during a Close that skipped the drain (RUN-540).
 		n.mu.Unlock()
 		return ErrClosed
 	}
+	done := n.startDrainLocked()
+	n.mu.Unlock()
+
+	if n.awaitDrain(ctx, done) {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("tenure: drain: %w%s", err, n.undrained())
+	}
+	return ErrClosed // Close stopped the node before the drain completed
+}
+
+// startDrainLocked starts the drain unless the first Drain or Close has already started it, and
+// returns the channel closed when it completes. The caller holds n.mu, so that Close cannot wait
+// for the goroutines before the drain goroutine is added.
+func (n *Node) startDrainLocked() chan struct{} {
 	if n.drainDone == nil {
-		// Under n.mu, so that Close cannot wait for the goroutines before this one is added.
 		n.drainDone = make(chan struct{})
 		n.obs.draining()
 		n.wg.Go(n.drain)
 	}
-	done := n.drainDone
-	n.mu.Unlock()
+	return n.drainDone
+}
 
+// awaitDrain waits until done, the drain's completion, is closed, ctx ends or the internal context
+// is done, and reports whether the drain completed. A drain that completes at the instant ctx
+// ends wins. A nil done never completes.
+func (n *Node) awaitDrain(ctx context.Context, done <-chan struct{}) bool {
 	select {
 	case <-done:
-		return nil
+		return true
 	case <-ctx.Done():
 	case <-n.ctx.Done():
 	}
 	select {
-	case <-done: // a drain that completed at the same instant wins
-		return nil
+	case <-done:
+		return true
 	default:
+		return false
 	}
-	if err := ctx.Err(); err != nil {
-		return err
+}
+
+// undrained returns RUN-510's account of what a drain that has not completed has left, as the
+// end of Drain's deadline error; see undrainedLocked.
+func (n *Node) undrained() string {
+	n.stepMu.Lock()
+	defer n.stepMu.Unlock()
+	return n.undrainedLocked()
+}
+
+// undrainedLocked returns " (not released: <space>/<shard>, …)" for the shards still published
+// or with a Release queued or in flight, by space name and then shard (RUN-510); else
+// " (session not closed)" while the machine is not done; else "", as without a store, where the
+// drain waits for SetDraining alone. The caller holds n.stepMu, under which the loop publishes,
+// unpublishes and queues Release in one step, so a shard between its RunStopped and its Release
+// is never missed. A shard whose Release failed and that the machine is yet to release again is
+// neither published nor out, and is not listed.
+func (n *Node) undrainedLocked() string {
+	if n.exec == nil {
+		return ""
 	}
-	return ErrClosed // Close stopped the node before the drain completed
+	out := n.exec.releasing()
+	names := make([]string, 0, len(n.shards))
+	for name := range n.shards {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	var left []string
+	for _, name := range names {
+		sp := n.shards[name]
+		for id := range sp.local {
+			if sp.local[id].Load() != nil || out[laneKey{kind: laneShard, space: name, shard: id}] {
+				left = append(left, name+"/"+strconv.Itoa(id))
+			}
+		}
+	}
+	if len(left) > 0 {
+		return " (not released: " + strings.Join(left, ", ") + ")"
+	}
+	select {
+	case <-n.machineDone:
+		return ""
+	default:
+		return " (session not closed)"
+	}
 }
 
 // drain is the drain goroutine (RUN-500). With a store it first posts Drain to the loop, so the
@@ -359,7 +433,7 @@ func (n *Node) Drain(ctx context.Context) error {
 // closed n.machineDone: the machine's session is closed, or it was lost and the machine is done
 // with every Run returned. After a loss the loop starts no new incarnation once a drain has been
 // requested, and nothing closes the lost session (RUN-190). It ends early when the internal
-// context is done.
+// context is done or a forced Close has halted the node.
 func (n *Node) drain() {
 	if n.cfg.Store != nil {
 		n.inbox.post(core.Drain{})
@@ -373,6 +447,12 @@ func (n *Node) drain() {
 		case <-n.ctx.Done():
 			return
 		}
+	}
+	// Under stepMu, so that the drain completes either before a forced Close's halt or not at all.
+	n.stepMu.Lock()
+	defer n.stepMu.Unlock()
+	if n.halted {
+		return
 	}
 	n.obs.drained()
 	close(n.drainDone)
@@ -412,9 +492,23 @@ func (n *Node) setDraining() bool {
 }
 
 // Close drains the node as Drain does, leaves the group, and stops every goroutine of the node.
-// It returns nil once all of that is done; later calls return ErrClosed. When ctx ends before
-// the drain completes, Close does not leave the group: it stops the node and returns an error
-// that wraps ctx's error.
+// It returns nil once all of that is done. Later calls return ErrClosed, and so do Route, Local,
+// Drain and the lookups of every Resolver the node returned; a Shard the node handed to Run
+// keeps returning its stop error.
+//
+// When ctx ends before the drain completes, or is done already when Close is called, Close
+// neither closes the member's session nor leaves the group: the store expires the session, so no
+// other member takes one of the shards while a Run of this member may still act on it. A ctx
+// done at the call does not start the drain at all. Close then stops every shard the member
+// still owns, with a stop error ending in "closed", cancels the shard's Run with that error,
+// stops the node and returns an error that wraps ctx's error and says what the drain had left,
+// as Drain does, such as "tenure: close: context deadline exceeded (not released: orders/3)". It
+// does not wait for a Run that has not returned: that Run's supervisor ends when it returns, and
+// makes no call of its own then.
+//
+// No call of the membership or the store starts after Close has returned. Close waits for the
+// calls in flight, whose context it cancels, so a call that does not return once its context
+// is done holds Close up.
 func (n *Node) Close(ctx context.Context) error {
 	n.mu.Lock()
 	if n.closing {
@@ -422,25 +516,128 @@ func (n *Node) Close(ctx context.Context) error {
 		return ErrClosed
 	}
 	n.closing = true
+	done := n.drainDone // the drain a Drain started, if any: a ctx done already starts none
+	if ctx.Err() == nil {
+		done = n.startDrainLocked()
+	}
 	n.mu.Unlock()
 
-	reason := "drained"
-	err := n.Drain(ctx)
-	if err == nil {
-		n.leave(ctx)
-	} else {
-		reason, err = "deadline", fmt.Errorf("tenure: close: %w", err)
+	if !n.awaitDrain(ctx, done) {
+		return n.forceClose(ctx)
 	}
+	n.leave(ctx)
 	n.closeResolvers()
 	n.cancel()
 	n.wait()
 	n.closeRoutes()
+	n.markClosed()
+	n.obs.closed(ctx, "drained")
+	return nil
+}
 
+// forceClose is RUN-530's path, for a Close whose ctx ended before the drain completed (MCH O7).
+// halt stops driving the machine and stops the published shards; then come observer.closed with
+// "deadline", the resolvers closed, the internal context canceled, and a wait for every goroutine
+// but the supervisors whose Run has not returned. Neither CloseSession nor Leave is called. It
+// returns Close's error.
+func (n *Node) forceClose(ctx context.Context) error {
+	detail := n.halt()
+	n.obs.closed(ctx, "deadline")
+	n.closeResolvers()
+	n.cancel()
+	n.wg.Wait() // the loop, and with it every lane, has returned: no supervisor starts any more
+	n.waitIdleSupervisors()
+	n.closeRoutes()
+	n.markClosed()
+	return fmt.Errorf("tenure: close: %w%s", ctx.Err(), detail)
+}
+
+// halt stops driving the machine: from now on the loop carries out no step, the executor starts
+// no store call (executor.halt), and the drain does not complete. In the same instant it takes
+// what the drain has left (undrainedLocked), which it returns, and stops every published shard:
+// with reason "closed" while the member owns it, reported to observer.shardClosed, and otherwise
+// with the error it already has, or "expired" past the session deadline. It cancels each shard's
+// Run with that error, before the internal context, so that Run sees the stop error as its
+// context's cause (RUN-320).
+func (n *Node) halt() string {
+	n.stepMu.Lock()
+	defer n.stepMu.Unlock()
+	detail := n.undrainedLocked()
+	n.halted = true
+	if n.exec != nil {
+		n.exec.halt() // no queued call, such as a CloseSession behind a KeepAlive, goes out
+	}
+	for _, sp := range n.shards {
+		for id := range sp.local {
+			sh, r := sp.local[id].Load(), sp.runs[id]
+			if sh == nil || r.sh != sh {
+				continue
+			}
+			var err error
+			if sh.Check() == nil {
+				err = sh.stop(reasonClosed)
+				n.obs.shardClosed(sh)
+			} else {
+				err = sh.stop(reasonExpired) // the error it has, or the deadline's
+			}
+			r.cancel(err)
+		}
+	}
+	return detail
+}
+
+// reasonClosed is the stop reason of a shard that a Close whose ctx ended first stopped.
+const reasonClosed = "closed"
+
+// gateRun returns the Run of sp for shard id, wrapped so that the node knows whether a Run of
+// the shard is in progress (sp.inRun): forceClose waits for the shard's supervisors only while
+// none is. A call whose ctx is done already does not start Run, so no Run starts after
+// waitIdleSupervisors has looked. At most one Run of a shard runs at a time (RUN-300).
+func (n *Node) gateRun(sp *spaceShards, id int) func(context.Context, *Shard) error {
+	run := sp.space.Run
+	return func(ctx context.Context, sh *Shard) error {
+		n.runMu.Lock()
+		if ctx.Err() != nil {
+			n.runMu.Unlock()
+			return context.Cause(ctx)
+		}
+		sp.inRun[id] = true
+		n.runMu.Unlock()
+		defer func() {
+			n.runMu.Lock()
+			sp.inRun[id] = false
+			n.runMu.Unlock()
+		}()
+		return run(ctx, sh)
+	}
+}
+
+// waitIdleSupervisors waits, once the internal context is done and the loop has returned, for
+// the supervisors of every shard with no Run in progress (RUN-530, RUN-550). They end at once:
+// their contexts are done, and the earlier supervisors of the shard, for which each waits, have
+// no Run in progress either. A shard whose Run has not returned keeps its supervisors, which end
+// once that Run returns.
+func (n *Node) waitIdleSupervisors() {
+	var wait []chan struct{}
+	n.runMu.Lock()
+	for _, sp := range n.shards {
+		for id, r := range sp.runs {
+			if r.done != nil && !sp.inRun[id] {
+				wait = append(wait, r.done)
+			}
+		}
+	}
+	n.runMu.Unlock()
+	for _, done := range wait {
+		<-done
+	}
+}
+
+// markClosed records that Close has stopped the node.
+func (n *Node) markClosed() {
 	n.mu.Lock()
 	n.closed = true
 	n.mu.Unlock()
-	n.obs.closed(ctx, reason)
-	return err
 }
 
 // Resolver returns a Resolver that ranks keys in namespace over the node's views, the same views
