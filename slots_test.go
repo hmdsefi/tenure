@@ -1091,6 +1091,56 @@ func TestATRUN24SetSlotsErrors(t *testing.T) {
 			check()
 		})
 	})
+
+	t.Run("forced Close while waiting", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			r := newShardRig(t)
+			cfg := r.slotConfig(1)
+			// Every read of Rand after Start's draw fails.
+			cfg.Rand = &countingReader{fails: 1000}
+			t0 := time.Now()
+			n := start(t, ctx, cfg)
+			sleepUntil(t0.Add(9 * time.Second))
+			loseSession(r.fs)
+			// The session is lost at T0+10s. The loop then draws the holder of a new incarnation
+			// again every RetryPeriod, and steps no view meanwhile.
+			sleepUntil(t0.Add(11 * time.Second))
+			synctest.Wait()
+			set := make(chan error, 1)
+			go func() { set <- n.SetSlots(ctx, 2) }()
+			synctest.Wait()
+			select {
+			case err := <-set:
+				t.Fatalf("SetSlots(2) = %v while the loop steps no view, want it to wait", err)
+			default:
+			}
+			ss, sl := r.fs.Calls("SetSlots"), r.fs.Calls("Slots")
+			if last := sl[len(sl)-1]; !last.Done || last.Err != nil || last.Seq < ss[len(ss)-1].EndSeq {
+				t.Errorf("last Slots call %v, want one that returned after %v: SetSlots waits for the stepped view", last, ss[len(ss)-1])
+			}
+
+			dead, cancel := context.WithCancel(ctx)
+			cancel()
+			at := time.Now()
+			err := n.Close(dead) // forced: no drain
+			if !errors.Is(err, context.Canceled) || time.Since(at) != 0 {
+				t.Errorf("Close(canceled ctx) = %v after %v, want context.Canceled at once", err, time.Since(at))
+			}
+			select {
+			case err := <-set:
+				if err != tenure.ErrClosed {
+					t.Errorf("SetSlots(2) waiting at a forced Close = %v, want ErrClosed", err)
+				}
+			default:
+				t.Error("SetSlots(2) waiting at a forced Close has not returned once Close returned")
+			}
+			if err := n.SetSlots(ctx, 2); err != tenure.ErrClosed {
+				t.Errorf("SetSlots(2) after a forced Close = %v, want ErrClosed", err)
+			}
+			check()
+		})
+	})
 }
 
 // TestATRUN25Rollout replaces both pods of a group with two slots, one at a time, as a rolling
