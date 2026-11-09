@@ -267,6 +267,43 @@ func TestK8S300TombstoneTerm(t *testing.T) {
 	}
 }
 
+// TestK8S110NotedReads checks the cache with states read from the API server noted in it: an
+// earlier state the informer delivers late is ignored, also when it is of the Lease that the
+// noted one replaced; a shard Lease replaced without a deletion event leaves its term.
+func TestK8S110NotedReads(t *testing.T) {
+	clock := newFakeClock()
+	terms := &shardTerms{}
+	c := &leaseCache{now: clock.now, defaultWait: T.LeaseDuration, terms: terms, obs: map[string]*observation{}, tombs: map[types.UID]tombstone{}}
+	const u1, u2 = types.UID("6f1c1a43-6c55-4f4e-9d0e-2b8f2b0c1d11"), types.UID("0b7d2b4e-1f3a-4c5d-8e9f-a0b1c2d3e4f5")
+	holder := "pod-0/1"
+	lease := func(name, kind string, uid types.UID, rv string) *coordinationv1.Lease {
+		return &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid, ResourceVersion: rv, Labels: leaseLabels("g", kind, "markets"),
+				Annotations: map[string]string{annotationTerm: rv}},
+			Spec: coordinationv1.LeaseSpec{HolderIdentity: &holder},
+		}
+	}
+	t0 := clock.now()
+	c.observe(lease("g-member-pod-0", kindMember, u1, "10"))
+	clock.advance(time.Second)
+	c.observe(lease("g-member-pod-0", kindMember, u2, "12")) // noted from a GET
+	clock.advance(time.Second)
+	c.observe(lease("g-member-pod-0", kindMember, u1, "11")) // the informer, late
+	o := c.obs["g-member-pod-0"]
+	if o.lease.UID != u2 || o.lease.ResourceVersion != "12" || !o.rvSeenAt.Equal(t0.Add(time.Second)) {
+		t.Errorf("observation %s at %s seen at %v, want %s at 12 seen at %v", o.lease.UID, o.lease.ResourceVersion, o.rvSeenAt, u2, t0.Add(time.Second))
+	}
+	if tb, ok := c.tombs[u1]; !ok || !tb.tokenSeenAt.Equal(t0) {
+		t.Errorf("tombstone of the replaced member Lease %+v, %v; want one from %v", tb, ok, t0)
+	}
+
+	c.observe(lease("g-markets-0", kindShard, u1, "20"))
+	c.observe(lease("g-markets-0", kindShard, u2, "30"))
+	if got := terms.of("g-markets-0"); got != 20 {
+		t.Errorf("term of the replaced shard Lease %d, want 20", got)
+	}
+}
+
 // TestK8S710RecordSemaphore checks the record semaphore: n places, then callers wait in arrival
 // order; a caller whose ctx ends while it waits leaves the line holding nothing.
 func TestK8S710RecordSemaphore(t *testing.T) {

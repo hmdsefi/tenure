@@ -184,8 +184,8 @@ func isOlder(rv, seen string) bool {
 	return ok1 && ok2 && v < w
 }
 
-// observe records state l of a Lease (K8S-110). A state older than the one recorded, of the same
-// Lease, is ignored.
+// observe records state l of a Lease (K8S-110). A state older than the one recorded is ignored,
+// also when the recorded one is of a Lease created anew at the name.
 func (c *leaseCache) observe(l *coordinationv1.Lease) {
 	if l == nil {
 		return
@@ -196,6 +196,9 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 	c.prune(now)
 	o, ok := c.obs[l.Name]
 	switch {
+	case ok && isOlder(l.ResourceVersion, o.lease.ResourceVersion):
+		// Older than the state recorded, also of a Lease since deleted: a late delivery after a
+		// read from the API server was noted (noteRead).
 	case !ok || o.lease.UID != l.UID:
 		if ok {
 			// The Lease was deleted and created again without a deletion event, as a relist
