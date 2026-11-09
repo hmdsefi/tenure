@@ -5,7 +5,9 @@ package debughttp
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -250,8 +252,9 @@ func TestATOBS22EventsJSON(t *testing.T) {
 func TestTableJSONEdges(t *testing.T) {
 	cet := time.FixedZone("CET", 3600)
 	tab := tenure.Table{
-		Taken:  time.Date(2026, 11, 9, 11, 0, 0, 1, cet),
-		Member: tenure.Member{ID: "a", Slot: 2, JoinAt: at(time.Hour), LeaveAt: time.Date(2026, 11, 9, 13, 0, 0, 0, cet)},
+		Taken:    time.Date(2026, 11, 9, 11, 0, 0, 1, cet),
+		Member:   tenure.Member{ID: "a", Slot: 2, JoinAt: at(time.Hour), LeaveAt: time.Date(2026, 11, 9, 13, 0, 0, 0, cet)},
+		Draining: true,
 		Members: []tenure.Member{
 			{ID: "a", Meta: map[string]string{"z": "<&>", "b": "2", "a": "1"}, Draining: true, Slot: 2},
 		},
@@ -274,7 +277,7 @@ func TestTableJSONEdges(t *testing.T) {
     "leave_at": "2026-11-09T12:00:00Z"
   },
   "holder": "",
-  "draining": false,
+  "draining": true,
   "closed": false,
   "session_live": false,
   "last_renewal": null,
@@ -353,13 +356,18 @@ func TestTableJSONEdges(t *testing.T) {
 		t.Errorf("encodeTable(Table{}) has %d nulls, want 5:\n%s", n, got)
 	}
 
-	// The slot holders keep their order and their vacant slots.
+	// A closed node; the slot holders keep their order and their vacant slots.
 	b.Reset()
-	if err := encodeTable(&b, tenure.Table{SlotHolders: []string{"b/1", "", "a/2"}}); err != nil {
+	if err := encodeTable(&b, tenure.Table{Closed: true, SlotHolders: []string{"b/1", "", "a/2"}}); err != nil {
 		t.Fatal(err)
 	}
-	if want := "\"slot_holders\": [\n    \"b/1\",\n    \"\",\n    \"a/2\"\n  ],"; !strings.Contains(b.String(), want) {
-		t.Errorf("encodeTable lacks %q:\n%s", want, b.String())
+	for _, want := range []string{
+		"\"draining\": false,\n  \"closed\": true,\n",
+		"\"slot_holders\": [\n    \"b/1\",\n    \"\",\n    \"a/2\"\n  ],",
+	} {
+		if !strings.Contains(b.String(), want) {
+			t.Errorf("encodeTable lacks %q:\n%s", want, b.String())
+		}
 	}
 }
 
@@ -487,6 +495,110 @@ func TestEventJSONEdges(t *testing.T) {
 	}
 	if want := "{\n  \"next_seq\": 1,\n  \"events\": []\n}\n"; b.String() != want {
 		t.Errorf("encodeEvents(1, nil) = %q, want %q", b.String(), want)
+	}
+}
+
+// TestEventJSONKinds encodes one event of every kind with every field set and checks its keys,
+// in order, with their values and JSON types: strings quoted, numbers bare. It pins debughttp's
+// own key list for each kind to the log attributes of the issue that adds the kinds.
+func TestEventJSONKinds(t *testing.T) {
+	const term = `18446744073709551615`
+	const loc = `space="sp" shard=5`
+	const own = loc + ` term=` + term
+	tests := []struct {
+		kind tenure.EventKind
+		name string
+		keys string // after seq, time and kind
+	}{
+		{tenure.EventViewChanged, "view.changed", `version=8 members=9`},
+		{tenure.EventSessionOpened, "session.opened", ``},
+		{tenure.EventSessionRenewFailed, "session.renew_failed", `error="boom"`},
+		{tenure.EventSessionRenewedLate, "session.renewed_late", `late_by="3s"`},
+		{tenure.EventSessionRecovered, "session.recovered", `failures=9`},
+		{tenure.EventSessionExpired, "session.expired", ``},
+		{tenure.EventSessionLost, "session.lost", `error="boom"`},
+		{tenure.EventSessionClosed, "session.closed", ``},
+		{tenure.EventShardAcquiring, "shard.acquiring", loc},
+		{tenure.EventShardAcquireFailed, "shard.acquire_failed", loc + ` holder="h/1" retry_after="3s" error="boom"`},
+		{tenure.EventShardAcquired, "shard.acquired", own},
+		{tenure.EventShardDegraded, "shard.degraded", own},
+		{tenure.EventShardRecovered, "shard.recovered", own},
+		{tenure.EventShardExpired, "shard.expired", own},
+		{tenure.EventShardLost, "shard.lost", own},
+		{tenure.EventShardStopping, "shard.stopping", own + ` reason="why"`},
+		{tenure.EventShardStuck, "shard.stuck", own + ` reason="why"`},
+		{tenure.EventShardReleasing, "shard.releasing", own},
+		{tenure.EventShardReleased, "shard.released", own + ` reason="why"`},
+		{tenure.EventShardHandoffCompleted, "shard.handoff_completed", own + ` reason="why" took="3s"`},
+		{tenure.EventSlotClaimed, "slot.claimed", `slot=6`},
+		{tenure.EventSlotReleased, "slot.released", `slot=6 reason="why"`},
+		{tenure.EventSlotStandby, "slot.standby", ``},
+		{tenure.EventSlotCountChanged, "slot.count_changed", `slots=9`},
+		{tenure.EventSlotCountMismatch, "slot.count_mismatch", `stored=9 configured=10`},
+		{tenure.EventRunReturned, "run.returned", own + ` restarts=9 restart_in="3s" error="boom"`},
+		{tenure.EventStoreFailed, "store.failed", `op="why" space="sp" shard=5 slot=6 error="boom"`},
+		{tenure.EventMembershipFailed, "membership.failed", `op="why" error="boom"`},
+		{tenure.EventNodeDraining, "node.draining", ``},
+		{tenure.EventNodeDrained, "node.drained", `took="3s"`},
+		{tenure.EventNodeClosed, "node.closed", `reason="why"`},
+		{tenure.EventSessionRestarted, "session.restarted", `previous="h/1"`},
+		{0, "EventKind(0)", ``},
+		{tenure.EventSessionRestarted + 1, "EventKind(33)", ``},
+	}
+	if n := len(tests) - 2; n != int(tenure.EventSessionRestarted) {
+		t.Fatalf("the test lists %d kinds, want %d", n, tenure.EventSessionRestarted)
+	}
+	for _, tt := range tests {
+		e := tenure.Event{
+			Seq: 1, Time: at(0), Kind: tt.kind, Space: "sp", Shard: 5, Term: 1<<64 - 1, Slot: 6, Reason: "why",
+			Holder: "h/1", Duration: 3 * time.Second, Version: 8, Count: 9, Configured: 10, Err: errors.New("boom"),
+		}
+		var b bytes.Buffer
+		if err := encodeEvents(&b, 2, []tenure.Event{e}); err != nil {
+			t.Fatal(err)
+		}
+		want := `seq=1 time="2026-11-09T10:00:00Z" kind="` + tt.name + `"`
+		if tt.keys != "" {
+			want += " " + tt.keys
+		}
+		if got := eventPairs(t, b.Bytes()); got != want {
+			t.Errorf("kind %d: got  %s\nwant %s", tt.kind, got, want)
+		}
+	}
+}
+
+// eventPairs returns the one event of an events body as key=value pairs in order, strings
+// quoted and numbers as written.
+func eventPairs(t *testing.T, body []byte) string {
+	t.Helper()
+	var v struct{ Events []json.RawMessage }
+	if err := json.Unmarshal(body, &v); err != nil || len(v.Events) != 1 {
+		t.Fatalf("body %s: %v, %d events", body, err, len(v.Events))
+	}
+	dec := json.NewDecoder(bytes.NewReader(v.Events[0]))
+	dec.UseNumber()
+	var pairs []string
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			t.Fatalf("event %s: %v", v.Events[0], err)
+		}
+		if tok == json.Delim('{') {
+			continue
+		}
+		if tok == json.Delim('}') {
+			return strings.Join(pairs, " ")
+		}
+		val, err := dec.Token()
+		if err != nil {
+			t.Fatalf("event %s: %v", v.Events[0], err)
+		}
+		switch val := val.(type) {
+		case string:
+			pairs = append(pairs, fmt.Sprintf("%s=%q", tok, val))
+		default:
+			pairs = append(pairs, fmt.Sprintf("%s=%v", tok, val))
+		}
 	}
 }
 
