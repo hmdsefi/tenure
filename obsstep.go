@@ -77,14 +77,29 @@ func (c *stepCollector) collect(rec stepRecord) {
 }
 
 // ignored reports that the machine ignored the input of rec: the step changed nothing that Status
-// shows but the clock, and returned no action but a Wake.
+// shows but the clock, and returned no action but a Wake. A failed renewal the machine accepts is
+// not ignored even so: a second failure with the same cause changes nothing that Status shows, but
+// session.renew_failed and session.recovered's count report each one.
 func ignored(rec stepRecord) bool {
+	if f, ok := rec.Input.(core.SessionFailed); ok && acceptsFailure(rec.Before, f.Cause) {
+		return false
+	}
 	for _, a := range rec.Actions {
 		if _, ok := a.(core.Wake); !ok {
 			return false
 		}
 	}
 	return sameStatus(rec.Before, rec.After)
+}
+
+// acceptsFailure reports whether a machine whose Status is st accepts a SessionFailed with cause:
+// one with a named cause, while the session has not ended.
+func acceptsFailure(st core.Status, cause core.Cause) bool {
+	switch st.Session {
+	case core.SessionStateLost, core.SessionStateClosing, core.SessionStateClosed:
+		return false
+	}
+	return cause == core.CauseUnreachable || cause == core.CauseLost
 }
 
 // sameStatus reports whether a and b are equal but for Now.
