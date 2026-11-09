@@ -31,12 +31,13 @@ import (
 // without fencing, and ledger, 8 fenced shards, for 300 s of bubble time. The faults come from
 // math/rand/v2's rand.NewPCG(seed, 0), for seeds 1 to 20:
 //
-//   - outages: every call of one node's fs fails at once or hangs until its ctx ends, for 3 s to
-//     13 s, so that the session goes late but is never lost at the store; an outage also breaks
-//     the node's store watch;
+//   - outages: every call of one node's fs fails at once, or hangs until its ctx or the outage
+//     ends, for 3 s to 13 s, so that the session goes late but is never lost at the store; an
+//     outage also breaks the node's store watch;
 //   - store errors: one method of one node's fs fails for 2 s to 10 s;
 //   - delays: one method of one node's fs waits up to 3 s before it goes to the store, or goes to
-//     the store and holds the answer up to 3 s, past the call's deadline at times;
+//     the store and holds the answer up to 3 s, past the call's deadline at times; slot reads take
+//     2.5 s, past their deadline, for 40 s from each event that moves slots;
 //   - stale states: the store watch of every node re-delivers an earlier value now and then, and
 //     lags the store by up to 8 s for 10 s to 40 s, in commit order;
 //   - a lost session: from one instant on, the store answers every KeepAlive, Acquire, Confirm and
@@ -44,8 +45,8 @@ import (
 //     and 3 s after the first grant to its next holder comes an outage (trap) that leaves a slow
 //     Holdings answer showing the record after the shards' Confirm went out;
 //   - a paused membership: one node's views are held back for 5 s to 40 s;
-//   - a SetSlots to 1 or 3 through one node, a Drain of another node and a forced Close of a third:
-//     a Close whose ctx is done already or ends within 5 s, before the drain can complete.
+//   - a SetSlots to 1 or 3 through one node, a Drain of one node and a forced Close of another: a
+//     Close whose ctx is done already or ends within 5 s, mostly before the drain can complete.
 //
 // The other nodes are closed at the end. Runs stop late now and then, some long enough to be
 // stuck, and the first Run of some shards returns an error and is restarted. Everything is
@@ -72,7 +73,7 @@ type faultKind int
 
 const (
 	faultFail  faultKind = iota // the call fails at once
-	faultHang                   // the call waits for its ctx and returns ctx's error
+	faultHang                   // the call waits for its ctx, or fails at the outage's end
 	faultDelay                  // the call waits d, or until its ctx ends, before it goes on
 	faultLate                   // the call goes on, and its answer waits d, or until its ctx ends
 	faultStuck                  // the call goes on, and its answer waits d, past its ctx's end
@@ -431,7 +432,7 @@ func (cn *contractNode) relay(in <-chan tenure.Holding, out chan tenure.Holding)
 			if !ok {
 				return
 			}
-			at := now
+			at := time.Now()
 			if f, ok := cn.faultAt(watchLag); ok {
 				at = at.Add(f.d)
 			}
