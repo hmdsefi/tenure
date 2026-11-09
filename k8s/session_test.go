@@ -69,6 +69,13 @@ func startRenewer(t testing.TB, a *Adapter, holder string) *renewer {
 	return r
 }
 
+// count returns how many calls of the renewer have returned nil so far.
+func (r *renewer) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.renewals
+}
+
 // stop stops the renewer and returns how many of its calls returned nil, and the errors of the
 // others, but for those that the stop ended.
 func (r *renewer) stop() (renewals int, errs []error) {
@@ -815,14 +822,18 @@ func TestK8S220RenewOutcomes(t *testing.T) {
 			t.Errorf("renewed Lease %+v, want only renewTime moved on from %v", l.Spec, before.Spec.RenewTime)
 		}
 
-		// The Renewer: one update per renewal, no GET.
+		// The Renewer: one update per renewal, no GET. It runs for 5 renewals, 2 s, or longer
+		// when the API server is slow, and is stopped as soon as the fifth has returned, which
+		// is in time for its next tick.
 		rec.reset()
 		r := startRenewer(t, a, "pod-0/1")
-		time.Sleep(2 * time.Second)
+		for deadline := time.Now().Add(15 * time.Second); r.count() < 5 && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
 		renewals, errs := r.stop()
 		updates := rec.count(func(r request) bool { return on(verbUpdate, name)(r) && r.status == 200 })
-		if len(errs) != 0 || renewals < 4 || renewals > 6 || updates != renewals || rec.count(on(verbGet, "")) != 0 {
-			t.Errorf("Renewer for 2s: %d renewals, errors %v, %d updates, %d GETs; want 5±1 renewals, no error, an update each, no GET",
+		if len(errs) != 0 || renewals < 5 || updates != renewals || rec.count(on(verbGet, "")) != 0 {
+			t.Errorf("Renewer: %d renewals, errors %v, %d updates, %d GETs; want 5 renewals, no error, an update each, no GET",
 				renewals, errs, updates, rec.count(on(verbGet, "")))
 		}
 
@@ -1084,12 +1095,20 @@ func TestATK8S12RenewalConflict(t *testing.T) {
 	a, rec := c.adapter(t, g)
 	closeAtEnd(t, a, "pod-0/1")
 	name := memberName(g, "pod-0")
-	mustKeepAlive(t, a, "pod-0/1")
+	// The session lasts 30 s: on a slow API server the bump, the conflict and the GET may take
+	// more than T's 3 s, and a session that has expired is not renewed.
+	long := T
+	long.LeaseDuration, long.SlotGrace = 30*time.Second, 30*time.Second
+	if err := a.KeepAlive(t.Context(), "pod-0/1", long); err != nil {
+		t.Fatalf("KeepAlive: %v", err)
+	}
 
 	raw := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
 	rec.bump(name, raw)
 	rec.reset()
-	mustKeepAlive(t, a, "pod-0/1")
+	if err := a.KeepAlive(t.Context(), "pod-0/1", long); err != nil {
+		t.Fatalf("KeepAlive: %v", err)
+	}
 	got := rec.filter(named)
 	want := []string{"UPDATE " + name + " 409", "GET " + name + " 200", "UPDATE " + name + " 200"}
 	if s := requestStrings(got); !slices.Equal(s, want) {
