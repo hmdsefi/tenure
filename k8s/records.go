@@ -76,13 +76,26 @@ func (a *Adapter) Acquire(ctx context.Context, holder, space string, shard int) 
 		return 0, err
 	}
 	defer a.records.release()
+	// The session may have ended or expired while Acquire waited for its place.
+	if s, err = a.activeSession(holder); err != nil {
+		return 0, err
+	}
 
 	cur, err := a.readRecord(ctx, "acquire", name)
 	if err != nil {
 		return 0, err
 	}
 	var term core.Term
+	last := cur
 	written, err := a.writeLease(ctx, "acquire", name, cur, func(cur *coordinationv1.Lease) (change, error) {
+		if cur == nil && last != nil {
+			// The record decided on before is gone, deleted before the informer told: its term
+			// is the term of a deleted shard Lease all the same.
+			if t, ok := decodeTerm(last.Annotations); ok && t > 0 {
+				a.terms.note(name, t)
+			}
+		}
+		last = cur
 		var ch change
 		var err error
 		ch, term, err = a.decideAcquire(ctx, s, space, name, cur)
@@ -207,11 +220,12 @@ func (a *Adapter) grant(s session, space, name string, cur *coordinationv1.Lease
 // is live (K8S-120). When liveness says it is gone but asks for confirmation, holderLive reads
 // the holder's member Lease from the API server, notes it in the cache, and decides again on
 // that state (K8S-130): a changed session token makes the holder live again. A gone verdict
-// that needs no confirmation (no holder, or the session ended) costs no request, nor does a
-// holder that is not <member ID>/<incarnation>, which has no member Lease to read. op names
-// the operation in errors: "k8s: <op> <member Lease>: <error>". fresh is false while the cache
-// is not fresh, for slot records (K8S-150): then time alone turns no holder gone (frozen), and
-// such a verdict needs no confirmation.
+// that needs no confirmation (no holder, or a session this Adapter saw end) costs no request,
+// nor does a holder that is not <member ID>/<incarnation>, which has no member Lease to read.
+// The decision on the GET's state is final: that state is newer than cur. op names the
+// operation in errors: "k8s: <op> <member Lease>: <error>". fresh is false while the cache is
+// not fresh, for slot records (K8S-150): then time alone turns no holder gone (frozen), and such
+// a verdict needs no confirmation.
 func (a *Adapter) holderLive(ctx context.Context, op string, cur *coordinationv1.Lease, fresh bool) (bool, error) {
 	h := holderOf(cur)
 	rec := a.observed(cur)
@@ -244,12 +258,14 @@ func (a *Adapter) holderLive(ctx context.Context, op string, cur *coordinationv1
 		o := a.observed(read)
 		next = &o
 	}
-	// The member Lease of the record's session is gone, and the informer has not told yet: what
-	// it will leave is a tombstone of the session as last observed.
+	// The member Lease of the record's session is gone, and the informer has not told yet. Its
+	// renewals since the cached state may have been missed too, so the session counts as seen
+	// now, until the informer delivers the deletion and leaves the tombstone of what it saw.
+	now := a.now()
 	if hasSession && tomb == nil && member != nil && member.lease.UID == s && (next == nil || next.lease.UID != s) {
-		tomb = &tombstone{tokenSeenAt: member.tokenSeenAt, wait: leaseWait(member.lease, a.timing.LeaseDuration)}
+		tomb = &tombstone{tokenSeenAt: now, wait: leaseWait(member.lease, a.timing.LeaseDuration)}
 	}
-	return frozen(liveness(rec, next, tomb, a.now(), a.timing.LeaseDuration), fresh).live, nil
+	return frozen(liveness(rec, next, tomb, now, a.timing.LeaseDuration), fresh).live, nil
 }
 
 // isMemberLease reports whether l carries the labels of a member Lease of group.
@@ -263,10 +279,10 @@ func isMemberLease(l *coordinationv1.Lease, group string) bool {
 func (a *Adapter) observed(l *coordinationv1.Lease) observation {
 	a.noteRead(l)
 	if o, ok := a.cached(l.Name); ok && o.lease.UID == l.UID && o.lease.ResourceVersion == l.ResourceVersion {
-		return observation{lease: l, rvSeenAt: o.rvSeenAt, tokenSeenAt: o.tokenSeenAt}
+		return observation{lease: l, rvSeenAt: o.rvSeenAt, tokenSeenAt: o.tokenSeenAt, named: o.named}
 	}
 	now := a.now()
-	return observation{lease: l, rvSeenAt: now, tokenSeenAt: now}
+	return observation{lease: l, rvSeenAt: now, tokenSeenAt: now, named: holderOf(l)}
 }
 
 // noteRead notes l, a state of a Lease of the group that this Adapter read from the API server
@@ -456,6 +472,10 @@ func (a *Adapter) Confirm(ctx context.Context, holder, space string, shard int, 
 		return tenure.Holding{}, err
 	}
 	defer a.records.release()
+	// The session may have ended or expired while Confirm waited for its place.
+	if _, err := a.activeSession(holder); err != nil {
+		return tenure.Holding{}, err
+	}
 
 	// seen is the state decided on last: the record as stored when the decision is no write.
 	var seen *coordinationv1.Lease

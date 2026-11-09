@@ -20,8 +20,8 @@ import (
 //	vacant     the record names no holder                   gone                           no
 //	current    M.uid == s, M names h                        live while now-tokenSeenAt(M)  when
 //	                                                        < wait(M), else expired        expired
-//	ended      M.uid == s, M names no holder                gone: only h's CloseSession    no
-//	                                                        clears it
+//	ended      M.uid == s, M names no holder                gone: only h's CloseSession    unless
+//	                                                        clears it                      seen
 //	replaced   M.uid == s, M names another holder           gone: a new incarnation opens  yes
 //	                                                        only once the old one stopped
 //	tombstone  M absent or M.uid != s, a tombstone of s     live until the tombstone's     when
@@ -31,6 +31,11 @@ import (
 //
 // wait(M) is M's leaseDurationSeconds, the holder's own LeaseDuration; wait(record) is the
 // record's; either is the Adapter's LeaseDuration when the Lease has none.
+//
+// An ended verdict needs no GET when this Adapter saw M name h before its holder was cleared
+// (observation.named): then the clearing came after h's session opened. Otherwise the cached M
+// may be older than the record, from before h opened its session on it, as when the record was
+// read from the API server ahead of the informer; the GET settles it.
 //
 // A gone verdict that asks for a GET is only a candidate (K8S-130): the acquirer reads the
 // record state its write will carry, then reads M from the API server, notes it as an
@@ -82,7 +87,7 @@ func liveness(rec observation, member *observation, tomb *tombstone, now time.Ti
 		case h:
 			return liveUntil(member.tokenSeenAt.Add(leaseWait(member.lease, defaultWait)), now, caseCurrent, caseExpired)
 		case "":
-			return verdict{why: caseEnded}
+			return verdict{get: member.named != h, why: caseEnded}
 		default:
 			return verdict{get: true, why: caseReplaced}
 		}

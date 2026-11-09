@@ -67,6 +67,9 @@ type observation struct {
 	// tokenSeenAt is when this Adapter first saw the Lease's current session token: its UID,
 	// holderIdentity and renewTime.
 	tokenSeenAt time.Time
+	// named is the last holder this Adapter saw the Lease name under its current UID: it stays
+	// when the holder is cleared, so a Lease without a holder tells whose session it saw end.
+	named string
 }
 
 // tombstone is what remains of a deleted member Lease (K8S-110): the session it held stays
@@ -245,10 +248,13 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 			// after a gap in the watch shows it: the deleted one leaves its tombstone all the same.
 			c.bury(o.lease, o.tokenSeenAt, now)
 		}
-		c.obs[l.Name] = &observation{lease: l, rvSeenAt: now, tokenSeenAt: now}
+		c.obs[l.Name] = &observation{lease: l, rvSeenAt: now, tokenSeenAt: now, named: holderOf(l)}
 	case l.ResourceVersion == o.lease.ResourceVersion || isOlder(l.ResourceVersion, o.lease.ResourceVersion):
 	default:
-		next := &observation{lease: l, rvSeenAt: now, tokenSeenAt: o.tokenSeenAt}
+		next := &observation{lease: l, rvSeenAt: now, tokenSeenAt: o.tokenSeenAt, named: o.named}
+		if h := holderOf(l); h != "" {
+			next.named = h
+		}
 		if !sameToken(o.lease, l) {
 			next.tokenSeenAt = now
 		}

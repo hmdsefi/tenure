@@ -72,6 +72,10 @@ func (a *Adapter) ClaimSlot(ctx context.Context, holder string) (int, error) {
 		return -1, err
 	}
 	defer a.records.release()
+	// The session may have ended or expired while ClaimSlot waited for its place.
+	if s, err = a.activeSession(holder); err != nil {
+		return -1, err
+	}
 	// The session holds the informer already; this hold keeps it for the scan, should the
 	// session end meanwhile.
 	c, err := a.holdCache(ctx)
@@ -334,7 +338,7 @@ func (a *Adapter) Slots(ctx context.Context) (count int, holders []string, err e
 		obs = make(map[string]observation, len(list.Items))
 		for i := range list.Items {
 			l := &list.Items[i]
-			obs[l.Name] = observation{lease: l, rvSeenAt: now, tokenSeenAt: now}
+			obs[l.Name] = observation{lease: l, rvSeenAt: now, tokenSeenAt: now, named: holderOf(l)}
 		}
 		fresh = true
 	}

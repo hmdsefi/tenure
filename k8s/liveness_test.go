@@ -18,7 +18,7 @@ import (
 // missing, with no member Lease, another member Lease, a missing or malformed tenure.session,
 // live and passed. Each wait comes from the right Lease, or from the Adapter's LeaseDuration
 // when the Lease has none. Only the gone verdicts that K8S-130 confirms ask for a GET; ended
-// does not. Every row is decided again with written times far in the past and far in the
+// does not when this Adapter saw the member Lease name the holder before it was cleared. Every row is decided again with written times far in the past and far in the
 // future (K8S-140), and the decision changes none of its inputs.
 func TestK8S120Liveness(t *testing.T) {
 	t0 := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
@@ -45,7 +45,13 @@ func TestK8S120Liveness(t *testing.T) {
 			l.Spec.HolderIdentity = &holder
 		}
 		l.Spec.LeaseDurationSeconds = seconds
-		return &observation{lease: l, rvSeenAt: tokenSeenAt, tokenSeenAt: tokenSeenAt}
+		// rvSeenAt is later than tokenSeenAt, as after a change that kept the session token.
+		return &observation{lease: l, rvSeenAt: tokenSeenAt.Add(2 * time.Second), tokenSeenAt: tokenSeenAt, named: holder}
+	}
+	// seenNaming is observation o of a member Lease that this Adapter saw name holder before.
+	seenNaming := func(o *observation, holder string) *observation {
+		o.named = holder
+		return o
 	}
 	tomb := func(tokenSeenAt time.Time, wait time.Duration) *tombstone {
 		return &tombstone{tokenSeenAt: tokenSeenAt, wait: wait}
@@ -99,10 +105,22 @@ func TestK8S120Liveness(t *testing.T) {
 			member: member(s, h, secs(3), t0), tomb: tomb(t0, time.Hour), now: t0.Add(4 * time.Second), want: gone(caseExpired),
 		},
 
-		{name: "ended", rec: record(h, string(s), secs(3)), seenAt: t0, member: member(s, "", secs(3), t0), now: t0, want: gone(caseEnded)},
+		{
+			name: "ended", rec: record(h, string(s), secs(3)), seenAt: t0, member: seenNaming(member(s, "", secs(3), t0), h),
+			now: t0, want: gone(caseEnded),
+		},
 		{
 			name: "ended, however recent the record", rec: record(h, string(s), secs(3)), seenAt: t0.Add(time.Second),
-			member: member(s, "", secs(3), t0.Add(time.Second)), tomb: tomb(t0, time.Hour), now: t0.Add(time.Second), want: gone(caseEnded),
+			member: seenNaming(member(s, "", secs(3), t0.Add(time.Second)), h), tomb: tomb(t0, time.Hour), now: t0.Add(time.Second),
+			want: gone(caseEnded),
+		},
+		{
+			name: "ended, the holder never seen on the member Lease", rec: record(h, string(s), secs(3)), seenAt: t0,
+			member: member(s, "", secs(3), t0), now: t0, want: verdict{get: true, why: caseEnded},
+		},
+		{
+			name: "ended, another incarnation seen on the member Lease", rec: record(h, string(s), secs(3)), seenAt: t0,
+			member: seenNaming(member(s, "", secs(3), t0), "pod-0/2"), now: t0, want: verdict{get: true, why: caseEnded},
 		},
 
 		{
@@ -198,7 +216,7 @@ func TestK8S120Liveness(t *testing.T) {
 				rec.Spec.AcquireTime, rec.Spec.RenewTime = w.acquire, w.renewal
 				var m *observation
 				if tc.member != nil {
-					m = &observation{lease: tc.member.lease.DeepCopy(), rvSeenAt: tc.member.rvSeenAt, tokenSeenAt: tc.member.tokenSeenAt}
+					m = &observation{lease: tc.member.lease.DeepCopy(), rvSeenAt: tc.member.rvSeenAt, tokenSeenAt: tc.member.tokenSeenAt, named: tc.member.named}
 					m.lease.Spec.AcquireTime, m.lease.Spec.RenewTime = w.acquire, w.renewal
 				}
 				var tb *tombstone
@@ -210,7 +228,8 @@ func TestK8S120Liveness(t *testing.T) {
 				if m != nil {
 					mBefore = m.lease.DeepCopy()
 				}
-				got := liveness(observation{lease: rec, rvSeenAt: tc.seenAt, tokenSeenAt: tc.seenAt}, m, tb, tc.now, wait)
+				// The record's tokenSeenAt is far from its rvSeenAt: only rvSeenAt counts.
+				got := liveness(observation{lease: rec, rvSeenAt: tc.seenAt, tokenSeenAt: tc.seenAt.Add(-24 * time.Hour)}, m, tb, tc.now, wait)
 				if got != tc.want {
 					t.Errorf("%s: liveness = %+v, want %+v", w.name, got, tc.want)
 				}
