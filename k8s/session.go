@@ -295,7 +295,12 @@ func (a *Adapter) decideRenew(cur *coordinationv1.Lease, s session, timing core.
 // matching tenure.ErrSessionLost. When the member Lease still names holder, CloseSession deletes
 // it, or, when the Lease carries a member record, only clears its holder. It never returns
 // tenure.ErrSessionLost.
-func (a *Adapter) CloseSession(ctx context.Context, holder string) error {
+//
+// First of all, CloseSession clears the holder of every shard record that names holder, keeping
+// its term, as Release at the record's term does. It finds the records with one request that
+// lists the group's Leases, goes on past records it fails to clear, and returns their errors
+// joined with the error of ending the session, if any.
+func (a *Adapter) CloseSession(ctx context.Context, holder string) (err error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -305,7 +310,9 @@ func (a *Adapter) CloseSession(ctx context.Context, holder string) error {
 	if err := checkHolder(a.group, holder); err != nil {
 		return fmt.Errorf("k8s: CloseSession: %w", err)
 	}
-	// Step 1, releasing the holder's shard and slot records, comes with the records.
+	// Step 1: the holder's records (records.go). Steps 2 and 3 follow whatever its outcome.
+	released := a.releaseRecordsOf(ctx, holder)
+	defer func() { err = errors.Join(released, err) }()
 	name := memberName(a.group, memberOf(holder))
 	unlock, err := a.lockLease(ctx, name)
 	if err != nil {

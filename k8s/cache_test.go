@@ -289,11 +289,12 @@ func TestK8S100InformerLifecycle(t *testing.T) {
 		}
 
 		// The next session starts a new run with a new list.
+		client.ClearActions()
 		if err := a.KeepAlive(ctx, "pod-2/1", T); err != nil {
 			t.Fatalf("KeepAlive pod-2/1: %v", err)
 		}
-		if c2 := a.runningCache(); c2 == nil || c2 == c || len(actions(client, "list")) != 2 {
-			t.Fatalf("after a new session: cache %p (first %p), %d lists; want a new run and 2", c2, c, len(actions(client, "list")))
+		if c2 := a.runningCache(); c2 == nil || c2 == c || len(actions(client, "list")) != 1 {
+			t.Fatalf("after a new session: cache %p (first %p), %d lists; want a new run and 1", c2, c, len(actions(client, "list")))
 		}
 		if err := a.CloseSession(ctx, "pod-2/1"); err != nil {
 			t.Fatalf("CloseSession pod-2/1: %v", err)
