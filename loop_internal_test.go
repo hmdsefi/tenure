@@ -84,12 +84,13 @@ func TestLoopExecute(t *testing.T) {
 		if got := time.Duration(l.n.deadline.Load()); got != 10*time.Second {
 			t.Errorf("deadline = %v, want 10s", got)
 		}
+		// The loop carries out every action of core, so only a nil action is unknown to it.
 		defer func() {
 			if r := recover(); r != "tenure: unknown action <nil>" {
 				t.Errorf("execute(nil) panicked with %v, want tenure: unknown action <nil>", r)
 			}
 		}()
-		l.execute(nil) // the loop carries out every action of core, so only nil is unknown
+		l.execute(nil)
 	})
 }
 
@@ -327,5 +328,24 @@ func TestLoopSlotResult(t *testing.T) {
 	}
 	if _, stale := m.slots(20, 1, nil); stale {
 		t.Error("slot data read at the floor dropped")
+	}
+
+	// deliver steps no result of an earlier generation and none that reaches a lost machine, so
+	// their slot results raise no floor that would hold back the next incarnation's views.
+	claimed := func(gen, end uint64) callResult {
+		return callResult{gen: gen, act: core.ClaimSlot{}, inputs: []core.Input{core.SlotClaimed{Slot: 0}}, start: end - 1, end: end}
+	}
+	l.gen = 2
+	l.deliver(claimed(1, 30))
+	l.status.Session = core.SessionStateLost
+	l.deliver(claimed(2, 40))
+	m.mu.Lock()
+	floor := m.floor
+	m.mu.Unlock()
+	if floor != 20 {
+		t.Errorf("floor %d after slot results that were not stepped, want 20", floor)
+	}
+	if len(recs) != 0 {
+		t.Errorf("stepped %d inputs, want none", len(recs))
 	}
 }

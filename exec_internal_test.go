@@ -976,6 +976,50 @@ func TestExecWait(t *testing.T) {
 	})
 }
 
+// TestExecHalt checks halt, which a Close whose ctx ended first calls: no queued call goes out,
+// not even one its lane has taken while it waits for a permit, do queues nothing and withPermit
+// runs nothing, while the calls in flight still return and deliver their results.
+func TestExecHalt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newExecHarness(t)
+		h.do(core.KeepAlive{}, true)
+		h.do(core.CloseSession{}, true) // behind the KeepAlive on the session lane
+		for i := range execPermits + 1 {
+			h.do(core.Acquire{Space: "s", Shard: i}, true) // one of them waits for a permit
+		}
+		h.do(core.Release{Space: "s", Shard: 0, Term: 1}, true) // behind Acquire s/0
+		synctest.Wait()
+		open := h.st.open()
+		if len(open) != execPermits+1 {
+			t.Fatalf("%d calls in flight, want %d: %s", len(open), execPermits+1, describe(open))
+		}
+
+		h.e.halt()
+		if h.e.do(1, execHolder, core.Acquire{Space: "t", Shard: 0}) {
+			t.Error("do queued a call after halt")
+		}
+		for _, c := range open {
+			h.answer(label(c), scriptReply{term: 1})
+		}
+		if h.e.withPermit(func() { t.Error("withPermit ran f after halt") }) {
+			t.Error("withPermit returned true after halt")
+		}
+		if open := h.st.open(); len(open) != 0 {
+			t.Errorf("calls started after halt: %s", describe(open))
+		}
+		if n := len(h.st.all()); n != execPermits+1 {
+			t.Errorf("%d store calls, want only the %d in flight at halt: %s", n, execPermits+1,
+				describe(h.st.all()))
+		}
+		if n := len(h.e.take()); n != execPermits+1 {
+			t.Errorf("%d results, want %d", n, execPermits+1)
+		}
+		if n := laneGoroutines(); n != 0 {
+			t.Errorf("%d lane goroutines once the calls in flight returned", n)
+		}
+	})
+}
+
 func TestExecPanics(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {

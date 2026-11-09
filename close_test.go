@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hmdsefi/tenure"
+	"github.com/hmdsefi/tenure/core"
 )
 
 // The tests of Drain and Close bounded by their contexts: Drain's deadline error, Close's
@@ -285,50 +286,174 @@ func TestATRUN74ForcedClose(t *testing.T) {
 
 // TestCloseCanceledContext closes a node with a ctx that is done already: Close skips the drain,
 // so it neither marks the member as draining nor releases a shard, and every Run is canceled with
-// the stop error "closed", which Check returns from then on.
+// the stop error "closed", which Check returns from then on, in a space with fencing and in one
+// without.
 func TestCloseCanceledContext(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		check := baseline(t)
-		r := newShardRig(t)
-		n := start(t, context.Background(), r.config())
-		synctest.Wait()
-		if got := running(r.runs); !slices.Equal(got, allShards) {
-			t.Fatalf("runs %v, want every shard", got)
-		}
+	for _, tt := range []struct {
+		name   string
+		fenced bool
+	}{{"unfenced", false}, {"fenced", true}} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				check := baseline(t)
+				r := newShardRig(t)
+				cfg := r.config()
+				cfg.Spaces[0].Fenced = tt.fenced
+				n := start(t, context.Background(), cfg)
+				synctest.Wait()
+				if got := running(r.runs); !slices.Equal(got, allShards) {
+					t.Fatalf("runs %v, want every shard", got)
+				}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		at := time.Now()
-		err := n.Close(ctx)
-		wantErrText(t, "Close(canceled ctx)", err, "tenure: close: context canceled (not released: orders/0, "+
-			"orders/1, orders/2, orders/3, orders/4, orders/5, orders/6, orders/7)", context.Canceled)
-		if d := time.Since(at); d != 0 {
-			t.Errorf("Close(canceled ctx) took %v, want 0", d)
-		}
-		for _, m := range []string{"SetDraining", "Leave"} {
-			if cs := r.sm.Calls(m); len(cs) != 0 {
-				t.Errorf("%s calls = %v, want none", m, cs)
-			}
-		}
-		for _, m := range []string{"Release", "CloseSession"} {
-			if cs := r.fs.Calls(m); len(cs) != 0 {
-				t.Errorf("%s calls = %v, want none", m, cs)
-			}
-		}
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				at := time.Now()
+				err := n.Close(ctx)
+				wantErrText(t, "Close(canceled ctx)", err, "tenure: close: context canceled (not released: orders/0, "+
+					"orders/1, orders/2, orders/3, orders/4, orders/5, orders/6, orders/7)", context.Canceled)
+				if d := time.Since(at); d != 0 {
+					t.Errorf("Close(canceled ctx) took %v, want 0", d)
+				}
+				for _, m := range []string{"SetDraining", "Leave"} {
+					if cs := r.sm.Calls(m); len(cs) != 0 {
+						t.Errorf("%s calls = %v, want none", m, cs)
+					}
+				}
+				for _, m := range []string{"Release", "CloseSession"} {
+					if cs := r.fs.Calls(m); len(cs) != 0 {
+						t.Errorf("%s calls = %v, want none", m, cs)
+					}
+				}
 
-		synctest.Wait()
-		calls := r.runs.Calls()
-		if len(calls) != len(allShards) {
-			t.Errorf("runs %v, want one per shard", calls)
-		}
-		for _, c := range calls {
-			if !c.Done || c.Err != c.Cause {
-				t.Errorf("%v, want it to have returned its cause", c)
+				synctest.Wait()
+				calls := r.runs.Calls()
+				if len(calls) != len(allShards) {
+					t.Errorf("runs %v, want one per shard", calls)
+				}
+				for _, c := range calls {
+					if !c.Done || c.Err != c.Cause {
+						t.Errorf("%v, want it to have returned its cause", c)
+					}
+					wantStopped(t, c, at, "closed")
+				}
+				wantStopErrors(t, r.runs, "closed")
+				wantAllClosed(t, n, n.Resolver(""))
+				check()
+			})
+		})
+	}
+}
+
+// TestCloseCanceledContextDrain checks Drain around a Close whose ctx is done at the call. A Drain
+// during such a Close, which skips the drain, returns ErrClosed and starts no drain; a drain that
+// a Drain started before is cut off by it, and that Drain returns ErrClosed; a drain that has
+// completed before lets it take the normal path, which leaves the group.
+func TestCloseCanceledContextDrain(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	all := "orders/0, orders/1, orders/2, orders/3, orders/4, orders/5, orders/6, orders/7"
+
+	t.Run("during", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			r := newShardRig(t)
+			n := start(t, context.Background(), r.config())
+			synctest.Wait()
+			// A renewal that ignores its ctx holds Close up once it has stopped the node.
+			release := r.fs.Block("KeepAlive")
+			time.Sleep(core.DefaultTiming.RetryPeriod + time.Second)
+			if ka := r.fs.Calls("KeepAlive"); len(ka) < 2 || ka[len(ka)-1].Done {
+				t.Fatalf("KeepAlive calls %v, want the last in flight", ka)
 			}
-			wantStopped(t, c, at, "closed")
-		}
-		wantStopErrors(t, r.runs, "closed")
-		wantAllClosed(t, n, n.Resolver(""))
-		check()
+
+			errc := make(chan error, 1)
+			go func() { errc <- n.Close(canceled) }()
+			synctest.Wait()
+			select {
+			case err := <-errc:
+				t.Fatalf("Close(canceled ctx) = %v before the renewal returned", err)
+			default:
+			}
+			if err := n.Drain(context.Background()); !errors.Is(err, tenure.ErrClosed) {
+				t.Errorf("Drain() during Close = %v, want ErrClosed", err)
+			}
+			if err := n.Drain(canceled); !errors.Is(err, tenure.ErrClosed) {
+				t.Errorf("Drain(canceled ctx) during Close = %v, want ErrClosed", err)
+			}
+			synctest.Wait()
+			if cs := r.sm.Calls("SetDraining"); len(cs) != 0 {
+				t.Errorf("SetDraining calls = %v, want none", cs)
+			}
+
+			release()
+			wantErrText(t, "Close(canceled ctx)", <-errc,
+				"tenure: close: context canceled (not released: "+all+")", context.Canceled)
+			for _, m := range []string{"Release", "CloseSession"} {
+				if cs := r.fs.Calls(m); len(cs) != 0 {
+					t.Errorf("%s calls = %v, want none", m, cs)
+				}
+			}
+			if ls := r.sm.Calls("Leave"); len(ls) != 0 {
+				t.Errorf("Leave calls = %v, want none", ls)
+			}
+			wantStopErrors(t, r.runs, "closed")
+			wantAllClosed(t, n, n.Resolver(""))
+			check()
+		})
+	})
+
+	t.Run("before", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			r := newShardRig(t)
+			free := make(chan struct{})
+			stuckRun(r, free)
+			n := start(t, context.Background(), r.config())
+			synctest.Wait()
+
+			drained := make(chan error, 1)
+			go func() { drained <- n.Drain(context.Background()) }()
+			time.Sleep(time.Second)
+			if got := running(r.runs); !slices.Equal(got, []int{3}) {
+				t.Fatalf("runs %v during the drain, want orders/3 only", got)
+			}
+			wantErrText(t, "Close(canceled ctx)", n.Close(canceled),
+				"tenure: close: context canceled (not released: orders/3)", context.Canceled)
+			if err := <-drained; !errors.Is(err, tenure.ErrClosed) {
+				t.Errorf("Drain() cut off by Close = %v, want ErrClosed", err)
+			}
+			if cs := r.fs.Calls("CloseSession"); len(cs) != 0 {
+				t.Errorf("CloseSession calls = %v, want none", cs)
+			}
+			if ls := r.sm.Calls("Leave"); len(ls) != 0 {
+				t.Errorf("Leave calls = %v, want none", ls)
+			}
+			wantStopErrors(t, r.runs, "draining")
+			wantAllClosed(t, n, n.Resolver(""))
+
+			close(free)
+			check()
+		})
+	})
+
+	t.Run("completed", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			r := newShardRig(t)
+			n := start(t, context.Background(), r.config())
+			synctest.Wait()
+			if err := n.Drain(context.Background()); err != nil {
+				t.Fatalf("Drain() = %v, want nil", err)
+			}
+			if err := n.Close(canceled); err != nil {
+				t.Errorf("Close(canceled ctx) after a completed drain = %v, want nil", err)
+			}
+			if ls := r.sm.Calls("Leave"); len(ls) != 1 {
+				t.Errorf("Leave calls = %v, want one", ls)
+			}
+			wantStopErrors(t, r.runs, "draining")
+			wantAllClosed(t, n, n.Resolver(""))
+			check()
+		})
 	})
 }
