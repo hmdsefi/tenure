@@ -6,6 +6,7 @@ package tenure
 import (
 	"errors"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/hmdsefi/tenure/core"
@@ -24,10 +25,11 @@ import (
 //     (expiredEvents), the input's own events (inputEvents), and the shards that left releasing,
 //     or whose stopped run let go of its term without a release (releasedEvents);
 //  3. one event per executed action, in Step's order (actionEvents);
-//  4. slot.claimed or slot.released;
+//  4. slot.claimed or slot.released (slotEvents);
 //  5. shard.stuck (stuckEvents).
 //
-// An input the machine ignores emits nothing but its view.changed (ignored).
+// An input the machine ignores emits nothing but its view.changed and slot.count_changed
+// (ignored). slot.standby comes from noSlot, outside the steps.
 type stepCollector struct {
 	// gen is the generation of the machine of the latest step: failures and expired belong to
 	// its incarnation, and a step of the next generation starts them again.
@@ -42,6 +44,16 @@ type stepCollector struct {
 
 	emit   func(Event) uint64
 	shards map[string][]shardTrack // by space name, indexed by shard
+
+	// slots is the slot count of the latest slot.count_changed, 0 before the first.
+	slots int
+
+	// standby reports that slot.standby was emitted and the node has held no slot since.
+	standby bool
+
+	// draining reports that Drain or Close has started the drain. observer.draining sets it,
+	// under n.mu rather than n.stepMu.
+	draining atomic.Bool
 }
 
 // shardTrack is what the collector keeps about one shard.
@@ -87,7 +99,7 @@ func (c *stepCollector) collect(rec stepRecord) {
 	c.inputEvents(rec)
 	c.releasedEvents(rec)
 	c.actionEvents(rec)
-	// Slot: slot.claimed and slot.released, from rec.Before.Slot and rec.After.Slot.
+	c.slotEvents(rec)
 	c.stuckEvents(rec)
 }
 
@@ -138,14 +150,18 @@ func sameStatus(a, b core.Status) bool {
 }
 
 // viewEvents emits view.changed for a stepped ViewChanged: the node has published its view, also
-// when the machine took no view, as while the session closes.
+// when the machine took no view, as while the session closes. slot.count_changed follows when the
+// view's slot count differs from the last one it reported, 0 before the first.
 func (c *stepCollector) viewEvents(rec stepRecord) {
 	v, ok := rec.Input.(core.ViewChanged)
 	if !ok {
 		return
 	}
 	c.emit(viewChanged(v.View))
-	// Slot: slot.count_changed, right after view.changed.
+	if v.View.Slots != c.slots {
+		c.slots = v.View.Slots
+		c.emit(Event{Kind: EventSlotCountChanged, Shard: -1, Slot: -1, Count: c.slots})
+	}
 }
 
 // viewChanged returns the view.changed event of v.
@@ -338,6 +354,47 @@ func (c *stepCollector) stopRun(a core.StopRun, now time.Duration) {
 		c.emit(shardEvent(EventShardExpired, a.Space, a.Shard, a.Term))
 	case core.StopLost:
 		c.emit(shardEvent(EventShardLost, a.Space, a.Shard, a.Term))
+	}
+}
+
+// slotEvents emits slot.released when the step ended the hold of the slot the node held, and
+// slot.claimed when it made the node hold a slot (OBS-130). A release that the step's SlotReleased
+// answered is "draining" once Drain or Close has started the drain, else "retired"; one without
+// it, as when another holder took the slot or the session was lost, is "lost".
+func (c *stepCollector) slotEvents(rec stepRecord) {
+	before, after := rec.Before.Slot, rec.After.Slot
+	if before == after {
+		return
+	}
+	if before >= 0 {
+		e := Event{Kind: EventSlotReleased, Shard: -1, Slot: before, Reason: slotLost}
+		if r, ok := rec.Input.(core.SlotReleased); ok && r.Slot == before {
+			e.Reason = slotRetired
+			if c.draining.Load() {
+				e.Reason = slotDraining
+			}
+		}
+		c.emit(e)
+	}
+	if after >= 0 {
+		c.standby = false
+		c.emit(Event{Kind: EventSlotClaimed, Shard: -1, Slot: after})
+	}
+}
+
+// The reasons of slot.released.
+const (
+	slotLost     = "lost"
+	slotDraining = "draining"
+	slotRetired  = "retired"
+)
+
+// noSlot emits slot.standby for a ClaimSlot that found no free slot, the first since the node
+// started or last held a slot.
+func (c *stepCollector) noSlot() {
+	if !c.standby {
+		c.standby = true
+		c.emit(Event{Kind: EventSlotStandby, Shard: -1, Slot: -1})
 	}
 }
 

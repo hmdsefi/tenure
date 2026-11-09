@@ -81,9 +81,10 @@ const EventShardRecovered EventKind = 13
 // shard and its term.
 const EventShardExpired EventKind = 14
 
-// EventShardLost ("shard.lost") is emitted when the node stops a shard's Run because another
-// holder has the shard or the session has ended for good. Space, Shard and Term name the
-// shard and its term.
+// EventShardLost ("shard.lost") is emitted when the node stops a shard's Run because it no
+// longer holds the shard: another holder has the shard, another holder took the slot the
+// shard belongs to, the node gave up a held slot that the views showed vacant too long, or
+// the session has ended for good. Space, Shard and Term name the shard and its term.
 const EventShardLost EventKind = 15
 
 // EventShardStopping ("shard.stopping") is emitted when the node stops a shard's Run to hand
@@ -121,7 +122,8 @@ const EventSlotClaimed EventKind = 21
 
 // EventSlotReleased ("slot.released") is emitted when the node stops holding a slot: Slot is
 // the slot, and Reason is "draining" (the node drains), "retired" (the slot count no longer
-// includes the slot) or "lost" (another holder took the slot).
+// includes the slot) or "lost" (the node lost the slot without releasing it, as when another
+// holder took it or the session was lost).
 const EventSlotReleased EventKind = 22
 
 // EventSlotStandby ("slot.standby") is emitted when the node finds no free slot for the first
