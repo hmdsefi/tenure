@@ -19,7 +19,9 @@
 //	<group>-slot-<n>          kind slot: a slot record
 //
 // <shard> and <n> are decimal numbers. A Lease at one of these names that lacks the group's
-// labels belongs to someone else, and the Adapter never writes it.
+// labels belongs to someone else, and the Adapter never writes it. The names of two groups in
+// one namespace can coincide when one group's name followed by "-" starts the other's, as with
+// the groups orders and orders-eu: give such groups their own namespaces.
 //
 // # Names
 //
