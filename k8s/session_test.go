@@ -249,6 +249,83 @@ func TestK8S200KeepAliveChecks(t *testing.T) {
 		}
 	})
 
+	t.Run("response after the expiry", func(t *testing.T) {
+		// A renewal sent at RenewDeadline whose response is delayed: the write succeeds, but a
+		// response at or after the session's expiry (its last renewal's sending + LeaseDuration)
+		// ends the session, since the write may have committed after a takeover's confirming
+		// GET. A response just before the expiry renews it.
+		for _, tc := range []struct {
+			name  string
+			delay time.Duration
+			lost  bool
+		}{
+			{"just before", T.LeaseDuration - T.RenewDeadline - time.Microsecond, false},
+			{"at the expiry", T.LeaseDuration - T.RenewDeadline, true},
+			{"after the expiry", T.LeaseDuration, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				clk := newFakeClock()
+				client := newFake()
+				a := fakeAdapter(t, client, withClock(clk.now))
+				const h = "pod-0/1"
+				closeAtEnd(t, a, h)
+				if err := a.KeepAlive(ctx, h, T); err != nil {
+					t.Fatalf("KeepAlive: %v", err)
+				}
+				clk.advance(T.RenewDeadline)
+				delayed := false
+				client.PrependReactor("update", resourceLeases, func(k8stesting.Action) (bool, runtime.Object, error) {
+					if !delayed {
+						delayed = true
+						clk.advance(tc.delay)
+					}
+					return false, nil, nil // the write goes through
+				})
+				client.ClearActions()
+				err := a.KeepAlive(ctx, h, T)
+				if got := writes(client); len(got) != 1 {
+					t.Errorf("writes %v, want the renewal alone", got)
+				}
+				if !tc.lost {
+					if err != nil {
+						t.Fatalf("KeepAlive with a response %v after sending = %v, want nil", tc.delay, err)
+					}
+					// The session now runs until the renewal's sending + LeaseDuration.
+					clk.advance(T.LeaseDuration - tc.delay - time.Microsecond)
+					if err := a.KeepAlive(ctx, h, T); err != nil {
+						t.Errorf("KeepAlive before the renewed expiry = %v, want nil", err)
+					}
+					return
+				}
+				const want = "k8s: session pod-0/1 lost: renewal returned at or after its expiry: tenure: session lost"
+				if !errors.Is(err, tenure.ErrSessionLost) || err.Error() != want {
+					t.Fatalf("KeepAlive with a response %v after sending = %v, want %s", tc.delay, err, want)
+				}
+				client.ClearActions()
+				const ended = "k8s: session pod-0/1 ended: tenure: session lost"
+				if err := a.KeepAlive(ctx, h, T); !errors.Is(err, tenure.ErrSessionLost) || err.Error() != ended {
+					t.Errorf("KeepAlive after the late renewal = %v, want %s", err, ended)
+				}
+				if term, err := a.Acquire(ctx, h, "markets", 0); term != 0 || !errors.Is(err, tenure.ErrSessionLost) {
+					t.Errorf("Acquire after the late renewal = %d, %v; want 0 and an error matching tenure.ErrSessionLost", term, err)
+				}
+				if n := len(client.Actions()); n != 0 {
+					t.Errorf("%d requests after the session ended, want none: %v", n, client.Actions())
+				}
+				if a.runningCache() != nil {
+					t.Error("the informer still runs after the only session ended")
+				}
+				// The Lease still names the holder: CloseSession deletes it.
+				if err := a.CloseSession(ctx, h); err != nil {
+					t.Fatalf("CloseSession: %v", err)
+				}
+				if got := actions(client, "delete"); len(got) != 1 {
+					t.Errorf("deletes %v, want 1", got)
+				}
+			})
+		}
+	})
+
 	t.Run("failed renewal with a shorter duration", func(t *testing.T) {
 		// A failed renewal may have been written with its shorter duration, which the session's
 		// expiry then follows.
