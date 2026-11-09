@@ -12,9 +12,7 @@ import (
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	coordinationinformers "k8s.io/client-go/informers/coordination/v1"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -110,6 +108,8 @@ type leaseCache struct {
 	// ownSeenAt is when the informer last delivered an own member Lease write; zero before the
 	// first.
 	ownSeenAt time.Time
+	// holders are the run's WatchHolders channels (holders.go).
+	holders holderWatches
 }
 
 // holdCache holds the informer running, starting it unless it runs already, and waits for its
@@ -164,20 +164,20 @@ func (a *Adapter) startCache() *leaseCache {
 		pending:     map[string][]uint64{},
 		delivered:   map[string]delivery{},
 	}
-	selector := labelGroup + "=" + a.group
-	informer := coordinationinformers.NewFilteredLeaseInformer(a.client, a.namespace, resyncPeriod, cache.Indexers{},
-		func(o *metav1.ListOptions) { o.LabelSelector = selector })
-	deliver := func(obj any) {
+	informer := a.leaseInformer(c)
+	deliver := func(old, obj any) {
 		l := asLease(obj)
 		c.observe(l)
 		a.delivered(c, l)
+		a.holderEvent(c, asLease(old), l, false, false)
 	}
 	reg, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    deliver,
-		UpdateFunc: func(_, obj any) { deliver(obj) },
+		AddFunc:    func(obj any) { deliver(nil, obj) },
+		UpdateFunc: deliver,
 		DeleteFunc: func(obj any) {
 			_, gap := obj.(cache.DeletedFinalStateUnknown)
 			c.forget(asLease(obj), gap)
+			a.holderEvent(c, nil, asLease(obj), true, gap)
 		},
 	})
 	if err != nil {
