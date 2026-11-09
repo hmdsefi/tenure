@@ -334,8 +334,10 @@ func testDelay(t *testing.T, c *cluster, g, name string) {
 		t.Errorf("GET of another Lease sent %v after it started, want no delay", r.sent.Sub(r.start))
 	}
 
-	// Three delayed requests at once are in flight together.
+	// Three delayed requests at once are in flight together. A stall holds them until all three
+	// have entered the transport, so a slow goroutine start cannot keep them apart.
 	rec.reset()
+	release := rec.stall(on(verbGet, name))
 	var wg sync.WaitGroup
 	for range 3 {
 		wg.Go(func() {
@@ -344,7 +346,21 @@ func testDelay(t *testing.T, c *cluster, g, name string) {
 			}
 		})
 	}
+	for deadline := time.Now().Add(5 * time.Second); rec.count(on(verbGet, name)) < 3; {
+		if time.Now().After(deadline) {
+			release()
+			wg.Wait()
+			t.Fatalf("%d GETs entered the transport in 5s, want 3", rec.count(on(verbGet, name)))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	release()
 	wg.Wait()
+	for _, r := range rec.filter(on(verbGet, name)) {
+		if r.sent.Sub(r.start) < d {
+			t.Errorf("concurrent GET %v sent %v after it started, want at least %v", r, r.sent.Sub(r.start), d)
+		}
+	}
 	if n := rec.maxInFlight(on(verbGet, name)); n != 3 {
 		t.Errorf("maxInFlight = %d, want 3", n)
 	}
@@ -408,12 +424,13 @@ func testBump(t *testing.T, c *cluster, name string) {
 		t.Errorf("bumped Lease: resourceVersion %s (was %s), renewTime %v, annotations %v; want a new version, renewTime %v, %s 1",
 			after.ResourceVersion, base.ResourceVersion, after.Spec.RenewTime, after.Annotations, renew, bumpAnnotation)
 	}
-	if r := last(t, rec, on(verbUpdate, name)); r.String() != "UPDATE "+name+" 409" || !r.bumped {
-		t.Errorf("bumped UPDATE record %+v, want UPDATE 409, bumped", r)
+	if r := last(t, rec, on(verbUpdate, name)); r.String() != "UPDATE "+name+" 409" || !r.bumped || r.bumpedTo == nil ||
+		r.bumpedTo.ResourceVersion != after.ResourceVersion || !r.bumpedTo.Spec.RenewTime.Equal(after.Spec.RenewTime) {
+		t.Errorf("bumped UPDATE record %+v, want UPDATE 409, bumped to resourceVersion %s", r, after.ResourceVersion)
 	}
 
 	update(ok)
-	if r := last(t, rec, on(verbUpdate, name)); r.String() != "UPDATE "+name+" 200" || r.bumped {
+	if r := last(t, rec, on(verbUpdate, name)); r.String() != "UPDATE "+name+" 200" || r.bumped || r.bumpedTo != nil {
 		t.Errorf("UPDATE after the bump record %+v, want UPDATE 200, not bumped", r)
 	}
 
