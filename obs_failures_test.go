@@ -74,8 +74,8 @@ func linesWith(lines []string, subs ...string) []string {
 
 // TestATOBS09RunReturned checks run.returned for a Run that returns boom at once: per shard,
 // Count 1 to 5 with Duration 2 s, 4 s, 8 s, 15 s and 15 s, Err boom and the run's term, each at
-// the return; and WARN records with keys space, shard, term, restarts, restart_in and error
-// after member and holder.
+// the return; the shard's table row has Restarts equal to the last Count; and WARN records with
+// keys space, shard, term, restarts, restart_in and error after member and holder.
 func TestATOBS09RunReturned(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
@@ -88,6 +88,7 @@ func TestATOBS09RunReturned(t *testing.T) {
 		}
 		sleepUntil(t0.Add(30 * time.Second)) // the fifth return is at T0+29s, the sixth at T0+44s
 		events := ofKinds(a.RecentEvents(), tenure.EventRunReturned)
+		table := a.Table()
 
 		backoffs := secs(2, 4, 8, 15, 15)
 		returns := secs(0, 2, 6, 14, 29)
@@ -117,6 +118,11 @@ func TestATOBS09RunReturned(t *testing.T) {
 			for _, c := range runs {
 				if c.Shard != runs[0].Shard {
 					t.Errorf("%v, want the first call's Shard", c)
+				}
+			}
+			if len(got) > 0 {
+				if row := table.Spaces[0].Rows[shard]; row.Restarts != got[len(got)-1].Count {
+					t.Errorf("s/%d: row Restarts %d, want the last run.returned Count %d", shard, row.Restarts, got[len(got)-1].Count)
 				}
 			}
 			recs := linesWith(a.Log.Lines(), `"msg":"tenure: run returned"`, fmt.Sprintf(`"shard":%d,`, shard))
