@@ -15,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -355,7 +356,8 @@ func TestK8S100InformerLifecycle(t *testing.T) {
 // TestK8S110Observation checks the observations of the Adapter's own clock: rvSeenAt moves with
 // every new resourceVersion, tokenSeenAt only with a new UID, holder or renewTime; a deleted
 // member Lease leaves a tombstone with its last tokenSeenAt and its duration until that has
-// passed; an older state is ignored; and a stopped informer's observations are discarded.
+// passed, also when it was replaced by a new Lease without a deletion event; an older state is
+// ignored; and a stopped informer's observations and tombstones are discarded.
 func TestK8S110Observation(t *testing.T) {
 	ctx := t.Context()
 	clk := newFakeClock()
@@ -481,6 +483,26 @@ func TestK8S110Observation(t *testing.T) {
 	}
 	gone := l.UID
 
+	// Created again without a deletion event, as a relist after a gap in the watch shows it:
+	// the replaced member Lease leaves its tombstone all the same.
+	relisted := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: memberName("g", "pod-2"), UID: "uid-1", ResourceVersion: "1", Labels: leaseLabels("g", kindMember, "")},
+		Spec:       coordinationv1.LeaseSpec{LeaseDurationSeconds: &seconds},
+	}
+	t8 := clk.now()
+	c.observe(relisted)
+	relisted = relisted.DeepCopy()
+	relisted.UID, relisted.ResourceVersion = "uid-2", "2"
+	clk.advance(time.Second)
+	c.observe(relisted)
+	want = tombstone{tokenSeenAt: t8, wait: 10 * time.Second}
+	if got, ok := a.tombstoneOf("uid-1"); !ok || got != want {
+		t.Errorf("tombstone of a Lease replaced without a deletion = %+v, %v; want %+v", got, ok, want)
+	}
+	if o, ok := a.cached(relisted.Name); !ok || o.lease.UID != "uid-2" || !o.tokenSeenAt.Equal(clk.now()) {
+		t.Errorf("observation of the new Lease %+v, %v; want uid-2 seen now", o, ok)
+	}
+
 	// Stopping the informer discards observations and tombstones; a new run observes anew.
 	l = &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: memberName("g", "pod-1"), Labels: leaseLabels("g", kindMember, "")}}
 	if l, err = leases.Create(ctx, l, metav1.CreateOptions{}); err != nil {
@@ -498,7 +520,9 @@ func TestK8S110Observation(t *testing.T) {
 	}
 	defer a.releaseCache(c)
 	check("pod-1 after a restart", l, t7, t7)
-	if _, ok := a.tombstoneOf(gone); ok {
-		t.Error("tombstone kept after the informer stopped")
+	for _, uid := range []types.UID{gone, "uid-1"} {
+		if _, ok := a.tombstoneOf(uid); ok {
+			t.Errorf("tombstone of %s kept after the informer stopped", uid)
+		}
 	}
 }
