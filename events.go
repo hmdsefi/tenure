@@ -86,9 +86,10 @@ const EventShardExpired EventKind = 14
 const EventShardLost EventKind = 15
 
 // EventShardStopping ("shard.stopping") is emitted when the node stops a shard's Run to hand
-// the shard over: Space, Shard and Term name the shard and its term, and Reason is "moved"
-// (the assignment gives the shard to another member), "draining" (the node drains) or
-// "closed" (Close's context ended before the drain completed).
+// the shard over, or because Close gives up on the drain: Space, Shard and Term name the shard
+// and its term, and Reason is "moved" (the assignment gives the shard to another member),
+// "draining" (the node drains) or "closed" (Close's context ended before the drain completed;
+// the node then stops without releasing the shard).
 const EventShardStopping EventKind = 16
 
 // EventShardStuck ("shard.stuck") is emitted once per run when a stopped Run has not returned
@@ -125,12 +126,13 @@ const EventSlotReleased EventKind = 22
 const EventSlotStandby EventKind = 23
 
 // EventSlotCountChanged ("slot.count_changed") is emitted right after EventViewChanged when
-// the view's slot count differs from the previous view's: Count is the new count.
+// the view's slot count differs from the previous view's, taken as 0 before the first view:
+// Count is the new count.
 const EventSlotCountChanged EventKind = 24
 
-// EventSlotCountMismatch ("slot.count_mismatch") is emitted by Start when Config.Slots
-// differs from the slot count in the store: Count is the stored count and Configured is
-// Config.Slots.
+// EventSlotCountMismatch ("slot.count_mismatch") is emitted by Start when Config.Slots is
+// above 0 and the store already holds another slot count, which the node keeps: Count is the
+// stored count and Configured is Config.Slots.
 const EventSlotCountMismatch EventKind = 25
 
 // EventRunReturned ("run.returned") is emitted when a shard's Run returns while the node
@@ -139,15 +141,18 @@ const EventSlotCountMismatch EventKind = 25
 // again, and Err is the error Run returned, or nil.
 const EventRunReturned EventKind = 26
 
-// EventStoreFailed ("store.failed") is emitted when a call to the Store fails, other than
-// Acquire and KeepAlive (which have their own events), or when the store's watch ends:
-// Reason is the name of the Store method, such as "Release", Err is the error, and Space,
-// Shard and Slot are the call's space, shard and slot when the call has them.
+// EventStoreFailed ("store.failed") is emitted when a call the node makes to the Store on its
+// own fails, or when the store's watch ends: Reason is the name of the Store method, such as
+// "Release" or "WatchHolders", Err is the error, and Space, Shard and Slot are the call's
+// space, shard and slot when the call has them. Failed Acquire and KeepAlive calls have their
+// own events, a ClaimSlot that finds no free slot is not a failure, and an error that Start or
+// Node.SetSlots returns emits no event.
 const EventStoreFailed EventKind = 27
 
-// EventMembershipFailed ("membership.failed") is emitted when a call to the Membership fails
-// or its watch channel closes before Close: Reason is the name of the Membership method, such
-// as "Watch", and Err is the error.
+// EventMembershipFailed ("membership.failed") is emitted when a Watch, SetDraining or Leave
+// call of the Membership fails, or when the watch channel closes before Close calls Leave:
+// Reason is the name of the Membership method, such as "Watch", and Err is the error. A failed
+// Join is Start's error and emits no event.
 const EventMembershipFailed EventKind = 28
 
 // EventNodeDraining ("node.draining") is emitted when the first Drain or Close starts the
