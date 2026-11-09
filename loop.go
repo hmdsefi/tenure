@@ -202,7 +202,6 @@ func (l *loop) run(first []loopInput, started chan<- struct{}) {
 		case <-n.exec.ready():
 			for _, r := range n.exec.take() {
 				l.deliver(r)
-				l.slotResult(r)
 			}
 		case <-rds:
 			for _, rd := range n.readings.take() {
@@ -213,6 +212,8 @@ func (l *loop) run(first []loopInput, started chan<- struct{}) {
 			for _, in := range ins {
 				l.step(in)
 			}
+			// The merger marks stale views by its own Version, before the bump of new
+			// incarnations is added.
 			if v != nil && !n.merge.stale(v.Version) {
 				v.Version += l.bump
 				l.step(loopInput{in: core.ViewChanged{View: *v}})
@@ -350,7 +351,8 @@ func (l *loop) lose(now time.Duration) {
 // the freshness state of a new machine, which keeps the floors; makes the new machine; and sends
 // KeepAlive for the new holder through the executor. The new machine steps that KeepAlive's
 // answer first, then the latest merged view (open). A drain requested by the time of a draw
-// completes instead (RUN-190). The internal context ending stops recover.
+// completes instead (RUN-190). The internal context ending stops recover, and so does a forced
+// Close that halted the node before the new holder is made the node's.
 func (l *loop) recover() {
 	n := l.n
 	l.recoverDue = false
@@ -372,6 +374,10 @@ func (l *loop) recover() {
 	}
 
 	n.stepMu.Lock()
+	if n.halted { // a forced Close during the wait or the draw: no new incarnation (RUN-530)
+		n.stepMu.Unlock()
+		return
+	}
 	prev := n.holder
 	n.holder = holder
 	n.stepMu.Unlock()

@@ -110,7 +110,7 @@ type executor struct {
 	lanes    map[laneKey]*lane
 	results  []callResult
 	floor    uint64                  // calls and results of older generations are dropped
-	closed   bool                    // wait was called: do queues nothing more
+	closed   bool                    // wait or halt was called: no call is queued or starts any more
 	confirms map[laneKey]confirmMark // the latest Confirm call that went out, by shard lane
 }
 
@@ -298,7 +298,7 @@ func (e *executor) stamp() uint64 { return e.stamps.Add(1) }
 
 // withPermit runs f while holding one of the permits the lanes' non-session calls share, for
 // store reads such as Holdings and Slots. It waits for a free permit, and returns false without
-// running f when the internal context ends first.
+// running f when the internal context ends first or halt has been called.
 func (e *executor) withPermit(f func()) bool {
 	select {
 	case e.permits <- struct{}{}:
@@ -306,11 +306,28 @@ func (e *executor) withPermit(f func()) bool {
 		return false
 	}
 	defer func() { <-e.permits }()
-	if e.ctx.Err() != nil {
+	e.mu.Lock()
+	closed := e.closed
+	e.mu.Unlock()
+	if closed || e.ctx.Err() != nil {
 		return false
 	}
 	f()
 	return true
+}
+
+// halt stops the executor from starting calls, for a Close whose ctx ended first (RUN-530): it
+// drops every queued call, which gets no result, and from now on do queues nothing, a lane starts
+// no call it has taken, and withPermit runs nothing. The calls in flight go on, and their results
+// are still delivered; wait still waits for them.
+func (e *executor) halt() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.closed = true
+	for _, l := range e.lanes {
+		clear(l.queue)
+		l.queue = l.queue[:0]
+	}
 }
 
 // wait stops do from queuing calls and waits until every lane goroutine has returned. Once the
@@ -379,9 +396,9 @@ func (e *executor) exec(l *lane, c execCall) (callResult, bool) {
 	var sentAt time.Duration
 	// The last look at the generation comes right before the call, in one critical section with
 	// its start stamp: once dropOlder has dropped c's generation, which the loop does in the step
-	// that loses the session, c never goes out (MCH O7).
+	// that loses the session, or halt has stopped the executor, c never goes out (MCH O7).
 	e.mu.Lock()
-	if c.gen < e.floor || e.ctx.Err() != nil {
+	if c.gen < e.floor || e.closed || e.ctx.Err() != nil {
 		e.mu.Unlock()
 		cancel()
 		return callResult{}, false

@@ -226,7 +226,11 @@ func (n *Node) Drain(ctx context.Context) error
     whose release is still out, by space and then shard, as in "tenure: drain:
     context deadline exceeded (not released: orders/3, orders/5)". When every
     shard is released but the session is not closed yet, it ends in "(session
-    not closed)". After Close, Drain returns ErrClosed.
+    not closed)".
+
+    Drain returns ErrClosed after Close, during a Close whose ctx was done when
+    it was called and that so skipped the drain, and when a Close stops the node
+    before the drain completes.
 
 func (n *Node) Local(space, key string) (*Shard, error)
     Local returns this member's Shard for key in space while the member owns it,
@@ -286,6 +290,10 @@ func (n *Node) SetSlots(ctx context.Context, count int) error
     SetSlots: " and wrap the store's error. When ctx ends first, SetSlots
     returns an error that wraps ctx's error; the count may have been written by
     then.
+
+    The wait goes on while the node steps no view, for example while it waits
+    for a new session after losing one, until ctx ends or Close stops the node.
+    When Close stops the node first, SetSlots returns ErrClosed.
 
 type NotOwnerError struct {
 	// Space and Shard name the shard.

@@ -236,7 +236,9 @@ func (b *readings) take() []reading {
 // KeepAlive opens its machine (open). A result of an earlier generation is not stepped, and
 // neither is one that reaches a lost machine: lose has discarded its machine's results in the
 // executor, but those taken in the batch the loss came in are still here, and the machine has
-// had its answers from lose (MCH O3).
+// had its answers from lose (MCH O3). A slot result that is stepped then raises the slot data
+// floor and asks for a slot read (slotResult); one that is not stepped does neither, since no
+// machine has seen it, so it holds back no view of the next incarnation.
 func (l *loop) deliver(r callResult) {
 	if r.gen != l.gen || l.status.Session == core.SessionStateLost {
 		return
@@ -271,6 +273,7 @@ func (l *loop) deliver(r callResult) {
 		}
 	}
 	l.resyncIfDue()
+	l.slotResult(r)
 }
 
 // observe steps rd as HolderChanged if the freshness filter admits it. The filter sees the

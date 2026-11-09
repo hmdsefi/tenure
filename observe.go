@@ -36,7 +36,8 @@ import (
 //   - membershipFailed, for each failed call of the membership after Join that the node retries
 //     or gives up: "Watch" (also a channel that closed before Leave), "SetDraining" and "Leave";
 //   - draining, once, when the first Drain or Close starts the drain;
-//   - drained, once, when the drain completes;
+//   - drained, once, when the drain completes, under n.stepMu, unless a Close whose ctx ended
+//     first has halted the node;
 //   - shardClosed, for each shard that a Close whose ctx ended first stops with reason "closed"
 //     (RUN-530), under n.stepMu, right after the stop and before its Run is canceled;
 //   - closed, once, with Close's ctx and the reason: "drained" last, when Close finishes after a
@@ -48,8 +49,9 @@ import (
 // from the slot refresher's goroutine, draining from the first Drain or Close while it holds
 // n.mu, step, newIncarnation and a store's view from the loop goroutine, the callFailed calls of
 // Holdings and the store watch from the resync and store-watch goroutines, the other callFailed
-// calls from the executor's lanes, runReturned from the shard's supervisor goroutine, and the rest
-// from the node's watcher and drain goroutines. No call may block, or call back into the node.
+// calls from the executor's lanes, runReturned from the shard's supervisor goroutine, and the
+// rest from the
+// node's watcher and drain goroutines. No call may block, or call back into the node.
 type observer interface {
 	start(holder string)
 	startFailed(ctx context.Context, err error)
