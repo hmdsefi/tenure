@@ -62,6 +62,15 @@
 // decided on an earlier state of the record fails; CloseSession releases every record of the
 // holder. Holdings lists a space's records as stored, with one request.
 //
+// # Membership
+//
+// A member that joined has its member record, a small JSON document, in the annotation
+// tenure.member of its member Lease. Join writes it, creating the Lease with no holder when there
+// is none, so a member needs no session: while no session holds the Lease, the Adapter moves its
+// renewTime on every RetryPeriod of the Adapter's Timing. SetDraining rewrites the record. A
+// session closed while the member has joined only clears the Lease's holder. Leave deletes the
+// Lease, or removes only the record while a session holds it.
+//
 // # Configuration
 //
 // New never fails and makes no request. It records the first problem it finds with its

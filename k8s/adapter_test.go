@@ -47,6 +47,9 @@ var adapterCalls = []struct {
 		_, err := a.Holdings(ctx, "markets")
 		return err
 	}},
+	{"Join", func(ctx context.Context, a *Adapter) error { return a.Join(ctx, core.Member{ID: "pod-0", Slot: -1}) }},
+	{"SetDraining", func(ctx context.Context, a *Adapter) error { return a.SetDraining(ctx, true) }},
+	{"Leave", func(ctx context.Context, a *Adapter) error { return a.Leave(ctx) }},
 }
 
 // TestATK8S01ConfigErrors checks New's configuration error, which every method returns first
