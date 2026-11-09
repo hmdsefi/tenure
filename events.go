@@ -40,7 +40,8 @@ const EventSessionRenewedLate EventKind = 4
 const EventSessionRecovered EventKind = 5
 
 // EventSessionExpired ("session.expired") is emitted once per session deadline, when the
-// node steps an input at or after that deadline without an accepted renewal.
+// node steps an input at or after that deadline without an accepted renewal, unless the
+// session was lost or is closing by then.
 const EventSessionExpired EventKind = 6
 
 // EventSessionLost ("session.lost") is emitted at the first sign that a session incarnation

@@ -88,7 +88,6 @@ func (c *stepCollector) collect(rec stepRecord) {
 	c.releasedEvents(rec)
 	c.actionEvents(rec)
 	// Slot: slot.claimed and slot.released, from rec.Before.Slot and rec.After.Slot.
-	// Slot: shard.stuck, for each shard whose Stuck turned true.
 	c.stuckEvents(rec)
 }
 

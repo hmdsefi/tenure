@@ -137,8 +137,9 @@ func wantLossAt(t *testing.T, calls []call, at time.Time) {
 // T0+13s; then session.restarted{Holder: H1}, H2's session.opened and shard.acquired of every
 // shard in H2's terms, all at T0+13s. The log records name H1 before session.restarted and H2
 // from it on. With the drain, session.lost comes at T0+12s and no session.restarted, second
-// session.opened or session.closed follows; orders/3, stopped for draining before the loss, has
-// no shard.lost and is released{draining} with its handoff at T0+40s.
+// session.opened, session.closed or session.expired follows (the lost session's deadline passes
+// at T0+20s); orders/3, stopped for draining before the loss, has no shard.lost and is
+// released{draining} with its handoff at T0+40s.
 func TestATRUN19SessionLostRecovery(t *testing.T) {
 	t.Run("recovery", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -397,7 +398,8 @@ func wantLossEvents(t *testing.T, events []tenure.Event, lines []string, runs *r
 func wantDrainLossEvents(t *testing.T, events []tenure.Event, sh *tenure.Shard, t0 time.Time) {
 	t.Helper()
 	wantErrEvents(t, events, tenure.EventSessionLost, tenure.ErrSessionLost, t0, secs(12))
-	for _, k := range []tenure.EventKind{tenure.EventSessionRestarted, tenure.EventSessionClosed, tenure.EventShardLost} {
+	for _, k := range []tenure.EventKind{tenure.EventSessionRestarted, tenure.EventSessionClosed, tenure.EventShardLost,
+		tenure.EventSessionExpired} {
 		if n := count(events, k); n != 0 {
 			t.Errorf("%d %v events, want none", n, k)
 		}

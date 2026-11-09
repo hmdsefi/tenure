@@ -171,11 +171,12 @@ func TestStepCollectorInputs(t *testing.T) {
 
 // TestStepCollectorOutage checks the outage, loss and stuck events on short runs of steps: one
 // session.renew_failed per failed KeepAlive the machine accepts, none for a loss another call
-// reports, and session.lost once; session.expired once per deadline value; session.renewed_late
-// and session.recovered only for a renewal that makes a late session live, counting the failures
-// since the last accepted renewal, in this generation; shard.expired and shard.lost in place of
-// shard.stopping, and shard.released with their reason and no handoff, also when the run ends
-// without a release; shard.degraded and shard.recovered; and one shard.stuck per run.
+// reports, and session.lost once; session.expired once per deadline value, and none once the
+// session is lost; session.renewed_late and session.recovered only for a renewal that makes a
+// late session live, counting the failures since the last accepted renewal, in this generation;
+// shard.expired and shard.lost in place of shard.stopping, and shard.released with their reason
+// and no handoff, also when the run ends without a release; shard.degraded and shard.recovered;
+// and one shard.stuck per run, after the events of the step's actions.
 func TestStepCollectorOutage(t *testing.T) {
 	const deadline = 10 * time.Second
 	live, late, lost := core.SessionStateLive, core.SessionStateLate, core.SessionStateLost
@@ -329,6 +330,37 @@ func TestStepCollectorOutage(t *testing.T) {
 					After:  status(12*time.Second, live, 20*time.Second, none, shard(core.ShardStateStopping, core.StopDraining, true))},
 			},
 			want: []Event{ev(EventShardStuck, "draining")},
+		},
+		{
+			// A step that marks one run stuck and acquires another shard: shard.stuck comes after
+			// the actions' events.
+			name: "StuckAfterActions",
+			recs: []stepRecord{
+				{Now: 11 * time.Second, Input: tick(11 * time.Second),
+					Actions: []core.Action{core.Acquire{Space: "s", Shard: 1}},
+					Before: core.Status{Now: 9 * time.Second, Session: live, Deadline: 20 * time.Second, Slot: -1,
+						Spaces: []core.SpaceStatus{{Name: "s", Shards: []core.ShardStatus{
+							shard(core.ShardStateStopping, core.StopMoved, false), idle}}}},
+					After: core.Status{Now: 11 * time.Second, Session: live, Deadline: 20 * time.Second, Slot: -1,
+						Spaces: []core.SpaceStatus{{Name: "s", Shards: []core.ShardStatus{
+							shard(core.ShardStateStopping, core.StopMoved, true), {State: core.ShardStateAcquiring}}}}}},
+			},
+			want: []Event{{Kind: EventShardAcquiring, Space: "s", Shard: 1, Slot: -1}, ev(EventShardStuck, "moved")},
+		},
+		{
+			// A loss reported by the KeepAlive, then by a Release, in a step that is not ignored
+			// since a run turns stuck, past the deadline: session.lost comes once, and the
+			// deadline of a lost session emits no session.expired.
+			name: "LostOnceNoExpiry",
+			recs: []stepRecord{
+				{Now: 2 * time.Second, Input: core.SessionFailed{Now: 2 * time.Second, Cause: core.CauseLost}, SentWall: wall,
+					Err: ErrSessionLost, Actions: stopRun(core.StopLost), Before: status(time.Second, live, deadline, none, owned),
+					After: status(2*time.Second, lost, deadline, core.CauseLost, shard(core.ShardStateLost, core.StopLost, false))},
+				{Now: 12 * time.Second, Input: core.SessionFailed{Now: 12 * time.Second, Cause: core.CauseLost}, Err: ErrSessionLost,
+					Before: status(2*time.Second, lost, deadline, core.CauseLost, shard(core.ShardStateLost, core.StopLost, false)),
+					After:  status(12*time.Second, lost, deadline, core.CauseLost, shard(core.ShardStateLost, core.StopLost, true))},
+			},
+			want: []Event{failed(ErrSessionLost), sessionLost, ev(EventShardLost, ""), ev(EventShardStuck, "lost")},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
