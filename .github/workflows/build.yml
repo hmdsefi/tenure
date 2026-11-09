@@ -26,6 +26,11 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.14.0
+      - name: golangci-lint (k8s)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+          working-directory: k8s
 
   build:
     name: Go build
