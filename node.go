@@ -126,7 +126,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		machineDone: make(chan struct{}),
 		shards:      newShardTable(cfg.Spaces),
 	}
-	n.obs = &logObserver{n: n}
+	n.obs = newLogObserver(n)
 	n.merge.post = n.postView
 	n.snap.Store(newRoutes(nil, nil, nil))
 	n.obs.start(n.holder)

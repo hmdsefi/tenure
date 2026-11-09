@@ -19,8 +19,10 @@ import (
 )
 
 // OBS §10's harness for the event tests. Every test runs inside a testing/synctest bubble with one
-// memstore.New(nil) and one static list that lists no member; each node joins it through a Share
-// of its own (the group's recMembership, sm) and gets its own recStore over the memstore (fs),
+// memstore.New(nil) and one static list, which lists no member unless the test names some (with
+// the data each node joins with, so that their Join does not change the view, whose Version stays
+// 1); each node joins it through a Share of its own (the group's recMembership, sm) and gets its
+// own recStore over the memstore (fs),
 // wrapped in faulty, which injects errors per method. Each node has core.DefaultTiming, space "s"
 // with 2 unfenced shards served by a runLog of its own, a holder drawn from a fixed Rand
 // (obsHolderA for "a", obsHolderB for "b"), a recording OnEvent (eventRec) and a Logger that
@@ -39,15 +41,29 @@ const obsSpace = "s"
 
 // obsHarness holds what every node of a test shares: the memstore and the group.
 type obsHarness struct {
-	t  *testing.T
-	ms *memstore.Store
-	g  *group
+	t      *testing.T
+	ms     *memstore.Store
+	g      *group
+	listed map[string]bool // the IDs the group lists from the start
 }
 
-// newObsHarness returns a harness over a new memstore and a group that lists no member.
-func newObsHarness(t *testing.T) *obsHarness {
+// newObsHarness returns a harness over a new memstore and a group that lists the members listed,
+// none by default, each as the harness's Node gives its Self.
+func newObsHarness(t *testing.T, listed ...string) *obsHarness {
 	t.Helper()
-	return &obsHarness{t: t, ms: memstore.New(nil), g: newGroup(t)}
+	members := make([]core.Member, len(listed))
+	h := &obsHarness{t: t, ms: memstore.New(nil), listed: make(map[string]bool, len(listed))}
+	for i, id := range listed {
+		members[i] = obsSelf(id)
+		h.listed[id] = true
+	}
+	h.g = newGroup(t, members...)
+	return h
+}
+
+// obsSelf returns the Self of the harness's member id.
+func obsSelf(id string) tenure.Member {
+	return tenure.Member{ID: id, Addr: id + ":1"}
 }
 
 // obsNode is one node of the harness with its doubles. Node is nil until Start has succeeded.
@@ -74,7 +90,7 @@ func (h *obsHarness) Node(id string, opts ...func(*tenure.Config)) *obsNode {
 		t:      h.t,
 		ID:     id,
 		Holder: id + "/" + strings.Repeat(fmt.Sprintf("%02x", obsRandBase(id)), 16),
-		M:      h.g.Absent(id),
+		M:      h.membership(id),
 		FS:     fs,
 		Store:  newFaulty(fs),
 		Runs:   &runLog{},
@@ -82,7 +98,7 @@ func (h *obsHarness) Node(id string, opts ...func(*tenure.Config)) *obsNode {
 		Log:    &logCapture{},
 	}
 	n.Cfg = tenure.Config{
-		Self:       tenure.Member{ID: id, Addr: id + ":1"},
+		Self:       obsSelf(id),
 		Membership: n.M,
 		Store:      n.Store,
 		Spaces:     []tenure.Space{{Name: obsSpace, Shards: 2, Run: n.Runs.Run}},
@@ -95,6 +111,15 @@ func (h *obsHarness) Node(id string, opts ...func(*tenure.Config)) *obsNode {
 		o(&n.Cfg)
 	}
 	return n
+}
+
+// membership returns the recMembership of member id: over a Share of the list, as a listed member
+// or one the list does not hold yet.
+func (h *obsHarness) membership(id string) *recMembership {
+	if h.listed[id] {
+		return h.g.Node(id)
+	}
+	return h.g.Absent(id)
 }
 
 // Start starts member id as Node does and fails t unless Start succeeds.
