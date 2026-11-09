@@ -40,6 +40,11 @@ type Node struct {
 	obs    observer
 	events *eventLog // the node's events; its delivery goroutine is not counted in wg
 
+	// tab is what Table shows, guarded by tableMu, which is held for nothing but reading or
+	// updating it (see tableState).
+	tableMu sync.Mutex
+	tab     tableState
+
 	// ctx is the internal context, context.WithCancel(context.WithoutCancel(Start's ctx)):
 	// every goroutine and every call after Start runs under it, and Close cancels it.
 	ctx    context.Context
@@ -126,6 +131,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		machineDone: make(chan struct{}),
 		shards:      newShardTable(cfg.Spaces),
 	}
+	n.tab = newTableState(cfg, holder, n.epoch)
 	n.obs = newLogObserver(n)
 	n.merge.post = n.postView
 	n.snap.Store(newRoutes(nil, nil, nil))
@@ -362,6 +368,9 @@ func (n *Node) Drain(ctx context.Context) error {
 func (n *Node) startDrainLocked() chan struct{} {
 	if n.drainDone == nil {
 		n.drainDone = make(chan struct{})
+		if n.cfg.Store == nil {
+			n.tableDrain() // with a store, the loop takes Draining from the machine
+		}
 		n.obs.draining()
 		n.wg.Go(n.drain)
 	}
@@ -662,6 +671,7 @@ func (n *Node) halt() string {
 			} else {
 				err = sh.stop(reasonExpired) // the error it has, or the deadline's
 			}
+			n.tableStopped(sh, err)
 			r.cancel(err)
 		}
 	}
@@ -715,11 +725,12 @@ func (n *Node) waitIdleSupervisors() {
 	}
 }
 
-// markClosed records that Close has stopped the node.
+// markClosed records that Close has stopped the node, also in its table.
 func (n *Node) markClosed() {
 	n.mu.Lock()
 	n.closed = true
 	n.mu.Unlock()
+	n.closeTable()
 }
 
 // Resolver returns a Resolver that ranks keys in namespace over the node's views, the same views
