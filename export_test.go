@@ -5,6 +5,7 @@ package tenure
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/hmdsefi/tenure/core"
@@ -60,3 +61,22 @@ func (n *Node) SessionDeadline() time.Duration { return time.Duration(n.deadline
 func (n *Node) PublishedShard(space string, id int) *Shard {
 	return n.shards[space].local[id].Load()
 }
+
+// NewNodeForTest returns an inert node that was never started: RecentEvents returns events as
+// they are given, the newest 256 of them, and Table shows a node of member "test" with no
+// spaces, view or session. No other method works on it.
+func NewNodeForTest(events ...Event) *Node {
+	cfg := Config{Self: Member{ID: "test"}}
+	n := &Node{cfg: cfg, epoch: time.Now(), events: newEventLog(cfg.Self.ID, nil, nil)}
+	n.tab = newTableState(cfg, n.holder, n.epoch)
+	l := n.events
+	l.seq = uint64(len(events))
+	for i, e := range events {
+		l.ring[i%ringSize] = e // recent reads event number i+1 at index i % ringSize
+	}
+	return n
+}
+
+// EventAttrsForTest is eventAttrs: the attributes of e's log record after its kind, in order, or
+// nil for a value that is not a kind.
+func EventAttrsForTest(e Event) []slog.Attr { return eventAttrs(e) }
