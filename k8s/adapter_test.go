@@ -141,9 +141,17 @@ func TestATK8S01ConfigErrors(t *testing.T) {
 			a.recordConcurrency != 2 || a.memberGC != 0 || a.watchLatency != 0 || a.logger != l {
 			t.Errorf("New with options = %+v", a)
 		}
-		if New(client, "default", strings.Repeat("g", 40), WithLogger(nil)).err != nil {
-			t.Error("New with a group of 40 and WithLogger(nil) failed")
+		b := New(client, "default", strings.Repeat("g", 40), WithLogger(nil), WithRecordConcurrency(1))
+		if b.err != nil {
+			t.Fatalf("New with a group of 40, WithLogger(nil) and WithRecordConcurrency(1): %v", b.err)
 		}
+		if b.recordConcurrency != 1 {
+			t.Errorf("record concurrency %d, want 1", b.recordConcurrency)
+		}
+		if b.logger == nil {
+			t.Fatal("WithLogger(nil) left no logger, want one that discards")
+		}
+		b.logger.Error("discarded")
 		if n := len(client.Actions()); n != 0 {
 			t.Errorf("%d requests, want none: %v", n, client.Actions())
 		}
@@ -160,6 +168,10 @@ func TestATK8S01ConfigErrors(t *testing.T) {
 		const want = "k8s: LeaseDuration 2.5s is not a whole number of seconds"
 		if err := a.CheckTiming(halfSecond); err == nil || err.Error() != want {
 			t.Errorf("CheckTiming with a 2.5s LeaseDuration = %v, want %s", err, want)
+		}
+		// Start validates the Timing; CheckTiming only adds the whole-second rule.
+		if err := a.CheckTiming(bad); err != nil {
+			t.Errorf("CheckTiming(%+v) = %v, want nil: it does not repeat Validate", bad, err)
 		}
 		if n := len(client.Actions()); n != 0 {
 			t.Errorf("%d requests, want none: %v", n, client.Actions())

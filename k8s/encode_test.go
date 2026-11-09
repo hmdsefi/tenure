@@ -107,6 +107,20 @@ func TestATK8S04Encoding(t *testing.T) {
 		}
 	})
 
+	t.Run("times with an offset decoded in UTC", func(t *testing.T) {
+		m, err := decodeMember("pod-0", `{"v":1,"id":"pod-0","joinAt":"2026-11-02T14:00:00+02:00","leaveAt":"2026-11-02T08:30:00.25-04:00"}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := core.Member{ID: "pod-0", Slot: -1, JoinAt: noon, LeaveAt: noon.Add(30*time.Minute + 250*time.Millisecond)}
+		if !sameMember(m, want) {
+			t.Errorf("decodeMember = %+v, want %+v", m, want)
+		}
+		if m.JoinAt.Location() != time.UTC || m.LeaveAt.Location() != time.UTC {
+			t.Errorf("decoded times %v, %v; want them in UTC", m.JoinAt, m.LeaveAt)
+		}
+	})
+
 	t.Run("invalid", func(t *testing.T) {
 		for _, tc := range []struct{ json, want string }{
 			{`{"v":2,"id":"pod-0"}`, "k8s: member record: version 2, want 1"},
