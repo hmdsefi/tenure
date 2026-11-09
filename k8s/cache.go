@@ -5,6 +5,7 @@ package k8s
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -31,9 +32,35 @@ import (
 // While a run is up, every Lease event is observed on the Adapter's clock (observation).
 // Deleting a member Lease leaves a tombstone keyed by its UID until the session it held has
 // been gone for that Lease's duration.
+//
+// Freshness (K8S-150). The cache is fresh while the Adapter has neither joined nor an active
+// session, or when the informer delivered one of the Adapter's own member Lease writes that
+// changed its resourceVersion and was sent within the last RenewDeadline (of the active
+// sessions' Timing, the largest when there are several, else of the Adapter's). The age counts
+// from the write's sending, not from its delivery: the watch delivers in resourceVersion order,
+// so the delivery shows the cache holds every change committed before the write, and no later
+// one. A watch that lags behind by more than RenewDeadline thus leaves the cache stale, even
+// while it still delivers. Own writes come every RetryPeriod (a renewal or a heartbeat), so a
+// cache whose watch has stopped delivering turns stale too. Only the informer's event handlers
+// count deliveries: reads and own writes are also fed through observe (noteRead), and must not
+// make a stopped watch look alive. While the cache is not
+// fresh, a holder that only the passing of time would turn gone stays live (frozen), for Slots,
+// ClaimSlot and the views. freshness reports the rule's answer and the next instant at which it
+// may change by itself; freshChanged signals every event that may change it otherwise.
 
 // resyncPeriod is the informer's resync period: none, as observations rest on changes only.
 const resyncPeriod = 0
+
+// maxPending is how many own writes of one member Lease the cache waits for at most: older ones
+// are dropped, as a delivery of a later one covers them.
+const maxPending = 8
+
+// pendingWrite is an own write of a member Lease that the informer has not delivered yet: its
+// resourceVersion, and when it was sent, on the Adapter's clock.
+type pendingWrite struct {
+	rv   uint64
+	sent time.Time
+}
 
 // observation is what this Adapter has observed of one Lease (K8S-110), on its own clock.
 type observation struct {
@@ -77,6 +104,15 @@ type leaseCache struct {
 	mu    sync.Mutex
 	obs   map[string]*observation // by Lease name
 	tombs map[types.UID]tombstone // of member Leases, by UID
+
+	// Freshness (K8S-150), from the informer's deliveries only.
+	// pending holds, by member Lease name, the own writes the informer has not delivered yet.
+	pending map[string][]pendingWrite
+	// delivered is the resourceVersion of the latest delivery of each member Lease, by name.
+	delivered map[string]uint64
+	// ownSentAt is when the latest own member Lease write that the informer delivered was sent;
+	// zero before the first.
+	ownSentAt time.Time
 	// gone holds, by Lease name, the UID of the last Lease of that name seen deleted.
 	gone map[string]types.UID
 }
@@ -130,15 +166,25 @@ func (a *Adapter) startCache() *leaseCache {
 		terms:       &a.terms,
 		obs:         map[string]*observation{},
 		tombs:       map[types.UID]tombstone{},
+		pending:     map[string][]pendingWrite{},
+		delivered:   map[string]uint64{},
 		gone:        map[string]types.UID{},
 	}
 	selector := labelGroup + "=" + a.group
 	informer := coordinationinformers.NewFilteredLeaseInformer(a.client, a.namespace, resyncPeriod, cache.Indexers{},
 		func(o *metav1.ListOptions) { o.LabelSelector = selector })
+	deliver := func(obj any) {
+		l := asLease(obj)
+		c.observe(l)
+		a.delivered(c, l)
+	}
 	reg, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj any) { c.observe(asLease(obj)) },
-		UpdateFunc: func(_, obj any) { c.observe(asLease(obj)) },
-		DeleteFunc: func(obj any) { c.forget(asLease(obj)) },
+		AddFunc:    deliver,
+		UpdateFunc: func(_, obj any) { deliver(obj) },
+		DeleteFunc: func(obj any) {
+			_, gap := obj.(cache.DeletedFinalStateUnknown)
+			c.forget(asLease(obj), gap)
+		},
 	})
 	if err != nil {
 		// AddEventHandler fails only on an informer that has stopped; this one has not started.
@@ -211,8 +257,9 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 	case !ok || o.lease.UID != l.UID:
 		if ok {
 			// The Lease was deleted and created again without a deletion event, as a relist
-			// after a gap in the watch shows it: the deleted one leaves its tombstone all the same.
-			c.bury(o.lease, o.tokenSeenAt, now)
+			// after a gap in the watch shows it: the deleted one leaves its tombstone all the
+			// same, stamped now, as renewals during the gap may have been missed.
+			c.bury(o.lease, now, now)
 			c.noteGone(l.Name, o.lease.UID)
 		}
 		c.obs[l.Name] = &observation{lease: l, rvSeenAt: now, tokenSeenAt: now, named: holderOf(l)}
@@ -230,8 +277,11 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 }
 
 // forget records the deletion of Lease l: its observation goes, its UID is noted as gone, and a
-// member Lease leaves a tombstone.
-func (c *leaseCache) forget(l *coordinationv1.Lease) {
+// member Lease leaves a tombstone. gap reports a deletion the informer found only by listing
+// again after a gap in its watch (a final state unknown): renewals of the session may have been
+// missed during the gap, so the tombstone counts the session as seen now, not when the cache last
+// saw its token change.
+func (c *leaseCache) forget(l *coordinationv1.Lease, gap bool) {
 	if l == nil {
 		return
 	}
@@ -241,7 +291,9 @@ func (c *leaseCache) forget(l *coordinationv1.Lease) {
 	c.prune(now)
 	tokenSeenAt := now
 	if o, ok := c.obs[l.Name]; ok && o.lease.UID == l.UID {
-		tokenSeenAt = o.tokenSeenAt
+		if !gap {
+			tokenSeenAt = o.tokenSeenAt
+		}
 		delete(c.obs, l.Name)
 	}
 	c.noteGone(l.Name, l.UID)
@@ -352,6 +404,201 @@ func (a *Adapter) tombstoneOf(uid types.UID) (t tombstone, ok bool) {
 	c.prune(now)
 	t, ok = c.tombs[uid]
 	return t, ok
+}
+
+// snapshot returns the observations of the running cache, by Lease name, and its tombstones
+// that have not expired, by UID, as of one moment. ok is false when the informer is not running.
+func (a *Adapter) snapshot() (obs map[string]observation, tombs map[types.UID]tombstone, ok bool) {
+	c := a.runningCache()
+	if c == nil {
+		return nil, nil, false
+	}
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.prune(now)
+	obs = make(map[string]observation, len(c.obs))
+	for name, o := range c.obs {
+		obs[name] = *o
+	}
+	return obs, maps.Clone(c.tombs), true
+}
+
+// noteOwnWrite notes written, the state of a Lease that this Adapter wrote on cur, nil for a
+// creation, in a request sent at sent, for freshness (K8S-150): a member Lease write that changed
+// the resourceVersion is waited for in the informer's deliveries.
+func (a *Adapter) noteOwnWrite(cur, written *coordinationv1.Lease, sent time.Time) {
+	if written == nil || !isMemberLease(written, a.group) || cur != nil && cur.ResourceVersion == written.ResourceVersion {
+		return
+	}
+	if c := a.runningCache(); c != nil {
+		if prev, ok := c.ownWrite(written, sent); ok {
+			a.ownWriteSeen(c, prev)
+		}
+	}
+}
+
+// ownWrite waits for own write l of a member Lease, sent at sent, in the informer's deliveries.
+// When a state at or past it was delivered already, as the watch can deliver a write before the
+// write's response comes back, the write counts at once: ok reports that, with prev, the send
+// time of the latest own write delivered before (zero for none).
+func (c *leaseCache) ownWrite(l *coordinationv1.Lease, sent time.Time) (prev time.Time, ok bool) {
+	v, ok := parseUint(l.ResourceVersion)
+	if !ok {
+		return time.Time{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if d, ok := c.delivered[l.Name]; ok && d >= v {
+		return c.countOwnLocked(sent)
+	}
+	p := c.pending[l.Name]
+	p = append(p, pendingWrite{rv: v, sent: sent})
+	if len(p) > maxPending {
+		p = p[len(p)-maxPending:]
+	}
+	c.pending[l.Name] = p
+	return time.Time{}, false
+}
+
+// deliver records that the informer delivered state l of a Lease. It reports whether that
+// delivered an own member Lease write the cache was waiting for, and prev, the send time of the
+// latest own write delivered before (zero for none).
+func (c *leaseCache) deliver(l *coordinationv1.Lease) (prev time.Time, own bool) {
+	if l == nil || l.Labels[labelKind] != kindMember {
+		return time.Time{}, false
+	}
+	v, ok := parseUint(l.ResourceVersion)
+	if !ok {
+		return time.Time{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if d, ok := c.delivered[l.Name]; !ok || v > d {
+		c.delivered[l.Name] = v
+	}
+	var sent time.Time
+	p := slices.DeleteFunc(c.pending[l.Name], func(w pendingWrite) bool {
+		if w.rv > v {
+			return false
+		}
+		if w.sent.After(sent) {
+			sent = w.sent
+		}
+		return true
+	})
+	if sent.IsZero() {
+		return time.Time{}, false
+	}
+	if len(p) == 0 {
+		delete(c.pending, l.Name)
+	} else {
+		c.pending[l.Name] = p
+	}
+	return c.countOwnLocked(sent)
+}
+
+// countOwnLocked counts a delivered own write sent at sent, and returns prev, the send time of
+// the latest own write delivered before (zero for none), and true. The caller holds c.mu.
+func (c *leaseCache) countOwnLocked(sent time.Time) (prev time.Time, ok bool) {
+	prev = c.ownSentAt
+	if sent.After(c.ownSentAt) {
+		c.ownSentAt = sent
+	}
+	return prev, true
+}
+
+// delivered is the informer's handler of state l of a Lease, delivered to run c, for freshness.
+func (a *Adapter) delivered(c *leaseCache, l *coordinationv1.Lease) {
+	if prev, own := c.deliver(l); own {
+		a.ownWriteSeen(c, prev)
+	}
+}
+
+// ownWriteSeen signals (freshChanged) an own write that run c counted as delivered, when the
+// latest one before, sent at prev, zero for none, left the cache stale: the new one may make it
+// fresh.
+func (a *Adapter) ownWriteSeen(c *leaseCache, prev time.Time) {
+	now := c.now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, deadline, _ := a.freshRuleLocked(now); prev.IsZero() || !now.Before(prev.Add(deadline)) {
+		a.signalFreshLocked()
+	}
+}
+
+// freshness reports whether the cache is fresh now (K8S-150), and next, the earliest instant at
+// which the answer may change without an event that freshChanged signals: when RenewDeadline has
+// passed since the latest own write delivered was sent, or when an active session expires. next is
+// zero when only an event can change the answer.
+func (a *Adapter) freshness() (fresh bool, next time.Time) {
+	now := a.now()
+	a.mu.Lock()
+	active, deadline, next := a.freshRuleLocked(now)
+	c := a.cache
+	a.mu.Unlock()
+	if !active {
+		return true, time.Time{}
+	}
+	if c == nil {
+		return false, next
+	}
+	c.mu.Lock()
+	seen := c.ownSentAt
+	c.mu.Unlock()
+	if seen.IsZero() || !now.Before(seen.Add(deadline)) {
+		return false, next
+	}
+	return true, earliest(next, seen.Add(deadline))
+}
+
+// freshRuleLocked returns the inputs of the freshness rule at now: whether the Adapter has
+// joined or has an active session, which then needs own writes delivered to be fresh; the
+// RenewDeadline that bounds their age, the largest of the active sessions' Timings, else the
+// Adapter's; and the earliest expiry of an active session, zero for none. The caller holds a.mu.
+func (a *Adapter) freshRuleLocked(now time.Time) (active bool, deadline time.Duration, expiry time.Time) {
+	active = a.member.joined
+	for _, s := range a.sessions {
+		if s.ended || s.expired(now) {
+			continue
+		}
+		active = true
+		deadline = max(deadline, s.timing.RenewDeadline)
+		expiry = earliest(expiry, s.sent.Add(s.timing.LeaseDuration))
+	}
+	if deadline == 0 {
+		deadline = a.timing.RenewDeadline
+	}
+	return active, deadline, expiry
+}
+
+// earliest returns the earlier of a and b, a zero time standing for none.
+func earliest(a, b time.Time) time.Time {
+	if a.IsZero() || !b.IsZero() && b.Before(a) {
+		return b
+	}
+	return a
+}
+
+// freshChanged returns a channel that is closed at the next event that may change freshness: a
+// session opening or ending, a session's Timing changing, Join, Leave, or a delivered own write
+// that makes a stale cache fresh. Changes by the passing of time alone come at freshness's next
+// instant instead. Take the channel before reading freshness, so no change falls between.
+func (a *Adapter) freshChanged() <-chan struct{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.freshCh == nil {
+		a.freshCh = make(chan struct{})
+	}
+	return a.freshCh
+}
+
+// signalFreshLocked closes the channel of freshChanged. The caller holds a.mu.
+func (a *Adapter) signalFreshLocked() {
+	if a.freshCh != nil {
+		close(a.freshCh)
+		a.freshCh = nil
+	}
 }
 
 // runningCache returns the running informer's cache, or nil.

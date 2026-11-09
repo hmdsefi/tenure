@@ -48,15 +48,6 @@
 // While the Adapter has an active session, it watches the group's Leases with one informer,
 // which stops once nothing needs it any more. CloseSession ends a session for good.
 //
-// # Membership
-//
-// A member that joined has its member record, a small JSON document, in the annotation
-// tenure.member of its member Lease. Join writes it, creating the Lease with no holder when there
-// is none, so a member needs no session: while no session holds the Lease, the Adapter moves its
-// renewTime on every RetryPeriod of the Adapter's Timing. SetDraining rewrites the record. A
-// session closed while the member has joined only clears the Lease's holder. Leave deletes the
-// Lease, or removes only the record while a session holds it.
-//
 // # Shard records
 //
 // Acquire grants a shard, with a new term, to a holder with an active session in the Adapter
@@ -70,6 +61,26 @@
 // keeping the term. Confirm writes a counter into the holder's own record, so that a takeover
 // decided on an earlier state of the record fails; CloseSession releases every record of the
 // holder. Holdings lists a space's records as stored, with one request.
+//
+// # Slots
+//
+// SetSlots sets the group's slot count, 0 to 10000. ClaimSlot returns the holder's own slot
+// below the count, or claims the lowest free one: a slot whose Lease is absent, names no holder,
+// or names a holder whose session is gone, judged as for shards. ReleaseSlot clears a slot's
+// holder only when the slot names the caller, and CloseSession releases every slot of the
+// holder. Slots returns the count and each slot's live holder. While the Adapter has joined or
+// holds a session but its watch has not delivered one of its own member Lease writes sent within
+// the last RenewDeadline, it takes its view of the group to be stale: the passing of time alone
+// then turns no slot's holder gone.
+//
+// # Membership
+//
+// A member that joined has its member record, a small JSON document, in the annotation
+// tenure.member of its member Lease. Join writes it, creating the Lease with no holder when there
+// is none, so a member needs no session: while no session holds the Lease, the Adapter moves its
+// renewTime on every RetryPeriod of the Adapter's Timing. SetDraining rewrites the record. A
+// session closed while the member has joined only clears the Lease's holder. Leave deletes the
+// Lease, or removes only the record while a session holds it.
 //
 // # Configuration
 //

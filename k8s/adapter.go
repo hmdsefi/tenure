@@ -69,6 +69,9 @@ type Adapter struct {
 	sessions map[string]*session
 	// leaseLocks serializes the writes of each member Lease, by Lease name (session.go).
 	leaseLocks map[string]chan struct{}
+	// freshCh is closed at the next event that may change freshness, nil until asked for
+	// (cache.go).
+	freshCh chan struct{}
 }
 
 // Option configures an Adapter. Pass options to New.

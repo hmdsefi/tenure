@@ -485,16 +485,16 @@ func TestK8S110Observation(t *testing.T) {
 	gone := l.UID
 
 	// Created again without a deletion event, as a relist after a gap in the watch shows it:
-	// the replaced member Lease leaves its tombstone all the same.
+	// the replaced member Lease leaves its tombstone all the same, stamped when the gap shows,
+	// as renewals during the gap may have been missed.
 	relisted := &coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{Name: memberName("g", "pod-2"), UID: "uid-1", ResourceVersion: "1", Labels: leaseLabels("g", kindMember, "")},
 		Spec:       coordinationv1.LeaseSpec{LeaseDurationSeconds: &seconds},
 	}
-	t8 := clk.now()
 	c.observe(relisted)
 	relisted = relisted.DeepCopy()
 	relisted.UID, relisted.ResourceVersion = "uid-2", "2"
-	clk.advance(time.Second)
+	t8 := clk.advance(time.Second)
 	c.observe(relisted)
 	want = tombstone{tokenSeenAt: t8, wait: 10 * time.Second}
 	if got, ok := a.tombstoneOf("uid-1"); !ok || got != want {
@@ -502,6 +502,25 @@ func TestK8S110Observation(t *testing.T) {
 	}
 	if o, ok := a.cached(relisted.Name); !ok || o.lease.UID != "uid-2" || !o.tokenSeenAt.Equal(clk.now()) {
 		t.Errorf("observation of the new Lease %+v, %v; want uid-2 seen now", o, ok)
+	}
+
+	// A deletion the informer finds only by listing again (a final state unknown) is stamped
+	// when it is found too; a deletion it watched keeps the token's first sighting.
+	t9 := clk.advance(time.Second)
+	c.forget(relisted, true)
+	want = tombstone{tokenSeenAt: t9, wait: 10 * time.Second}
+	if got, ok := a.tombstoneOf("uid-2"); !ok || got != want {
+		t.Errorf("tombstone of a deletion found after a gap = %+v, %v; want %+v", got, ok, want)
+	}
+	watched := relisted.DeepCopy()
+	watched.UID, watched.ResourceVersion = "uid-3", "3"
+	c.observe(watched)
+	t10 := clk.now()
+	clk.advance(time.Second)
+	c.forget(watched, false)
+	want = tombstone{tokenSeenAt: t10, wait: 10 * time.Second}
+	if got, ok := a.tombstoneOf("uid-3"); !ok || got != want {
+		t.Errorf("tombstone of a watched deletion = %+v, %v; want %+v", got, ok, want)
 	}
 
 	// Stopping the informer discards observations and tombstones; a new run observes anew.
@@ -539,7 +558,7 @@ func TestK8S110NotedAfterDeletion(t *testing.T) {
 		return &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid, ResourceVersion: rv, Labels: leaseLabels("g", kindMember, "")}}
 	}
 	c.observe(lease("u1", "10"))
-	c.forget(lease("u1", "12"))
+	c.forget(lease("u1", "12"), false)
 	c.observe(lease("u1", "11"))
 	if o, ok := c.obs[name]; ok {
 		t.Fatalf("a deleted Lease noted again: %+v", o.lease)
