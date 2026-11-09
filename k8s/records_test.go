@@ -311,8 +311,10 @@ func TestK8S110NotedReads(t *testing.T) {
 	if o.lease.UID != u2 || o.lease.ResourceVersion != "12" || !o.rvSeenAt.Equal(t0.Add(time.Second)) {
 		t.Errorf("observation %s at %s seen at %v, want %s at 12 seen at %v", o.lease.UID, o.lease.ResourceVersion, o.rvSeenAt, u2, t0.Add(time.Second))
 	}
-	if tb, ok := c.tombs[u1]; !ok || !tb.tokenSeenAt.Equal(t0) {
-		t.Errorf("tombstone of the replaced member Lease %+v, %v; want one from %v", tb, ok, t0)
+	// Replaced without a deletion event: renewals in between may have been missed, so the
+	// tombstone is stamped when the replacement shows.
+	if tb, ok := c.tombs[u1]; !ok || !tb.tokenSeenAt.Equal(t0.Add(time.Second)) {
+		t.Errorf("tombstone of the replaced member Lease %+v, %v; want one from %v", tb, ok, t0.Add(time.Second))
 	}
 
 	c.observe(lease("g-markets-0", kindShard, u1, "20"))

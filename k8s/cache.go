@@ -175,7 +175,10 @@ func (a *Adapter) startCache() *leaseCache {
 	reg, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    deliver,
 		UpdateFunc: func(_, obj any) { deliver(obj) },
-		DeleteFunc: func(obj any) { c.forget(asLease(obj)) },
+		DeleteFunc: func(obj any) {
+			_, gap := obj.(cache.DeletedFinalStateUnknown)
+			c.forget(asLease(obj), gap)
+		},
 	})
 	if err != nil {
 		// AddEventHandler fails only on an informer that has stopped; this one has not started.
@@ -245,8 +248,9 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 	case !ok || o.lease.UID != l.UID:
 		if ok {
 			// The Lease was deleted and created again without a deletion event, as a relist
-			// after a gap in the watch shows it: the deleted one leaves its tombstone all the same.
-			c.bury(o.lease, o.tokenSeenAt, now)
+			// after a gap in the watch shows it: the deleted one leaves its tombstone all the
+			// same, stamped now, as renewals during the gap may have been missed.
+			c.bury(o.lease, now, now)
 		}
 		c.obs[l.Name] = &observation{lease: l, rvSeenAt: now, tokenSeenAt: now, named: holderOf(l)}
 	case l.ResourceVersion == o.lease.ResourceVersion || isOlder(l.ResourceVersion, o.lease.ResourceVersion):
@@ -263,8 +267,11 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 }
 
 // forget records the deletion of Lease l: its observation goes, and a member Lease leaves a
-// tombstone.
-func (c *leaseCache) forget(l *coordinationv1.Lease) {
+// tombstone. gap reports a deletion the informer found only by listing again after a gap in its
+// watch (a final state unknown): renewals of the session may have been missed during the gap,
+// so the tombstone counts the session as seen now, not when the cache last saw its token
+// change.
+func (c *leaseCache) forget(l *coordinationv1.Lease, gap bool) {
 	if l == nil {
 		return
 	}
@@ -274,7 +281,9 @@ func (c *leaseCache) forget(l *coordinationv1.Lease) {
 	c.prune(now)
 	tokenSeenAt := now
 	if o, ok := c.obs[l.Name]; ok && o.lease.UID == l.UID {
-		tokenSeenAt = o.tokenSeenAt
+		if !gap {
+			tokenSeenAt = o.tokenSeenAt
+		}
 		delete(c.obs, l.Name)
 	}
 	c.bury(l, tokenSeenAt, now)

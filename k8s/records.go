@@ -159,6 +159,11 @@ func (a *Adapter) decideAcquire(ctx context.Context, s session, space, name stri
 			return change{}, 0, err
 		}
 		if h := holderOf(cur); h != "" && h != s.holder {
+			// No freeze while the cache is stale (K8S-150 names slots and views): a takeover
+			// rests on the member Lease read from the API server (K8S-130), whose changed token
+			// makes the holder live again, and the write's compare-and-swap on the record state
+			// decided on, so a cache that missed changes cannot make it take a live holder's
+			// shard.
 			live, err := a.holderLive(ctx, "acquire", cur, true)
 			if err != nil {
 				return change{}, 0, err
