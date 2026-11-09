@@ -74,6 +74,20 @@ func fakeGet(t testing.TB, client *fake.Clientset, name string) *coordinationv1.
 	return l
 }
 
+// waitWatching waits up to 2 s for the informer of a fake client to watch the Leases. The fake
+// client's watch starts with no resourceVersion: a change made before it starts never reaches
+// the informer, whose list came first.
+func waitWatching(t testing.TB, client *fake.Clientset) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(actions(client, "watch")) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no watch of the Leases in 2s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // withoutAnnotation returns the annotations of l without key.
 func withoutAnnotation(l *coordinationv1.Lease, key string) map[string]string {
 	a := maps.Clone(l.Annotations)
@@ -338,6 +352,7 @@ func TestK8S600Join(t *testing.T) {
 		m := member("pod-0")
 		mustJoin(t, a, m)
 		joined.Store(true)
+		waitWatching(t, client)
 		if err := client.CoordinationV1().Leases("default").Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
 			t.Fatalf("delete: %v", err)
 		}
@@ -357,6 +372,7 @@ func TestK8S600Join(t *testing.T) {
 		a := fakeAdapter(t, client)
 		mustJoin(t, a, member("pod-0"))
 		mustKeepAlive(t, a, "pod-0/1")
+		waitWatching(t, client)
 		l := fakeGet(t, client, name)
 		delete(l.Annotations, annotationMember)
 		l, err := client.CoordinationV1().Leases("default").Update(ctx, l, metav1.UpdateOptions{})
