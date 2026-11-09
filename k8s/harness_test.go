@@ -187,7 +187,8 @@ func (c *cluster) newClient(t testing.TB, config *rest.Config) (kubernetes.Inter
 
 // adapter returns an Adapter of group g in the test's namespace with timing T and then opts,
 // on a new recorded client, and that client's recorder. It fails the test when New reports a
-// configuration error.
+// configuration error, and, when the test ends, unless the Adapter's informer has stopped
+// within 1 s: a test ends every session it opens.
 func (c *cluster) adapter(t testing.TB, g string, opts ...Option) (*Adapter, *recorder) {
 	t.Helper()
 	cl, rec := c.client(t)
@@ -195,6 +196,7 @@ func (c *cluster) adapter(t testing.TB, g string, opts ...Option) (*Adapter, *re
 	if a.err != nil {
 		t.Fatalf("New: %v", a.err)
 	}
+	t.Cleanup(func() { waitStopped(t, a) })
 	return a, rec
 }
 
