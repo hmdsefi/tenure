@@ -86,8 +86,9 @@ func lifecycle(shard int, term core.Term, reason string, took time.Duration) []t
 // and closes: Seq 1…N without gaps; session.opened, view.changed{Version: 1, Count: 1}, then
 // shard.acquiring for s/0 and s/1; per shard exactly acquiring, acquired, stopping{draining},
 // releasing, released{draining}, handoff_completed{draining}; node.draining before both stops,
-// session.closed after both releases, then node.drained, and node.closed{drained} last; and no
-// other kinds but further view.changed.
+// session.closed after both releases, then node.drained, and node.closed{drained} last; no
+// other kinds; and one more view.changed, of Close's SetDraining{Version: 2, Count: 1}, after
+// node.draining and before node.drained, but none of the view Leave publishes (RUN-200).
 func TestATOBS02SingleNodeLifecycle(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
@@ -164,6 +165,15 @@ func TestATOBS02SingleNodeLifecycle(t *testing.T) {
 		last := tenure.Event{Kind: tenure.EventNodeClosed, Shard: -1, Slot: -1, Reason: "drained"}
 		if bare(events[len(events)-1]) != last {
 			t.Errorf("last event %+v, want %+v", events[len(events)-1], last)
+		}
+		views := []tenure.Event{
+			{Kind: tenure.EventViewChanged, Shard: -1, Slot: -1, Version: 1, Count: 1},
+			{Kind: tenure.EventViewChanged, Shard: -1, Slot: -1, Version: 2, Count: 1},
+		}
+		if got := ofKinds(events, tenure.EventViewChanged); !reflect.DeepEqual(bareAll(got), views) {
+			t.Errorf("view.changed events %+v, want %+v", got, views)
+		} else if v := slices.Index(events, got[1]); v < draining || v > drained {
+			t.Errorf("SetDraining's view.changed at %d, want it between node.draining at %d and node.drained at %d", v, draining, drained)
 		}
 		check()
 	})

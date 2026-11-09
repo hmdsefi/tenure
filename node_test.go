@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"testing"
@@ -436,6 +437,78 @@ func TestATRUN20WatchRetry(t *testing.T) {
 		}
 		check()
 	})
+}
+
+// TestATRUN20WatchEndsAtLeave checks that the watcher ends once Leave has been called (RUN-200):
+// Close's Leave takes a second, in which another member joins, and neither that view nor the one
+// Leave publishes without n1 reaches the loop or the published view: every view.changed has n1
+// and n2 only, and so has the published view after Close. Without a store the watcher publishes
+// each view itself, and the drain completes once SetDraining returns, so whether the watcher reads
+// the view of Close's SetDraining before Leave depends on scheduling. With a store the loop steps
+// each view, and the drain completes only once the loop has stepped that view: the published
+// view has n1 draining.
+func TestATRUN20WatchEndsAtLeave(t *testing.T) {
+	for _, withStore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("store=%t", withStore), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				check := baseline(t)
+				g := newGroup(t, tenure.Member{ID: "n2", Addr: "a2"})
+				m := g.Absent("n1")
+				events := &eventRec{}
+				cfg := tenure.Config{
+					Self:       tenure.Member{ID: "n1", Addr: addrOf("n1")},
+					Membership: m,
+					Rand:       countingRand(),
+					OnEvent:    events.OnEvent,
+				}
+				if withStore {
+					cfg = nodeConfig("n1", m, newRecStore(memstore.New(nil)), orders((&runLog{}).Run))
+					cfg.OnEvent = events.OnEvent
+				}
+				n := start(t, context.Background(), cfg)
+				synctest.Wait()
+
+				m.Delay("Leave", time.Second)
+				closed := make(chan error, 1)
+				go func() { closed <- n.Close(context.Background()) }()
+				synctest.Wait() // Close sleeps in Leave
+				if leaves := m.Calls("Leave"); len(leaves) != 1 {
+					t.Fatalf("Leave calls = %v, want one in flight", leaves)
+				}
+				g.Join(tenure.Member{ID: "n3", Addr: "a3"})
+				synctest.Wait()
+				if err := <-closed; err != nil {
+					t.Fatalf("Close() = %v, want nil", err)
+				}
+
+				views := ofKinds(events.Events(), tenure.EventViewChanged)
+				if len(views) == 0 {
+					t.Fatalf("no view.changed events")
+				}
+				for _, e := range views {
+					if e.Count != 2 {
+						t.Errorf("view.changed %+v, want Count 2: no view read after Leave", e)
+					}
+				}
+				v := published(t, n)
+				if got, want := memberIDs(v), []string{"n1", "n2"}; !slices.Equal(got, want) {
+					t.Errorf("published view after Close has %v, want %v", got, want)
+				}
+				if withStore {
+					if i := slices.IndexFunc(v.Members, func(m core.Member) bool { return m.ID == "n1" }); i < 0 || !v.Members[i].Draining {
+						t.Errorf("published view after Close = %+v, want n1 draining", v)
+					}
+				}
+				if watches := m.Calls("Watch"); len(watches) != 1 {
+					t.Errorf("Watch calls = %v, want Start's only", watches)
+				}
+				if got := ofKinds(events.Events(), tenure.EventMembershipFailed); len(got) != 0 {
+					t.Errorf("membership.failed events %+v, want none", got)
+				}
+				check()
+			})
+		})
+	}
 }
 
 // TestWatcherStopsAtLeave checks that no Watch follows Close's Leave while the watcher waits to

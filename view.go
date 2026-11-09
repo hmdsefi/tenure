@@ -57,8 +57,9 @@ func holderID(holder string) string {
 // watchViews is the watcher goroutine (RUN-200). It follows ch, the channel of Start's Watch, and
 // after a closed channel or a failed Watch calls Watch again RetryPeriod later. It ends when Watch
 // returns ErrClosed, when the internal context is done, and once leave has been called: the
-// channel Leave closes is not reported and no Watch follows it. Each view it reads is merged and
-// offered; ended is closed when it returns.
+// channel Leave closes is not reported, no Watch follows it, and no view read after leave was
+// called is offered. Each view it reads before that is merged and offered; ended is closed when
+// it returns.
 func (n *Node) watchViews(ch <-chan core.View) {
 	defer close(n.ended)
 	for {
@@ -81,11 +82,16 @@ func (n *Node) watchViews(ch <-chan core.View) {
 }
 
 // follow offers each view of ch until ch is closed, and reports whether the watcher should call
-// Watch again: false when the internal context is done or leave has been called.
+// Watch again: false when the internal context is done or leave has been called. A view read once
+// leave has been called is dropped and ends the watcher (RUN-200), so that the view Leave
+// publishes, without the member, never reaches the loop or the published view.
 func (n *Node) follow(ch <-chan core.View) bool {
 	for {
 		select {
 		case v, ok := <-ch:
+			if ok && n.leaving() {
+				return false
+			}
 			if ok {
 				n.offer(v)
 				continue
