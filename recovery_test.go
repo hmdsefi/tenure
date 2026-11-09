@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -129,13 +131,22 @@ func wantLossAt(t *testing.T, calls []call, at time.Time) {
 // when a drain started at T0+10s is in progress at a loss at T0+12s, with the first Run of
 // orders/3 returning at T0+40s, Drain returns nil at T0+40s, no CloseSession goes out, and no new
 // incarnation starts.
+//
+// The OnEvent sequence: (e) session.lost{ErrSessionLost} at T0+10s; shard.lost for every shard in
+// H1's term, then shard.released{Reason: "lost"} once its Run has returned, orders/3's last at
+// T0+13s; then session.restarted{Holder: H1}, H2's session.opened and shard.acquired of every
+// shard in H2's terms, all at T0+13s. The log records name H1 before session.restarted and H2
+// from it on. With the drain, session.lost comes at T0+12s and no session.restarted, second
+// session.opened or session.closed follows; orders/3, stopped for draining before the loss, has
+// no shard.lost and is released{draining} with its handoff at T0+40s.
 func TestATRUN19SessionLostRecovery(t *testing.T) {
 	t.Run("recovery", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			check := baseline(t)
 			r := newShardRig(t)
-			cfg := r.config()
+			cfg, evs, lc := r.config(), &eventRec{}, &logCapture{}
 			cfg.Rand = recoveryRand()
+			cfg.OnEvent, cfg.Logger = evs.OnEvent, lc.Logger()
 			r.runs.Script(lateRun(3, 3*time.Second))
 			t0 := time.Now()
 			n := start(t, context.Background(), cfg)
@@ -209,6 +220,9 @@ func TestATRUN19SessionLostRecovery(t *testing.T) {
 				t.Errorf("Join calls %v, Leave calls %v; want one Join and no Leave", j, l)
 			}
 
+			// (e)
+			wantLossEvents(t, evs.Events(), lc.Lines(), r.runs, t0)
+
 			closeNode(t, n)
 			if l := r.sm.Calls("Leave"); len(l) != 1 {
 				t.Errorf("Leave calls %v after Close, want one", l)
@@ -226,8 +240,8 @@ func TestATRUN19SessionLostRecovery(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			check := baseline(t)
 			r := newShardRig(t)
-			cfg := r.config()
-			cfg.Rand = recoveryRand()
+			cfg, evs := r.config(), &eventRec{}
+			cfg.Rand, cfg.OnEvent = recoveryRand(), evs.OnEvent
 			r.runs.Script(lateRun(3, 30*time.Second))
 			t0 := time.Now()
 			n := start(t, context.Background(), cfg)
@@ -262,6 +276,8 @@ func TestATRUN19SessionLostRecovery(t *testing.T) {
 			if slices.Sort(released); !slices.Equal(released, []int{0, 1, 2, 4, 5, 6, 7}) {
 				t.Errorf("released %v, want every shard but orders/3", released)
 			}
+			synctest.Wait()
+			wantDrainLossEvents(t, evs.Events(), r.runs.Of("orders", 3)[0].Shard, t0)
 
 			closeNode(t, n)
 			calls = r.fs.Calls()
@@ -282,6 +298,127 @@ func TestATRUN19SessionLostRecovery(t *testing.T) {
 			check()
 		})
 	})
+}
+
+// ordersEv returns the event of kind about orders/id in term with reason.
+func ordersEv(kind tenure.EventKind, id int, term core.Term, reason string) tenure.Event {
+	return tenure.Event{Kind: kind, Space: "orders", Shard: id, Term: term, Slot: -1, Reason: reason}
+}
+
+// ofOrders returns the events among events of the listed kinds about orders/id, in order.
+func ofOrders(events []tenure.Event, id int, kinds ...tenure.EventKind) []tenure.Event {
+	var out []tenure.Event
+	for _, e := range ofKinds(events, kinds...) {
+		if e.Space == "orders" && e.Shard == id {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// wantLossEvents checks (e) of TestATRUN19SessionLostRecovery's recovery case on the events and
+// log lines of n1, whose runs are in runs.
+func wantLossEvents(t *testing.T, events []tenure.Event, lines []string, runs *runLog, t0 time.Time) {
+	t.Helper()
+	wantErrEvents(t, events, tenure.EventSessionLost, tenure.ErrSessionLost, t0, secs(10))
+	r := indexOf(events, tenure.EventSessionRestarted, -1)
+	if r < 0 {
+		t.Fatalf("no session.restarted among %v", kindsOf(events))
+	}
+	restarted := sessEv(tenure.EventSessionRestarted)
+	restarted.Holder = holder01
+	if got := bare(events[r]); got != restarted || events[r].Time != t0.Add(13*time.Second).UTC() {
+		t.Errorf("session.restarted %+v at T0+%v, want %+v at T0+13s", got, events[r].Time.Sub(t0), restarted)
+	}
+	opened := ofKinds(events, tenure.EventSessionOpened)
+	if o := lastIndexOf(events, tenure.EventSessionOpened); len(opened) != 2 || o < r ||
+		opened[1].Time != t0.Add(13*time.Second).UTC() {
+		t.Errorf("session.opened events %+v, want a second one at T0+13s after session.restarted", opened)
+	}
+	lost := indexOf(events, tenure.EventSessionLost, -1)
+	for _, id := range allShards {
+		calls := runs.Of("orders", id)
+		if len(calls) != 2 {
+			continue // (b) reports it
+		}
+		h1, h2 := calls[0].Shard.Term, calls[1].Shard.Term
+		returned := 10 * time.Second
+		if id == 3 {
+			returned = 13 * time.Second
+		}
+		got := ofOrders(events, id, tenure.EventShardAcquired, tenure.EventShardLost, tenure.EventShardReleased,
+			tenure.EventShardHandoffCompleted, tenure.EventShardStopping, tenure.EventShardExpired)
+		want := []tenure.Event{
+			ordersEv(tenure.EventShardAcquired, id, h1, ""),
+			ordersEv(tenure.EventShardLost, id, h1, ""),
+			ordersEv(tenure.EventShardReleased, id, h1, "lost"),
+			ordersEv(tenure.EventShardAcquired, id, h2, ""),
+		}
+		if !reflect.DeepEqual(bareAll(got), want) {
+			t.Errorf("orders/%d events =\n%+v\nwant\n%+v", id, bareAll(got), want)
+			continue
+		}
+		if at := []time.Duration{0, 10 * time.Second, returned, 13 * time.Second}; !slices.Equal(timesOf(got, t0), at) {
+			t.Errorf("orders/%d events at %v, want %v", id, timesOf(got, t0), at)
+		}
+		if i := indexOf(events, tenure.EventShardLost, id); i < lost {
+			t.Errorf("orders/%d: shard.lost at %d, session.lost at %d: want the session first", id, i, lost)
+		}
+		if i := indexOf(events, tenure.EventShardReleased, id); i > r {
+			t.Errorf("orders/%d: shard.released at %d, session.restarted at %d: want the release first", id, i, r)
+		}
+		if i := slices.IndexFunc(events, func(e tenure.Event) bool {
+			return e.Kind == tenure.EventShardAcquired && e.Space == "orders" && e.Shard == id && e.Term == h2
+		}); i < r {
+			t.Errorf("orders/%d: shard.acquired of H2 at %d, session.restarted at %d: want the restart first", id, i, r)
+		}
+	}
+	if len(lines) != len(events) {
+		t.Fatalf("%d log records for %d events, want as many", len(lines), len(events))
+	}
+	for i, l := range lines {
+		holder := holder01
+		if i >= r {
+			holder = holder02
+		}
+		if !strings.Contains(l, `"holder":"`+holder+`"`) {
+			t.Errorf("record %d %s: want holder %s", i+1, l, holder)
+		}
+	}
+	want := `{"level":"INFO","msg":"tenure: session restarted","member":"n1","holder":"` + holder02 +
+		`","previous":"` + holder01 + `"}`
+	if lines[r] != want {
+		t.Errorf("session.restarted record %s, want %s", lines[r], want)
+	}
+}
+
+// wantDrainLossEvents checks the events of TestATRUN19SessionLostRecovery's drain case, where sh
+// is the Shard of the first Run of orders/3.
+func wantDrainLossEvents(t *testing.T, events []tenure.Event, sh *tenure.Shard, t0 time.Time) {
+	t.Helper()
+	wantErrEvents(t, events, tenure.EventSessionLost, tenure.ErrSessionLost, t0, secs(12))
+	for _, k := range []tenure.EventKind{tenure.EventSessionRestarted, tenure.EventSessionClosed, tenure.EventShardLost} {
+		if n := count(events, k); n != 0 {
+			t.Errorf("%d %v events, want none", n, k)
+		}
+	}
+	if n := count(events, tenure.EventSessionOpened); n != 1 {
+		t.Errorf("%d session.opened events, want 1", n)
+	}
+	handoff := ordersEv(tenure.EventShardHandoffCompleted, 3, sh.Term, "draining")
+	handoff.Duration = 30 * time.Second
+	want := []tenure.Event{
+		ordersEv(tenure.EventShardStopping, 3, sh.Term, "draining"),
+		ordersEv(tenure.EventShardReleased, 3, sh.Term, "draining"),
+		handoff,
+	}
+	got := ofOrders(events, 3, tenure.EventShardStopping, tenure.EventShardLost, tenure.EventShardReleasing,
+		tenure.EventShardReleased, tenure.EventShardHandoffCompleted)
+	if !reflect.DeepEqual(bareAll(got), want) {
+		t.Errorf("orders/3 events =\n%+v\nwant\n%+v", bareAll(got), want)
+	} else if at := secs(10, 40, 40); !slices.Equal(timesOf(got, t0), at) {
+		t.Errorf("orders/3 events at %v, want %v", timesOf(got, t0), at)
+	}
 }
 
 // TestATRUN40RunAcrossIncarnations checks RUN-300 across incarnations: the first Run of

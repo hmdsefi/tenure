@@ -102,8 +102,10 @@ const EventShardStuck EventKind = 17
 const EventShardReleasing EventKind = 18
 
 // EventShardReleased ("shard.released") is emitted when the node has released a shard's
-// term: Space, Shard and Term name the shard and the term, and Reason is the reason the run
-// that held the term was stopped, or "" when no run held it.
+// term, or has let go of it without a release once its stopped Run returned because the store
+// no longer names the node for it or the session was lost: Space, Shard and Term name the
+// shard and the term, and Reason is the reason the run that held the term was stopped, or ""
+// when no run held it.
 const EventShardReleased EventKind = 19
 
 // EventShardHandoffCompleted ("shard.handoff_completed") is emitted right after

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -627,11 +628,15 @@ func TestATRUN36MoveDuringBackoff(t *testing.T) {
 
 // TestATRUN39StuckRun checks a Run that ignores its ctx: stopped at M, it is stuck from
 // M+RenewDeadline, the shard stays published with its stop error, and it is released only once
-// Run returns at M+30s.
+// Run returns at M+30s. Each stuck shard emits one shard.stuck{Reason: "moved"} with its term at
+// M+10s, after its shard.stopping and before its shard.released{moved} at M+30s; the shards
+// that stay emit none.
 func TestATRUN39StuckRun(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
 		r := newShardRig(t)
+		cfg, evs := r.config(), &eventRec{}
+		cfg.OnEvent = evs.OnEvent
 		moved := bal("orders", 8, "n1", "n2")["n2"]
 		r.runs.Script(func(ctx context.Context, sh *tenure.Shard, _ int) error {
 			<-ctx.Done()
@@ -642,7 +647,7 @@ func TestATRUN39StuckRun(t *testing.T) {
 		})
 		var log stepLog
 		t0 := time.Now()
-		n := start(t, log.ctx(context.Background()), r.config())
+		n := start(t, log.ctx(context.Background()), cfg)
 		m := t0.Add(time.Second)
 		sleepUntil(m)
 		r.g.Join(tenure.Member{ID: "n2", Addr: "a2"})
@@ -687,6 +692,28 @@ func TestATRUN39StuckRun(t *testing.T) {
 			}
 			if want := 11 * time.Second; stuckAt != want {
 				t.Errorf("orders/%d first stuck at %v, want %v", id, stuckAt, want)
+			}
+		}
+
+		events := evs.Events()
+		for _, id := range allShards {
+			got := ofOrders(events, id, tenure.EventShardStopping, tenure.EventShardStuck, tenure.EventShardReleased)
+			if !slices.Contains(moved, id) {
+				if len(got) != 0 {
+					t.Errorf("kept orders/%d events %+v, want no stop, stuck run or release", id, got)
+				}
+				continue
+			}
+			term := r.runs.Of("orders", id)[0].Shard.Term
+			want := []tenure.Event{
+				ordersEv(tenure.EventShardStopping, id, term, "moved"),
+				ordersEv(tenure.EventShardStuck, id, term, "moved"),
+				ordersEv(tenure.EventShardReleased, id, term, "moved"),
+			}
+			if !reflect.DeepEqual(bareAll(got), want) {
+				t.Errorf("stuck orders/%d events =\n%+v\nwant\n%+v", id, bareAll(got), want)
+			} else if at := secs(1, 11, 31); !slices.Equal(timesOf(got, t0), at) {
+				t.Errorf("stuck orders/%d events at %v, want %v", id, timesOf(got, t0), at)
 			}
 		}
 		closeNode(t, n)

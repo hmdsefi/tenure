@@ -6,6 +6,7 @@ package tenure_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"testing"
 	"testing/synctest"
@@ -488,13 +489,20 @@ func equalSteps(got, want []stepAt) bool {
 // deadline the fenced runs degrade and keep running while the unfenced ones expire; at the first
 // renewal after the outage the fenced shards are confirmed, restored by the answers, and only then
 // is every space resynced, f before u. The fenced runs are never canceled.
+//
+// The events: one session.expired at T0+10s, then shard.degraded for f/0 and f/1 and
+// shard.expired for u/0 and u/1 with their terms; u's shards are released{expired} with no
+// handoff; at T0+12s session.renewed_late{2s}, session.recovered{5}, then shard.recovered for
+// f/0 and f/1 with their unchanged terms. No fenced shard is stopped, expired or lost.
 func TestATRUN37Degrade(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
 		r := newHolderRig(t)
 		var log stepLog
+		cfg, evs := r.config(r.fs, "u", "f"), &eventRec{}
+		cfg.OnEvent = evs.OnEvent
 		t0 := time.Now()
-		n := start(t, log.ctx(context.Background()), r.config(r.fs, "u", "f"))
+		n := start(t, log.ctx(context.Background()), cfg)
 		r.fs.Fail("KeepAlive", errBoom)
 		synctest.Wait()
 		acq := r.fs.Calls("Acquire")
@@ -561,6 +569,7 @@ func TestATRUN37Degrade(t *testing.T) {
 		if got := actionsAt[core.StopRun](recs); len(got) != 2 {
 			t.Errorf("StopRun actions %+v, want only the two expiries", got)
 		}
+		wantDegradeEvents(t, evs.Events(), r.runs, t0)
 		closeNode(t, n)
 		for id := range 2 {
 			if c := r.runs.Of("f", id)[0]; !c.Done || c.Cause == nil || c.Cause.Error() != stopText(c.Shard, "draining") {
@@ -569,6 +578,57 @@ func TestATRUN37Degrade(t *testing.T) {
 		}
 		check()
 	})
+}
+
+// wantDegradeEvents checks the events of TestATRUN37Degrade up to T0+20s, whose runs are in runs.
+func wantDegradeEvents(t *testing.T, events []tenure.Event, runs *runLog, t0 time.Time) {
+	t.Helper()
+	ev := func(kind tenure.EventKind, space string, id int, reason string) tenure.Event {
+		return tenure.Event{Kind: kind, Space: space, Shard: id, Term: runs.Of(space, id)[0].Shard.Term,
+			Slot: -1, Reason: reason}
+	}
+	expired := ofKinds(events, tenure.EventSessionExpired)
+	if len(expired) != 1 || expired[0].Time != t0.Add(10*time.Second).UTC() {
+		t.Errorf("session.expired events %+v, want one at T0+10s", expired)
+	}
+	at10 := []tenure.Event{
+		ev(tenure.EventShardDegraded, "f", 0, ""), ev(tenure.EventShardDegraded, "f", 1, ""),
+		ev(tenure.EventShardExpired, "u", 0, ""), ev(tenure.EventShardExpired, "u", 1, ""),
+	}
+	got := ofKinds(events, tenure.EventShardDegraded, tenure.EventShardExpired)
+	if !reflect.DeepEqual(bareAll(got), at10) || !slices.Equal(timesOf(got, t0), secs(10, 10, 10, 10)) {
+		t.Errorf("shard.degraded and shard.expired events %+v at %v, want %+v at T0+10s", bareAll(got), timesOf(got, t0), at10)
+	}
+	if i, j := indexOf(events, tenure.EventSessionExpired, -1), indexOf(events, tenure.EventShardDegraded, -1); j < i {
+		t.Errorf("shard.degraded at %d, session.expired at %d: want the session first", j, i)
+	}
+	released := []tenure.Event{ev(tenure.EventShardReleased, "u", 0, "expired"), ev(tenure.EventShardReleased, "u", 1, "expired")}
+	got = slices.SortedFunc(slices.Values(ofKinds(events, tenure.EventShardReleased)),
+		func(x, y tenure.Event) int { return x.Shard - y.Shard })
+	if !reflect.DeepEqual(bareAll(got), released) {
+		t.Errorf("shard.released events %+v, want %+v", bareAll(got), released)
+	}
+	late := ofKinds(events, tenure.EventSessionRenewedLate, tenure.EventSessionRecovered)
+	if len(late) != 2 || late[0].Kind != tenure.EventSessionRenewedLate || late[0].Duration != 2*time.Second ||
+		late[1].Count != 5 || !slices.Equal(timesOf(late, t0), secs(12, 12)) {
+		t.Errorf("session.renewed_late and session.recovered events %+v, want 2s late and 5 failures at T0+12s", late)
+	}
+	recovered := []tenure.Event{ev(tenure.EventShardRecovered, "f", 0, ""), ev(tenure.EventShardRecovered, "f", 1, "")}
+	got = slices.SortedFunc(slices.Values(ofKinds(events, tenure.EventShardRecovered)),
+		func(x, y tenure.Event) int { return x.Shard - y.Shard })
+	if !reflect.DeepEqual(bareAll(got), recovered) || !slices.Equal(timesOf(got, t0), secs(12, 12)) {
+		t.Errorf("shard.recovered events %+v at %v, want %+v at T0+12s", bareAll(got), timesOf(got, t0), recovered)
+	}
+	for _, e := range events {
+		switch e.Kind {
+		case tenure.EventShardStopping, tenure.EventShardLost, tenure.EventShardHandoffCompleted, tenure.EventShardStuck:
+			t.Errorf("%+v, want no stop, loss, handoff or stuck run", e)
+		case tenure.EventShardExpired, tenure.EventShardReleasing, tenure.EventShardReleased:
+			if e.Space != "u" {
+				t.Errorf("%+v: a fenced shard expired or released", e)
+			}
+		}
+	}
 }
 
 // sameActions reports whether got and want hold the same actions, in any order.
