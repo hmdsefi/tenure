@@ -4,7 +4,9 @@
 // Package k8s keeps one tenure group in Kubernetes: an Adapter is the group's store, slot store,
 // holder watch and membership, built only on coordination.k8s.io/v1 Leases in one namespace.
 // It needs no other infrastructure and one RBAC rule: get, list, watch, create, update and
-// delete on Leases in that namespace.
+// delete on Leases in that namespace. The module's rbac.yaml holds that rule as a Role tenure,
+// with a ServiceAccount tenure and a RoleBinding tenure between them, in the namespace default:
+// change the namespace to the Adapter's.
 //
 // # Objects
 //
