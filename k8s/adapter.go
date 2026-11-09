@@ -60,11 +60,13 @@ type Adapter struct {
 	mu sync.Mutex
 	// cache is the running informer, nil while none runs (cache.go).
 	cache *leaseCache
-	// runs counts the goroutines of the Adapter that have not ended yet: informer runs and the
-	// heartbeat.
+	// runs counts the goroutines of the Adapter that have not ended yet: informer runs, member
+	// GC, the heartbeat and the builder of the views.
 	runs sync.WaitGroup
 	// member is the membership state (members.go).
 	member memberState
+	// views is the state of the Watch channels (views.go). Its own mutex guards it.
+	views views
 	// sessions is the session table, by holder (session.go).
 	sessions map[string]*session
 	// leaseLocks serializes the writes of each member Lease, by Lease name (session.go).

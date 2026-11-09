@@ -74,6 +74,13 @@ var adapterCalls = []struct {
 	{"Join", func(ctx context.Context, a *Adapter) error { return a.Join(ctx, core.Member{ID: "pod-0", Slot: -1}) }},
 	{"SetDraining", func(ctx context.Context, a *Adapter) error { return a.SetDraining(ctx, true) }},
 	{"Leave", func(ctx context.Context, a *Adapter) error { return a.Leave(ctx) }},
+	{"Watch", func(ctx context.Context, a *Adapter) error {
+		ch, err := a.Watch(ctx)
+		if ch != nil {
+			return fmt.Errorf("a channel with %w", err)
+		}
+		return err
+	}},
 }
 
 // TestATK8S01ConfigErrors checks New's configuration error, which every method returns first

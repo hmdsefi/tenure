@@ -145,7 +145,6 @@ func (a *Adapter) Join(ctx context.Context, self core.Member) error {
 	hctx, stop := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.member.joined, a.member.self, a.member.name, a.member.lease = true, self, name, written
 	a.member.cache, a.member.stop, a.member.done = c, stop, done
 	a.signalFreshLocked()
@@ -153,6 +152,9 @@ func (a *Adapter) Join(ctx context.Context, self core.Member) error {
 		defer close(done)
 		a.heartbeat(hctx, name)
 	})
+	a.mu.Unlock()
+	// The Adapter's own views show the record, which writeLease noted, at once.
+	a.viewsChanged()
 	return nil
 }
 
@@ -198,16 +200,19 @@ func (a *Adapter) SetDraining(ctx context.Context, draining bool) error {
 		return err
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.member.self, a.member.lease = self, written
+	a.mu.Unlock()
+	a.viewsChanged()
 	return nil
 }
 
 // Leave removes the member that joined from the group: it stops keeping the member Lease alive,
 // and deletes the Lease, with its UID and resourceVersion as preconditions, or, while a session
-// holds it, removes only the member record. Join and SetDraining then return tenure.ErrClosed.
+// holds it, removes only the member record. Every channel Watch returned then receives a view
+// without the member and is closed, and Join, SetDraining and Watch return tenure.ErrClosed.
 // Leave ends the membership also when its write fails, and returns that write's error; the
-// member Lease then expires. Leave before Join or again returns nil, with no request.
+// member Lease then expires. Leave before Join or again returns nil, with no request; it closes
+// the channels all the same.
 func (a *Adapter) Leave(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -225,6 +230,7 @@ func (a *Adapter) Leave(ctx context.Context) error {
 	if !m.joined {
 		a.member.left = true
 		a.mu.Unlock()
+		a.closeViews("")
 		return nil
 	}
 	a.mu.Unlock()
@@ -239,9 +245,9 @@ func (a *Adapter) Leave(ctx context.Context) error {
 		written, err = a.writeLease(ctx, "leave", m.name, a.knownMember(m.name), a.decideLeave)
 	}
 
-	// The member's part in the group ends here, whatever the write did.
+	// The member's part in the group ends here, whatever the write did: its Watch channels get
+	// a last view without it and close.
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.member.joined, a.member.left, a.member.lease = false, true, nil
 	a.member.cache, a.member.stop, a.member.done = nil, nil, nil
 	a.signalFreshLocked()
@@ -253,6 +259,8 @@ func (a *Adapter) Leave(ctx context.Context) error {
 			s.lease = written
 		}
 	}
+	a.mu.Unlock()
+	a.closeViews(m.self.ID)
 	return err
 }
 

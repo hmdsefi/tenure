@@ -82,6 +82,12 @@
 // session closed while the member has joined only clears the Lease's holder. Leave deletes the
 // Lease, or removes only the record while a session holds it.
 //
+// Watch delivers views of the group, also to an Adapter that never joins: the members whose
+// Lease carries a record and has changed within its duration, as the Adapter observes it, with
+// their slots. While the Adapter's view of the group is stale, the passing of time alone removes
+// no member. The Adapter deletes member Leases that have not changed for a long time; see
+// WithMemberGC.
+//
 // # Configuration
 //
 // New never fails and makes no request. It records the first problem it finds with its
