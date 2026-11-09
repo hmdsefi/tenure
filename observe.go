@@ -21,7 +21,8 @@ import (
 //   - step, for each step of the loop, under n.stepMu, after the step's actions were executed
 //     and its view published;
 //   - callFailed, for each failed store call other than Acquire and KeepAlive, on the call's
-//     lane (KeepAlive failures reach step as SessionFailed with Err), for a failed CloseSession
+//     lane, unless the internal context was done when the call returned (KeepAlive failures
+//     reach step as SessionFailed with Err), for a failed CloseSession
 //     of Start's cleanup, for each failed Holdings call of a resync (op "Holdings" and the space),
 //     and for each failed WatchHolders call or closed store watch (op "WatchHolders", with
 //     errStoreWatchEnded for a closed channel);
