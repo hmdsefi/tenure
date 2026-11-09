@@ -171,12 +171,22 @@ func TestNodeLifecycleEvents(t *testing.T) {
 			return context.Cause(ctx)
 		}
 	}
+	// startSlow starts member a with slowStop(d) as its Run. The script is set before Start: the
+	// node starts the Runs in the background, and each call takes the script it starts with.
+	startSlow := func(t *testing.T, d time.Duration) *obsNode {
+		t.Helper()
+		a := newObsHarness(t).Node("a")
+		a.Runs.Script(slowStop(d))
+		if err := a.Start(context.Background()); err != nil {
+			t.Fatalf("Start(a) = %v, want nil", err)
+		}
+		return a
+	}
 
 	t.Run("Drained", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			check := baseline(t)
-			a := newObsHarness(t).Start("a")
-			a.Runs.Script(slowStop(3 * time.Second))
+			a := startSlow(t, 3*time.Second)
 			synctest.Wait()
 			if n := len(a.Runs.Calls()); n != 2 {
 				t.Fatalf("%d Run calls, want 2", n)
@@ -222,8 +232,7 @@ func TestNodeLifecycleEvents(t *testing.T) {
 	t.Run("DrainThenClose", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			check := baseline(t)
-			a := newObsHarness(t).Start("a")
-			a.Runs.Script(slowStop(time.Second))
+			a := startSlow(t, time.Second)
 			synctest.Wait()
 			if err := a.Drain(context.Background()); err != nil {
 				t.Fatalf("Drain() = %v, want nil", err)
@@ -249,8 +258,7 @@ func TestNodeLifecycleEvents(t *testing.T) {
 	t.Run("Deadline", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			check := baseline(t)
-			a := newObsHarness(t).Start("a")
-			a.Runs.Script(slowStop(10 * time.Second))
+			a := startSlow(t, 10*time.Second)
 			synctest.Wait()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
