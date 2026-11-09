@@ -1054,7 +1054,7 @@ func TestK8S130StaleCache(t *testing.T) {
 	gets := func(name string) int {
 		n := 0
 		for _, x := range actions(client, "get") {
-			if x.(k8stesting.GetAction).GetName() == name {
+			if get, ok := x.(k8stesting.GetAction); ok && get.GetName() == name {
 				n++
 			}
 		}
