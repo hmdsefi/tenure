@@ -68,6 +68,8 @@ type leaseCache struct {
 
 	now         func() time.Time
 	defaultWait time.Duration
+	// terms is the Adapter's, which outlives the run: the terms of deleted shard Leases.
+	terms *shardTerms
 
 	mu    sync.Mutex
 	obs   map[string]*observation // by Lease name
@@ -120,6 +122,7 @@ func (a *Adapter) startCache() *leaseCache {
 	c := &leaseCache{
 		now:         a.now,
 		defaultWait: a.timing.LeaseDuration,
+		terms:       &a.terms,
 		obs:         map[string]*observation{},
 		tombs:       map[types.UID]tombstone{},
 	}
@@ -219,6 +222,11 @@ func (c *leaseCache) forget(l *coordinationv1.Lease) {
 	if o, ok := c.obs[l.Name]; ok && o.lease.UID == l.UID {
 		tokenSeenAt = o.tokenSeenAt
 		delete(c.obs, l.Name)
+	}
+	if l.Labels[labelKind] == kindShard {
+		if term, ok := decodeTerm(l.Annotations); ok && term > 0 {
+			c.terms.note(l.Name, term)
+		}
 	}
 	if l.Labels[labelKind] != kindMember {
 		return

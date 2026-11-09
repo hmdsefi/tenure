@@ -34,6 +34,10 @@ var adapterCalls = []struct {
 	{"CheckTiming", func(_ context.Context, a *Adapter) error { return a.CheckTiming(T) }},
 	{"KeepAlive", func(ctx context.Context, a *Adapter) error { return a.KeepAlive(ctx, "pod-0/1", T) }},
 	{"CloseSession", func(ctx context.Context, a *Adapter) error { return a.CloseSession(ctx, "pod-0/1") }},
+	{"Acquire", func(ctx context.Context, a *Adapter) error {
+		_, err := a.Acquire(ctx, "pod-0/1", "markets", 0)
+		return err
+	}},
 }
 
 // TestATK8S01ConfigErrors checks New's configuration error, which every method returns first
