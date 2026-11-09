@@ -1180,3 +1180,43 @@ func TestK8S300VanishedRecord(t *testing.T) {
 		t.Errorf("writes %q, want an update, then a create", got)
 	}
 }
+
+// TestK8S710SessionAfterWait checks that an Acquire that waited for a place of the record
+// semaphore checks its session again: a session that expired meanwhile gets an error matching
+// tenure.ErrSessionLost, and no record request.
+func TestK8S710SessionAfterWait(t *testing.T) {
+	ctx := t.Context()
+	clock := newFakeClock()
+	client := newFake()
+	a := fakeAdapter(t, client, withClock(clock.now), WithRecordConcurrency(1))
+	closeAtEnd(t, a, "pod-0/1")
+	mustKeepAlive(t, a, "pod-0/1")
+	if err := a.records.acquire(ctx); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	client.ClearActions()
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Acquire(ctx, "pod-0/1", "markets", 0)
+		done <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, waiting := a.records.load(); waiting == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Acquire does not wait for a place")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	clock.advance(T.LeaseDuration)
+	a.records.release()
+	err := <-done
+	if want := "k8s: session pod-0/1 expired: tenure: session lost"; err == nil || err.Error() != want || !errors.Is(err, tenure.ErrSessionLost) {
+		t.Errorf("Acquire = %v, want %s", err, want)
+	}
+	if got := append(actions(client, "get"), writes(client)...); len(got) != 0 {
+		t.Errorf("requests %v, want none", got)
+	}
+}

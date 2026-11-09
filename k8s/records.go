@@ -65,6 +65,10 @@ func (a *Adapter) Acquire(ctx context.Context, holder, space string, shard int) 
 		return 0, err
 	}
 	defer a.records.release()
+	// The session may have ended or expired while Acquire waited for its place.
+	if s, err = a.activeSession(holder); err != nil {
+		return 0, err
+	}
 
 	cur, err := a.readRecord(ctx, "acquire", name)
 	if err != nil {
