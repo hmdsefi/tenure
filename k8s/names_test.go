@@ -28,6 +28,21 @@ func TestATK8S02NameRules(t *testing.T) {
 	release := func(holder, space string, shard int, term core.Term) func(context.Context, *Adapter) error {
 		return func(ctx context.Context, a *Adapter) error { return a.Release(ctx, holder, space, shard, term) }
 	}
+	setSlots := func(count int) func(context.Context, *Adapter) error {
+		return func(ctx context.Context, a *Adapter) error { return a.SetSlots(ctx, count) }
+	}
+	releaseSlot := func(holder string, slot int) func(context.Context, *Adapter) error {
+		return func(ctx context.Context, a *Adapter) error { return a.ReleaseSlot(ctx, holder, slot) }
+	}
+	claimSlot := func(holder string) func(context.Context, *Adapter) error {
+		return func(ctx context.Context, a *Adapter) error {
+			slot, err := a.ClaimSlot(ctx, holder)
+			if slot != -1 {
+				return fmt.Errorf("slot %d, want -1 with %w", slot, err)
+			}
+			return err
+		}
+	}
 	space := func(s, detail string) string { return fmt.Sprintf("k8s: invalid space %q: %s", s, detail) }
 	member := func(id, detail string) string { return fmt.Sprintf("k8s: invalid member ID %q: %s", id, detail) }
 	const (
@@ -88,6 +103,17 @@ func TestATK8S02NameRules(t *testing.T) {
 		{"Release space member-0", release("pod-0/1", "member-0", 0, 1), `k8s: Release: space "member-0": must not start with "member-"`},
 		{"Release shard -1", release("pod-0/1", "markets", -1, 0), "k8s: Release: shard -1: must not be negative"},
 		{"Release term 0", release("pod-0/1", "markets", 0, 0), "k8s: Release: term 0: must not be 0"},
+		{"SetSlots 10001", setSlots(10001), "k8s: SetSlots: count 10001: must be in [0, 10000]"},
+		{"SetSlots -1", setSlots(-1), "k8s: SetSlots: count -1: must be in [0, 10000]"},
+		{"ReleaseSlot 10000", releaseSlot("pod-0/1", 10000), "k8s: ReleaseSlot: slot 10000: must be in [0, 9999]"},
+		{"ReleaseSlot -1", releaseSlot("pod-0/1", -1), "k8s: ReleaseSlot: slot -1: must be in [0, 9999]"},
+		{"ReleaseSlot empty holder", releaseSlot("", 10000), "k8s: ReleaseSlot: empty holder"},
+		{"ReleaseSlot holder without /", releaseSlot("pod-0", 0), `k8s: ReleaseSlot: holder "pod-0": has no "/"`},
+		{"ReleaseSlot holder Pod/1", releaseSlot("Pod/1", 0), `k8s: ReleaseSlot: holder "Pod/1": member ID ` + notSubdomain},
+		{"ClaimSlot empty holder", claimSlot(""), "k8s: ClaimSlot: empty holder"},
+		{"ClaimSlot holder zero byte", claimSlot("pod-0/\x00"), `k8s: ClaimSlot: holder "pod-0/\x00": contains a zero byte`},
+		{"ClaimSlot holder empty incarnation", claimSlot("pod-0/"), `k8s: ClaimSlot: holder "pod-0/": has an empty incarnation`},
+		{"ClaimSlot holder a/b/c", claimSlot("a/b/c"), `k8s: ClaimSlot: holder "a/b/c": has a "/" in its incarnation`},
 	}
 	ctx := t.Context()
 	client := fake.NewClientset()
