@@ -285,6 +285,73 @@ func TestTableMembershipOnly(t *testing.T) {
 	})
 }
 
+// TestTableRestarts checks a row's Restarts and Stop over two acquisitions. a's Run of every shard
+// returns at once twice, then runs: each row counts the 2 restarts while a owns it. b joins and
+// takes two shards: their rows on a keep the count, with Stop "moved", while not running. b
+// closes, a takes them again, and the new runs start those rows over: 0 restarts, no Stop,
+// running. The rows a kept still count 2.
+func TestTableRestarts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		h := newObsHarness(t)
+		t0 := time.Now()
+		a := h.Node("a", tableSpace)
+		a.Runs.Script(func(ctx context.Context, _ *tenure.Shard, earlier int) error {
+			if earlier < 2 {
+				return errBoom
+			}
+			<-ctx.Done()
+			return context.Cause(ctx)
+		})
+		if err := a.Start(context.Background()); err != nil {
+			t.Fatalf("Start(a) = %v", err)
+		}
+		// Returns at T0 and T0+2s; the third Run, from T0+6s, runs.
+		sleepUntil(t0.Add(10 * time.Second))
+		for id := range 4 {
+			if row := rowOf(t, a.Table(), obsSpace, id); row.State != "owned" || row.Restarts != 2 || !row.Running || row.Stop != "" {
+				t.Errorf("row %d at T0+10s = %+v, want owned, 2 restarts, running, no Stop", id, row)
+			}
+		}
+
+		b := h.Start("b", tableSpace)
+		sleepUntil(t0.Add(40 * time.Second))
+		moved := map[int]bool{}
+		for id, row := range a.Table().Spaces[0].Rows {
+			want := tenure.TableRow{State: "owned", Running: true, Restarts: 2}
+			if row.Route == "b" {
+				moved[id] = true
+				want = tenure.TableRow{State: "idle", Restarts: 2, Stop: "moved"}
+			}
+			if row.State != want.State || row.Running != want.Running || row.Restarts != want.Restarts || row.Stop != want.Stop {
+				t.Errorf("row %d routed to %s at T0+40s = %+v, want %+v", id, row.Route, row, want)
+			}
+		}
+		if len(moved) != 2 {
+			t.Fatalf("rows %v route to b, want 2", moved)
+		}
+
+		b.MustClose()
+		sleepUntil(t0.Add(70 * time.Second))
+		for id := range 4 {
+			row := rowOf(t, a.Table(), obsSpace, id)
+			runs := a.Runs.Of(obsSpace, id)
+			last, restarts := runs[len(runs)-1], 2
+			if moved[id] {
+				restarts = 0 // a new acquisition, whose Run has not returned
+				if first := runs[0].Shard.Term; last.Shard.Term <= first {
+					t.Errorf("row %d: the last run's term %d is not above the first's %d", id, last.Shard.Term, first)
+				}
+			}
+			if row.State != "owned" || row.Restarts != restarts || !row.Running || row.Stop != "" || row.Term != last.Shard.Term || last.Done {
+				t.Errorf("row %d at T0+70s = %+v, want owned in term %d, %d restarts, running, no Stop", id, row, last.Shard.Term, restarts)
+			}
+		}
+		a.MustClose()
+		check()
+	})
+}
+
 // rowWant is what wantRows checks of one row: its State, Holder and Term.
 type rowWant struct {
 	space  string

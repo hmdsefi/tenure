@@ -62,8 +62,21 @@ func TestATOBS24Callbacks(t *testing.T) {
 					if tab.Holder != n.Holder {
 						fail(n.ID + ": Table in OnEvent names another holder")
 					}
-					if e.Kind == tenure.EventNodeClosed && !tab.Closed {
-						fail(n.ID + ": Table at node.closed is not closed")
+					// The table is updated before the step's events are emitted, so it is never
+					// behind the event at hand.
+					switch e.Kind {
+					case tenure.EventViewChanged:
+						if tab.ViewVersion < e.Version {
+							fail(n.ID + ": Table at view.changed has an older view")
+						}
+					case tenure.EventShardAcquired:
+						if row := tab.Spaces[0].Rows[e.Shard]; row.Term < e.Term {
+							fail(n.ID + ": Table at shard.acquired has an older term")
+						}
+					case tenure.EventNodeClosed:
+						if !tab.Closed {
+							fail(n.ID + ": Table at node.closed is not closed")
+						}
 					}
 				})
 				if err := n.Start(context.Background()); err != nil {

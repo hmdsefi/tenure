@@ -89,7 +89,7 @@ type TableRow struct {
 	Shard int
 
 	// Route is the ID of the member that Node.Route names for the shard's keys, "" when Route
-	// finds none.
+	// finds none. After Close it is the last such member.
 	Route string
 
 	// Slot is the slot the shard is placed on in a group with slots, -1 without slots or when
@@ -186,9 +186,9 @@ func (n *Node) Table() Table {
 }
 
 // tableState is what the node keeps for Table, guarded by n.tableMu. The loop updates it while it
-// carries out each step, under n.stepMu, so a Table shows the node between two steps; publish,
-// the supervisors, a forced Close's halt, the first Drain of a node without a store and Close
-// update their parts of it.
+// carries out each step, under n.stepMu, so a Table shows the node between two steps; the
+// publish of a node without a store, a new incarnation, the supervisors, a forced Close's halt,
+// the first Drain of a node without a store and Close update their parts of it.
 type tableState struct {
 	holder      string
 	draining    bool
@@ -246,11 +246,20 @@ func (t *tableState) row(space string, shard int) (*TableRow, *core.Term) {
 	return &sp.rows[shard], &sp.runs[shard]
 }
 
-// tableView notes v, which the node publishes, as the table's view.
+// tableView notes v, which a node without a store has published, as the table's view. With a
+// store, tableStep takes the view the step published.
 func (n *Node) tableView(v *core.View) {
 	n.tableMu.Lock()
 	defer n.tableMu.Unlock()
 	n.tab.view = v
+}
+
+// tableHolder notes that holder is the node's holder from now on, the new incarnation's. The
+// caller holds n.stepMu.
+func (n *Node) tableHolder(holder string) {
+	n.tableMu.Lock()
+	defer n.tableMu.Unlock()
+	n.tab.holder = holder
 }
 
 // tableDrain notes that the drain has started, for a node without a store, whose table takes
@@ -262,19 +271,21 @@ func (n *Node) tableDrain() {
 }
 
 // tableStep updates the table after the step rec, once its actions are executed and its view and
-// routes published. The caller holds n.stepMu. The session fields, the holder, the slot held and
-// each row's State, Since and Stuck come from the machine's Status after the step. A row's Holder
-// and Term come from the StartRun of its run, a stepped HolderChanged and a Released that is not
-// older than them; Running, Restarts and Stop start with the StartRun, Stop takes the reason of
-// the run's StopRun, and Running ends with its RunStopped. Route and Slot follow the routing
-// snapshot.
+// routes published. The caller holds n.stepMu. The view and the routing snapshot are the ones the
+// step published, read here so that the view, the routes and the rows change in one critical
+// section. The session fields, the holder, the slot held and each row's State, Since and Stuck
+// come from the machine's Status after the step. A row's Holder and Term come from the StartRun
+// of its run, a stepped HolderChanged and a Released that is not older than them; Running,
+// Restarts and Stop start with the StartRun, Stop takes the reason of the run's StopRun, and
+// Running ends with its RunStopped. Route and Slot follow the routing snapshot.
 func (l *loop) tableStep(rec stepRecord) {
 	n := l.n
-	snap := n.snap.Load()
+	view, snap := n.view.Load(), n.snap.Load()
 	n.tableMu.Lock()
 	defer n.tableMu.Unlock()
 	t := &n.tab
 	st := rec.After
+	t.view = view
 	t.holder = n.holder
 	t.draining = st.Draining
 	t.live = st.Session == core.SessionStateLive
