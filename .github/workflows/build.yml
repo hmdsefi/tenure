@@ -217,6 +217,41 @@ jobs:
             echo "::endgroup::"
           done
 
+  k8s:
+    name: k8s on kind
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: k8s/go.mod
+          cache-dependency-path: k8s/go.sum
+      - name: install kind
+        run: go install sigs.k8s.io/kind@v0.33.0
+      - name: create the kind cluster
+        run: kind create cluster --name tenure --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5 --kubeconfig "$RUNNER_TEMP/kubeconfig" --wait 120s
+      - name: test the k8s module on kind
+        env:
+          TENURE_TEST_EXTERNAL: '1'
+        run: |
+          set -o pipefail
+          TENURE_TEST_KUBECONFIG="$RUNNER_TEMP/kubeconfig" go -C k8s test -race -count=1 -v ./... 2>&1 | tee "$RUNNER_TEMP/k8s-test.log"
+      - name: no k8s test skipped
+        # The only skips allowed are the storetest cases that need Advance or SetWall, which a
+        # real cluster cannot offer, and, until Phase 2, membershiptest's Propagation/Estimate.
+        # go test -v names the test before each line it logs, so a skip message belongs to the
+        # last test named.
+        run: |
+          awk '
+            /^ *=== (RUN|NAME|CONT|PAUSE) / { current = $3 }
+            /: storetest: fixture has no (Advance|SetWall)$/ { allowed[current] = 1 }
+            /: membershiptest: membership does not implement tenure\.PropagationEstimator$/ { allowed[current] = 1 }
+            /^ *--- SKIP: / && !allowed[$3] { print "unexpected skip: " $0; bad = 1 }
+            END { exit bad }
+          ' "$RUNNER_TEMP/k8s-test.log"
+
   golden-trailer:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
