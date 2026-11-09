@@ -15,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/core"
@@ -616,8 +617,14 @@ func TestATK8S18Acquire(t *testing.T) {
 	startRenewer(t, a, "pod-0/1")
 	const h = "pod-0/1"
 	uid := rawGet(t, c, memberName(g, "pod-0")).UID
-	// pod-9's session has ended: its member Lease names no holder.
-	ended := rawCreate(t, c, &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: memberName(g, "pod-9"), Labels: leaseLabels(g, kindMember, "")}})
+	// pod-9's session has ended, and a saw it end: its member Lease named pod-9/1, then no
+	// holder.
+	ended := rawCreate(t, c, &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: memberName(g, "pod-9"), Labels: leaseLabels(g, kindMember, "")},
+		Spec:       coordinationv1.LeaseSpec{HolderIdentity: new("pod-9/1")},
+	})
+	waitObserved(t, a, ended.Name, ended.ResourceVersion)
+	ended = rawUpdate(t, c, ended.Name, func(l *coordinationv1.Lease) { l.Spec.HolderIdentity = nil })
 	waitObserved(t, a, ended.Name, ended.ResourceVersion)
 	endedRecord := func(n int, term string) *coordinationv1.Lease {
 		l := shardLease(g, "markets", n, "pod-9/1", map[string]string{annotationTerm: term, annotationSession: string(ended.UID)})
@@ -997,4 +1004,144 @@ func TestATK8S31RecordConcurrency(t *testing.T) {
 			}
 		}
 	}
+}
+
+// staleCache sets the observation of Lease name in a's cache to o, or drops it when o is nil,
+// and drops the tombstone of uid when it is not empty, as an informer that has not delivered the
+// latest changes would have it.
+func staleCache(t testing.TB, a *Adapter, name string, o *observation, uid types.UID) {
+	t.Helper()
+	c := a.runningCache()
+	if c == nil {
+		t.Fatal("the informer does not run")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if o == nil {
+		delete(c.obs, name)
+	} else {
+		c.obs[name] = o
+	}
+	if uid != "" {
+		delete(c.tombs, uid)
+	}
+}
+
+// TestK8S130StaleCache checks that a takeover never rests on a cached member Lease older than
+// the record it replaces. A member Lease cached without a holder, from before the record's
+// holder opened its session on it, is confirmed by a GET that finds the session live; once the
+// Adapter has seen the holder's session cleared, the record is taken without that GET. A member
+// Lease deleted while the informer lags reads as a tombstone seen at the GET, so the holder,
+// whose renewals the Adapter missed, stays live for its LeaseDuration from then.
+func TestK8S130StaleCache(t *testing.T) {
+	ctx := t.Context()
+	clock := newFakeClock()
+	client := newFake()
+	a := fakeAdapter(t, client, withClock(clock.now))
+	closeAtEnd(t, a, "pod-1/1")
+	mustKeepAlive(t, a, "pod-1/1")
+	leases := client.CoordinationV1().Leases("default")
+	gets := func(name string) int {
+		n := 0
+		for _, x := range actions(client, "get") {
+			if x.(k8stesting.GetAction).GetName() == name {
+				n++
+			}
+		}
+		return n
+	}
+	memberLease := func(id, holder string) *coordinationv1.Lease {
+		l := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: memberName("g", id), Labels: leaseLabels("g", kindMember, "")}}
+		if holder != "" {
+			l.Spec.HolderIdentity = &holder
+			l.Spec.RenewTime = new(metav1.NewMicroTime(clock.now()))
+		}
+		l.Spec.LeaseDurationSeconds = new(int32(3))
+		return l
+	}
+	record := func(n int, holder string, session types.UID) *coordinationv1.Lease {
+		l := shardLease("g", "markets", n, holder, map[string]string{annotationTerm: "1", annotationSession: string(session)})
+		l.Spec.LeaseDurationSeconds = new(int32(3))
+		l, err := leases.Create(ctx, l, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("create record: %v", err)
+		}
+		waitObserved(t, a, l.Name, l.ResourceVersion)
+		return l
+	}
+	update := func(l *coordinationv1.Lease) *coordinationv1.Lease {
+		l, err := leases.Update(ctx, l, metav1.UpdateOptions{})
+		if err != nil {
+			t.Fatalf("update %s: %v", l.Name, err)
+		}
+		waitObserved(t, a, l.Name, l.ResourceVersion)
+		return l
+	}
+
+	t.Run("ended", func(t *testing.T) {
+		mname := memberName("g", "pod-0")
+		m, err := leases.Create(ctx, memberLease("pod-0", ""), metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("create member Lease: %v", err)
+		}
+		stale := waitObserved(t, a, mname, m.ResourceVersion)
+		m.Spec.HolderIdentity = new("pod-0/1")
+		m.Spec.RenewTime = new(metav1.NewMicroTime(clock.now()))
+		m = update(m)
+		r := record(0, "pod-0/1", m.UID)
+
+		// The informer has delivered neither the session's opening nor the record.
+		staleCache(t, a, mname, &stale, "")
+		staleCache(t, a, r.Name, nil, "")
+		client.ClearActions()
+		term, err := a.Acquire(ctx, "pod-1/1", "markets", 0)
+		wantHeld(t, term, err, "pod-0/1", T.RetryPeriod)
+		if n := gets(mname); n != 1 {
+			t.Errorf("%d GETs of the member Lease, want 1", n)
+		}
+		if w := writes(client); len(w) != 0 {
+			t.Errorf("writes %v, want none", w)
+		}
+
+		// The Adapter sees the session cleared: the record is free without a GET.
+		m.Spec.HolderIdentity = nil
+		update(m)
+		client.ClearActions()
+		mustAcquire(t, a, "pod-1/1", "markets", 0)
+		if n := gets(mname); n != 0 {
+			t.Errorf("%d GETs of the member Lease, want none", n)
+		}
+	})
+
+	t.Run("deleted", func(t *testing.T) {
+		mname := memberName("g", "pod-2")
+		m, err := leases.Create(ctx, memberLease("pod-2", "pod-2/1"), metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("create member Lease: %v", err)
+		}
+		stale := waitObserved(t, a, mname, m.ResourceVersion)
+		record(1, "pod-2/1", m.UID)
+		clock.advance(2 * time.Second)
+		mustKeepAlive(t, a, "pod-1/1")
+		m.Spec.RenewTime = new(metav1.NewMicroTime(clock.now()))
+		update(m)
+		if err := leases.Delete(ctx, mname, metav1.DeleteOptions{}); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		waitForgotten(t, a, mname)
+
+		// The informer has delivered neither the renewal nor the deletion: the cached state is
+		// LeaseDuration old once the clock moves on.
+		staleCache(t, a, mname, &stale, m.UID)
+		clock.advance(time.Second)
+		client.ClearActions()
+		term, err := a.Acquire(ctx, "pod-1/1", "markets", 1)
+		wantHeld(t, term, err, "pod-2/1", T.RetryPeriod)
+		if n := gets(mname); n != 1 {
+			t.Errorf("%d GETs of the member Lease, want 1", n)
+		}
+		if w := writes(client); len(w) != 0 {
+			t.Errorf("writes %v, want none", w)
+		}
+	})
 }

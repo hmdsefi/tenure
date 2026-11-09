@@ -196,9 +196,10 @@ func (a *Adapter) grant(s session, space, name string, cur *coordinationv1.Lease
 // is live (K8S-120). When liveness says it is gone but asks for confirmation, holderLive reads
 // the holder's member Lease from the API server, notes it in the cache, and decides again on
 // that state (K8S-130): a changed session token makes the holder live again. A gone verdict
-// that needs no confirmation (no holder, or the session ended) costs no request, nor does a
-// holder that is not <member ID>/<incarnation>, which has no member Lease to read. op names
-// the operation in errors: "k8s: <op> <member Lease>: <error>".
+// that needs no confirmation (no holder, or a session this Adapter saw end) costs no request,
+// nor does a holder that is not <member ID>/<incarnation>, which has no member Lease to read.
+// The decision on the GET's state is final: that state is newer than cur. op names the
+// operation in errors: "k8s: <op> <member Lease>: <error>".
 func (a *Adapter) holderLive(ctx context.Context, op string, cur *coordinationv1.Lease) (bool, error) {
 	h := holderOf(cur)
 	rec := a.observed(cur)
@@ -231,12 +232,14 @@ func (a *Adapter) holderLive(ctx context.Context, op string, cur *coordinationv1
 		o := a.observed(fresh)
 		next = &o
 	}
-	// The member Lease of the record's session is gone, and the informer has not told yet: what
-	// it will leave is a tombstone of the session as last observed.
+	// The member Lease of the record's session is gone, and the informer has not told yet. Its
+	// renewals since the cached state may have been missed too, so the session counts as seen
+	// now, until the informer delivers the deletion and leaves the tombstone of what it saw.
+	now := a.now()
 	if hasSession && tomb == nil && member != nil && member.lease.UID == s && (next == nil || next.lease.UID != s) {
-		tomb = &tombstone{tokenSeenAt: member.tokenSeenAt, wait: leaseWait(member.lease, a.timing.LeaseDuration)}
+		tomb = &tombstone{tokenSeenAt: now, wait: leaseWait(member.lease, a.timing.LeaseDuration)}
 	}
-	return liveness(rec, next, tomb, a.now(), a.timing.LeaseDuration).live, nil
+	return liveness(rec, next, tomb, now, a.timing.LeaseDuration).live, nil
 }
 
 // isMemberLease reports whether l carries the labels of a member Lease of group.
@@ -250,10 +253,10 @@ func isMemberLease(l *coordinationv1.Lease, group string) bool {
 func (a *Adapter) observed(l *coordinationv1.Lease) observation {
 	a.noteRead(l)
 	if o, ok := a.cached(l.Name); ok && o.lease.UID == l.UID && o.lease.ResourceVersion == l.ResourceVersion {
-		return observation{lease: l, rvSeenAt: o.rvSeenAt, tokenSeenAt: o.tokenSeenAt}
+		return observation{lease: l, rvSeenAt: o.rvSeenAt, tokenSeenAt: o.tokenSeenAt, named: o.named}
 	}
 	now := a.now()
-	return observation{lease: l, rvSeenAt: now, tokenSeenAt: now}
+	return observation{lease: l, rvSeenAt: now, tokenSeenAt: now, named: holderOf(l)}
 }
 
 // noteRead notes l, a state of a Lease of the group that this Adapter read from the API server
