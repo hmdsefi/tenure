@@ -179,7 +179,8 @@ func TestATOBS03EventFields(t *testing.T) {
 		if err := a.Start(context.Background()); err != nil {
 			t.Fatalf("Start(a) = %v, want nil", err)
 		}
-		synctest.Wait()
+		// The node runs a while first, so that a duration measured from Start would differ.
+		time.Sleep(10 * time.Second)
 		t0 := time.Now()
 		a.MustClose()
 		events := a.Events.Events()
@@ -440,6 +441,40 @@ func TestStoppingClosed(t *testing.T) {
 			t.Errorf("last event %+v, want %+v", events[len(events)-1], last)
 		}
 		wantDelivery(t, a)
+		check()
+	})
+}
+
+// TestViewChangedWithoutStore checks view.changed on a node without a store, which publishes each
+// merged view as its watcher takes it: one event per published view, with its Version and the
+// number of its members, and no event of any other kind but the node's own.
+func TestViewChangedWithoutStore(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		h := newObsHarness(t, "a")
+		noStore := func(c *tenure.Config) { c.Store, c.Spaces = nil, nil }
+		a := h.Start("a", noStore)
+		synctest.Wait()
+		b := h.Start("b", noStore)
+		synctest.Wait()
+		events := a.RecentEvents()
+
+		want := []tenure.Event{
+			{Kind: tenure.EventViewChanged, Shard: -1, Slot: -1, Version: 1, Count: 1},
+			{Kind: tenure.EventViewChanged, Shard: -1, Slot: -1, Version: 2, Count: 2},
+		}
+		if got := bareAll(events); !reflect.DeepEqual(got, want) {
+			t.Errorf("a: events =\n%+v\nwant\n%+v", got, want)
+		}
+		b.MustClose()
+		a.MustClose()
+		for _, e := range a.RecentEvents() {
+			if e.Kind != tenure.EventViewChanged && !slices.Contains(nodeKinds, e.Kind) {
+				t.Errorf("a: event %+v, want only view.changed and node events", e)
+			}
+		}
+		wantDelivery(t, a)
+		wantDelivery(t, b)
 		check()
 	})
 }
