@@ -110,6 +110,8 @@ type leaseCache struct {
 	// ownSeenAt is when the informer last delivered an own member Lease write; zero before the
 	// first.
 	ownSeenAt time.Time
+	// gone holds, by Lease name, the UID of the last Lease of that name seen deleted.
+	gone map[string]types.UID
 }
 
 // holdCache holds the informer running, starting it unless it runs already, and waits for its
@@ -163,6 +165,7 @@ func (a *Adapter) startCache() *leaseCache {
 		tombs:       map[types.UID]tombstone{},
 		pending:     map[string][]uint64{},
 		delivered:   map[string]delivery{},
+		gone:        map[string]types.UID{},
 	}
 	selector := labelGroup + "=" + a.group
 	informer := coordinationinformers.NewFilteredLeaseInformer(a.client, a.namespace, resyncPeriod, cache.Indexers{},
@@ -245,12 +248,16 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 	case ok && isOlder(l.ResourceVersion, o.lease.ResourceVersion):
 		// Older than the state recorded, also of a Lease since deleted: a late delivery after a
 		// read from the API server was noted (noteRead).
+	case c.isGone(l.Name, l.UID):
+		// A state of a Lease seen deleted, noted after the deletion (noteRead): that Lease is
+		// gone for good.
 	case !ok || o.lease.UID != l.UID:
 		if ok {
 			// The Lease was deleted and created again without a deletion event, as a relist
 			// after a gap in the watch shows it: the deleted one leaves its tombstone all the
 			// same, stamped now, as renewals during the gap may have been missed.
 			c.bury(o.lease, now, now)
+			c.noteGone(l.Name, o.lease.UID)
 		}
 		c.obs[l.Name] = &observation{lease: l, rvSeenAt: now, tokenSeenAt: now, named: holderOf(l)}
 	case l.ResourceVersion == o.lease.ResourceVersion || isOlder(l.ResourceVersion, o.lease.ResourceVersion):
@@ -266,11 +273,11 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 	}
 }
 
-// forget records the deletion of Lease l: its observation goes, and a member Lease leaves a
-// tombstone. gap reports a deletion the informer found only by listing again after a gap in its
-// watch (a final state unknown): renewals of the session may have been missed during the gap,
-// so the tombstone counts the session as seen now, not when the cache last saw its token
-// change.
+// forget records the deletion of Lease l: its observation goes, its UID is noted as gone, and a
+// member Lease leaves a tombstone. gap reports a deletion the informer found only by listing
+// again after a gap in its watch (a final state unknown): renewals of the session may have been
+// missed during the gap, so the tombstone counts the session as seen now, not when the cache last
+// saw its token change.
 func (c *leaseCache) forget(l *coordinationv1.Lease, gap bool) {
 	if l == nil {
 		return
@@ -286,7 +293,22 @@ func (c *leaseCache) forget(l *coordinationv1.Lease, gap bool) {
 		}
 		delete(c.obs, l.Name)
 	}
+	c.noteGone(l.Name, l.UID)
 	c.bury(l, tokenSeenAt, now)
+}
+
+// noteGone notes uid as the last Lease named name seen deleted. The caller holds c.mu.
+func (c *leaseCache) noteGone(name string, uid types.UID) {
+	if c.gone == nil {
+		c.gone = map[string]types.UID{}
+	}
+	c.gone[name] = uid
+}
+
+// isGone reports whether uid is the last Lease named name seen deleted. The caller holds c.mu.
+func (c *leaseCache) isGone(name string, uid types.UID) bool {
+	u, ok := c.gone[name]
+	return ok && u == uid
 }
 
 // bury leaves the tombstone of deleted Lease l, whose session token was first seen at
@@ -333,6 +355,18 @@ func (a *Adapter) cached(name string) (o observation, ok bool) {
 		return observation{}, false
 	}
 	return *p, true
+}
+
+// deleted reports whether the running informer has seen the deletion of Lease name with uid,
+// the last Lease of that name to go.
+func (a *Adapter) deleted(name string, uid types.UID) bool {
+	c := a.runningCache()
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.isGone(name, uid)
 }
 
 // cachedLeases returns the observations of the Leases of kind, by name. It returns nil when the

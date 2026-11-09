@@ -184,7 +184,16 @@ func (a *Adapter) SetDraining(ctx context.Context, draining bool) error {
 	}
 	self := m.self
 	self.Draining = draining
-	written, err := a.writeMember(ctx, "drain", m.name, encodeMember(self))
+	// The new state is recorded before the Lease's lock is given back: a heartbeat that comes
+	// next starts from this write, and re-creates the Lease with this record.
+	unlock, err := a.lockLease(ctx, m.name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	written, err := a.writeLease(ctx, "drain", m.name, a.knownMember(m.name), func(cur *coordinationv1.Lease) (change, error) {
+		return a.decideRecord(cur, encodeMember(self))
+	})
 	if err != nil {
 		return err
 	}
@@ -223,10 +232,11 @@ func (a *Adapter) Leave(ctx context.Context) error {
 	// No heartbeat may write after the Lease is gone.
 	m.stop()
 	<-m.done
+	var written *coordinationv1.Lease
 	unlock, err := a.lockLease(ctx, m.name)
 	if err == nil {
-		_, err = a.writeLease(ctx, "leave", m.name, a.knownMember(m.name), a.decideLeave)
-		unlock()
+		defer unlock()
+		written, err = a.writeLease(ctx, "leave", m.name, a.knownMember(m.name), a.decideLeave)
 	}
 
 	// The member's part in the group ends here, whatever the write did.
@@ -236,6 +246,13 @@ func (a *Adapter) Leave(ctx context.Context) error {
 	a.member.cache, a.member.stop, a.member.done = nil, nil, nil
 	a.signalFreshLocked()
 	a.releaseCacheLocked(m.cache)
+	// A session that holds the Lease renews from the Lease without the record.
+	for _, s := range a.sessions {
+		if written != nil && s.name == m.name && !s.ended && s.lease != nil && s.lease.UID == written.UID &&
+			isOlder(s.lease.ResourceVersion, written.ResourceVersion) {
+			s.lease = written
+		}
+	}
 	return err
 }
 
@@ -259,8 +276,8 @@ func (a *Adapter) decideLeave(cur *coordinationv1.Lease) (change, error) {
 	return change{lease: l}, nil
 }
 
-// writeMember writes the member record record into member Lease name for op, Join or
-// SetDraining, under the Lease's lock, and returns the Lease written.
+// writeMember writes the member record record into member Lease name for op, under the Lease's
+// lock, and returns the Lease written.
 func (a *Adapter) writeMember(ctx context.Context, op, name, record string) (*coordinationv1.Lease, error) {
 	unlock, err := a.lockLease(ctx, name)
 	if err != nil {
@@ -397,7 +414,9 @@ func (a *Adapter) noteMemberWriteLocked(name string, l *coordinationv1.Lease) {
 
 // knownMember returns the latest state the Adapter knows of member Lease name, nil when it knows
 // none: of its own last write while joined, the last writes of its active sessions on that
-// Lease, and the informer's state, the one with the highest resourceVersion.
+// Lease, and the informer's state, the one with the highest resourceVersion; nil also when the
+// informer has seen that Lease deleted. A deleted Lease's last state would hold a decision on
+// it, the heartbeat's above all, to a Lease that is no more.
 func (a *Adapter) knownMember(name string) *coordinationv1.Lease {
 	var best *coordinationv1.Lease
 	consider := func(l *coordinationv1.Lease) {
@@ -417,6 +436,9 @@ func (a *Adapter) knownMember(name string) *coordinationv1.Lease {
 	a.mu.Unlock()
 	if o, ok := a.cached(name); ok {
 		consider(o.lease)
+	}
+	if best != nil && a.deleted(name, best.UID) {
+		return nil
 	}
 	return best
 }
