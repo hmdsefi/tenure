@@ -70,7 +70,18 @@ type Config struct {
 	// means crypto/rand.Reader.
 	Rand io.Reader
 
-	// OnEvent, when not nil, is called with each event of the node, one at a time and in order.
+	// Logger, when not nil, gets a log record for each event of the node, at the event kind's
+	// level, with the kind's message, such as "tenure: shard acquired", and the attributes
+	// "member" (Self.ID) and "holder" (the node's holder when it emitted the event) followed by
+	// the kind's own. The record's time is the handler's. The node writes the records on the
+	// goroutine that calls OnEvent, and Close waits for a record being written. nil means no log
+	// records.
+	Logger *slog.Logger
+
+	// OnEvent, when not nil, is called with each event of the node, one at a time and in order
+	// of Seq, right after the event's log record was written. The calls run on a goroutine of
+	// the node's own, so a slow OnEvent never holds the node up: events wait for it in a queue.
+	// OnEvent may call RecentEvents. A panic in OnEvent is not recovered.
 	OnEvent func(Event)
 }
     Config configures a node for Start.
@@ -404,8 +415,10 @@ func Start(ctx context.Context, cfg Config) (*Node, error)
     config: " when cfg is not valid, and otherwise with the step that failed,
     such as "tenure: join: " and the error of Join, or "tenure: open session:
     " and the error of the store's KeepAlive. A failed Start closes the session
-    again if it opened one, leaves the group again if it joined, and leaves no
-    goroutine behind.
+    again if it opened one, leaves the group again if it joined, and leaves
+    no goroutine behind. Before it returns, it waits until Config.OnEvent
+    has returned for each event the node emitted, or ctx ends; it emits no
+    EventNodeClosed, and calls OnEvent no more once it has returned.
 
     ctx bounds Start only: Start's own calls of the membership and the store
     use it, and the node keeps running after ctx ends, until Close. Start does
@@ -434,6 +447,14 @@ func (n *Node) Close(ctx context.Context) error
     No call of the membership or the store starts after Close has returned.
     Close waits for the calls in flight, whose context it cancels, so a call
     that does not return once its context is done holds Close up.
+
+    The node's last event is EventNodeClosed, with Reason "drained" when the
+    drain completed and "deadline" when ctx ended first. After a completed
+    drain, Close returns once Config.OnEvent has returned for that event,
+    or when ctx ends first. The node emits no event after Close has returned,
+    and OnEvent gets none of the events it had not been called with by then:
+    no call of OnEvent starts after Close has returned, though one in progress
+    may go on.
 
 func (n *Node) Drain(ctx context.Context) error
     Drain hands the member's work over: it marks the member as draining in
@@ -465,6 +486,12 @@ func (n *Node) Local(space, key string) (*Shard, error)
     none. After Close, for an unknown space and for a ShardOf result outside
     the space's shards, Local fails as Route does. Local takes no lock and never
     waits for the node.
+
+func (n *Node) RecentEvents() []Event
+    RecentEvents returns a copy of the node's newest events, at most 256,
+    oldest first. It holds events the node emitted but did not deliver to
+    Config.OnEvent, such as those Close dropped. It may be called at any time,
+    from OnEvent too, and after Close.
 
 func (n *Node) Resolver(namespace string) *Resolver
     Resolver returns a Resolver that ranks keys in namespace over the node's

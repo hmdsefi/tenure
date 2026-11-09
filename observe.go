@@ -11,7 +11,8 @@ import (
 )
 
 // observer is the seam through which the node reports what happens to it. Start installs
-// nopObserver; plan 1.6 implements events and Table behind it. The node calls it at these points:
+// logObserver, which emits the node's events; nopObserver serves tests. The node calls it at these
+// points:
 //
 //   - start, once Start has drawn the incarnation and before it calls Join, with the holder;
 //   - startFailed, last, when Start fails after start, with Start's ctx and the error it returns;
