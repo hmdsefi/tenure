@@ -37,9 +37,12 @@ import (
 //   - store errors: one method of one node's fs fails for 2 s to 10 s;
 //   - delays: one method of one node's fs waits up to 3 s before it goes to the store, or goes to
 //     the store and holds the answer up to 3 s, past the call's deadline at times;
-//   - stale states: the store watch of every node re-delivers an earlier value now and then;
+//   - stale states: the store watch of every node re-delivers an earlier value now and then, and
+//     lags the store by up to 8 s for 10 s to 40 s, in commit order;
 //   - a lost session: from one instant on, the store answers every KeepAlive, Acquire, Confirm and
-//     ClaimSlot of one node's holder with ErrSessionLost;
+//     ClaimSlot of one node's holder with ErrSessionLost; the node's watch lags 8 s from then on,
+//     and 3 s after the first grant to its next holder comes an outage (trap) that leaves a slow
+//     Holdings answer showing the record after the shards' Confirm went out;
 //   - a paused membership: one node's views are held back for 5 s to 40 s;
 //   - a SetSlots to 1 or 3 through one node, a Drain of another node and a forced Close of a third:
 //     a Close whose ctx is done already or ends within 5 s, before the drain can complete.
@@ -72,6 +75,7 @@ const (
 	faultHang                   // the call waits for its ctx and returns ctx's error
 	faultDelay                  // the call waits d, or until its ctx ends, before it goes on
 	faultLate                   // the call goes on, and its answer waits d, or until its ctx ends
+	faultStuck                  // the call goes on, and its answer waits d, past its ctx's end
 )
 
 // fault is one fault of one node's fs: from from to to after the scenario's start, every call
@@ -82,6 +86,9 @@ type fault struct {
 	kind     faultKind
 	d        time.Duration
 }
+
+// watchLag is the method name of a fault that makes the store watch lag by d: no call has it.
+const watchLag = "WatchLag"
 
 // faultMethods are the store methods that errors and delays hit.
 var faultMethods = []string{"KeepAlive", "Acquire", "Release", "Confirm", "CloseSession", "Holdings", "ClaimSlot",
@@ -143,6 +150,11 @@ func drawPlan(rng *rand.Rand) contractPlan {
 			p.faults[i] = append(p.faults[i], fault{from: from, to: from + sec(5, 20),
 				method: faultMethods[rng.IntN(len(faultMethods))], kind: kind, d: sec(0.1, 3)})
 		}
+		for range 2 {
+			from := sec(10, 280)
+			p.faults[i] = append(p.faults[i], fault{from: from, to: from + sec(10, 40), method: watchLag,
+				kind: faultDelay, d: sec(0.5, 8)})
+		}
 	}
 	p.lossNode, p.lossAt = rng.IntN(3), sec(40, 200)
 	p.pauseNode, p.pauseAt, p.pauseFor = rng.IntN(3), sec(20, 200), sec(5, 40)
@@ -152,36 +164,46 @@ func drawPlan(rng *rand.Rand) contractPlan {
 	if rng.IntN(2) == 0 {
 		p.closeWait = sec(0.5, 5)
 	}
+	// Slow slot reads while slots change hands, so that some read before a claim or a release
+	// answers after its result.
+	for i := range p.faults {
+		for _, at := range []time.Duration{p.lossAt, p.slotsAt, p.drainAt, p.closeAt} {
+			p.faults[i] = append(p.faults[i], fault{from: at, to: at + 40*time.Second, method: "Slots",
+				kind: faultStuck, d: 2500 * time.Millisecond})
+		}
+	}
 	return p
 }
 
-// watchSend is one value a node's store watch handed to the node. seq is the stamp taken when
-// the value was first sent: a re-delivered value keeps the stamp of its first delivery, since
-// that is when it was read.
+// watchSend is one value a node's store watch handed to the node, with the stamp taken when it
+// was sent: the node counts a watch value as read when it receives it (RUN-175).
 type watchSend struct {
 	h           tenure.Holding
 	seq         uint64
+	at          time.Time
 	redelivered bool
 }
 
 // contractNode is one node of the scenario while it runs.
 type contractNode struct {
-	id     string
-	t0     time.Time
-	faults []fault
-	fs     *recStore
-	sm     *recMembership
-	runs   *runLog
-	log    *stepLog
-	n      *tenure.Node
+	id   string
+	t0   time.Time
+	fs   *recStore
+	sm   *recMembership
+	runs *runLog
+	log  *stepLog
+	n    *tenure.Node
 
 	startSeq uint64
 
-	mu    sync.Mutex
-	rng   *rand.Rand // shared by the nodes of a run; guarded by rngMu
-	rngMu *sync.Mutex
-	lost  map[string]bool
-	sends []watchSend
+	mu      sync.Mutex
+	faults  []fault
+	changed chan struct{} // closed and replaced when a fault is added
+	rng     *rand.Rand    // shared by the nodes of a run; guarded by rngMu
+	rngMu   *sync.Mutex
+	lost    map[string]bool
+	sends   []watchSend
+	trapped bool // the outage after the first grant of a new incarnation has been added
 
 	closeSeq uint64 // the stamp taken right after Close returned
 	closeErr error
@@ -189,6 +211,8 @@ type contractNode struct {
 
 // faultAt returns the fault that hits a call of method now: an outage before any other.
 func (cn *contractNode) faultAt(method string) (fault, bool) {
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
 	now := time.Since(cn.t0)
 	var found fault
 	ok := false
@@ -206,8 +230,11 @@ func (cn *contractNode) faultAt(method string) (fault, bool) {
 	return found, ok
 }
 
-// nextOutage returns the start of the next outage of the node, and false when none is left.
-func (cn *contractNode) nextOutage() (time.Time, bool) {
+// nextOutage returns the start of the next outage of the node, and false when none is left, and
+// a channel closed when a fault is added.
+func (cn *contractNode) nextOutage() (time.Time, bool, <-chan struct{}) {
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
 	now := time.Since(cn.t0)
 	var next time.Duration
 	ok := false
@@ -216,7 +243,36 @@ func (cn *contractNode) nextOutage() (time.Time, bool) {
 			next, ok = f.from, true
 		}
 	}
-	return cn.t0.Add(next), ok
+	return cn.t0.Add(next), ok, cn.changed
+}
+
+// addFault adds f to the node's faults.
+func (cn *contractNode) addFault(f fault) {
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
+	cn.faults = append(cn.faults, f)
+	close(cn.changed)
+	cn.changed = make(chan struct{})
+}
+
+// trap adds, after the first grant to the holder of a new incarnation, an outage of 9 s that
+// starts 3 s later and hangs every call. The store watch lags 8 s from the loss on, so the outage
+// breaks the watch before it delivers the grant, and the record naming the new holder reaches the
+// node first through a resync or a Confirm, while its fenced shards are degraded or just after.
+func (cn *contractNode) trap(holder string) {
+	cn.mu.Lock()
+	first := !cn.trapped && len(cn.lost) > 0 && !cn.lost[holder]
+	cn.trapped = cn.trapped || first
+	cn.mu.Unlock()
+	if first {
+		now := time.Since(cn.t0)
+		cn.addFault(fault{from: now + 3*time.Second, to: now + 10*time.Second, kind: faultHang})
+		cn.addFault(fault{from: now + 3*time.Second, to: now + 13*time.Second, method: "KeepAlive", kind: faultFail})
+		cn.addFault(fault{from: now + 3*time.Second, to: now + 30*time.Second, method: "Holdings", kind: faultStuck,
+			d: 2500 * time.Millisecond})
+		cn.addFault(fault{from: now + 3*time.Second, to: now + 30*time.Second, method: "Confirm", kind: faultLate,
+			d: 1900 * time.Millisecond})
+	}
 }
 
 // loseSession makes the store lose the session of holder from now on.
@@ -266,9 +322,13 @@ func (cn *contractNode) answer(method string) answerFunc {
 		if slices.Contains(lostMethods, method) && cn.isLost(argAt[string](args, 0)) {
 			return nil, tenure.ErrSessionLost
 		}
-		return cn.faulty(ctx, method, func(ctx context.Context) ([]any, error) {
+		res, err := cn.faulty(ctx, method, func(ctx context.Context) ([]any, error) {
 			return cn.fs.Forward(ctx, method, args)
 		})
+		if method == "Acquire" && err == nil {
+			cn.trap(argAt[string](args, 0))
+		}
+		return res, err
 	}
 }
 
@@ -285,13 +345,19 @@ func (cn *contractNode) faulty(ctx context.Context, method string, forward func(
 		}
 		return nil, errBoom
 	case faultHang:
-		<-ctx.Done()
-		return nil, ctx.Err()
+		if err := sleepCtx(ctx, time.Until(cn.t0.Add(f.to))); err != nil {
+			return nil, err
+		}
+		return nil, errUnreachable // the outage is over, but its calls fail
 	case faultDelay:
 		if err := sleepCtx(ctx, f.d); err != nil {
 			return nil, err
 		}
 		return forward(ctx)
+	case faultStuck:
+		res, err := forward(ctx)
+		time.Sleep(f.d)
+		return res, err
 	default: // faultLate
 		res, err := forward(ctx)
 		if e := sleepCtx(ctx, f.d); e != nil {
@@ -314,39 +380,75 @@ func (cn *contractNode) watch(ctx context.Context, args []any) ([]any, error) {
 	})
 }
 
-// relay hands each value of in to out, and one time in four also an earlier value again. It
-// closes out when in closes, at the start of the node's next outage, and when out is full, as a
-// store that cannot deliver every write does.
+// relay hands each value of in to out, in order, as late as a watch lag says, and one time in
+// four also an earlier value again. It closes out when in closes, at the start of the node's next
+// outage, and when out is full, as a store that cannot deliver every write does; values it holds
+// then are lost.
 func (cn *contractNode) relay(in <-chan tenure.Holding, out chan tenure.Holding) {
 	defer close(out)
 	var brk <-chan time.Time
-	if at, ok := cn.nextOutage(); ok {
-		t := time.NewTimer(time.Until(at))
-		defer t.Stop()
-		brk = t.C
+	brkTimer := time.NewTimer(time.Hour)
+	defer brkTimer.Stop()
+	var changed <-chan struct{}
+	arm := func() {
+		at, ok, ch := cn.nextOutage()
+		changed, brk = ch, nil
+		brkTimer.Stop()
+		if ok {
+			brkTimer.Reset(time.Until(at))
+			brk = brkTimer.C
+		}
 	}
-	var sent []watchSend
+	arm()
+	type held struct {
+		h           tenure.Holding
+		due         time.Time
+		redelivered bool
+	}
+	var queue []held
+	var sent []tenure.Holding
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
 	for {
+		now := time.Now()
+		for len(queue) > 0 && !queue[0].due.After(now) {
+			q := queue[0]
+			queue = queue[1:]
+			if !cn.send(out, watchSend{h: q.h, seq: seq(), at: time.Now(), redelivered: q.redelivered}) {
+				return
+			}
+			if !q.redelivered {
+				sent = append(sent, q.h)
+			}
+		}
+		var due <-chan time.Time
+		if len(queue) > 0 {
+			timer.Reset(time.Until(queue[0].due))
+			due = timer.C
+		}
 		select {
 		case h, ok := <-in:
 			if !ok {
 				return
 			}
-			s := watchSend{h: h, seq: seq()}
-			if !cn.send(out, s) {
-				return
+			at := now
+			if f, ok := cn.faultAt(watchLag); ok {
+				at = at.Add(f.d)
 			}
-			sent = append(sent, s)
-			if cn.chance(4) {
-				old := sent[cn.intn(len(sent))]
-				old.redelivered = true
-				if !cn.send(out, old) {
-					return
-				}
+			if n := len(queue); n > 0 && queue[n-1].due.After(at) {
+				at = queue[n-1].due
 			}
+			queue = append(queue, held{h: h, due: at})
+			if len(sent) > 0 && cn.chance(4) {
+				queue = append(queue, held{h: sent[cn.intn(len(sent))], due: at, redelivered: true})
+			}
+		case <-due:
+		case <-changed:
+			arm()
 		case <-brk:
 			return
 		}
+		timer.Stop()
 	}
 }
 
@@ -466,8 +568,8 @@ func runContract(t *testing.T, r *contractRun) {
 	nodes := make([]*contractNode, len(contractIDs))
 	for i, id := range contractIDs {
 		sleepUntil(t0.Add(time.Duration(i) * time.Second))
-		cn := &contractNode{id: id, t0: t0, faults: p.faults[i], fs: newRecStore(ms), sm: g.Absent(id),
-			runs: &runLog{}, log: &stepLog{}, rng: rng, rngMu: &rngMu, lost: make(map[string]bool)}
+		cn := &contractNode{id: id, t0: t0, faults: p.faults[i], changed: make(chan struct{}), fs: newRecStore(ms),
+			sm: g.Absent(id), runs: &runLog{}, log: &stepLog{}, rng: rng, rngMu: &rngMu, lost: make(map[string]bool)}
 		cn.runs.Script(contractRunScript)
 		for _, m := range faultMethods {
 			if m != "WatchHolders" {
@@ -501,7 +603,12 @@ func runContract(t *testing.T, r *contractRun) {
 		do func()
 	}
 	events := []event{
-		{p.lossAt, func() { nodes[p.lossNode].loseSession(nodes[p.lossNode].n.Holder()) }},
+		{p.lossAt, func() {
+			cn := nodes[p.lossNode]
+			cn.addFault(fault{from: p.lossAt, to: p.lossAt + time.Minute, method: watchLag, kind: faultDelay,
+				d: 8 * time.Second})
+			cn.loseSession(cn.n.Holder())
+		}},
 		{p.pauseAt, func() { nodes[p.pauseNode].sm.Pause() }},
 		{p.pauseAt + p.pauseFor, func() { nodes[p.pauseNode].sm.Resume() }},
 		{p.slotsAt, func() {
@@ -961,7 +1068,7 @@ func checkRestore(t *testing.T, nr *nodeRecord, i int, a core.Restore, k int) {
 		t.Errorf("%s: %+v before the call of Confirm action %d went out (%d calls)", nr.where(i), a, k, len(confirms))
 		return
 	}
-	from := confirms[k-1].Seq
+	from, fromAt := confirms[k-1].Seq, confirms[k-1].Start
 	in, ok := nr.steps[i].Input.(core.HolderChanged)
 	if !ok || in.Space != a.Space || in.Shard != a.Shard || in.Holder != h || in.Term != a.Term {
 		t.Errorf("%s: %+v not on a HolderChanged naming %s at term %d", nr.where(i), a, h, a.Term)
@@ -970,8 +1077,12 @@ func checkRestore(t *testing.T, nr *nodeRecord, i int, a core.Restore, k int) {
 	shows := func(x tenure.Holding) bool {
 		return x.Space == a.Space && x.Shard == a.Shard && x.Holder == h && x.Term == a.Term
 	}
+	// A reading at the instant the Confirm call started counts as after it: the node stamps the
+	// call when it hands it over, which the double does not see, and at one instant nothing else
+	// orders the two.
+	after := func(seq uint64, start time.Time) bool { return seq > from || start.Equal(fromAt) }
 	for _, c := range nr.calls {
-		if !c.Done || c.Err != nil || c.Seq < from || c.EndSeq > at {
+		if !c.Done || c.Err != nil || !after(c.Seq, c.Start) || c.EndSeq > at {
 			continue
 		}
 		switch {
@@ -982,7 +1093,7 @@ func checkRestore(t *testing.T, nr *nodeRecord, i int, a core.Restore, k int) {
 		}
 	}
 	for _, s := range nr.sends {
-		if s.seq > from && s.seq < at && shows(s.h) {
+		if after(s.seq, s.at) && s.seq < at && shows(s.h) {
 			return
 		}
 	}
