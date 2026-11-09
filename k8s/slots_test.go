@@ -16,7 +16,9 @@ import (
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/core"
@@ -142,8 +144,11 @@ func slotSteps(rec *recorder, m match) []string {
 // member Lease write, for RenewDeadline of the session's Timing; while not fresh, Slots keeps a
 // current session's slot held past its wait and ClaimSlot does not take it, without a request;
 // a delivered own write makes the cache fresh again and frees the slot; a write by someone else
-// to the own member Lease does not count; and opening and ending sessions, Join, Leave and a
-// stale cache turning fresh are signalled.
+// to the own member Lease does not count; and opening and ending sessions, Join, Leave, a
+// session's RenewDeadline changing and a stale cache turning fresh are signalled. An own write
+// counts from when it was sent, not from its delivery: a renewal whose request took
+// RenewDeadline leaves the cache stale, and a write the watch delivered before its response
+// came back counts at once.
 func TestK8S150Freshness(t *testing.T) {
 	ctx := t.Context()
 	clock := newFakeClock()
@@ -274,6 +279,99 @@ func TestK8S150Freshness(t *testing.T) {
 			t.Error("not fresh after Leave")
 		}
 	})
+
+	t.Run("slow renewal", func(t *testing.T) {
+		clock := newFakeClock()
+		client := newFake()
+		b := fakeAdapter(t, client, withClock(clock.now))
+		closeAtEnd(t, b, own)
+		if err := b.KeepAlive(ctx, own, long); err != nil {
+			t.Fatalf("KeepAlive: %v", err)
+		}
+		waitFresh(t, b, true)
+		// A renewal with a shorter RenewDeadline changes the rule's bound; on a fresh cache, its
+		// delivery signals nothing.
+		shorter := long
+		shorter.RenewDeadline -= time.Second
+		changed := b.freshChanged()
+		if err := b.KeepAlive(ctx, own, shorter); err != nil {
+			t.Fatalf("KeepAlive: %v", err)
+		}
+		signalled(t, changed, "a session's RenewDeadline changed")
+		name := memberName("g", "pod-0")
+		waitDelivered(t, b, name, fakeGet(t, client, name).ResourceVersion)
+		if _, next := b.freshness(); !next.Equal(clock.now().Add(shorter.RenewDeadline)) {
+			t.Errorf("fresh until %v, want %v", next, clock.now().Add(shorter.RenewDeadline))
+		}
+
+		// The renewal's request takes RenewDeadline: its delivery shows no change committed
+		// since it was sent, so it leaves the cache stale.
+		var slow sync.Once
+		client.PrependReactor("update", resourceLeases, func(k8stesting.Action) (bool, runtime.Object, error) {
+			slow.Do(func() { clock.advance(shorter.RenewDeadline) })
+			return false, nil, nil
+		})
+		if err := b.KeepAlive(ctx, own, shorter); err != nil {
+			t.Fatalf("KeepAlive: %v", err)
+		}
+		waitDelivered(t, b, name, fakeGet(t, client, name).ResourceVersion)
+		waitFresh(t, b, false)
+		if err := b.KeepAlive(ctx, own, shorter); err != nil {
+			t.Fatalf("KeepAlive: %v", err)
+		}
+		waitFresh(t, b, true)
+	})
+
+	t.Run("delivered before the response", func(t *testing.T) {
+		clock := newFakeClock()
+		c := &leaseCache{now: clock.now, pending: map[string][]pendingWrite{}, delivered: map[string]uint64{}}
+		lease := func(rv string) *coordinationv1.Lease {
+			return &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: "g-member-pod-0", ResourceVersion: rv, Labels: leaseLabels("g", kindMember, "")}}
+		}
+		t0 := clock.now()
+		if _, ok := c.ownWrite(lease("10"), t0); ok {
+			t.Error("an own write not delivered yet counted")
+		}
+		clock.advance(time.Second)
+		if prev, own := c.deliver(lease("10")); !own || !prev.IsZero() {
+			t.Errorf("deliver = %v, %v; want none, true", prev, own)
+		}
+		if !c.ownSentAt.Equal(t0) {
+			t.Errorf("own write counted at %v, want its send time %v", c.ownSentAt, t0)
+		}
+		if _, own := c.deliver(lease("12")); own {
+			t.Error("a delivery no own write waits for counted")
+		}
+		t1 := clock.advance(time.Second)
+		if prev, ok := c.ownWrite(lease("11"), t1); !ok || !prev.Equal(t0) {
+			t.Errorf("ownWrite of a write delivered already = %v, %v; want %v, true", prev, ok, t0)
+		}
+		if !c.ownSentAt.Equal(t1) {
+			t.Errorf("own write counted at %v, want its send time %v", c.ownSentAt, t1)
+		}
+	})
+}
+
+// waitDelivered waits up to 2 s for a's informer to deliver Lease name at resourceVersion rv or
+// later. Unlike waitObserved, it does not count the Adapter's own notes of its writes.
+func waitDelivered(t testing.TB, a *Adapter, name, rv string) {
+	t.Helper()
+	want, _ := parseUint(rv)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if c := a.runningCache(); c != nil {
+			c.mu.Lock()
+			got := c.delivered[name]
+			c.mu.Unlock()
+			if got >= want {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s at %s not delivered after 2s", name, rv)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // TestK8S400SlotChecks checks what ClaimSlot, ReleaseSlot, SetSlots and Slots return with a fake

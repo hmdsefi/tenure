@@ -262,9 +262,15 @@ func (a *Adapter) renew(ctx context.Context, s session, timing core.Timing) erro
 		return err
 	case err != nil:
 		if timing.LeaseDuration < p.timing.LeaseDuration {
+			// The session's expiry comes forward, and with it the end of its part in freshness.
 			p.timing = timing
+			a.signalFreshLocked()
 		}
 		return err
+	}
+	if timing.RenewDeadline != p.timing.RenewDeadline {
+		// Freshness takes the largest RenewDeadline of the active sessions (cache.go).
+		a.signalFreshLocked()
 	}
 	p.lease, p.timing, p.sent = written, timing, sent
 	return nil
