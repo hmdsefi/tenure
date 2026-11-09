@@ -276,15 +276,24 @@ func (o *logObserver) shardClosed(sh *Shard) { o.steps.closed(sh, time.Since(o.n
 
 func (o *logObserver) callFailed(callResult)                         {}
 func (o *logObserver) runReturned(*Shard, error, int, time.Duration) {}
-func (o *logObserver) slotCountMismatch(int, int)                    {}
 func (o *logObserver) slotsFailed(error)                             {}
 func (o *logObserver) membershipFailed(string, error)                {}
+
+// slotCountMismatch emits slot.count_mismatch: Start keeps the stored count, which differs from
+// Config.Slots.
+func (o *logObserver) slotCountMismatch(configured, stored int) {
+	o.n.events.emit(Event{Kind: EventSlotCountMismatch, Shard: -1, Slot: -1, Count: stored, Configured: configured})
+}
+
+// noSlot emits slot.standby for a ClaimSlot that found no free slot, once per standby period.
+func (o *logObserver) noSlot() { o.steps.noSlot() }
 
 // newIncarnation notes the node's new holder, which the loop has set, for the events from now on.
 func (o *logObserver) newIncarnation(string) { o.n.events.setHolder(o.n.holder) }
 
 func (o *logObserver) draining() {
 	o.drainStart = time.Now()
+	o.steps.draining.Store(true)
 	o.n.events.emit(Event{Kind: EventNodeDraining, Shard: -1, Slot: -1})
 }
 

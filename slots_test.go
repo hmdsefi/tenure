@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -140,7 +141,8 @@ func running(l *runLog) []int {
 
 // TestATRUN07SeedSlots checks Start's slot count (RUN-230): (a) a count of 0 in the store is
 // seeded with SetSlots(Config.Slots) and read again before KeepAlive; (b) a positive stored count
-// is kept, also when Config.Slots differs, and Route works over its slots; (c) the member claims
+// is kept, also when Config.Slots differs, which slot.count_mismatch reports before
+// session.opened, and Route works over its slots; (c) the member claims
 // a slot and runs that slot's shards, and the shards of the vacant slots once SlotGrace has
 // passed.
 func TestATRUN07SeedSlots(t *testing.T) {
@@ -177,12 +179,28 @@ func TestATRUN07SeedSlots(t *testing.T) {
 				if err := r.ms.SetSlots(context.Background(), 3); err != nil {
 					t.Fatal(err)
 				}
-				n := start(t, context.Background(), r.slotConfig(configured))
+				cfg := r.slotConfig(configured)
+				events := &eventRec{}
+				cfg.OnEvent = events.OnEvent
+				n := start(t, context.Background(), cfg)
 				synctest.Wait()
 
 				calls := withoutRefreshes(r.fs.Calls("Slots", "SetSlots", "KeepAlive"))
 				if got, want := callMethods(calls), []string{"Slots", "KeepAlive"}; !slices.Equal(got, want) {
 					t.Errorf("store calls of Start = %v, want %v", got, want)
+				}
+				// A positive Config.Slots that differs from the stored count is reported once, before
+				// the session opens; 0 and the stored count are not.
+				want := []tenure.Event{}
+				if configured == 2 {
+					want = []tenure.Event{{Kind: tenure.EventSlotCountMismatch, Shard: -1, Slot: -1, Count: 3, Configured: 2}}
+				}
+				got := events.Events()
+				if mm := bareAll(ofKinds(got, tenure.EventSlotCountMismatch)); !reflect.DeepEqual(mm, want) {
+					t.Errorf("slot.count_mismatch events %+v, want %+v", mm, want)
+				}
+				if m, opened := indexOf(got, tenure.EventSlotCountMismatch, -1), indexOf(got, tenure.EventSessionOpened, -1); m > opened {
+					t.Errorf("slot.count_mismatch at %d, session.opened at %d: want the mismatch first", m, opened)
 				}
 				if ss := r.fs.Calls("SetSlots"); len(ss) != 0 {
 					t.Errorf("SetSlots calls = %v, want none", ss)
