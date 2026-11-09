@@ -39,6 +39,17 @@ type stepRecord struct {
 
 	// Err is the error of the store call the input answers, nil otherwise.
 	Err error
+
+	// Read is, for a HolderChanged stepped from a reading, the executor stamp the freshness
+	// filter ordered that reading by: the start stamp of the Confirm or Holdings call that read
+	// the record, or the stamp a store watch value got when the node received it. It is 0 for
+	// any other input.
+	Read uint64
+
+	// Stamp is an executor stamp taken once the step's actions have been handed to the
+	// executor, before the step is reported: a store call with a larger start stamp started
+	// after the step was carried out.
+	Stamp uint64
 }
 
 // stepHookKey is the context key of the step hook: a func(stepRecord) that Start reads from its
@@ -51,6 +62,7 @@ type loopInput struct {
 	in       core.Input
 	sentWall time.Time
 	err      error
+	read     uint64 // the start stamp of the reading a HolderChanged came from (stepRecord.Read)
 
 	// sh is the shard whose supervisor ended, for the RunStopped it posted: once the step is
 	// carried out, the loop unpublishes sh if it is still the shard's published one.
@@ -264,6 +276,7 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 		Actions:  acts,
 		SentWall: in.sentWall,
 		Err:      in.err,
+		Read:     in.read,
 	}
 	l.status = rec.After
 	lost := rec.Before.Session != core.SessionStateLost && rec.After.Session == core.SessionStateLost
@@ -297,6 +310,7 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 	if in.sh != nil {
 		n.shards[in.sh.Space].local[in.sh.ID].CompareAndSwap(in.sh, nil)
 	}
+	rec.Stamp = n.exec.stamp()
 	n.obs.step(rec)
 	if l.hook != nil {
 		l.hook(rec)

@@ -45,6 +45,13 @@ func WithStepHook(ctx context.Context, f func(StepRecord)) context.Context {
 	return context.WithValue(ctx, stepHookKey{}, f)
 }
 
+// CallStamp returns the executor's start stamp of the store call made with ctx: lane calls,
+// Holdings and Slots reads carry one. It returns 0 for any other context.
+func CallStamp(ctx context.Context) uint64 {
+	s, _ := ctx.Value(callStampKey{}).(uint64)
+	return s
+}
+
 // SessionDeadline returns the session deadline the loop keeps for unfenced shards, as a reading
 // since the epoch.
 func (n *Node) SessionDeadline() time.Duration { return time.Duration(n.deadline.Load()) }

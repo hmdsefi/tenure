@@ -431,7 +431,7 @@ func (r *refresher) read() (res slotsRead, again, ok bool) {
 		ctx, cancel := context.WithTimeout(n.ctx, n.cfg.Timing.RetryPeriod)
 		defer cancel()
 		stamp = n.exec.stamp()
-		count, holders, err = readSlotData(ctx, r.store)
+		count, holders, err = readSlotData(withCallStamp(ctx, stamp), r.store)
 	}) || n.ctx.Err() != nil {
 		return slotsRead{}, false, false
 	}

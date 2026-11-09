@@ -283,7 +283,7 @@ func (l *loop) observe(rd reading) {
 	now := time.Since(l.n.epoch)
 	l.tickUntil(now)
 	if hc, ok := l.n.fresh.admit(rd, l.status); ok {
-		l.apply(loopInput{in: l.at(hc, now)}, now)
+		l.apply(loopInput{in: l.at(hc, now), read: rd.start}, now)
 	}
 }
 
@@ -398,7 +398,7 @@ func (n *Node) readHoldings(space string) bool {
 			ctx, cancel := context.WithTimeout(n.ctx, period)
 			defer cancel()
 			at, start = time.Now(), n.exec.stamp()
-			hs, err = n.cfg.Store.Holdings(ctx, space)
+			hs, err = n.cfg.Store.Holdings(withCallStamp(ctx, start), space)
 			end = n.exec.stamp()
 		}) {
 			return false

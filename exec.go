@@ -412,7 +412,7 @@ func (e *executor) exec(l *lane, c execCall) (callResult, bool) {
 		e.confirms[l.key] = confirmMark{tag: c.tag, start: r.start}
 	}
 	e.mu.Unlock()
-	o := e.invoke(ctx, c)
+	o := e.invoke(withCallStamp(ctx, r.start), c)
 	cancel()
 
 	r.err, r.holding = o.err, o.holding
@@ -431,6 +431,16 @@ func (e *executor) exec(l *lane, c execCall) (callResult, bool) {
 	}
 	e.mu.Unlock()
 	return r, true
+}
+
+// callStampKey is the context key under which a store call's context carries the call's start
+// stamp, so that tests can order the call by the executor's stamps.
+type callStampKey struct{}
+
+// withCallStamp returns a copy of ctx that carries start, the start stamp of the store call made
+// with it.
+func withCallStamp(ctx context.Context, start uint64) context.Context {
+	return context.WithValue(ctx, callStampKey{}, start)
 }
 
 // outcome is what a store call returned.

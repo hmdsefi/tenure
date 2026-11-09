@@ -49,6 +49,10 @@ type call struct {
 	Seq, EndSeq uint64    // stamps from seq at the start and the end
 	Done        bool      // the call has returned
 
+	// Stamp is the node's own start stamp of the call, from its executor (tenure.CallStamp): it
+	// orders the call against the node's readings and steps, and is 0 for a call made without one.
+	Stamp uint64
+
 	Result []any // the results before the error, in order
 	Err    error
 }
@@ -169,7 +173,7 @@ func (s *script) edit(method string, f func(r *callRule)) {
 func (s *script) do(ctx context.Context, method string, args []any, forward func(context.Context) ([]any, error)) ([]any, error) {
 	// The start stamp comes first, before the double's own lock, which other calls may hold: the
 	// call has started once the method is entered.
-	c := &call{Seq: seq(), Method: method, Start: time.Now()}
+	c := &call{Seq: seq(), Method: method, Start: time.Now(), Stamp: tenure.CallStamp(ctx)}
 	c.Args = snapshot(args)
 	c.Deadline, c.HasDeadline = ctx.Deadline()
 	s.mu.Lock()
