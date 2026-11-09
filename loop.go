@@ -246,11 +246,11 @@ func (l *loop) tickUntil(now time.Duration) {
 // apply steps in, whose Now is set to now, and carries the step out (RUN-100): under n.stepMu it
 // executes the actions in order, publishes a stepped view, computes the view's assignments itself
 // when the machine did not apply the view, publishes the routing snapshot when the view or an
-// assignment changed, unpublishes the shard of a stepped RunStopped that is still published, and
-// reports the step to the observer and the hook. After the step that loses the session it runs
-// lose. It then re-arms the timer. The first time the machine is done, it closes n.machineDone,
-// unless the machine is done after a lost session and no drain has been requested: then a new
-// incarnation is due instead.
+// assignment changed, records a stepped view for SetSlots (n.stepped), unpublishes the shard of a
+// stepped RunStopped that is still published, and reports the step to the observer and the hook.
+// After the step that loses the session it runs lose. It then re-arms the timer. The first time
+// the machine is done, it closes n.machineDone, unless the machine is done after a lost session
+// and no drain has been requested: then a new incarnation is due instead.
 func (l *loop) apply(in loopInput, now time.Duration) {
 	n := l.n
 	acts := l.m.Step(in.in)
@@ -282,6 +282,11 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 		}
 	}
 	l.publishRoutes()
+	if v, ok := in.in.(core.ViewChanged); ok {
+		// After its routes, so that SetSlots returns once Route follows the view. The merger's
+		// Version of the view is its own less bump.
+		n.stepped.record(v.View.Version-l.bump, v.View.Slots)
+	}
 	if in.sh != nil {
 		n.shards[in.sh.Space].local[in.sh.ID].CompareAndSwap(in.sh, nil)
 	}

@@ -54,6 +54,7 @@ type Node struct {
 	// publishes; refresh reads the slot data of a SlotStore once the session is open, else nil.
 	merge   merger
 	refresh *refresher
+	stepped steppedViews // the latest merged view the loop has stepped, for SetSlots
 
 	// With a store: the session, the executor of the machine's store calls, and the loop that
 	// drives the machine. The loop is the only goroutine that steps the machine.
@@ -491,10 +492,79 @@ func (n *Node) setDraining() bool {
 	}
 }
 
+// SetSlots sets the slot count of the group, which the Store keeps, to count, and returns once
+// this node follows it: once the node has read the slots again after the write and steps, and
+// routes by, a view that holds what it read. Raising the count adds vacant slots, which standby
+// members claim. Lowering it retires the highest slots: their holders hand their shards over to
+// the members of the remaining slots and become standbys. SetSlots does not wait for that
+// hand-over, and it does not need this member to hold a slot. A count of 0 turns slots off.
+//
+// SetSlots returns ErrClosed once Close has been called, and ErrDraining once Drain has been
+// called. A negative count fails with "tenure: SetSlots: negative count -1", and a Store that
+// does not implement SlotStore with "tenure: SetSlots: store does not implement SlotStore".
+// Errors of the store's SetSlots, and of the read of the slots after it, start with
+// "tenure: SetSlots: " and wrap the store's error. When ctx ends first, SetSlots returns an error
+// that wraps ctx's error; the count may have been written by then.
+//
+// The wait goes on while the node steps no view, for example while it waits for a new session
+// after losing one, until ctx ends or Close stops the node. When Close stops the node first,
+// SetSlots returns ErrClosed.
+func (n *Node) SetSlots(ctx context.Context, count int) error {
+	n.mu.Lock()
+	switch {
+	case n.closing:
+		n.mu.Unlock()
+		return ErrClosed
+	case n.drainDone != nil:
+		n.mu.Unlock()
+		return ErrDraining
+	case count < 0:
+		n.mu.Unlock()
+		return fmt.Errorf("tenure: SetSlots: negative count %d", count)
+	}
+	ss, ok := n.cfg.Store.(SlotStore)
+	if !ok {
+		n.mu.Unlock()
+		return errors.New("tenure: SetSlots: store does not implement SlotStore")
+	}
+	// Close waits for the node's goroutines once it has set closing, under n.mu: the call counts
+	// as one of them, so no store call of SetSlots starts after Close has returned.
+	n.wg.Add(1)
+	n.mu.Unlock()
+	defer n.wg.Done()
+
+	err := n.writeSlots(ctx, ss, count)
+	switch {
+	case err == nil:
+		err = n.awaitSlots(ctx, count)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() == nil && n.ctx.Err() == nil {
+			return fmt.Errorf("tenure: SetSlots: read slots: %w", err)
+		}
+	case ctx.Err() == nil && n.ctx.Err() == nil:
+		return fmt.Errorf("tenure: SetSlots: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("tenure: SetSlots: %w", err)
+	}
+	return ErrClosed // Close stopped the node first
+}
+
+// writeSlots calls the store's SetSlots with ctx, which the internal context also cancels.
+func (n *Node) writeSlots(ctx context.Context, ss SlotStore, count int) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(n.ctx, cancel)
+	defer stop()
+	return ss.SetSlots(ctx, count)
+}
+
 // Close drains the node as Drain does, leaves the group, and stops every goroutine of the node.
 // It returns nil once all of that is done. Later calls return ErrClosed, and so do Route, Local,
-// Drain and the lookups of every Resolver the node returned; a Shard the node handed to Run
-// keeps returning its stop error.
+// Drain, SetSlots and the lookups of every Resolver the node returned; a Shard the node handed to
+// Run keeps returning its stop error.
 //
 // When ctx ends before the drain completes, or is done already when Close is called, Close
 // neither closes the member's session nor leaves the group: the store expires the session, so no
