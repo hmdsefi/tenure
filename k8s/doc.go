@@ -48,6 +48,15 @@
 // While the Adapter has an active session, it watches the group's Leases with one informer,
 // which stops once nothing needs it any more. CloseSession ends a session for good.
 //
+// # Membership
+//
+// A member that joined has its member record, a small JSON document, in the annotation
+// tenure.member of its member Lease. Join writes it, creating the Lease with no holder when there
+// is none, so a member needs no session: while no session holds the Lease, the Adapter moves its
+// renewTime on every RetryPeriod of the Adapter's Timing. SetDraining rewrites the record. A
+// session closed while the member has joined only clears the Lease's holder. Leave deletes the
+// Lease, or removes only the record while a session holds it.
+//
 // # Shard records
 //
 // Acquire grants a shard, with a new term, to a holder with an active session in the Adapter

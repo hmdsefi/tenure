@@ -38,8 +38,9 @@ type decider func(cur *coordinationv1.Lease) (change, error)
 // the write fails because the Lease changed (Conflict, AlreadyExists, or NotFound for an update
 // or a delete), it reads the Lease and decides again, sending at most maxWriteAttempts writes;
 // then it returns "k8s: lease <name>: 3 conflicts: <last error>". It returns the Lease written,
-// nil when it deleted the Lease or decided on no change. Other errors of the API server come
-// back as "k8s: <op> <name>: <error>"; errors of decide come back as they are.
+// which it notes in the running cache (noteRead), nil when it deleted the Lease or decided on no
+// change. Other errors of the API server come back as "k8s: <op> <name>: <error>"; errors of
+// decide come back as they are.
 func (a *Adapter) writeLease(ctx context.Context, op, name string, cur *coordinationv1.Lease, decide decider) (*coordinationv1.Lease, error) {
 	leases := a.leases()
 	for attempt := 1; ; attempt++ {
@@ -62,6 +63,10 @@ func (a *Adapter) writeLease(ctx context.Context, op, name string, cur *coordina
 			written, err = leases.Update(ctx, ch.lease, metav1.UpdateOptions{})
 		}
 		if err == nil {
+			// The cache knows the write at once, before the informer tells: a decision on the
+			// cache, such as whether a replaced incarnation still holds its member Lease, must not
+			// meet an older state of a Lease this Adapter wrote.
+			a.noteRead(written)
 			return written, nil
 		}
 		gone := cur != nil && apierrors.IsNotFound(err)

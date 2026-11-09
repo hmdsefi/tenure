@@ -145,7 +145,7 @@ func fakeAdapter(t testing.TB, client *fake.Clientset, opts ...Option) *Adapter 
 	return a
 }
 
-// waitStopped fails the test unless every informer goroutine of a ends within 1 s.
+// waitStopped fails the test unless every goroutine of a, informer and heartbeat, ends within 1 s.
 func waitStopped(t testing.TB, a *Adapter) {
 	t.Helper()
 	done := make(chan struct{})
@@ -156,7 +156,7 @@ func waitStopped(t testing.TB, a *Adapter) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Error("the informer still runs 1s after the Adapter's last use")
+		t.Error("a goroutine of the Adapter still runs 1s after its last use")
 	}
 	if c := a.runningCache(); c != nil {
 		t.Errorf("the Adapter still has a running cache with %d holds", c.refs)
@@ -525,5 +525,27 @@ func TestK8S110Observation(t *testing.T) {
 		if _, ok := a.tombstoneOf(uid); ok {
 			t.Errorf("tombstone of %s kept after the informer stopped", uid)
 		}
+	}
+}
+
+// TestK8S110NotedAfterDeletion checks that a state of a Lease noted after the informer saw it
+// deleted, such as a write that returned late, leaves the Lease gone; a new Lease of that name
+// is observed as usual.
+func TestK8S110NotedAfterDeletion(t *testing.T) {
+	clock := newFakeClock()
+	c := &leaseCache{now: clock.now, defaultWait: T.LeaseDuration, terms: &shardTerms{}, obs: map[string]*observation{}, tombs: map[types.UID]tombstone{}}
+	const name = "g-member-pod-0"
+	lease := func(uid types.UID, rv string) *coordinationv1.Lease {
+		return &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid, ResourceVersion: rv, Labels: leaseLabels("g", kindMember, "")}}
+	}
+	c.observe(lease("u1", "10"))
+	c.forget(lease("u1", "12"))
+	c.observe(lease("u1", "11"))
+	if o, ok := c.obs[name]; ok {
+		t.Fatalf("a deleted Lease noted again: %+v", o.lease)
+	}
+	c.observe(lease("u2", "13"))
+	if o, ok := c.obs[name]; !ok || o.lease.UID != "u2" {
+		t.Errorf("observation %+v, want the new Lease u2", o)
 	}
 }

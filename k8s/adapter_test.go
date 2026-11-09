@@ -34,6 +34,9 @@ var adapterCalls = []struct {
 	{"CheckTiming", func(_ context.Context, a *Adapter) error { return a.CheckTiming(T) }},
 	{"KeepAlive", func(ctx context.Context, a *Adapter) error { return a.KeepAlive(ctx, "pod-0/1", T) }},
 	{"CloseSession", func(ctx context.Context, a *Adapter) error { return a.CloseSession(ctx, "pod-0/1") }},
+	{"Join", func(ctx context.Context, a *Adapter) error { return a.Join(ctx, core.Member{ID: "pod-0", Slot: -1}) }},
+	{"SetDraining", func(ctx context.Context, a *Adapter) error { return a.SetDraining(ctx, true) }},
+	{"Leave", func(ctx context.Context, a *Adapter) error { return a.Leave(ctx) }},
 	{"Acquire", func(ctx context.Context, a *Adapter) error {
 		_, err := a.Acquire(ctx, "pod-0/1", "markets", 0)
 		return err
