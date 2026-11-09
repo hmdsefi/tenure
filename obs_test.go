@@ -154,6 +154,44 @@ func TestATOBS16FailedStart(t *testing.T) {
 			check()
 		})
 	})
+
+	// The store holds 3 slots and Config.Slots is 2, so Start emits slot.count_mismatch before
+	// its KeepAlive fails: OnEvent has returned for it when Start returns.
+	t.Run("SessionFails", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			check := baseline(t)
+			h := newObsHarness(t)
+			if err := h.ms.SetSlots(context.Background(), 3); err != nil {
+				t.Fatal(err)
+			}
+			a := h.Node("a", func(cfg *tenure.Config) { cfg.Slots = 2 })
+			errKeepAlive := errors.New("keepalive refused")
+			a.Store.Fail("KeepAlive", errKeepAlive, 0)
+			err := a.Start(context.Background())
+			returned := seq()
+			if !errors.Is(err, errKeepAlive) || !strings.HasPrefix(err.Error(), "tenure: open session: ") {
+				t.Fatalf("Start() = %v, want tenure: open session: wrapping %v", err, errKeepAlive)
+			}
+			calls := a.Events.Calls()
+			want := tenure.Event{Kind: tenure.EventSlotCountMismatch, Shard: -1, Slot: -1, Count: 3, Configured: 2}
+			if len(calls) != 1 || bare(calls[0].Event) != want {
+				t.Fatalf("OnEvent calls = %+v, want one with %+v", calls, want)
+			}
+			if !calls[0].Done || calls[0].EndSeq > returned {
+				t.Errorf("OnEvent call %+v returned after Start, want before", calls[0])
+			}
+
+			// No node.closed, nor any other event, comes later.
+			time.Sleep(time.Minute)
+			if got := a.Events.Calls(); len(got) != 1 {
+				t.Errorf("OnEvent calls after Start returned = %+v, want only the one before", got)
+			}
+			if got := a.Log.Lines(); len(got) != 1 || !strings.Contains(got[0], `"msg":"tenure: slot count mismatch"`) {
+				t.Errorf("log records = %q, want the one of slot.count_mismatch", got)
+			}
+			check()
+		})
+	})
 }
 
 // TestNodeLifecycleEvents checks node.draining, node.drained and node.closed: their fields, their

@@ -5,6 +5,7 @@ package tenure
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -508,11 +509,20 @@ func (l *loop) execute(act core.Action) {
 // slotResult follows up the result r of a ClaimSlot or ReleaseSlot call once its inputs have been
 // stepped (RUN-210, MCH O8). A SlotClaimed or SlotReleased raises the merger's floor to the end of
 // the call, so that no slot data read before it reaches the machine again, and every result asks
-// for a slot read. Other results need nothing.
+// for a slot read. A ClaimSlot that found no free slot, while the machine holds none, goes to the
+// observer (slot.standby). Other results need nothing.
 func (l *loop) slotResult(r callResult) {
 	n := l.n
 	switch r.act.(type) {
-	case core.ClaimSlot, core.ReleaseSlot:
+	case core.ClaimSlot:
+		if errors.Is(r.err, ErrNoSlot) && l.status.Slot < 0 {
+			n.stepMu.Lock()
+			if !n.halted {
+				n.obs.noSlot()
+			}
+			n.stepMu.Unlock()
+		}
+	case core.ReleaseSlot:
 	default:
 		return
 	}

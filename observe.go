@@ -35,6 +35,8 @@ import (
 //     positive Config.Slots, with both counts; the node keeps the stored count;
 //   - slotsFailed, for each failed Slots call of the slot refresher, which keeps the slot data
 //     it has and reads again later;
+//   - noSlot, for each ClaimSlot result ErrNoSlot that the loop takes for its machine while the
+//     machine holds no slot, under n.stepMu;
 //   - membershipFailed, for each failed call of the membership after Join that the node retries
 //     or gives up: "Watch" (also a channel that closed before Leave), "SetDraining" and "Leave";
 //   - draining, once, when the first Drain or Close starts the drain;
@@ -49,10 +51,10 @@ import (
 // start, startFailed, slotCountMismatch, shardClosed, closed, membershipFailed("Leave") and the
 // callFailed of Start's cleanup are called from the goroutine of Start or Close, slotsFailed
 // from the slot refresher's goroutine, draining from the first Drain or Close while it holds
-// n.mu, step, newIncarnation and a store's view from the loop goroutine, the callFailed calls of
-// Holdings and the store watch from the resync and store-watch goroutines, the other callFailed
-// calls from the executor's lanes, runReturned from the shard's supervisor goroutine, and the
-// rest from the node's watcher and drain goroutines. No call may call back into the node, and
+// n.mu, step, newIncarnation, noSlot and a store's view from the loop goroutine, the callFailed
+// calls of Holdings and the store watch from the resync and store-watch goroutines, the other
+// callFailed calls from the executor's lanes, runReturned from the shard's supervisor goroutine,
+// and the rest from the node's watcher and drain goroutines. No call may call back into the node, and
 // none may block, but startFailed and closed, which may wait for the delivery of the node's
 // events until their ctx ends.
 type observer interface {
@@ -65,6 +67,7 @@ type observer interface {
 	runReturned(sh *Shard, err error, count int, backoff time.Duration)
 	slotCountMismatch(configured, stored int)
 	slotsFailed(err error)
+	noSlot()
 	membershipFailed(op string, err error)
 	draining()
 	drained()
@@ -86,6 +89,7 @@ func (nopObserver) newIncarnation(string)                         {}
 func (nopObserver) runReturned(*Shard, error, int, time.Duration) {}
 func (nopObserver) slotCountMismatch(int, int)                    {}
 func (nopObserver) slotsFailed(error)                             {}
+func (nopObserver) noSlot()                                       {}
 func (nopObserver) membershipFailed(string, error)                {}
 func (nopObserver) draining()                                     {}
 func (nopObserver) drained()                                      {}

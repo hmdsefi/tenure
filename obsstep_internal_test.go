@@ -129,6 +129,26 @@ func TestStepCollectorInputs(t *testing.T) {
 			},
 		},
 		{
+			// shard.expired and shard.lost take the place of shard.stopping, with no reason;
+			// the shard.released of a lost run takes its reason, and no handoff follows.
+			name: "ExpiredAndLost",
+			recs: []stepRecord{
+				{Now: time.Second, Input: core.Tick{Now: time.Second}, Before: status(0, owned(7)),
+					After:   status(time.Second, stopping(7)),
+					Actions: []core.Action{core.StopRun{Space: "s", Shard: 0, Term: 7, Reason: core.StopExpired}}},
+				{Now: 2 * time.Second, Input: core.Tick{Now: 2 * time.Second}, Before: status(time.Second, owned(8)),
+					After:   status(2*time.Second, stopping(8)),
+					Actions: []core.Action{core.StopRun{Space: "s", Shard: 0, Term: 8, Reason: core.StopLost}}},
+				{Now: 3 * time.Second, Input: core.Released{Space: "s", Shard: 0, Term: 8},
+					Before: status(2*time.Second, releasing(8)), After: status(3*time.Second, idle)},
+			},
+			want: []Event{
+				ev(EventShardExpired, 7, ""),
+				ev(EventShardLost, 8, ""),
+				ev(EventShardReleased, 8, "lost"),
+			},
+		},
+		{
 			// Term 7's run was stopped as moved; term 9, granted later, is released without a
 			// run, so its shard.released has no reason and no handoff follows.
 			name: "ReleasedWithoutRunAfterRun",
@@ -201,5 +221,54 @@ func TestStepCollectorIgnored(t *testing.T) {
 				t.Errorf("ignored(%+v) = %v, want %v", tc.rec, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestStepCollectorSlots checks slot.claimed and slot.released from the held slot before and after
+// a step, with Reason "lost" for a hold that no SlotReleased ended, as at a lost session, and else
+// "retired", or "draining" once the drain has started; and that noSlot emits slot.standby once
+// per standby period, which a claimed slot ends.
+func TestStepCollectorSlots(t *testing.T) {
+	var got []Event
+	c := newStepCollector(nil, func(e Event) uint64 {
+		got = append(got, e)
+		return uint64(len(got))
+	})
+	held := func(slot int) core.Status {
+		return core.Status{Session: core.SessionStateLive, Deadline: time.Minute, Slot: slot}
+	}
+	lost := held(-1)
+	lost.Session = core.SessionStateLost
+	slotEv := func(kind EventKind, slot int, reason string) Event {
+		return Event{Kind: kind, Shard: -1, Slot: slot, Reason: reason}
+	}
+	standby := slotEv(EventSlotStandby, -1, "")
+
+	c.noSlot()
+	c.noSlot()
+	c.collect(stepRecord{Input: core.SlotClaimed{Slot: 1}, Before: held(-1), After: held(1)})
+	c.collect(stepRecord{Input: core.SessionFailed{Cause: core.CauseLost}, Before: held(1), After: lost})
+	c.noSlot()
+	c.collect(stepRecord{Input: core.SlotClaimed{Slot: 0}, Before: held(-1), After: held(0)})
+	c.collect(stepRecord{Input: core.SlotReleased{Slot: 1}, Before: held(0), After: held(0)})
+	c.collect(stepRecord{Input: core.SlotReleased{Slot: 0}, Before: held(0), After: held(-1)})
+	c.noSlot()
+	c.collect(stepRecord{Input: core.SlotClaimed{Slot: 0}, Before: held(-1), After: held(0)})
+	c.draining.Store(true)
+	c.collect(stepRecord{Input: core.SlotReleased{Slot: 0}, Before: held(0), After: held(-1)})
+
+	want := []Event{
+		standby,
+		slotEv(EventSlotClaimed, 1, ""),
+		slotEv(EventSlotReleased, 1, "lost"),
+		standby,
+		slotEv(EventSlotClaimed, 0, ""),
+		slotEv(EventSlotReleased, 0, "retired"),
+		standby,
+		slotEv(EventSlotClaimed, 0, ""),
+		slotEv(EventSlotReleased, 0, "draining"),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("events =\n%+v\nwant\n%+v", got, want)
 	}
 }
