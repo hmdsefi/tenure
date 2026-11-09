@@ -2262,3 +2262,73 @@ func TestK8S240CloseSessionShards(t *testing.T) {
 		released(t, name, term)
 	})
 }
+
+// TestK8S330AcquireRaces checks how Acquire's conflicts count: writes that lose to grants of the
+// shard to other holders, which leave the record free again with a larger term, do not use its
+// three attempts up, so racing acquirers get a term or a *tenure.HeldError; writes that lose to
+// changes that keep the term end it after three with "k8s: lease <name>: 3 conflicts: …".
+func TestK8S330AcquireRaces(t *testing.T) {
+	const big = core.Term(5_000_000_000_000_000)
+	name := shardName("g", "markets", 0)
+	// race makes the first n updates of the record conflict, each after change changed the
+	// stored record, and returns the Adapter and its client.
+	race := func(t *testing.T, n int, change func(l *coordinationv1.Lease)) (*Adapter, *fake.Clientset) {
+		client := newFake()
+		a := fakeAdapter(t, client)
+		closeAtEnd(t, a, "pod-0/1")
+		mustKeepAlive(t, a, "pod-0/1")
+		l := shardLease("g", "markets", 0, "", map[string]string{annotationTerm: encodeTerm(big)})
+		if _, err := client.CoordinationV1().Leases("default").Create(t.Context(), l, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		lost := 0
+		client.PrependReactor("update", resourceLeases, func(action k8stesting.Action) (bool, runtime.Object, error) {
+			update, _ := action.(k8stesting.UpdateAction)
+			if l, _ := update.GetObject().(*coordinationv1.Lease); l == nil || l.Name != name || lost == n {
+				return false, nil, nil
+			}
+			lost++
+			obj, err := client.Tracker().Get(leasesResource, "default", name)
+			if err != nil {
+				return true, nil, err
+			}
+			stored, _ := obj.(*coordinationv1.Lease)
+			stored = stored.DeepCopy()
+			change(stored)
+			if err := client.Tracker().Update(leasesResource, stored, "default"); err != nil {
+				return true, nil, err
+			}
+			return true, nil, apierrors.NewConflict(leasesResource.GroupResource(), name, errors.New("injected"))
+		})
+		client.ClearActions()
+		return a, client
+	}
+
+	t.Run("grants to others", func(t *testing.T) {
+		// Each lost write met a grant and a release by another holder: one term more.
+		a, client := race(t, 5, func(l *coordinationv1.Lease) {
+			term, _ := decodeTerm(l.Annotations)
+			l.Annotations[annotationTerm] = encodeTerm(term + 1)
+		})
+		if got := mustAcquire(t, a, "pod-0/1", "markets", 0); got != big+6 {
+			t.Errorf("Acquire = %d, want %d", got, big+6)
+		}
+		if got := actions(client, "update"); len(got) != 6 {
+			t.Errorf("updates %v, want 6", got)
+		}
+	})
+
+	t.Run("changes that keep the term", func(t *testing.T) {
+		a, client := race(t, 3, func(l *coordinationv1.Lease) {
+			l.Annotations["other"] += "x"
+		})
+		term, err := a.Acquire(t.Context(), "pod-0/1", "markets", 0)
+		const prefix = "k8s: lease g-markets-0: 3 conflicts: "
+		if term != 0 || err == nil || !strings.HasPrefix(err.Error(), prefix) || !apierrors.IsConflict(err) {
+			t.Errorf("Acquire = %d, %v; want 0 and %s<a Conflict>", term, err, prefix)
+		}
+		if got := actions(client, "update"); len(got) != 3 {
+			t.Errorf("updates %v, want 3", got)
+		}
+	})
+}
