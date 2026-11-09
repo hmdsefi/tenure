@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/hmdsefi/tenure/core"
 )
 
 // TestATK8S02NameRules checks the name rules on every method that takes a name, each row with
@@ -22,6 +24,9 @@ func TestATK8S02NameRules(t *testing.T) {
 	id245 := strings.Repeat("b", 245)
 	checkNames := func(spaces []string, member string) func(context.Context, *Adapter) error {
 		return func(_ context.Context, a *Adapter) error { return a.CheckNames(spaces, member) }
+	}
+	release := func(holder, space string, shard int, term core.Term) func(context.Context, *Adapter) error {
+		return func(ctx context.Context, a *Adapter) error { return a.Release(ctx, holder, space, shard, term) }
 	}
 	space := func(s, detail string) string { return fmt.Sprintf("k8s: invalid space %q: %s", s, detail) }
 	member := func(id, detail string) string { return fmt.Sprintf("k8s: invalid member ID %q: %s", id, detail) }
@@ -71,6 +76,18 @@ func TestATK8S02NameRules(t *testing.T) {
 			member(id245, "makes Lease name g-member-"+id245+" longer than 253 characters"),
 		},
 		{"CheckNames member of 254", checkNames(nil, id245+"bbbbbbbbb"), member(id245+"bbbbbbbbb", notSubdomain)},
+		{"Release empty holder", release("", "Bad", -1, 0), "k8s: Release: empty holder"},
+		{"Release holder zero byte", release("pod-0/\x00", "markets", 0, 1), `k8s: Release: holder "pod-0/\x00": contains a zero byte`},
+		{"Release holder without /", release("pod-0", "markets", 0, 1), `k8s: Release: holder "pod-0": has no "/"`},
+		{"Release holder empty incarnation", release("pod-0/", "markets", 0, 1), `k8s: Release: holder "pod-0/": has an empty incarnation`},
+		{"Release holder Pod/1", release("Pod/1", "markets", 0, 1), `k8s: Release: holder "Pod/1": member ID ` + notSubdomain},
+		{"Release space Bad", release("pod-0/1", "Bad", -1, 0), `k8s: Release: space "Bad": ` + notLabel},
+		{"Release space empty", release("pod-0/1", "", 0, 1), `k8s: Release: space "": ` + notLabel},
+		{"Release space a/0", release("pod-0/1", "a/0", 0, 1), `k8s: Release: space "a/0": ` + notLabel},
+		{"Release space slots", release("pod-0/1", "slots", 0, 1), `k8s: Release: space "slots": ` + reserved},
+		{"Release space member-0", release("pod-0/1", "member-0", 0, 1), `k8s: Release: space "member-0": must not start with "member-"`},
+		{"Release shard -1", release("pod-0/1", "markets", -1, 0), "k8s: Release: shard -1: must not be negative"},
+		{"Release term 0", release("pod-0/1", "markets", 0, 0), "k8s: Release: term 0: must not be 0"},
 	}
 	ctx := t.Context()
 	client := fake.NewClientset()

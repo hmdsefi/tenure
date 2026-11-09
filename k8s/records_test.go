@@ -6,15 +6,23 @@ package k8s
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/core"
@@ -997,4 +1005,849 @@ func TestATK8S31RecordConcurrency(t *testing.T) {
 			}
 		}
 	}
+}
+
+// wantCloseLists checks that the fake client's only requests are n LISTs of the Leases of group
+// g, as CloseSession sends to find the holder's records.
+func wantCloseLists(t testing.TB, client *fake.Clientset, n int) {
+	t.Helper()
+	got := client.Actions()
+	ok := len(got) == n
+	for _, x := range got {
+		l, isList := x.(k8stesting.ListActionImpl)
+		ok = ok && isList && x.GetResource() == leasesResource && l.GetListRestrictions().Labels.String() == "tenure.group=g"
+	}
+	if !ok {
+		t.Errorf("requests %v, want %d LISTs of the group's Leases", got, n)
+	}
+}
+
+// version returns the resourceVersion of Lease l as a Holding's Version.
+func version(t testing.TB, l *coordinationv1.Lease) uint64 {
+	t.Helper()
+	v, err := parseVersion(l.Name, l.ResourceVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+// TestK8S370RecordChecks checks what Release, Confirm and Holdings return without a request:
+// ctx.Err() first, then the holder's, the space's, the shard's and the term's errors in that
+// order; and, for Confirm only, an error matching tenure.ErrSessionLost for a holder with no
+// active session in this Adapter: never opened, ended, or expired.
+func TestK8S370RecordChecks(t *testing.T) {
+	ctx := t.Context()
+	clock := newFakeClock()
+	client := newFake()
+	a := fakeAdapter(t, client, withClock(clock.now))
+	closeAtEnd(t, a, "pod-0/1")
+	mustKeepAlive(t, a, "pod-0/1")
+	if err := a.CloseSession(ctx, "pod-2/1"); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	release := func(holder, space string, shard int, term core.Term) func(context.Context) error {
+		return func(ctx context.Context) error { return a.Release(ctx, holder, space, shard, term) }
+	}
+	confirm := func(holder, space string, shard int, term core.Term) func(context.Context) error {
+		return func(ctx context.Context) error {
+			h, err := a.Confirm(ctx, holder, space, shard, term)
+			if h != (tenure.Holding{}) {
+				t.Errorf("Confirm(%q, %q, %d, %d) = %+v with its error, want the zero Holding", holder, space, shard, term, h)
+			}
+			return err
+		}
+	}
+	holdings := func(space string) func(context.Context) error {
+		return func(ctx context.Context) error {
+			hs, err := a.Holdings(ctx, space)
+			if hs != nil {
+				t.Errorf("Holdings(%q) = %v with its error, want nil", space, hs)
+			}
+			return err
+		}
+	}
+	tests := []struct {
+		name string
+		ctx  context.Context
+		call func(context.Context) error
+		want string
+		lost bool
+	}{
+		{name: "Release canceled", ctx: canceled, call: release("", "Bad", -1, 0), want: context.Canceled.Error()},
+		{name: "Confirm canceled", ctx: canceled, call: confirm("", "Bad", -1, 0), want: context.Canceled.Error()},
+		{name: "Holdings canceled", ctx: canceled, call: holdings("Bad"), want: context.Canceled.Error()},
+		{name: "Release holder first", call: release("pod-0", "Bad", -1, 0), want: `k8s: Release: holder "pod-0": has no "/"`},
+		{name: "Release space next", call: release("pod-0/1", "Bad", -1, 0), want: `k8s: Release: space "Bad": must be a DNS-1123 label`},
+		{name: "Release shard next", call: release("pod-0/1", "markets", -1, 0), want: "k8s: Release: shard -1: must not be negative"},
+		{name: "Release term last", call: release("pod-0/1", "markets", 0, 0), want: "k8s: Release: term 0: must not be 0"},
+		{name: "Confirm empty holder", call: confirm("", "Bad", -1, 0), want: "k8s: Confirm: empty holder"},
+		{name: "Confirm holder zero byte", call: confirm("pod-0/\x00", "markets", 0, 1), want: `k8s: Confirm: holder "pod-0/\x00": contains a zero byte`},
+		{name: "Confirm holder Pod/1", call: confirm("Pod/1", "markets", 0, 1), want: `k8s: Confirm: holder "Pod/1": member ID must be a DNS-1123 subdomain`},
+		{name: "Confirm space Bad", call: confirm("pod-0/1", "Bad", -1, 0), want: `k8s: Confirm: space "Bad": must be a DNS-1123 label`},
+		{name: "Confirm space a/0", call: confirm("pod-0/1", "a/0", 0, 1), want: `k8s: Confirm: space "a/0": must be a DNS-1123 label`},
+		{name: "Confirm space slot", call: confirm("pod-0/1", "slot", 0, 1), want: `k8s: Confirm: space "slot": is reserved`},
+		{name: "Confirm shard -1", call: confirm("pod-0/1", "markets", -1, 0), want: "k8s: Confirm: shard -1: must not be negative"},
+		{name: "Confirm term 0", call: confirm("pod-0/1", "markets", 0, 0), want: "k8s: Confirm: term 0: must not be 0"},
+		{name: "Confirm term before the session", call: confirm("pod-1/1", "markets", 0, 0), want: "k8s: Confirm: term 0: must not be 0"},
+		{name: "Confirm never opened", call: confirm("pod-1/1", "markets", 0, 1), want: "k8s: session pod-1/1 is not open: tenure: session lost", lost: true},
+		{name: "Confirm ended", call: confirm("pod-2/1", "markets", 0, 1), want: "k8s: session pod-2/1 ended: tenure: session lost", lost: true},
+		{name: "Holdings space empty", call: holdings(""), want: `k8s: Holdings: space "": must be a DNS-1123 label`},
+		{name: "Holdings space zero byte", call: holdings("a\x00"), want: `k8s: Holdings: space "a\x00": must be a DNS-1123 label`},
+		{name: "Holdings space slots", call: holdings("slots"), want: `k8s: Holdings: space "slots": is reserved`},
+		{name: "Holdings space request-1", call: holdings("request-1"), want: `k8s: Holdings: space "request-1": must not start with "request-"`},
+	}
+	check := func(t *testing.T, ctx context.Context, call func(context.Context) error, want string, lost bool) {
+		t.Helper()
+		client.ClearActions()
+		err := call(ctx)
+		if err == nil || err.Error() != want {
+			t.Errorf("err = %v, want %s", err, want)
+		}
+		if errors.Is(err, tenure.ErrSessionLost) != lost {
+			t.Errorf("errors.Is(%v, tenure.ErrSessionLost) = %v, want %v", err, !lost, lost)
+		}
+		if n := len(client.Actions()); n != 0 {
+			t.Errorf("%d requests, want none: %v", n, client.Actions())
+		}
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := tc.ctx
+			if ctx == nil {
+				ctx = t.Context()
+			}
+			check(t, ctx, tc.call, tc.want, tc.lost)
+		})
+	}
+
+	t.Run("Confirm expired", func(t *testing.T) {
+		clock.advance(T.LeaseDuration)
+		check(t, t.Context(), confirm("pod-0/1", "markets", 0, 1), "k8s: session pod-0/1 expired: tenure: session lost", true)
+		check(t, t.Context(), confirm("pod-0/1", "markets", 0, 1), "k8s: session pod-0/1 ended: tenure: session lost", true)
+	})
+}
+
+// TestK8S070VersionFallback checks that a resourceVersion that does not parse, in a write's
+// response or a listed record, makes Confirm and Holdings read the record again and report the
+// version read; a version that still does not parse is an error, and a record gone by then is
+// left out of Holdings.
+func TestK8S070VersionFallback(t *testing.T) {
+	ctx := t.Context()
+	name := shardName("g", "markets", 1)
+
+	t.Run("Holdings", func(t *testing.T) {
+		client := newFake()
+		a := fakeAdapter(t, client)
+		tracker := client.Tracker()
+		for _, l := range []*coordinationv1.Lease{
+			shardLease("g", "markets", 1, "pod-0/1", map[string]string{annotationTerm: "5"}),
+			shardLease("g", "markets", 2, "", map[string]string{annotationTerm: "3"}),
+		} {
+			l.Namespace = "default"
+			l.ResourceVersion = "21"
+			if l.Name == name {
+				l.ResourceVersion = "abc"
+			}
+			if err := tracker.Add(l); err != nil {
+				t.Fatalf("add %s: %v", l.Name, err)
+			}
+		}
+		// A GET of name answers with the version in reread, or NotFound when reread is "".
+		reread := "17"
+		client.PrependReactor("get", resourceLeases, func(action k8stesting.Action) (bool, runtime.Object, error) {
+			get, _ := action.(k8stesting.GetAction)
+			if get.GetName() != name {
+				return false, nil, nil
+			}
+			if reread == "" {
+				return true, nil, apierrors.NewNotFound(leasesResource.GroupResource(), name)
+			}
+			obj, err := tracker.Get(leasesResource, "default", name)
+			if err != nil {
+				return true, nil, err
+			}
+			l, _ := obj.(*coordinationv1.Lease)
+			l = l.DeepCopy()
+			l.ResourceVersion = reread
+			return true, l, nil
+		})
+
+		got, err := a.Holdings(ctx, "markets")
+		want := []tenure.Holding{
+			{Space: "markets", Shard: 1, Holder: "pod-0/1", Term: 5, Version: 17},
+			{Space: "markets", Shard: 2, Term: 3, Version: 21},
+		}
+		if err != nil || !slices.Equal(got, want) {
+			t.Errorf("Holdings = %+v, %v; want %+v", got, err, want)
+		}
+		if n, m := len(actions(client, "list")), len(actions(client, "get")); n != 1 || m != 1 {
+			t.Errorf("%d LISTs and %d GETs, want 1 and 1", n, m)
+		}
+
+		reread = "abc"
+		const wantErr = `k8s: lease g-markets-1: resourceVersion "abc" is not an integer`
+		if got, err := a.Holdings(ctx, "markets"); got != nil || err == nil || err.Error() != wantErr {
+			t.Errorf("Holdings with a reread version abc = %+v, %v; want nil, %s", got, err, wantErr)
+		}
+
+		reread = ""
+		if got, err := a.Holdings(ctx, "markets"); err != nil || !slices.Equal(got, want[1:]) {
+			t.Errorf("Holdings with the record gone on reread = %+v, %v; want %+v", got, err, want[1:])
+		}
+	})
+
+	t.Run("Confirm", func(t *testing.T) {
+		client := newFake()
+		a := fakeAdapter(t, client)
+		closeAtEnd(t, a, "pod-0/1")
+		mustKeepAlive(t, a, "pod-0/1")
+		term := mustAcquire(t, a, "pod-0/1", "markets", 1)
+		// The update is stored at version 40, and its response says "abc".
+		tracker := client.Tracker()
+		client.PrependReactor("update", resourceLeases, func(action k8stesting.Action) (bool, runtime.Object, error) {
+			update, _ := action.(k8stesting.UpdateAction)
+			l, _ := update.GetObject().(*coordinationv1.Lease)
+			if l.Name != name {
+				return false, nil, nil
+			}
+			l = l.DeepCopy()
+			l.ResourceVersion = "40"
+			if err := tracker.Update(leasesResource, l, "default"); err != nil {
+				return true, nil, err
+			}
+			l = l.DeepCopy()
+			l.ResourceVersion = "abc"
+			return true, l, nil
+		})
+		client.ClearActions()
+		got, err := a.Confirm(ctx, "pod-0/1", "markets", 1, term)
+		if want := (tenure.Holding{Space: "markets", Shard: 1, Holder: "pod-0/1", Term: term, Version: 40}); err != nil || got != want {
+			t.Errorf("Confirm = %+v, %v; want %+v", got, err, want)
+		}
+		var seq []string
+		for _, x := range actions(client, "") {
+			if x.GetVerb() != "watch" {
+				seq = append(seq, x.GetVerb())
+			}
+		}
+		if strings.Join(seq, " ") != "update get" {
+			t.Errorf("requests %v, want [update get]", seq)
+		}
+	})
+}
+
+// TestATK8S21Release checks Release on a cluster: by the holder at its term it clears
+// holderIdentity, tenure.session and tenure.confirm with one write from the cache's state,
+// keeping the term, the times, leaseTransitions and foreign labels and annotations, and frees the
+// shard at once; at another term or by another holder or incarnation, for no record, or for a
+// record already released, it returns nil after a GET and writes nothing; it does not need a
+// session; a cache that shows another term is checked by a GET; a conflict makes it read the
+// record and write again; and a foreign Lease is never written. The acceptance test's steps were
+// written from the issue's text: the original text is unavailable.
+func TestATK8S21Release(t *testing.T) {
+	c := newCluster(t)
+	g := group()
+	ctx := t.Context()
+	a, recA := c.adapter(t, g)
+	b, recB := c.adapter(t, g)
+	closeAtEnd(t, a, "pod-0/1")
+	closeAtEnd(t, b, "pod-1/1")
+	mustKeepAlive(t, a, "pod-0/1")
+	startRenewer(t, a, "pod-0/1")
+	mustKeepAlive(t, b, "pod-1/1")
+	startRenewer(t, b, "pod-1/1")
+	const h = "pod-0/1"
+	// release calls x.Release on shard of markets and checks that it returns nil, with the
+	// requests want on the shard's Lease.
+	release := func(t *testing.T, x *Adapter, rec *recorder, holder string, shard int, term core.Term, want ...string) {
+		t.Helper()
+		name := shardName(g, "markets", shard)
+		rec.reset()
+		if err := x.Release(ctx, holder, "markets", shard, term); err != nil {
+			t.Errorf("Release(%s, markets, %d, %d) = %v, want nil", holder, shard, term, err)
+		}
+		if got := requestStrings(rec.filter(on("", name))); strings.Join(got, ", ") != strings.Join(want, ", ") {
+			t.Errorf("Release(%s, markets, %d, %d): requests %v, want %v", holder, shard, term, got, want)
+		}
+	}
+
+	t.Run("match", func(t *testing.T) {
+		name := shardName(g, "markets", 0)
+		t1 := mustAcquire(t, a, h, "markets", 0)
+		before := rawUpdate(t, c, name, func(l *coordinationv1.Lease) {
+			l.Annotations[annotationConfirm] = "4"
+			l.Annotations["example.com/note"] = "kept"
+			l.Labels["example.com/team"] = "a"
+			l.Spec.LeaseTransitions = new(int32(5))
+		})
+		waitObserved(t, a, name, before.ResourceVersion)
+		release(t, a, recA, h, 0, t1, "UPDATE "+name+" 200")
+		after := rawGet(t, c, name)
+		wantSpec := before.Spec.DeepCopy()
+		wantSpec.HolderIdentity = nil
+		if !apiequality.Semantic.DeepEqual(after.Spec, *wantSpec) {
+			t.Errorf("spec after Release %+v, want %+v", after.Spec, *wantSpec)
+		}
+		wantAnnotations := maps.Clone(before.Annotations)
+		delete(wantAnnotations, annotationSession)
+		delete(wantAnnotations, annotationConfirm)
+		if !maps.Equal(after.Annotations, wantAnnotations) || after.Annotations[annotationTerm] != encodeTerm(t1) {
+			t.Errorf("annotations after Release %v, want %v", after.Annotations, wantAnnotations)
+		}
+		if !maps.Equal(after.Labels, before.Labels) {
+			t.Errorf("labels after Release %v, want %v", after.Labels, before.Labels)
+		}
+
+		// The shard is free at once: another holder takes it without reading the member Lease.
+		waitObserved(t, b, name, after.ResourceVersion)
+		recB.reset()
+		if t2 := mustAcquire(t, b, "pod-1/1", "markets", 0); t2 <= t1 {
+			t.Errorf("term %d after the Release, want above %d", t2, t1)
+		}
+		if n := recB.count(on(verbGet, memberName(g, "pod-0"))); n != 0 {
+			t.Errorf("%d GETs of the released holder's member Lease, want none", n)
+		}
+	})
+
+	t.Run("mismatch", func(t *testing.T) {
+		name := shardName(g, "markets", 1)
+		t1 := mustAcquire(t, a, h, "markets", 1)
+		l := rawGet(t, c, name)
+		waitObserved(t, a, name, l.ResourceVersion)
+		for _, x := range []struct {
+			holder string
+			term   core.Term
+		}{{h, t1 + 1}, {h, t1 - 1}, {"pod-1/1", t1}, {"pod-0/2", t1}} {
+			release(t, a, recA, x.holder, 1, x.term, "GET "+name+" 200")
+		}
+		if got := rawGet(t, c, name); got.ResourceVersion != l.ResourceVersion {
+			t.Errorf("record written: resourceVersion %s, want %s", got.ResourceVersion, l.ResourceVersion)
+		}
+
+		absent := shardName(g, "markets", 99)
+		release(t, a, recA, h, 99, t1, "GET "+absent+" 404")
+		if rawGet(t, c, absent) != nil {
+			t.Errorf("Release created %s", absent)
+		}
+
+		release(t, a, recA, h, 1, t1, "UPDATE "+name+" 200")
+		l = rawGet(t, c, name)
+		release(t, a, recA, h, 1, t1, "GET "+name+" 200")
+		if got := rawGet(t, c, name); got.ResourceVersion != l.ResourceVersion {
+			t.Errorf("the released record written again: resourceVersion %s, want %s", got.ResourceVersion, l.ResourceVersion)
+		}
+	})
+
+	t.Run("without a session", func(t *testing.T) {
+		r, recR := c.adapter(t, g)
+		name := shardName(g, "markets", 2)
+		t1 := mustAcquire(t, a, h, "markets", 2)
+		release(t, r, recR, h, 2, t1, "GET "+name+" 200", "UPDATE "+name+" 200")
+		if l := rawGet(t, c, name); holderOf(l) != "" || l.Annotations[annotationTerm] != encodeTerm(t1) {
+			t.Errorf("record names %q at %s, want no holder at %d", holderOf(l), l.Annotations[annotationTerm], t1)
+		}
+	})
+
+	t.Run("stale cache", func(t *testing.T) {
+		name := shardName(g, "markets", 3)
+		t1 := mustAcquire(t, a, h, "markets", 3)
+		waitObserved(t, b, name, rawGet(t, c, name).ResourceVersion)
+		resume := recB.stall(on(verbWatch, ""))
+		t.Cleanup(resume) // before the sessions close
+		t2 := mustAcquire(t, a, h, "markets", 3)
+		if o, _ := b.cached(name); o.lease.Annotations[annotationTerm] != encodeTerm(t1) {
+			t.Fatalf("the stalled cache shows term %s, want %d", o.lease.Annotations[annotationTerm], t1)
+		}
+		release(t, b, recB, h, 3, t2, "GET "+name+" 200", "UPDATE "+name+" 200")
+		resume()
+		if l := rawGet(t, c, name); holderOf(l) != "" || l.Annotations[annotationTerm] != encodeTerm(t2) {
+			t.Errorf("record names %q at %s, want no holder at %d", holderOf(l), l.Annotations[annotationTerm], t2)
+		}
+	})
+
+	t.Run("conflict", func(t *testing.T) {
+		name := shardName(g, "markets", 4)
+		t1 := mustAcquire(t, a, h, "markets", 4)
+		recA.bump(name, time.Time{})
+		release(t, a, recA, h, 4, t1, "UPDATE "+name+" 409", "GET "+name+" 200", "UPDATE "+name+" 200")
+		if l := rawGet(t, c, name); holderOf(l) != "" || l.Annotations[annotationTerm] != encodeTerm(t1) || l.Annotations[bumpAnnotation] != "1" {
+			t.Errorf("record names %q, annotations %v; want no holder at %d, bumped once", holderOf(l), l.Annotations, t1)
+		}
+	})
+
+	t.Run("foreign lease", func(t *testing.T) {
+		holder := h
+		l := rawCreate(t, c, &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Name: shardName(g, "markets", 7), Annotations: map[string]string{annotationTerm: "5"}},
+			Spec:       coordinationv1.LeaseSpec{HolderIdentity: &holder},
+		})
+		recA.reset()
+		want := "k8s: lease " + l.Name + " is not a shard lease of group " + g
+		if err := a.Release(ctx, h, "markets", 7, 5); err == nil || err.Error() != want {
+			t.Errorf("Release of %s = %v, want %s", l.Name, err, want)
+		}
+		if got := requestStrings(recA.filter(on("", l.Name))); len(got) != 1 || got[0] != "GET "+l.Name+" 200" {
+			t.Errorf("requests %v, want [GET %s 200]", got, l.Name)
+		}
+		if got := rawGet(t, c, l.Name); got.ResourceVersion != l.ResourceVersion {
+			t.Errorf("%s written: resourceVersion %s, want %s", l.Name, got.ResourceVersion, l.ResourceVersion)
+		}
+	})
+}
+
+// TestATK8S22Holdings checks Holdings on a cluster: the records of the space with their holders,
+// terms and versions as stored, sorted by shard, also records with no holder, a holder whose
+// session ended or never existed, or a malformed term (term 0); not the records of other spaces
+// or groups, Leases without the group's shard labels, or names that are no record's of the space;
+// nil for a space with no records; a slice of the caller's own; each from one LIST with the
+// space's label selector and no other request, with or without a session; and versions that grow
+// with every write. The acceptance test's steps were written from the issue's text: the
+// original text is unavailable.
+func TestATK8S22Holdings(t *testing.T) {
+	c := newCluster(t)
+	g := group()
+	ctx := t.Context()
+	a, recA := c.adapter(t, g)
+	b, _ := c.adapter(t, g)
+	h, rec := c.adapter(t, g)
+	closeAtEnd(t, a, "pod-0/1")
+	closeAtEnd(t, b, "pod-1/1")
+	mustKeepAlive(t, a, "pod-0/1")
+	startRenewer(t, a, "pod-0/1")
+	mustKeepAlive(t, b, "pod-1/1")
+	startRenewer(t, b, "pod-1/1")
+
+	t7 := mustAcquire(t, a, "pod-0/1", "markets", 7)
+	t2 := mustAcquire(t, b, "pod-1/1", "markets", 2)
+	t11 := mustAcquire(t, a, "pod-0/1", "markets", 11)
+	t0 := mustAcquire(t, b, "pod-1/1", "markets", 0)
+	if err := b.Release(ctx, "pod-1/1", "markets", 2, t2); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	t3 := mustAcquire(t, a, "pod-0/1", "orders", 3)
+	// pod-8/1's session has ended; pod-9/1 never had one, and its record's term is malformed.
+	ended := rawCreate(t, c, &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: memberName(g, "pod-8"), Labels: leaseLabels(g, kindMember, "")}})
+	rawCreate(t, c, shardLease(g, "markets", 9, "pod-8/1", map[string]string{annotationTerm: "3", annotationSession: string(ended.UID)}))
+	rawCreate(t, c, shardLease(g, "markets", 5, "pod-9/1", map[string]string{annotationTerm: "x"}))
+	// No records of markets in g: another group's record, a Lease without the labels, a labeled
+	// Lease whose name is no record's, and one named as a record of another space.
+	rawCreate(t, c, shardLease(group(), "markets", 4, "pod-0/1", map[string]string{annotationTerm: "1"}))
+	rawCreate(t, c, &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: shardName(g, "markets", 6)}})
+	rawCreate(t, c, &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: g + "-markets-x", Labels: leaseLabels(g, kindShard, "markets")}})
+	rawCreate(t, c, &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: shardName(g, "orders", 8), Labels: leaseLabels(g, kindShard, "markets")}})
+
+	// stored returns hs in space with the versions their Leases have now.
+	stored := func(space string, hs ...tenure.Holding) []tenure.Holding {
+		for i := range hs {
+			hs[i].Space = space
+			hs[i].Version = version(t, rawGet(t, c, shardName(g, space, hs[i].Shard)))
+		}
+		return hs
+	}
+	// holdings checks that x's Holdings of space returns want from one LIST and no other request
+	// but those of x's own member Lease.
+	holdings := func(t *testing.T, x *Adapter, rec *recorder, space string, want []tenure.Holding) []tenure.Holding {
+		t.Helper()
+		rec.reset()
+		got, err := x.Holdings(ctx, space)
+		if err != nil || !slices.Equal(got, want) || (want == nil) != (got == nil) {
+			t.Errorf("Holdings(%s) = %+v, %v; want %+v", space, got, err, want)
+		}
+		reqs := rec.filter(func(r request) bool {
+			return r.verb != verbWatch && r.name != memberName(g, "pod-0")
+		})
+		sel := labelGroup + "=" + g + "," + labelKind + "=shard," + labelSpace + "=" + space
+		if len(reqs) != 1 || reqs[0].verb != verbList || reqs[0].status != 200 || reqs[0].query.Get("labelSelector") != sel {
+			t.Errorf("Holdings(%s): requests %v (%v), want one LIST with labelSelector %s", space, requestStrings(reqs), reqs, sel)
+		}
+		return got
+	}
+
+	markets := stored("markets",
+		tenure.Holding{Shard: 0, Holder: "pod-1/1", Term: t0},
+		tenure.Holding{Shard: 2, Term: t2},
+		tenure.Holding{Shard: 5, Holder: "pod-9/1"},
+		tenure.Holding{Shard: 7, Holder: "pod-0/1", Term: t7},
+		tenure.Holding{Shard: 9, Holder: "pod-8/1", Term: 3},
+		tenure.Holding{Shard: 11, Holder: "pod-0/1", Term: t11},
+	)
+
+	t.Run("as stored", func(t *testing.T) {
+		got := holdings(t, h, rec, "markets", markets)
+		holdings(t, a, recA, "markets", markets)
+		holdings(t, h, rec, "orders", stored("orders", tenure.Holding{Shard: 3, Holder: "pod-0/1", Term: t3}))
+		holdings(t, h, rec, "trades", nil)
+		if len(got) == len(markets) {
+			got[0].Holder, got[1].Term = "x", 0
+			holdings(t, h, rec, "markets", markets)
+		}
+	})
+
+	t.Run("versions", func(t *testing.T) {
+		var top uint64
+		for _, x := range markets {
+			top = max(top, x.Version)
+		}
+		if err := a.Release(ctx, "pod-0/1", "markets", 7, t7); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+		t2b := mustAcquire(t, b, "pod-1/1", "markets", 2)
+		now := slices.Clone(markets)
+		now[1].Holder, now[1].Term = "pod-1/1", t2b
+		now[3].Holder = ""
+		now[1].Version = version(t, rawGet(t, c, shardName(g, "markets", 2)))
+		now[3].Version = version(t, rawGet(t, c, shardName(g, "markets", 7)))
+		holdings(t, h, rec, "markets", now)
+		if now[3].Version <= top || now[1].Version <= now[3].Version {
+			t.Errorf("versions %d (release) and %d (grant) after %d, want growing", now[3].Version, now[1].Version, top)
+		}
+	})
+}
+
+// TestATK8S37Confirm checks Confirm on a cluster. counts: the holder's Confirm at its term
+// writes tenure.confirm 1, 2, 3, changing nothing else, from the cache's state with one update,
+// and returns the record written with a growing version; another holder's, or one at another
+// term, returns the record as stored after a GET with no write; for no record it returns
+// Holding{Space, Shard}; a conflict makes it read the record and write again; Release and a
+// re-grant remove the counter. race: a degraded owner, whose clock stands still so its sessions
+// stay active by it while another Adapter sees them unchanged for their LeaseDuration, renews and
+// confirms while the other takes the shard over, in 10 rounds; each round has exactly one
+// outcome: the takeover commits first and Confirm shows it, or Confirm commits first and the
+// takeover, decided on an earlier state, fails and is held. The acceptance test's steps were
+// written from the issue's text: the original text is unavailable.
+func TestATK8S37Confirm(t *testing.T) {
+	c := newCluster(t)
+	ctx := t.Context()
+
+	t.Run("counts", func(t *testing.T) {
+		g := group()
+		a, recA := c.adapter(t, g)
+		b, recB := c.adapter(t, g)
+		closeAtEnd(t, a, "pod-0/1")
+		closeAtEnd(t, b, "pod-1/1")
+		mustKeepAlive(t, a, "pod-0/1")
+		startRenewer(t, a, "pod-0/1")
+		mustKeepAlive(t, b, "pod-1/1")
+		startRenewer(t, b, "pod-1/1")
+		const h = "pod-0/1"
+		name := shardName(g, "markets", 0)
+		t1 := mustAcquire(t, a, h, "markets", 0)
+		base := rawUpdate(t, c, name, func(l *coordinationv1.Lease) {
+			l.Annotations["example.com/note"] = "kept"
+			l.Labels["example.com/team"] = "a"
+		})
+		waitObserved(t, a, name, base.ResourceVersion)
+
+		// confirm calls x.Confirm on shard of markets and checks that it returns no error, with the
+		// requests want on the shard's Lease.
+		confirm := func(t *testing.T, x *Adapter, rec *recorder, holder string, shard int, term core.Term, want ...string) tenure.Holding {
+			t.Helper()
+			rec.reset()
+			got, err := x.Confirm(ctx, holder, "markets", shard, term)
+			if err != nil {
+				t.Fatalf("Confirm(%s, markets, %d, %d) = %v", holder, shard, term, err)
+			}
+			if seq := requestStrings(rec.filter(on("", shardName(g, "markets", shard)))); strings.Join(seq, ", ") != strings.Join(want, ", ") {
+				t.Errorf("Confirm(%s, markets, %d, %d): requests %v, want %v", holder, shard, term, seq, want)
+			}
+			return got
+		}
+		// stored checks that got is the record of shard as stored now, and returns that.
+		stored := func(t *testing.T, got tenure.Holding, shard int) *coordinationv1.Lease {
+			t.Helper()
+			l := rawGet(t, c, shardName(g, "markets", shard))
+			want := tenure.Holding{Space: "markets", Shard: shard}
+			if l != nil {
+				term, _ := decodeTerm(l.Annotations)
+				want.Holder, want.Term, want.Version = holderOf(l), term, version(t, l)
+			}
+			if got != want {
+				t.Errorf("Confirm = %+v, want the record as stored, %+v", got, want)
+			}
+			return l
+		}
+
+		last := version(t, base)
+		for n := 1; n <= 3; n++ {
+			got := confirm(t, a, recA, h, 0, t1, "UPDATE "+name+" 200")
+			l := stored(t, got, 0)
+			if got.Holder != h || got.Term != t1 || got.Version <= last {
+				t.Errorf("Confirm %d = %+v, want %s at %d with a version above %d", n, got, h, t1, last)
+			}
+			last = got.Version
+			wantAnnotations := maps.Clone(base.Annotations)
+			wantAnnotations[annotationConfirm] = strconv.Itoa(n)
+			if !maps.Equal(l.Annotations, wantAnnotations) || !maps.Equal(l.Labels, base.Labels) || !apiequality.Semantic.DeepEqual(l.Spec, base.Spec) {
+				t.Errorf("record after Confirm %d: %+v; want only %s=%d changed from %+v", n, l, annotationConfirm, n, base)
+			}
+		}
+
+		l := rawGet(t, c, name)
+		waitObserved(t, b, name, l.ResourceVersion)
+		stored(t, confirm(t, b, recB, "pod-1/1", 0, t1, "GET "+name+" 200"), 0)
+		stored(t, confirm(t, a, recA, h, 0, t1+1, "GET "+name+" 200"), 0)
+		if got := rawGet(t, c, name); got.ResourceVersion != l.ResourceVersion {
+			t.Errorf("record written: resourceVersion %s, want %s", got.ResourceVersion, l.ResourceVersion)
+		}
+
+		absent := shardName(g, "markets", 9)
+		if got := confirm(t, a, recA, h, 9, t1, "GET "+absent+" 404"); got != (tenure.Holding{Space: "markets", Shard: 9}) {
+			t.Errorf("Confirm of no record = %+v, want {Space: markets, Shard: 9}", got)
+		}
+		if rawGet(t, c, absent) != nil {
+			t.Errorf("Confirm created %s", absent)
+		}
+
+		recA.bump(name, time.Time{})
+		got := confirm(t, a, recA, h, 0, t1, "UPDATE "+name+" 409", "GET "+name+" 200", "UPDATE "+name+" 200")
+		if l := stored(t, got, 0); l.Annotations[annotationConfirm] != "4" || l.Annotations[bumpAnnotation] != "1" {
+			t.Errorf("annotations %v after a conflict, want %s=4 and the bump", l.Annotations, annotationConfirm)
+		}
+
+		if err := a.Release(ctx, h, "markets", 0, t1); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+		l = stored(t, confirm(t, a, recA, h, 0, t1, "GET "+name+" 200"), 0)
+		if _, ok := l.Annotations[annotationConfirm]; ok || holderOf(l) != "" || l.Annotations[annotationTerm] != encodeTerm(t1) {
+			t.Errorf("record after Release %+v, want no holder and no %s at %d", l, annotationConfirm, t1)
+		}
+		t2 := mustAcquire(t, a, h, "markets", 0)
+		confirm(t, a, recA, h, 0, t2, "UPDATE "+name+" 200")
+		mustAcquire(t, a, h, "markets", 0)
+		if l := rawGet(t, c, name); l.Annotations[annotationConfirm] != "" {
+			t.Errorf("%s %q after a re-grant, want none", annotationConfirm, l.Annotations[annotationConfirm])
+		}
+	})
+
+	t.Run("race", func(t *testing.T) {
+		g := group()
+		clock := newFakeClock()
+		a, _ := c.adapter(t, g, withClock(clock.now))
+		b, _ := c.adapter(t, g)
+		const rounds = 10
+		const taker = "pod-10/1"
+		closeAtEnd(t, b, taker)
+		mustKeepAlive(t, b, taker)
+		startRenewer(t, b, taker)
+		owners := make([]string, rounds)
+		terms := make([]core.Term, rounds)
+		for i := range rounds {
+			owners[i] = fmt.Sprintf("pod-%d/1", i)
+			closeAtEnd(t, a, owners[i])
+			mustKeepAlive(t, a, owners[i])
+			terms[i] = mustAcquire(t, a, owners[i], "race", i)
+		}
+		for i := range rounds {
+			for _, name := range []string{memberName(g, memberOf(owners[i])), shardName(g, "race", i)} {
+				waitObserved(t, b, name, rawGet(t, c, name).ResourceVersion)
+			}
+		}
+		// b has observed every owner's session unchanged for its LeaseDuration.
+		time.Sleep(T.LeaseDuration + 200*time.Millisecond)
+
+		var taken, confirmed int
+		for i := range rounds {
+			var takeTerm core.Term
+			var takeErr, renewErr, confirmErr error
+			var got tenure.Holding
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Go(func() {
+				<-start
+				takeTerm, takeErr = b.Acquire(ctx, taker, "race", i)
+			})
+			wg.Go(func() {
+				<-start
+				if renewErr = a.KeepAlive(ctx, owners[i], T); renewErr == nil {
+					got, confirmErr = a.Confirm(ctx, owners[i], "race", i, terms[i])
+				}
+			})
+			close(start)
+			wg.Wait()
+			if renewErr != nil || confirmErr != nil {
+				t.Errorf("round %d: KeepAlive = %v, Confirm = %v; want nil, nil", i, renewErr, confirmErr)
+				continue
+			}
+			l := rawGet(t, c, shardName(g, "race", i))
+			var held *tenure.HeldError
+			switch {
+			case takeErr == nil:
+				taken++
+				want := tenure.Holding{Space: "race", Shard: i, Holder: taker, Term: takeTerm, Version: version(t, l)}
+				if takeTerm <= terms[i] || got != want || holderOf(l) != taker {
+					t.Errorf("round %d: taken over at %d after %d; Confirm = %+v, want %+v", i, takeTerm, terms[i], got, want)
+				}
+			case errors.As(takeErr, &held) && held.Holder == owners[i] && takeTerm == 0:
+				confirmed++
+				want := tenure.Holding{Space: "race", Shard: i, Holder: owners[i], Term: terms[i], Version: version(t, l)}
+				if got != want || l.Annotations[annotationConfirm] != "1" {
+					t.Errorf("round %d: held; Confirm = %+v, record %s=%q; want %+v and 1", i, got, annotationConfirm, l.Annotations[annotationConfirm], want)
+				}
+			default:
+				t.Errorf("round %d: Acquire = %d, %v; want a term or a *tenure.HeldError naming %s", i, takeTerm, takeErr, owners[i])
+			}
+		}
+		t.Logf("%d rounds with the takeover first, %d with Confirm first", taken, confirmed)
+	})
+}
+
+// TestK8S240CloseSessionShards checks step 1 of CloseSession on a cluster: one LIST of the
+// group's Leases, then each shard record naming the holder released at its own term, in name
+// order, also one with a malformed term, and after a conflict; other holders' records and
+// foreign Leases are left; a failed release or LIST does not stop the other records or steps 2
+// and 3, and its error is returned; and a later CloseSession, also by another Adapter, releases
+// what is left.
+func TestK8S240CloseSessionShards(t *testing.T) {
+	c := newCluster(t)
+	g := group()
+	ctx := t.Context()
+	a, rec := c.adapter(t, g)
+	b, recB := c.adapter(t, g)
+	closeAtEnd(t, b, "pod-1/1")
+	mustKeepAlive(t, b, "pod-1/1")
+	startRenewer(t, b, "pod-1/1")
+	// steps returns the requests of rec on the group's Leases but WATCHes and pod-1's renewals.
+	steps := func(rec *recorder) []string {
+		return requestStrings(rec.filter(func(r request) bool {
+			return r.resource == resourceLeases && r.verb != verbWatch && r.name != memberName(g, "pod-1")
+		}))
+	}
+	// released checks that record name names no holder, at term, without tenure.session and
+	// tenure.confirm.
+	released := func(t *testing.T, name, term string) {
+		t.Helper()
+		l := rawGet(t, c, name)
+		_, session := l.Annotations[annotationSession]
+		_, confirm := l.Annotations[annotationConfirm]
+		if holderOf(l) != "" || l.Annotations[annotationTerm] != term || session || confirm {
+			t.Errorf("%s names %q, annotations %v; want no holder at term %s, no session and no confirm", name, holderOf(l), l.Annotations, term)
+		}
+	}
+
+	t.Run("release", func(t *testing.T) {
+		const h = "pod-0/1"
+		mustKeepAlive(t, a, h)
+		terms := map[string]string{}
+		for _, x := range []struct {
+			space string
+			shard int
+		}{{"markets", 3}, {"markets", 1}, {"markets", 10}, {"orders", 2}} {
+			terms[shardName(g, x.space, x.shard)] = encodeTerm(mustAcquire(t, a, h, x.space, x.shard))
+		}
+		t3, _ := decodeTerm(map[string]string{annotationTerm: terms[shardName(g, "markets", 3)]})
+		if _, err := a.Confirm(ctx, h, "markets", 3, t3); err != nil {
+			t.Fatalf("Confirm: %v", err)
+		}
+		malformed := rawCreate(t, c, shardLease(g, "orders", 0, h, map[string]string{annotationTerm: "x"}))
+		terms[malformed.Name] = "x"
+		mustAcquire(t, b, "pod-1/1", "markets", 2)
+		other := rawGet(t, c, shardName(g, "markets", 2))
+		holder := h
+		foreign := rawCreate(t, c, &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Name: shardName(g, "markets", 20)},
+			Spec:       coordinationv1.LeaseSpec{HolderIdentity: &holder},
+		})
+		rec.bump(shardName(g, "markets", 10), time.Time{})
+
+		rec.reset()
+		if err := a.CloseSession(ctx, h); err != nil {
+			t.Fatalf("CloseSession: %v", err)
+		}
+		m1, m3, m10 := shardName(g, "markets", 1), shardName(g, "markets", 3), shardName(g, "markets", 10)
+		o0, o2 := shardName(g, "orders", 0), shardName(g, "orders", 2)
+		want := []string{
+			"LIST 200",
+			"UPDATE " + m1 + " 200",
+			"UPDATE " + m10 + " 409", "GET " + m10 + " 200", "UPDATE " + m10 + " 200",
+			"UPDATE " + m3 + " 200",
+			"UPDATE " + o0 + " 200",
+			"UPDATE " + o2 + " 200",
+			"DELETE " + memberName(g, "pod-0") + " 200",
+		}
+		if got := steps(rec); strings.Join(got, ", ") != strings.Join(want, ", ") {
+			t.Errorf("requests %v, want %v", got, want)
+		}
+		if lists := rec.filter(on(verbList, "")); len(lists) == 0 || lists[0].query.Get("labelSelector") != labelGroup+"="+g {
+			t.Errorf("LIST %v, want one with labelSelector %s=%s", lists, labelGroup, g)
+		}
+		for name, term := range terms {
+			released(t, name, term)
+		}
+		if l := rawGet(t, c, m10); l.Annotations[bumpAnnotation] != "1" {
+			t.Errorf("%s annotations %v, want the bump kept", m10, l.Annotations)
+		}
+		for _, l := range []*coordinationv1.Lease{other, foreign} {
+			if got := rawGet(t, c, l.Name); got.ResourceVersion != l.ResourceVersion {
+				t.Errorf("%s written: resourceVersion %s, want %s", l.Name, got.ResourceVersion, l.ResourceVersion)
+			}
+		}
+	})
+
+	t.Run("failed release", func(t *testing.T) {
+		const h = "pod-2/1"
+		mustKeepAlive(t, a, h)
+		names := make([]string, 3)
+		terms := map[string]string{}
+		for i := range names {
+			names[i] = shardName(g, "markets", 30+i)
+			terms[names[i]] = encodeTerm(mustAcquire(t, a, h, "markets", 30+i))
+		}
+		rec.failNext(on(verbUpdate, names[1]), 1)
+		err := a.CloseSession(ctx, h)
+		prefix := "k8s: release " + names[1] + ": "
+		if err == nil || !strings.HasPrefix(err.Error(), prefix) || errors.Is(err, tenure.ErrSessionLost) {
+			t.Errorf("CloseSession = %v, want %s<a server error>", err, prefix)
+		}
+		released(t, names[0], terms[names[0]])
+		released(t, names[2], terms[names[2]])
+		if l := rawGet(t, c, names[1]); holderOf(l) != h {
+			t.Errorf("%s names %q, want %s still", names[1], holderOf(l), h)
+		}
+		mname := memberName(g, "pod-2")
+		if rawGet(t, c, mname) != nil {
+			t.Errorf("member Lease %s still exists", mname)
+		}
+		if err := a.KeepAlive(ctx, h, T); !errors.Is(err, tenure.ErrSessionLost) {
+			t.Errorf("KeepAlive after CloseSession = %v, want an error matching tenure.ErrSessionLost", err)
+		}
+
+		// Another Adapter, which does not know the holder, releases the record left.
+		waitForgotten(t, b, mname)
+		recB.reset()
+		if err := b.CloseSession(ctx, h); err != nil {
+			t.Fatalf("CloseSession by another Adapter: %v", err)
+		}
+		want := []string{"LIST 200", "UPDATE " + names[1] + " 200", "GET " + mname + " 404"}
+		if got := steps(recB); strings.Join(got, ", ") != strings.Join(want, ", ") {
+			t.Errorf("requests %v, want %v", got, want)
+		}
+		released(t, names[1], terms[names[1]])
+	})
+
+	t.Run("failed list", func(t *testing.T) {
+		const h = "pod-3/1"
+		mustKeepAlive(t, a, h)
+		name := shardName(g, "markets", 40)
+		term := encodeTerm(mustAcquire(t, a, h, "markets", 40))
+		rec.failNext(on(verbList, ""), 1)
+		err := a.CloseSession(ctx, h)
+		prefix := "k8s: close " + h + ": list leases: "
+		if err == nil || !strings.HasPrefix(err.Error(), prefix) {
+			t.Errorf("CloseSession = %v, want %s<a server error>", err, prefix)
+		}
+		if l := rawGet(t, c, name); holderOf(l) != h {
+			t.Errorf("%s names %q, want %s still", name, holderOf(l), h)
+		}
+		if rawGet(t, c, memberName(g, "pod-3")) != nil {
+			t.Error("the member Lease still exists")
+		}
+		if err := a.CloseSession(ctx, h); err != nil {
+			t.Fatalf("CloseSession again: %v", err)
+		}
+		released(t, name, term)
+	})
 }
