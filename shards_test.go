@@ -526,15 +526,18 @@ func TestATRUN31Moved(t *testing.T) {
 
 // TestATRUN34RunRestarts checks the restart backoff of a Run that keeps returning at once:
 // min(RetryPeriod·2^(c−1), LeaseDuration), so calls at T0+{0,2,6,14,29,44}s, each with the same
-// Shard.
+// Shard. Each return emits run.returned with the run's term, Count 1 to 6, Duration the backoff
+// and Err boom, and its WARN record.
 func TestATRUN34RunRestarts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
 		r := newShardRig(t)
 		boom := errors.New("boom")
 		r.runs.Script(func(context.Context, *tenure.Shard, int) error { return boom })
+		cfg, events, log := r.config(), &eventRec{}, &logCapture{}
+		cfg.OnEvent, cfg.Logger = events.OnEvent, log.Logger()
 		t0 := time.Now()
-		n := start(t, context.Background(), r.config())
+		n := start(t, context.Background(), cfg)
 		sleepUntil(t0.Add(45 * time.Second))
 		for _, id := range allShards {
 			calls := r.runs.Of("orders", id)
@@ -546,6 +549,7 @@ func TestATRUN34RunRestarts(t *testing.T) {
 					t.Errorf("%v, want the first call's Shard and boom", c)
 				}
 			}
+			wantRunReturned(t, events, log, calls[0].Shard, boom, t0, secs(0, 2, 6, 14, 29, 44), secs(2, 4, 8, 15, 15, 15))
 		}
 		if rel := r.fs.Calls("Release"); len(rel) != 0 {
 			t.Errorf("Release calls while the member owns the shards: %v", rel)
@@ -556,7 +560,8 @@ func TestATRUN34RunRestarts(t *testing.T) {
 }
 
 // TestATRUN35RestartAfterLongRun checks that a Run that lasted at least LeaseDuration resets the
-// count: a 20 s call from T0, then quick returns, restarts at T0+22s, +26s and +34s.
+// count: a 20 s call from T0, then quick returns, restarts at T0+22s, +26s and +34s. The returns
+// emit run.returned with Count 1 to 4 and Duration 2 s, 4 s, 8 s and 15 s, and their WARN records.
 func TestATRUN35RestartAfterLongRun(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
@@ -571,17 +576,53 @@ func TestATRUN35RestartAfterLongRun(t *testing.T) {
 			}
 			return boom
 		})
+		cfg, events, log := r.config(), &eventRec{}, &logCapture{}
+		cfg.OnEvent, cfg.Logger = events.OnEvent, log.Logger()
 		t0 := time.Now()
-		n := start(t, context.Background(), r.config())
+		n := start(t, context.Background(), cfg)
 		sleepUntil(t0.Add(35 * time.Second))
 		for _, id := range allShards {
-			if got, want := runStarts(r.runs.Of("orders", id), t0), secs(0, 22, 26, 34); !slices.Equal(got, want) {
+			calls := r.runs.Of("orders", id)
+			if got, want := runStarts(calls, t0), secs(0, 22, 26, 34); !slices.Equal(got, want) {
 				t.Errorf("orders/%d runs at %v, want %v", id, got, want)
 			}
+			wantRunReturned(t, events, log, calls[0].Shard, boom, t0, secs(20, 22, 26, 34), secs(2, 4, 8, 15))
 		}
 		closeNode(t, n)
 		check()
 	})
+}
+
+// wantRunReturned fails t unless the run.returned events about sh are one per return, at T0
+// plus each of at, with Count 1, 2, …, Duration the backoff of each, sh's term and Err err, and
+// unless the WARN records of sh's run.returned events say the same, after member and holder.
+func wantRunReturned(t *testing.T, events *eventRec, log *logCapture, sh *tenure.Shard, err error,
+	t0 time.Time, at, backoffs []time.Duration) {
+	t.Helper()
+	var got, want []tenure.Event
+	for _, e := range ofKinds(events.Events(), tenure.EventRunReturned) {
+		if e.Space == sh.Space && e.Shard == sh.ID {
+			got = append(got, e)
+		}
+	}
+	var lines []string
+	for i, d := range backoffs {
+		want = append(want, tenure.Event{Kind: tenure.EventRunReturned, Space: sh.Space, Shard: sh.ID,
+			Term: sh.Term, Slot: -1, Count: i + 1, Duration: d, Err: err})
+		lines = append(lines, fmt.Sprintf(`{"level":"WARN","msg":"tenure: run returned","member":"n1",`+
+			`"holder":"%s","space":"%s","shard":%d,"term":%d,"restarts":%d,"restart_in":%d,"error":"%v"}`,
+			holder01, sh.Space, sh.ID, sh.Term, i+1, d.Nanoseconds(), err))
+	}
+	wantEvents(t, fmt.Sprintf("%s/%d run.returned events", sh.Space, sh.ID), got, want)
+	for i, e := range got {
+		if i < len(at) && e.Time != t0.Add(at[i]).UTC() {
+			t.Errorf("%s/%d: run.returned %d at %v, want T0+%v", sh.Space, sh.ID, i+1, e.Time, at[i])
+		}
+	}
+	recs := linesWith(log.Lines(), `"msg":"tenure: run returned"`, fmt.Sprintf(`"space":"%s","shard":%d,`, sh.Space, sh.ID))
+	if !slices.Equal(recs, lines) {
+		t.Errorf("%s/%d run.returned records =\n%s\nwant\n%s", sh.Space, sh.ID, strings.Join(recs, "\n"), strings.Join(lines, "\n"))
+	}
 }
 
 // TestATRUN36MoveDuringBackoff checks that a shard that moves while its Run waits to be restarted

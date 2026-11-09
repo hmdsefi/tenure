@@ -117,7 +117,7 @@ type executor struct {
 // newExecutor returns an executor whose calls derive their contexts from ctx and send t with
 // KeepAlive. SentAt readings are time.Since(epoch). failed, when not nil, is called on the lane
 // with every result whose error came from a call other than Acquire and KeepAlive, also when
-// the result itself is discarded by dropOlder.
+// the result itself is discarded by dropOlder, unless ctx was done when the call returned.
 func newExecutor(ctx context.Context, store Store, t core.Timing, epoch time.Time,
 	failed func(callResult)) *executor {
 	if failed == nil {
@@ -351,8 +351,9 @@ func (e *executor) run(l *lane) {
 		if !ok {
 			return
 		}
-		// failed runs after exec has given the permit back, so a slow callback holds none.
-		if r, ok := e.exec(l, c); ok && r.err != nil {
+		// failed runs after exec has given the permit back, so a slow callback holds none. A call
+		// that the internal context cut off, as Start's cleanup and Close do, did not fail.
+		if r, ok := e.exec(l, c); ok && r.err != nil && e.ctx.Err() == nil {
 			switch c.act.(type) {
 			case core.Acquire, core.KeepAlive:
 			default:

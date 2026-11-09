@@ -346,14 +346,19 @@ func TestStartWaitsForValidView(t *testing.T) {
 
 // TestATRUN20WatchRetry checks the watcher: a closed channel and a failing Watch are retried
 // RetryPeriod later, the view after a gap is the latest one and reaches Route, and no Watch
-// follows Close's Leave. The node has a store and orders, so that it routes keys.
+// follows Close's Leave. The node has a store and orders, so that it routes keys. Each closed
+// channel and failed Watch emits membership.failed{Reason: "Watch"} when the watcher sees it, with
+// the Watch error or "tenure: watch channel closed", and the channel Leave closes emits none.
 func TestATRUN20WatchRetry(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
 		g := newGroup(t, tenure.Member{ID: "n2", Addr: "a2"})
 		m := g.Absent("n1")
+		events := &eventRec{}
+		cfg := nodeConfig("n1", m, newRecStore(memstore.New(nil)), orders((&runLog{}).Run))
+		cfg.OnEvent = events.OnEvent
 		t0 := time.Now()
-		n := start(t, context.Background(), nodeConfig("n1", m, newRecStore(memstore.New(nil)), orders((&runLog{}).Run)))
+		n := start(t, context.Background(), cfg)
 		routes := func(ids ...string) {
 			t.Helper()
 			owner := ownerOf(bal("orders", 8, ids...))
@@ -416,6 +421,18 @@ func TestATRUN20WatchRetry(t *testing.T) {
 			if c.Seq > leaves[0].Seq {
 				t.Errorf("%v started after Leave", c)
 			}
+		}
+		closed := errors.New("tenure: watch channel closed")
+		wantEvents(t, "membership.failed events", ofKinds(events.Events(), tenure.EventMembershipFailed), []tenure.Event{
+			membershipFailedEv("Watch", closed), membershipFailedEv("Watch", closed),
+			membershipFailedEv("Watch", boom), membershipFailedEv("Watch", boom), membershipFailedEv("Watch", boom),
+		})
+		var failedAt []time.Duration
+		for _, e := range ofKinds(events.Events(), tenure.EventMembershipFailed) {
+			failedAt = append(failedAt, e.Time.Sub(t0.UTC()))
+		}
+		if want := secs(10, 20, 22, 24, 26); !slices.Equal(failedAt, want) {
+			t.Errorf("membership.failed at %v, want %v", failedAt, want)
 		}
 		check()
 	})
