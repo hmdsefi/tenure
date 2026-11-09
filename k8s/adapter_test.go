@@ -32,6 +32,8 @@ var adapterCalls = []struct {
 }{
 	{"CheckNames", func(_ context.Context, a *Adapter) error { return a.CheckNames([]string{"markets"}, "pod-0") }},
 	{"CheckTiming", func(_ context.Context, a *Adapter) error { return a.CheckTiming(T) }},
+	{"KeepAlive", func(ctx context.Context, a *Adapter) error { return a.KeepAlive(ctx, "pod-0/1", T) }},
+	{"CloseSession", func(ctx context.Context, a *Adapter) error { return a.CloseSession(ctx, "pod-0/1") }},
 }
 
 // TestATK8S01ConfigErrors checks New's configuration error, which every method returns first

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"k8s.io/client-go/kubernetes"
@@ -45,6 +46,21 @@ type Adapter struct {
 	memberGC          time.Duration
 	logger            *slog.Logger
 	watchLatency      time.Duration
+
+	// now is the Adapter's clock: its readings carry the monotonic clock that observations
+	// rest on, and give the wall times written to Leases. Tests replace it.
+	now func() time.Time
+
+	// mu guards the fields below it.
+	mu sync.Mutex
+	// cache is the running informer, nil while none runs (cache.go).
+	cache *leaseCache
+	// runs counts the informer goroutines that have not ended yet.
+	runs sync.WaitGroup
+	// sessions is the session table, by holder (session.go).
+	sessions map[string]*session
+	// leaseLocks serializes the writes of each member Lease, by Lease name (session.go).
+	leaseLocks map[string]chan struct{}
 }
 
 // Option configures an Adapter. Pass options to New.
@@ -135,6 +151,9 @@ func New(client kubernetes.Interface, namespace, group string, opts ...Option) *
 		memberGC:          defaultMemberGC,
 		logger:            slog.New(slog.DiscardHandler),
 		watchLatency:      defaultWatchLatency,
+		now:               time.Now,
+		sessions:          map[string]*session{},
+		leaseLocks:        map[string]chan struct{}{},
 	}
 	// K8S-010: the checks in order; the first failure is the configuration error.
 	switch {

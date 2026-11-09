@@ -39,6 +39,15 @@
 // holder's LeaseDuration, on its own monotonic clock. No time written into a Lease is ever
 // compared with a clock.
 //
+// # Sessions
+//
+// A holder is <member ID>/<incarnation>, and its session is its member Lease: KeepAlive
+// creates the Lease naming the holder, or takes it over from another incarnation of the same
+// member, which loses its session, and then renews it with one write each time. Every write is a
+// compare-and-swap of the whole Lease that keeps the labels and annotations it does not own.
+// While the Adapter has an active session, it watches the group's Leases with one informer,
+// which stops once nothing needs it any more. CloseSession ends a session for good.
+//
 // # Configuration
 //
 // New never fails and makes no request. It records the first problem it finds with its
