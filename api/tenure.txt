@@ -553,6 +553,12 @@ func (n *Node) SetSlots(ctx context.Context, count int) error
     for a new session after losing one, until ctx ends or Close stops the node.
     When Close stops the node first, SetSlots returns ErrClosed.
 
+func (n *Node) Table() Table
+    Table returns the node's ownership table: a snapshot of the node,
+    its session, its view and every shard of its spaces, which the node updates
+    while it carries out each step. Table never waits for a step to be carried
+    out. It may be called at any time, from Config.OnEvent too, and after Close.
+
 type NotOwnerError struct {
 	// Space and Shard name the shard.
 	Space string
@@ -816,6 +822,125 @@ type Store interface {
     or returns ErrSessionLost, a *HeldError or ErrNoSlot, changes nothing.
     Any other error, such as a failed request or a context that ends during the
     call, leaves the outcome unknown: the call may have taken effect.
+
+type Table struct {
+	// Taken is when the snapshot was taken.
+	Taken time.Time
+
+	// Member is this member as the node's latest view lists it, or Config.Self while the view
+	// does not list it.
+	Member Member
+
+	// Holder is the node's holder: the member ID, "/" and the incarnation in lowercase hex. It
+	// changes when the node starts a new incarnation after a lost session.
+	Holder string
+
+	// Draining reports that the member is handing its work over: Drain or Close has started the
+	// drain. It stays true after Close.
+	Draining bool
+
+	// Closed reports that Close has stopped the node.
+	Closed bool
+
+	// SessionLive reports that the member's session is live: a renewal was accepted and its
+	// deadline has not passed. It is false without a Store, while the session opens, once the
+	// deadline has passed, once the session is lost or closed, and after Close.
+	SessionLive bool
+
+	// LastRenewal is the wall-clock time at which the node sent the last renewal of its session
+	// that the store accepted, zero before the first.
+	LastRenewal time.Time
+
+	// SessionDeadline is when the session ends unless a renewal is accepted first, zero before
+	// the first accepted renewal of the incarnation and without a Store. It is Taken plus the
+	// time to the deadline on the node's monotonic clock, so a step of the wall clock does not
+	// move it away from Taken.
+	SessionDeadline time.Time
+
+	// ViewVersion is the Version of the node's latest view, 0 before the first.
+	ViewVersion uint64
+
+	// Members are the members of the node's latest view, sorted by ID.
+	Members []Member
+
+	// Slots is the group's slot count in the node's latest view, 0 without slots.
+	Slots int
+
+	// Slot is the slot this member holds, -1 for none.
+	Slot int
+
+	// SlotHolders holds the holder of each slot in the node's latest view, "" for a vacant
+	// slot.
+	SlotHolders []string
+
+	// Spaces holds the node's spaces sorted by name.
+	Spaces []TableSpace
+}
+    Table is the ownership table of a node, as Node.Table returns it:
+    one consistent snapshot of what the node believes about itself, its session,
+    its view and every shard of its spaces. All of it describes the node at one
+    instant between two steps of its loop. It shares no memory with the node.
+    Its times are in UTC, and a zero time means none.
+
+type TableRow struct {
+	// Shard is the shard's number in its space.
+	Shard int
+
+	// Route is the ID of the member that Node.Route names for the shard's keys, "" when Route
+	// finds none. After Close it is the last such member.
+	Route string
+
+	// Slot is the slot the shard is placed on in a group with slots, -1 without slots or when
+	// the shard has no placement.
+	Slot int
+
+	// State is where the shard stands on this member, the name of a core.ShardState: "idle",
+	// "acquiring", "owned", "degraded", "stopping", "expired", "lost" or "releasing". Every row
+	// is "idle" after Close.
+	State string
+
+	// Holder and Term are the holder the shard's record names, as far as the node knows, and the
+	// record's term: this member's holder from the start of its run, another member's when the
+	// node reads the record, and "" once the record names no holder. Holder is "" and Term 0
+	// before the node knows anything of the record.
+	Holder string
+	Term   core.Term
+
+	// Since is when State last changed.
+	Since time.Time
+
+	// Running reports that a Run of the shard's latest ownership by this member is in progress
+	// or about to restart, from the shard's acquisition until its Run has returned for the last
+	// time. After Close it reports a Run that has not returned yet.
+	Running bool
+
+	// Stuck reports that the Run was told to stop longer than the renewal deadline ago and has
+	// not returned yet.
+	Stuck bool
+
+	// Restarts is the number of consecutive returns of Run that the node restarted it after, 0
+	// from each acquisition of the shard until Run first returns. A Run that lasted the lease
+	// duration starts the count again.
+	Restarts int
+
+	// Stop is why the node told the shard's latest Run to stop: "moved", "draining", "expired",
+	// "lost" or "closed", "" from each acquisition until it is told to stop. It stays once the
+	// shard is released.
+	Stop string
+}
+    TableRow is one shard of a TableSpace: where the node routes it and what the
+    node knows about it and its Run.
+
+type TableSpace struct {
+	// Name, Shards and Fenced are the space's from Config.Spaces.
+	Name   string
+	Shards int
+	Fenced bool
+
+	// Rows holds one row per shard, indexed by shard number.
+	Rows []TableRow
+}
+    TableSpace is one space of a Table.
 
 type TimingChecker interface {
 	// CheckTiming returns an error when the backend cannot work with t, the timing the node

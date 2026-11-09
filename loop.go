@@ -310,6 +310,7 @@ func (l *loop) apply(in loopInput, now time.Duration) {
 	if in.sh != nil {
 		n.shards[in.sh.Space].local[in.sh.ID].CompareAndSwap(in.sh, nil)
 	}
+	l.tableStep(rec)
 	rec.Stamp = n.exec.stamp()
 	n.obs.step(rec)
 	if l.hook != nil {
@@ -394,6 +395,7 @@ func (l *loop) recover() {
 	}
 	prev := n.holder
 	n.holder = holder
+	n.tableHolder(holder)
 	n.stepMu.Unlock()
 	n.obs.newIncarnation(prev)
 
@@ -590,6 +592,7 @@ func (n *Node) startRun(a core.StartRun) {
 
 	run, timing := n.gateRun(sp, a.Shard), n.cfg.Timing
 	onReturn := func(err error, count int, backoff time.Duration) {
+		n.tableRunReturned(sh, count)
 		n.obs.runReturned(sh, err, count, backoff)
 	}
 	n.sups.Go(func() {

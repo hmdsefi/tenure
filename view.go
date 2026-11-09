@@ -160,6 +160,7 @@ func (n *Node) postView(v core.View) {
 	if n.cfg.Store == nil {
 		n.publish(v)
 		n.snap.Store(newRoutes(n.view.Load(), nil, nil)) // no spaces: nothing to assign
+		n.tableView(n.view.Load())
 		return
 	}
 	n.inbox.postView(v)
