@@ -36,8 +36,9 @@ type Node struct {
 	// changes it, under stepMu, when it starts a new incarnation (RUN-180).
 	holder string
 
-	epoch time.Time // the node's monotonic origin, taken after the incarnation is drawn
-	obs   observer
+	epoch  time.Time // the node's monotonic origin, taken after the incarnation is drawn
+	obs    observer
+	events *eventLog // the node's events; its delivery goroutine is not counted in wg
 
 	// ctx is the internal context, context.WithCancel(context.WithoutCancel(Start's ctx)):
 	// every goroutine and every call after Start runs under it, and Close cancels it.
@@ -97,7 +98,9 @@ type Node struct {
 // error that starts with "tenure: invalid config: " when cfg is not valid, and otherwise with the
 // step that failed, such as "tenure: join: " and the error of Join, or "tenure: open session: "
 // and the error of the store's KeepAlive. A failed Start closes the session again if it opened
-// one, leaves the group again if it joined, and leaves no goroutine behind.
+// one, leaves the group again if it joined, and leaves no goroutine behind. Before it returns, it
+// waits until Config.OnEvent has returned for each event the node emitted, or ctx ends; it emits
+// no EventNodeClosed, and calls OnEvent no more once it has returned.
 //
 // ctx bounds Start only: Start's own calls of the membership and the store use it, and the node
 // keeps running after ctx ends, until Close. Start does not wait for the shards of Spaces: the
@@ -116,13 +119,14 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 		cfg:         cfg,
 		holder:      holder,
 		epoch:       time.Now(),
-		obs:         nopObserver{},
+		events:      newEventLog(cfg.Self.ID, cfg.Logger, cfg.OnEvent),
 		first:       make(chan struct{}),
 		ended:       make(chan struct{}),
 		inbox:       newInbox(),
 		machineDone: make(chan struct{}),
 		shards:      newShardTable(cfg.Spaces),
 	}
+	n.obs = &logObserver{n: n}
 	n.merge.post = n.postView
 	n.snap.Store(newRoutes(nil, nil, nil))
 	n.obs.start(n.holder)
@@ -579,6 +583,12 @@ func (n *Node) writeSlots(ctx context.Context, ss SlotStore, count int) error {
 // No call of the membership or the store starts after Close has returned. Close waits for the
 // calls in flight, whose context it cancels, so a call that does not return once its context
 // is done holds Close up.
+//
+// The node's last event is EventNodeClosed, with Reason "drained" when the drain completed and
+// "deadline" when ctx ended first. After a completed drain, Close returns once Config.OnEvent has
+// returned for that event, or when ctx ends first. The node emits no event after Close has
+// returned, and OnEvent gets none of the events it had not been called with by then: no call of
+// OnEvent starts after Close has returned, though one in progress may go on.
 func (n *Node) Close(ctx context.Context) error {
 	n.mu.Lock()
 	if n.closing {
@@ -601,24 +611,26 @@ func (n *Node) Close(ctx context.Context) error {
 	n.wait()
 	n.closeRoutes()
 	n.markClosed()
-	n.obs.closed(ctx, "drained")
+	n.obs.closed(ctx, closedDrained) // waits for node.closed's delivery, then stops it
 	return nil
 }
 
 // forceClose is RUN-530's path, for a Close whose ctx ended before the drain completed (MCH O7).
 // halt stops driving the machine and stops the published shards; then come observer.closed with
 // "deadline", the resolvers closed, the internal context canceled, and a wait for every goroutine
-// but the supervisors whose Run has not returned. Neither CloseSession nor Leave is called. It
-// returns Close's error.
+// but the supervisors whose Run has not returned. Neither CloseSession nor Leave is called. Last,
+// it stops the delivery of events, without waiting for node.closed's (OBS-220). It returns
+// Close's error.
 func (n *Node) forceClose(ctx context.Context) error {
 	detail := n.halt()
-	n.obs.closed(ctx, "deadline")
+	n.obs.closed(ctx, closedDeadline)
 	n.closeResolvers()
 	n.cancel()
 	n.wg.Wait() // the loop, and with it every lane, has returned: no supervisor starts any more
 	n.waitIdleSupervisors()
 	n.closeRoutes()
 	n.markClosed()
+	n.events.stop() // ctx is done: no wait for node.closed's delivery
 	return fmt.Errorf("tenure: close: %w%s", ctx.Err(), detail)
 }
 

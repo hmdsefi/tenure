@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"slices"
 	"strings"
@@ -58,7 +59,18 @@ type Config struct {
 	// means crypto/rand.Reader.
 	Rand io.Reader
 
-	// OnEvent, when not nil, is called with each event of the node, one at a time and in order.
+	// Logger, when not nil, gets a log record for each event of the node, at the event kind's
+	// level, with the kind's message, such as "tenure: shard acquired", and the attributes
+	// "member" (Self.ID) and "holder" (the node's holder when it emitted the event) followed by
+	// the kind's own. The record's time is the handler's. The node writes the records on the
+	// goroutine that calls OnEvent, and Close waits for a record being written. nil means no log
+	// records.
+	Logger *slog.Logger
+
+	// OnEvent, when not nil, is called with each event of the node, one at a time and in order
+	// of Seq, right after the event's log record was written. The calls run on a goroutine of
+	// the node's own, so a slow OnEvent never holds the node up: events wait for it in a queue.
+	// OnEvent may call RecentEvents. A panic in OnEvent is not recovered.
 	OnEvent func(Event)
 }
 

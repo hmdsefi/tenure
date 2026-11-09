@@ -11,7 +11,8 @@ import (
 )
 
 // observer is the seam through which the node reports what happens to it. Start installs
-// nopObserver; plan 1.6 implements events and Table behind it. The node calls it at these points:
+// logObserver, which emits the node's events; nopObserver serves tests. The node calls it at these
+// points:
 //
 //   - start, once Start has drawn the incarnation and before it calls Join, with the holder;
 //   - startFailed, last, when Start fails after start, with Start's ctx and the error it returns;
@@ -50,8 +51,9 @@ import (
 // n.mu, step, newIncarnation and a store's view from the loop goroutine, the callFailed calls of
 // Holdings and the store watch from the resync and store-watch goroutines, the other callFailed
 // calls from the executor's lanes, runReturned from the shard's supervisor goroutine, and the
-// rest from the
-// node's watcher and drain goroutines. No call may block, or call back into the node.
+// rest from the node's watcher and drain goroutines. No call may call back into the node, and
+// none may block, but startFailed and closed, which may wait for the delivery of the node's
+// events until their ctx ends.
 type observer interface {
 	start(holder string)
 	startFailed(ctx context.Context, err error)
