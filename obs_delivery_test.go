@@ -164,6 +164,9 @@ func TestATOBS17Logger(t *testing.T) {
 		events := a.Events.Events()
 		logged = events
 		lines := a.Log.Lines()
+		if emitted := a.RecentEvents(); !reflect.DeepEqual(events, emitted) {
+			t.Fatalf("OnEvent got %+v, want every event emitted: %+v", events, emitted)
+		}
 		if len(lines) != len(events) {
 			t.Fatalf("%d log records for %d events, want as many:\n%s", len(lines), len(events), strings.Join(lines, "\n"))
 		}
@@ -202,30 +205,43 @@ func TestATOBS17Logger(t *testing.T) {
 		if lines := a.Log.Lines(); len(lines) != 0 {
 			t.Errorf("records without a Logger = %v, want none", lines)
 		}
-		// The two shards' lanes may finish their calls of one instant in either order, so the
-		// runs are compared as sets of events with their times, Seq aside. Whether the loop
-		// steps the view that Close's Leave publishes before it stops depends on scheduling too,
-		// so that view's view.changed (the one without members) is left out.
-		if got, want := unordered(a.Events.Events()), unordered(logged); logged != nil && !reflect.DeepEqual(got, want) {
-			t.Errorf("events without a Logger =\n%s\nwant those with one:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+		// The two shards' lanes may finish their calls of one instant in either order, and the
+		// watcher hands the loop a membership view whenever it reads one, so how the streams of
+		// events interleave depends on scheduling, with a Logger or without. The runs are
+		// compared stream by stream, in order, with times, Seq aside. Whether the loop steps the
+		// views of Close's SetDraining and Leave before it stops depends on scheduling too, so
+		// their view.changed events are left out.
+		if got, want := streams(a.Events.Events()), streams(logged); logged != nil && !reflect.DeepEqual(got, want) {
+			t.Errorf("events without a Logger =\n%v\nwant those with one:\n%v", got, want)
 		}
 		wantSerial(t, a)
 		check()
 	})
 }
 
-// unordered returns each event without its Seq, formatted, in sorted order, leaving out any
-// view.changed of a view without members.
-func unordered(events []tenure.Event) []string {
-	var out []string
+// streams splits events, in Seq order, into the streams whose order does not depend on
+// scheduling, each event without its Seq and formatted, in order: one per shard, one of
+// view.changed, and one of the node's other events. It leaves out every view.changed after
+// node.draining: the views of Close's own SetDraining and Leave reach the loop through the
+// watcher, and the loop may stop before it steps them.
+func streams(events []tenure.Event) map[string][]string {
+	out := make(map[string][]string)
+	closing := false
 	for _, e := range events {
-		if e.Kind == tenure.EventViewChanged && e.Count == 0 {
+		key := "node"
+		switch {
+		case e.Kind == tenure.EventNodeDraining:
+			closing = true
+		case e.Kind == tenure.EventViewChanged && closing:
 			continue
+		case e.Kind == tenure.EventViewChanged:
+			key = "views"
+		case e.Shard >= 0:
+			key = fmt.Sprintf("%s/%d", e.Space, e.Shard)
 		}
 		e.Seq = 0
-		out = append(out, fmt.Sprintf("%+v", e))
+		out[key] = append(out[key], fmt.Sprintf("%+v", e))
 	}
-	slices.Sort(out)
 	return out
 }
 
@@ -249,7 +265,8 @@ func wantSerial(t *testing.T, n *obsNode) {
 
 // TestATOBS18RecentRing checks RecentEvents with 200 shards, whose start alone emits more than
 // 256 events: it holds the newest 256 events, with consecutive Seqs ending at the newest, before
-// and after Close; and changing the slice it returns changes nothing in the node.
+// and after Close; and changing the slice it returns changes nothing in the node, nor does it
+// on a node whose ring is not full yet.
 func TestATOBS18RecentRing(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
@@ -277,24 +294,50 @@ func TestATOBS18RecentRing(t *testing.T) {
 			return recent
 		}
 
-		recent := wantRing("running")
-		kept := slices.Clone(recent)
-		recent[0] = tenure.Event{Kind: tenure.EventNodeClosed, Seq: 1, Err: errors.New("changed")}
-		recent[255].Space = "changed"
-		_ = append(recent[:10], tenure.Event{})
-		if got := a.RecentEvents(); !reflect.DeepEqual(got, kept) {
-			t.Errorf("RecentEvents() after changing its result = %+v, want %+v", got, kept)
-		}
+		wantRing("running")
+		wantOwnCopy(t, a, "running")
 
 		a.MustClose()
-		recent = wantRing("closed")
+		recent := wantRing("closed")
 		want := tenure.Event{Kind: tenure.EventNodeClosed, Shard: -1, Slot: -1, Reason: "drained"}
 		if bare(recent[255]) != want {
 			t.Errorf("newest event after Close = %+v, want %+v", recent[255], want)
 		}
+		wantOwnCopy(t, a, "closed")
 		wantDelivery(t, a)
 		check()
 	})
+
+	// Before the ring is full, its events sit in it from the first slot on, so a result that
+	// shared the ring's array would be easy to return: it must be a copy there too.
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		a := newObsHarness(t, "a").Start("a")
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		if n := len(a.RecentEvents()); n < 2 || n >= 256 {
+			t.Fatalf("RecentEvents() holds %d events, want 2 to 255: the ring not yet full", n)
+		}
+		wantOwnCopy(t, a, "not full")
+		a.MustClose()
+		wantOwnCopy(t, a, "not full, closed")
+		check()
+	})
+}
+
+// wantOwnCopy fails t unless changing the slice n.RecentEvents() returns, its elements and,
+// through an append, its array, leaves the result of a later call unchanged.
+func wantOwnCopy(t *testing.T, n *obsNode, when string) {
+	t.Helper()
+	recent := n.RecentEvents()
+	kept := slices.Clone(recent)
+	last := len(recent) - 1
+	recent[0] = tenure.Event{Kind: tenure.EventNodeClosed, Seq: 1, Err: errors.New("changed")}
+	recent[last].Space = "changed"
+	_ = append(recent[:last/2], tenure.Event{Space: "appended"})
+	if got := n.RecentEvents(); !reflect.DeepEqual(got, kept) {
+		t.Errorf("%s: RecentEvents() after changing its result = %+v, want %+v", when, got, kept)
+	}
 }
 
 // TestATRUN91EventsNeverBlock checks that a node without a Logger whose OnEvent blocks keeps its
