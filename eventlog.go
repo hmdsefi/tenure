@@ -274,11 +274,7 @@ func (o *logObserver) step(rec stepRecord) { o.steps.collect(rec) }
 // shardClosed emits shard.stopping with reason "closed" for a shard that a forced Close stopped.
 func (o *logObserver) shardClosed(sh *Shard) { o.steps.closed(sh, time.Since(o.n.epoch)) }
 
-func (o *logObserver) callFailed(callResult)                         {}
-func (o *logObserver) runReturned(*Shard, error, int, time.Duration) {}
-func (o *logObserver) slotCountMismatch(int, int)                    {}
-func (o *logObserver) slotsFailed(error)                             {}
-func (o *logObserver) membershipFailed(string, error)                {}
+func (o *logObserver) slotCountMismatch(int, int) {}
 
 // newIncarnation notes the node's new holder, which the loop has set, for the events from now on.
 func (o *logObserver) newIncarnation(string) { o.n.events.setHolder(o.n.holder) }
