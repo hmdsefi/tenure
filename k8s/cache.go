@@ -47,6 +47,9 @@ import (
 // fresh, a holder that only the passing of time would turn gone stays live (frozen), for Slots,
 // ClaimSlot and the views. freshness reports the rule's answer and the next instant at which it
 // may change by itself; freshChanged signals every event that may change it otherwise.
+//
+// Every event also wakes the builder of the views (views.go), and each run collects member Leases
+// dead for long (gc.go).
 
 // resyncPeriod is the informer's resync period: none, as observations rest on changes only.
 const resyncPeriod = 0
@@ -177,6 +180,7 @@ func (a *Adapter) startCache() *leaseCache {
 		l := asLease(obj)
 		c.observe(l)
 		a.delivered(c, l)
+		a.viewsChanged()
 	}
 	reg, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    deliver,
@@ -184,6 +188,7 @@ func (a *Adapter) startCache() *leaseCache {
 		DeleteFunc: func(obj any) {
 			_, gap := obj.(cache.DeletedFinalStateUnknown)
 			c.forget(asLease(obj), gap)
+			a.viewsChanged()
 		},
 	})
 	if err != nil {
@@ -194,6 +199,7 @@ func (a *Adapter) startCache() *leaseCache {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancel = cancel
 	a.runs.Go(func() { informer.RunWithContext(ctx) })
+	a.runs.Go(func() { a.collectMembers(ctx) })
 	return c
 }
 
