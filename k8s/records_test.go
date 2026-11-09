@@ -987,6 +987,8 @@ func TestATK8S31RecordConcurrency(t *testing.T) {
 		t.Fatalf("KeepAlive: %v", err)
 	}
 	renewed := time.Now()
+	// The Acquires take longer than the LeaseDuration: keep the session they need alive.
+	startRenewer(t, a, "pod-0/1")
 	wg.Wait()
 
 	for i, r := range results {
