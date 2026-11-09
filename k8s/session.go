@@ -105,8 +105,9 @@ func (a *Adapter) lockLease(ctx context.Context, name string) (unlock func(), er
 
 // KeepAlive opens a session for holder on its member Lease, or renews the session, with the
 // Lease duration of timing. The first KeepAlive of a holder creates the member Lease naming the
-// holder, or takes over the Lease when it names no holder or another incarnation of the same
-// member, which ends that incarnation's session. A renewal moves the Lease's renewTime on with
+// holder, with the member record when the Adapter has joined as the holder's member, or takes
+// over the Lease when it names no holder or another incarnation of the same member, which ends
+// that incarnation's session. A renewal moves the Lease's renewTime on with
 // one write. KeepAlive returns an error matching tenure.ErrSessionLost, without a request, for a
 // holder whose session ended in this Adapter or expired, LeaseDuration after its latest
 // successful renewal was sent; and when a renewal finds the Lease deleted, naming another
@@ -154,12 +155,8 @@ func (a *Adapter) openSession(ctx context.Context, holder, name string, timing c
 	if err != nil {
 		return err
 	}
-	var cur *coordinationv1.Lease
-	if o, ok := a.cached(name); ok {
-		cur = o.lease
-	}
 	sent := a.now()
-	written, err := a.writeLease(ctx, "open", name, cur, func(cur *coordinationv1.Lease) (change, error) {
+	written, err := a.writeLease(ctx, "open", name, a.knownMember(name), func(cur *coordinationv1.Lease) (change, error) {
 		return a.decideOpen(cur, holder, timing)
 	})
 	if err != nil {
@@ -173,15 +170,20 @@ func (a *Adapter) openSession(ctx context.Context, holder, name string, timing c
 }
 
 // decideOpen decides the write that opens the session of holder on its member Lease cur
-// (K8S-210): create the Lease naming holder; or name holder, as a new acquisition, on a Lease
-// that names no holder or another; or renew a Lease that names holder already.
+// (K8S-210): create the Lease naming holder, with the member record when the Adapter has joined
+// as holder's member; or name holder, as a new acquisition, on a Lease that names no holder or
+// another; or renew a Lease that names holder already.
 func (a *Adapter) decideOpen(cur *coordinationv1.Lease, holder string, timing core.Timing) (change, error) {
 	now := a.microNow()
 	seconds := leaseSeconds(timing)
 	if cur == nil {
 		var transitions int32
+		var annotations map[string]string
+		if record, ok := a.joinedRecord(memberOf(holder)); ok {
+			annotations = map[string]string{annotationMember: record}
+		}
 		return change{lease: &coordinationv1.Lease{
-			ObjectMeta: metav1.ObjectMeta{Labels: leaseLabels(a.group, kindMember, "")},
+			ObjectMeta: metav1.ObjectMeta{Labels: leaseLabels(a.group, kindMember, ""), Annotations: annotations},
 			Spec: coordinationv1.LeaseSpec{
 				HolderIdentity:       &holder,
 				LeaseDurationSeconds: &seconds,
@@ -258,7 +260,8 @@ func (a *Adapter) decideRenew(cur *coordinationv1.Lease, s session, timing core.
 // CloseSession ends the session of holder for good, also for a holder that this Adapter does
 // not know or whose session ended already: later calls of KeepAlive for holder return an error
 // matching tenure.ErrSessionLost. When the member Lease still names holder, CloseSession deletes
-// it, or, when the Lease carries a member record, only clears its holder. It never returns
+// it, or, when the Adapter has joined as the holder's member or the Lease carries a member
+// record, only clears its holder, so the member stays in the group. It never returns
 // tenure.ErrSessionLost.
 func (a *Adapter) CloseSession(ctx context.Context, holder string) error {
 	if err := ctx.Err(); err != nil {
@@ -289,8 +292,8 @@ func (a *Adapter) CloseSession(ctx context.Context, holder string) error {
 	// The latest state known, read while the session still holds the informer.
 	if base != nil {
 		base = a.latest(name, base)
-	} else if o, ok := a.cached(name); ok {
-		base = o.lease
+	} else {
+		base = a.knownMember(name)
 	}
 
 	// Step 3 before step 2, under the Lease's lock: the holder has ended whatever step 2 meets.
@@ -307,20 +310,22 @@ func (a *Adapter) CloseSession(ctx context.Context, holder string) error {
 			return fmt.Errorf("k8s: close %s: %w", name, err)
 		}
 	}
-	if _, err := a.writeLease(ctx, "close", name, base, func(cur *coordinationv1.Lease) (change, error) {
+	written, err := a.writeLease(ctx, "close", name, base, func(cur *coordinationv1.Lease) (change, error) {
 		return a.decideClose(cur, holder)
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	a.mu.Lock()
 	s.cleared = true
+	a.noteMemberWriteLocked(name, written)
 	a.mu.Unlock()
 	return nil
 }
 
 // decideClose decides step 2 of closing the session of holder on its member Lease cur (K8S-240):
-// nothing when the Lease does not name holder; else clear its holder when it carries a member
-// record, which stays, or delete it.
+// nothing when the Lease does not name holder; else clear its holder when the Adapter has joined
+// as holder's member or the Lease carries a member record, which stays; else delete it.
 func (a *Adapter) decideClose(cur *coordinationv1.Lease, holder string) (change, error) {
 	if cur == nil || holderOf(cur) != holder {
 		return change{}, nil
@@ -328,7 +333,8 @@ func (a *Adapter) decideClose(cur *coordinationv1.Lease, holder string) (change,
 	if err := checkOwned(cur, a.group, kindMember); err != nil {
 		return change{}, err
 	}
-	if _, ok := cur.Annotations[annotationMember]; !ok {
+	_, joined := a.joinedRecord(memberOf(holder))
+	if _, ok := cur.Annotations[annotationMember]; !ok && !joined {
 		return change{del: true}, nil
 	}
 	l := cur.DeepCopy()
@@ -336,12 +342,12 @@ func (a *Adapter) decideClose(cur *coordinationv1.Lease, holder string) (change,
 	return change{lease: l}, nil
 }
 
-// latest returns the newer of own, the member Lease name as this Adapter last wrote it, and the
-// informer's state of that Lease, when that is the same Lease (same UID) at a later
-// resourceVersion.
+// latest returns the newer of own, the member Lease name as a session of this Adapter last wrote
+// it, and the latest state the Adapter knows of that Lease (knownMember), when that is the same
+// Lease (same UID) at a later resourceVersion.
 func (a *Adapter) latest(name string, own *coordinationv1.Lease) *coordinationv1.Lease {
-	if o, ok := a.cached(name); ok && o.lease.UID == own.UID && isOlder(own.ResourceVersion, o.lease.ResourceVersion) {
-		return o.lease
+	if l := a.knownMember(name); l != nil && l.UID == own.UID && isOlder(own.ResourceVersion, l.ResourceVersion) {
+		return l
 	}
 	return own
 }

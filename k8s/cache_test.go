@@ -144,7 +144,7 @@ func fakeAdapter(t testing.TB, client *fake.Clientset, opts ...Option) *Adapter 
 	return a
 }
 
-// waitStopped fails the test unless every informer goroutine of a ends within 1 s.
+// waitStopped fails the test unless every goroutine of a, informer and heartbeat, ends within 1 s.
 func waitStopped(t testing.TB, a *Adapter) {
 	t.Helper()
 	done := make(chan struct{})
@@ -155,7 +155,7 @@ func waitStopped(t testing.TB, a *Adapter) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Error("the informer still runs 1s after the Adapter's last use")
+		t.Error("a goroutine of the Adapter still runs 1s after its last use")
 	}
 	if c := a.runningCache(); c != nil {
 		t.Errorf("the Adapter still has a running cache with %d holds", c.refs)
