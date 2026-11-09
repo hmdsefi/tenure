@@ -257,7 +257,7 @@ func TestATOBS23Endpoints(t *testing.T) {
 		n := startNode(t)
 		synctest.Wait()
 		h := http.StripPrefix("/debug/tenure", debughttp.Handler(n))
-		before := n.RecentEvents()
+		before, beforeTable := n.RecentEvents(), n.Table()
 		if len(before) < 4 {
 			t.Fatalf("RecentEvents() = %v, want at least 4 events", before)
 		}
@@ -310,6 +310,8 @@ func TestATOBS23Endpoints(t *testing.T) {
 			want  []tenure.Event
 		}{
 			{"?since=3", before[2:]},
+			{"?since=%33", before[2:]},
+			{"?x=%zz&since=3&since=abc", before[2:]},
 			{"", before},
 			{"?since=0", before},
 			{"?since=1", before},
@@ -376,9 +378,25 @@ func TestATOBS23Endpoints(t *testing.T) {
 			wantError(t, what, serve(h, http.MethodGet, "/debug/tenure/events?since="+url.QueryEscape(since)), http.StatusBadRequest,
 				"invalid since \""+since+"\": want a decimal sequence number")
 		}
+		// A since that a query parser would drop, because it cannot be unescaped or holds a
+		// semicolon, is still a bad since, and the first since counts.
+		for query, since := range map[string]string{
+			"since=%zz":          "%zz",
+			"since=3;x=1":        "3;x=1",
+			"since=abc&since=3":  "abc",
+			"x=1&since=4%zz&y=2": "4%zz",
+		} {
+			what := "GET /events?" + query
+			wantError(t, what, serve(h, http.MethodGet, "/debug/tenure/events?"+query), http.StatusBadRequest,
+				"invalid since \""+since+"\": want a decimal sequence number")
+		}
 
 		if after := n.RecentEvents(); !reflect.DeepEqual(after, before) {
 			t.Errorf("RecentEvents() after the requests = %v, want %v", after, before)
+		}
+		// No time passes in the bubble while the test serves requests, so even Taken is the same.
+		if after := n.Table(); !reflect.DeepEqual(after, beforeTable) {
+			t.Errorf("Table() after the requests = %+v, want %+v", after, beforeTable)
 		}
 
 		if err := n.Close(context.Background()); err != nil {

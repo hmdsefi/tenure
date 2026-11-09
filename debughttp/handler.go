@@ -7,7 +7,9 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/hmdsefi/tenure"
 )
@@ -74,8 +76,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		err = encodeTable(&b, h.n.Table())
 	case "/events":
 		var since uint64 // without since: every event
-		if q := r.URL.Query(); q.Has("since") {
-			s := q.Get("since")
+		if s, ok := sinceParam(r.URL.RawQuery); ok {
 			if since, err = strconv.ParseUint(s, 10, 64); err != nil {
 				writeError(w, r, http.StatusBadRequest,
 					fmt.Sprintf("invalid since %q: want a decimal sequence number", s))
@@ -95,6 +96,24 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, r, http.StatusOK, &b)
+}
+
+// sinceParam returns the value of the first since parameter in the query rawQuery, unescaped, and
+// whether there is one. Unlike url.ParseQuery, which drops a pair it cannot unescape or that
+// holds a semicolon, it keeps such a since, with the text it cannot unescape left as it is, so
+// that a malformed since is a 400 rather than an answer with every event.
+func sinceParam(rawQuery string) (string, bool) {
+	for pair := range strings.SplitSeq(rawQuery, "&") {
+		k, v, _ := strings.Cut(pair, "=")
+		if key, err := url.QueryUnescape(k); err != nil || key != "since" {
+			continue
+		}
+		if s, err := url.QueryUnescape(v); err == nil {
+			return s, true
+		}
+		return v, true
+	}
+	return "", false
 }
 
 // nextSeq returns the Seq of the newest of events, which are oldest first, plus one, and 1 when
