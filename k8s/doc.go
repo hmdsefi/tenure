@@ -48,6 +48,15 @@
 // While the Adapter has an active session, it watches the group's Leases with one informer,
 // which stops once nothing needs it any more. CloseSession ends a session for good.
 //
+// # Shard records
+//
+// Acquire grants a shard, with a new term, to a holder with an active session in the Adapter
+// when the shard's Lease is absent, names no holder, names the holder itself, or names a holder
+// whose session is gone: closed, replaced by another incarnation of its member, or observed
+// unchanged for its LeaseDuration. Before it takes a shard from another holder, it reads that
+// holder's member Lease from the API server and decides again. At most WithRecordConcurrency
+// record operations run at once; the others wait in arrival order.
+//
 // # Configuration
 //
 // New never fails and makes no request. It records the first problem it finds with its
