@@ -1255,13 +1255,20 @@ func TestDriverContractO6OrderAndRepeats(t *testing.T) {
 
 // TestDriverContractO7Closing checks O7 (RUN-130, RUN-180, RUN-530): per generation, the
 // CloseSession calls of its holder never outnumber its machine's CloseSession actions; no call of
-// the holder of a machine that lost its session starts after the step of the loss; and no call of
-// the store or the membership starts after Close returned, also when Close's ctx ended first.
+// the holder of a machine that lost its session starts after the step of the loss, but for a call
+// already in flight then; and no call of the store or the membership starts after Close returned,
+// also when Close's ctx ended first.
+//
+// A lane hands its next call over once it has checked the generation, so the double may see that
+// call start right after the step of the loss, at the same instant: nothing between the check and
+// the call waits. A lane has one such call at most, so per record the first call after the step,
+// at its instant, counts as in flight.
 func TestDriverContractO7Closing(t *testing.T) {
 	var forced, losses int
 	eachNode(t, func(t *testing.T, _ *contractRun, nr *nodeRecord) {
 		actions := make(map[uint64]int)
 		loss := make(map[uint64]uint64) // the stamp of the step of the loss, by generation
+		lossAt := make(map[uint64]time.Time)
 		for i, s := range nr.steps {
 			for _, a := range s.Actions {
 				if _, ok := a.(core.CloseSession); ok {
@@ -1269,12 +1276,13 @@ func TestDriverContractO7Closing(t *testing.T) {
 				}
 			}
 			if s.Before.Session != core.SessionStateLost && s.After.Session == core.SessionStateLost {
-				loss[s.Gen] = nr.seqs[i]
+				loss[s.Gen], lossAt[s.Gen] = nr.seqs[i], nr.at(i)
 				losses++
 			}
 		}
 		for gen := uint64(1); gen <= uint64(len(nr.holders)); gen++ {
 			h, n := nr.holder(gen), 0
+			inFlight := make(map[string]bool) // the records with a call in flight at the loss
 			for _, c := range nr.calls {
 				if holderOfCall(c) != h {
 					continue
@@ -1283,7 +1291,13 @@ func TestDriverContractO7Closing(t *testing.T) {
 					n++
 				}
 				if at, ok := loss[gen]; ok && c.Seq > at {
-					t.Errorf("gen %d: %v started after the loss", gen, c)
+					lane, _ := callText(c)
+					if c.Start.Equal(lossAt[gen]) && !inFlight[lane] {
+						inFlight[lane] = true
+						continue
+					}
+					t.Errorf("gen %d: %v started at %v, after the loss at %v", gen, c, c.Start.Sub(nr.epoch),
+						lossAt[gen].Sub(nr.epoch))
 				}
 			}
 			if n > actions[gen] {
