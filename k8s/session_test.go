@@ -155,9 +155,7 @@ func TestK8S200KeepAliveChecks(t *testing.T) {
 		if err := a.CloseSession(ctx, "pod-0/1"); err != nil {
 			t.Errorf("CloseSession of an ended holder = %v, want nil", err)
 		}
-		if got := client.Actions(); len(got) != 0 {
-			t.Errorf("requests %v, want none", got)
-		}
+		wantCloseLists(t, client, 1)
 		// Another incarnation of the member is another holder.
 		if err := a.KeepAlive(ctx, "pod-0/2", T); err != nil {
 			t.Errorf("KeepAlive pod-0/2 = %v, want nil", err)
@@ -293,9 +291,7 @@ func TestK8S200KeepAliveChecks(t *testing.T) {
 		if err := a.CloseSession(ctx, "pod-0/1"); err != nil {
 			t.Errorf("CloseSession pod-0/1: %v", err)
 		}
-		if got := client.Actions(); len(got) != 0 {
-			t.Errorf("requests %v, want none", got)
-		}
+		wantCloseLists(t, client, 1)
 	})
 
 	t.Run("close while the lease is busy", func(t *testing.T) {

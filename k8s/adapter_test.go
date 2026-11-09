@@ -38,6 +38,15 @@ var adapterCalls = []struct {
 		_, err := a.Acquire(ctx, "pod-0/1", "markets", 0)
 		return err
 	}},
+	{"Release", func(ctx context.Context, a *Adapter) error { return a.Release(ctx, "pod-0/1", "markets", 0, 1) }},
+	{"Confirm", func(ctx context.Context, a *Adapter) error {
+		_, err := a.Confirm(ctx, "pod-0/1", "markets", 0, 1)
+		return err
+	}},
+	{"Holdings", func(ctx context.Context, a *Adapter) error {
+		_, err := a.Holdings(ctx, "markets")
+		return err
+	}},
 }
 
 // TestATK8S01ConfigErrors checks New's configuration error, which every method returns first

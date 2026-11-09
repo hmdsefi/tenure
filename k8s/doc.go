@@ -57,6 +57,11 @@
 // holder's member Lease from the API server and decides again. At most WithRecordConcurrency
 // record operations run at once; the others wait in arrival order.
 //
+// Release clears a record's holder only when the record names the caller at the caller's term,
+// keeping the term. Confirm writes a counter into the holder's own record, so that a takeover
+// decided on an earlier state of the record fails; CloseSession releases every record of the
+// holder. Holdings lists a space's records as stored, with one request.
+//
 // # Configuration
 //
 // New never fails and makes no request. It records the first problem it finds with its

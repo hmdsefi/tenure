@@ -5,10 +5,12 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,7 +21,7 @@ import (
 	"github.com/hmdsefi/tenure/core"
 )
 
-// Shard records (K8S-300 to K8S-330, K8S-710).
+// Shard records (K8S-300 to K8S-370, K8S-710).
 //
 // The record of shard n of space s is the Lease <group>-<s>-<n>: holderIdentity names its
 // holder, tenure.term its term and tenure.session the UID of the holder's member Lease when the
@@ -28,12 +30,21 @@ import (
 // writeLease, deciding again on each conflict. A record that names another holder is taken
 // only when liveness, confirmed against the API server, says that holder is gone (holderLive).
 //
+// Release and Confirm write a record only when it names the caller at the caller's term. They
+// decide on the cache's state when it shows that, and otherwise read the record from the API
+// server first (recheck), since the cache may be behind. Confirm's write changes only the
+// tenure.confirm counter: a grant decided on an earlier state then fails its compare-and-swap
+// and decides again. Holdings lists the records of a space as stored, with no liveness. The
+// only writers of shard Leases are Acquire, Release, Confirm and CloseSession (K8S-360).
+//
 // The terms of deleted shard Leases that the informer saw are kept for the Adapter's life
 // (shardTerms, K8S-110), so a record created anew never goes back to an earlier term.
 //
 // Record requests run under the record semaphore (K8S-710): at most recordConcurrency
 // operations on shard and slot records are in flight, and further callers wait in arrival
 // order. Session renewals never wait for it.
+
+var _ tenure.Store = (*Adapter)(nil)
 
 // Acquire grants the shard to holder and returns the new term when the shard's Lease is absent,
 // names no holder, names holder itself, or names a holder whose session this Adapter has
@@ -267,6 +278,286 @@ func (a *Adapter) noteRead(l *coordinationv1.Lease) {
 	if c := a.runningCache(); c != nil {
 		c.observe(l)
 	}
+}
+
+// Release clears the holder of the shard's record when the record names holder at term: its
+// holderIdentity, tenure.session and tenure.confirm go, and its term, acquireTime and
+// leaseTransitions stay. Release reads the record from the cache, and from the API server when
+// the cache has not seen it or shows another holder or term. When there is no record, or it
+// names another holder or term, Release writes nothing and returns nil. It does not look at
+// holder's session. It never writes a Lease that lacks the group's shard labels, and returns an
+// error for one.
+func (a *Adapter) Release(ctx context.Context, holder, space string, shard int, term core.Term) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if a.err != nil {
+		return a.err
+	}
+	name, err := a.checkTermArgs("Release", holder, space, shard, term)
+	if err != nil {
+		return err
+	}
+	if err := a.records.acquire(ctx); err != nil {
+		return err
+	}
+	defer a.records.release()
+	return a.releaseRecord(ctx, name, nil, holder, encodeTerm(term))
+}
+
+// checkTermArgs is checkRecordArgs, followed by the check of term (K8S-030).
+func (a *Adapter) checkTermArgs(method, holder, space string, shard int, term core.Term) (name string, err error) {
+	name, err = a.checkRecordArgs(method, holder, space, shard)
+	if err == nil && term == 0 {
+		err = fmt.Errorf("k8s: %s: term 0: must not be 0", method)
+	}
+	return name, err
+}
+
+// releaseRecord clears the holder of shard record name when the record names holder at term, its
+// tenure.term annotation as written (K8S-340). base is the state of the record the caller knows,
+// nil to take the cache's; when there is none, or it does not name holder at term, the record is
+// read from the API server first. The caller holds a place of the record semaphore.
+func (a *Adapter) releaseRecord(ctx context.Context, name string, base *coordinationv1.Lease, holder, term string) error {
+	decide := func(cur *coordinationv1.Lease) (change, error) { return decideRelease(cur, a.group, holder, term) }
+	base, err := a.recheck(ctx, "release", name, base, decide)
+	if err != nil {
+		return err
+	}
+	written, err := a.writeLease(ctx, "release", name, base, decide)
+	a.noteRead(written)
+	return err
+}
+
+// decideRelease decides Release's write on cur, the state of a shard record of group, nil when
+// there is none (K8S-340): when it names holder at term, clear holderIdentity, tenure.session and
+// tenure.confirm, keeping the rest; else nothing.
+func decideRelease(cur *coordinationv1.Lease, group, holder, term string) (change, error) {
+	if cur == nil {
+		return change{}, nil
+	}
+	if err := checkOwned(cur, group, kindShard); err != nil {
+		return change{}, err
+	}
+	if !namesAt(cur, holder, term) {
+		return change{}, nil
+	}
+	l := cur.DeepCopy()
+	l.Spec.HolderIdentity = nil
+	delete(l.Annotations, annotationSession)
+	delete(l.Annotations, annotationConfirm)
+	return change{lease: l}, nil
+}
+
+// namesAt reports whether record l names holder at term, its tenure.term annotation as written,
+// "" for none.
+func namesAt(l *coordinationv1.Lease, holder, term string) bool {
+	return holderOf(l) == holder && l.Annotations[annotationTerm] == term
+}
+
+// recheck returns the state of record name that a write decided by decide starts from: base, or
+// the cache's state when base is nil, when decide writes on it; else the record as the API
+// server has it, noted in the cache, nil when there is none. A cache that shows another holder or
+// term may be behind, so only a write is decided on its state.
+func (a *Adapter) recheck(ctx context.Context, op, name string, base *coordinationv1.Lease, decide decider) (*coordinationv1.Lease, error) {
+	if base == nil {
+		if o, ok := a.cached(name); ok {
+			base = o.lease
+		}
+	}
+	if base != nil {
+		if ch, err := decide(base); err == nil && (ch.lease != nil || ch.del) {
+			return base, nil
+		}
+	}
+	l, err := a.getLease(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("k8s: %s %s: %w", op, name, err)
+	}
+	a.noteRead(l)
+	return l, nil
+}
+
+// releaseRecordsOf releases every shard record that names holder, each at its own term, in name
+// order (K8S-240, step 1). It finds them with one LIST of the group's Leases, goes on past
+// failures, and returns their errors joined.
+func (a *Adapter) releaseRecordsOf(ctx context.Context, holder string) error {
+	list, err := a.leases().List(ctx, metav1.ListOptions{LabelSelector: labelGroup + "=" + a.group})
+	if err != nil {
+		return fmt.Errorf("k8s: close %s: list leases: %w", holder, err)
+	}
+	var shards []*coordinationv1.Lease
+	for i := range list.Items {
+		l := &list.Items[i]
+		kind, _, _, _, ok := parseName(a.group, l.Name)
+		if ok && kind == kindShard && checkOwned(l, a.group, kindShard) == nil && holderOf(l) == holder {
+			shards = append(shards, l)
+		}
+	}
+	slices.SortFunc(shards, func(x, y *coordinationv1.Lease) int { return strings.Compare(x.Name, y.Name) })
+	var errs []error
+	for _, l := range shards {
+		errs = append(errs, a.releaseListed(ctx, l, holder))
+	}
+	return errors.Join(errs...)
+}
+
+// releaseListed releases shard record l, a listed state that names holder, at the term l shows.
+func (a *Adapter) releaseListed(ctx context.Context, l *coordinationv1.Lease, holder string) error {
+	if err := a.records.acquire(ctx); err != nil {
+		return err
+	}
+	defer a.records.release()
+	return a.releaseRecord(ctx, l.Name, l, holder, l.Annotations[annotationTerm])
+}
+
+// Confirm returns the shard's record, written so that no grant to another holder decided on an
+// earlier state of the record can commit after it. When the record names holder at term, Confirm
+// increments the record's counter in the annotation tenure.confirm, changing nothing else, and
+// returns the record as written. Otherwise it returns the record as the API server has it, or
+// tenure.Holding{Space: space, Shard: shard} when there is none. Confirm reads the record from
+// the cache first, and from the API server when the cache shows another holder or term or has
+// not seen the record. It needs an active session of holder in this Adapter, opened by
+// KeepAlive; otherwise it returns an error matching tenure.ErrSessionLost without a request. It
+// never writes a Lease that lacks the group's shard labels, and returns an error for one.
+func (a *Adapter) Confirm(ctx context.Context, holder, space string, shard int, term core.Term) (tenure.Holding, error) {
+	if err := ctx.Err(); err != nil {
+		return tenure.Holding{}, err
+	}
+	if a.err != nil {
+		return tenure.Holding{}, a.err
+	}
+	name, err := a.checkTermArgs("Confirm", holder, space, shard, term)
+	if err != nil {
+		return tenure.Holding{}, err
+	}
+	if _, err := a.activeSession(holder); err != nil {
+		return tenure.Holding{}, err
+	}
+	if err := a.records.acquire(ctx); err != nil {
+		return tenure.Holding{}, err
+	}
+	defer a.records.release()
+
+	// seen is the state decided on last: the record as stored when the decision is no write.
+	var seen *coordinationv1.Lease
+	decide := func(cur *coordinationv1.Lease) (change, error) {
+		seen = cur
+		return decideConfirm(cur, a.group, holder, encodeTerm(term))
+	}
+	base, err := a.recheck(ctx, "confirm", name, nil, decide)
+	if err != nil {
+		return tenure.Holding{}, err
+	}
+	written, err := a.writeLease(ctx, "confirm", name, base, decide)
+	if err != nil {
+		return tenure.Holding{}, err
+	}
+	a.noteRead(written)
+	if written == nil {
+		written = seen
+	}
+	l, v, err := a.version(ctx, "confirm", name, written)
+	if err != nil {
+		return tenure.Holding{}, err
+	}
+	if l == nil {
+		return tenure.Holding{Space: space, Shard: shard}, nil
+	}
+	return holdingOf(space, shard, l, v), nil
+}
+
+// decideConfirm decides Confirm's write on cur, the state of a shard record of group, nil when
+// there is none (K8S-370): when it names holder at term, add one to its tenure.confirm counter,
+// a malformed one counting as 0; else nothing.
+func decideConfirm(cur *coordinationv1.Lease, group, holder, term string) (change, error) {
+	if cur == nil {
+		return change{}, nil
+	}
+	if err := checkOwned(cur, group, kindShard); err != nil {
+		return change{}, err
+	}
+	if !namesAt(cur, holder, term) {
+		return change{}, nil
+	}
+	n, ok := decodeConfirm(cur.Annotations)
+	if !ok || n == math.MaxUint64 {
+		n = 0
+	}
+	l := cur.DeepCopy()
+	l.Annotations[annotationConfirm] = encodeConfirm(n + 1)
+	return change{lease: l}, nil
+}
+
+// Holdings returns the records of space, sorted by shard, from one LIST request to the API
+// server; nil when there are none. A record's Holder is the holder it names, whether or not that
+// holder's session is live, and a malformed term reads as 0. Leases without the group's shard
+// labels for space, and Leases whose names are not names of records of space, are left out.
+func (a *Adapter) Holdings(ctx context.Context, space string) ([]tenure.Holding, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if a.err != nil {
+		return nil, a.err
+	}
+	if d := spaceDetail(space); d != "" {
+		return nil, fmt.Errorf("k8s: Holdings: space %q: %s", space, d)
+	}
+	selector := labelGroup + "=" + a.group + "," + labelKind + "=" + kindShard + "," + labelSpace + "=" + space
+	list, err := a.leases().List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, fmt.Errorf("k8s: holdings %s: %w", space, err)
+	}
+	var out []tenure.Holding
+	for i := range list.Items {
+		l := &list.Items[i]
+		kind, s, _, shard, ok := parseName(a.group, l.Name)
+		if !ok || kind != kindShard || s != space || checkOwned(l, a.group, kindShard) != nil || l.Labels[labelSpace] != space {
+			continue
+		}
+		l, v, err := a.version(ctx, "holdings", l.Name, l)
+		if err != nil {
+			return nil, err
+		}
+		if l != nil {
+			out = append(out, holdingOf(space, shard, l, v))
+		}
+	}
+	slices.SortFunc(out, func(x, y tenure.Holding) int { return x.Shard - y.Shard })
+	return out, nil
+}
+
+// holdingOf returns l, the record of shard in space, at version v, as a tenure.Holding. A
+// malformed term reads as 0.
+func holdingOf(space string, shard int, l *coordinationv1.Lease, v uint64) tenure.Holding {
+	term, _ := decodeTerm(l.Annotations)
+	return tenure.Holding{Space: space, Shard: shard, Holder: holderOf(l), Term: term, Version: v}
+}
+
+// version returns l, a state of Lease name from a response of the API server, and its parsed
+// resourceVersion (K8S-070). When that does not parse, it reads the Lease again and returns the
+// state read, noted in the cache, and its version; nil when the Lease is gone; or the error when
+// that version does not parse either. It returns nil for a nil l.
+func (a *Adapter) version(ctx context.Context, op, name string, l *coordinationv1.Lease) (*coordinationv1.Lease, uint64, error) {
+	if l == nil {
+		return nil, 0, nil
+	}
+	if v, err := parseVersion(name, l.ResourceVersion); err == nil {
+		return l, v, nil
+	}
+	l, err := a.getLease(ctx, name)
+	if err != nil {
+		return nil, 0, fmt.Errorf("k8s: %s %s: %w", op, name, err)
+	}
+	if l == nil {
+		return nil, 0, nil
+	}
+	v, err := parseVersion(name, l.ResourceVersion)
+	if err != nil {
+		return nil, 0, err
+	}
+	a.noteRead(l)
+	return l, v, nil
 }
 
 // shardTerms keeps the last term of every deleted shard Lease the informer saw, by Lease name,
