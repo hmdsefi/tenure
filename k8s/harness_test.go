@@ -30,16 +30,19 @@ package k8s
 //	rec.bump(name, rt)    before the next UPDATE of Lease name is sent, the harness writes that
 //	                      Lease through the raw client: it increments the annotation
 //	                      tenure.test/bump and sets spec.renewTime to rt unless rt is zero. Its
-//	                      resourceVersion changes, so the UPDATE gets 409 Conflict.
+//	                      resourceVersion changes, so the UPDATE gets 409 Conflict. The
+//	                      UPDATE's record holds the Lease as written (bumpedTo); the server
+//	                      keeps renewTime to the microsecond.
 //	rec.delay(name, d)    requests on Lease name are held d before they are sent, until the
 //	                      returned func is called.
 //
 // A match selects requests: on(verb, name) matches Lease requests by verb (GET, LIST, WATCH,
-// CREATE, UPDATE, PATCH, DELETE, DELETECOLLECTION) and name, "" matching any. Recorded requests
-// are read with rec.requests(), rec.filter(m), rec.count(m), rec.maxInFlight(m) (the most matching requests
-// between entering the transport and getting their response, for record concurrency) and
-// rec.waitFor(t, d, m); rec.reset() forgets what was recorded. String() of a request is
-// "<VERB> <name> <status>", for example "GET g0a1b2c3d-member-pod-0 200".
+// CREATE, UPDATE, PATCH, DELETE, DELETECOLLECTION) and name, "" matching any; any func(request)
+// bool is a match too. Recorded requests are read with rec.requests(), rec.filter(m),
+// rec.count(m), rec.maxInFlight(m) (the most matching requests between entering the transport
+// and getting their response, for record concurrency) and rec.waitFor(t, d, m); rec.reset()
+// forgets what was recorded. String() of a request is "<VERB> <name> <status>", for example
+// "GET g0a1b2c3d-member-pod-0 200".
 //
 // Every switch is turned off and every stall released when the test that made the recorder
 // ends, so a test may leave them on.
@@ -237,6 +240,9 @@ type request struct {
 	err      error // the transport's error, including a context's while stalled or delayed
 	injected bool  // the fail switch answered it
 	bumped   bool  // a bump changed its Lease just before it was sent
+	// bumpedTo is the Lease as the bump wrote it, with the resourceVersion and the
+	// microsecond spec.renewTime the server stored; nil when not bumped.
+	bumpedTo *coordinationv1.Lease
 }
 
 // String returns "<VERB> <name> <status>", leaving out an empty name.
@@ -535,26 +541,34 @@ func (r *recorder) takeBump(x request) (bumpSpec, bool) {
 	return q[0], true
 }
 
-// doBump writes Lease name in namespace through the raw client so its resourceVersion changes.
-func (r *recorder) doBump(ctx context.Context, namespace, name string, b bumpSpec) error {
+// doBump writes Lease name in namespace through the raw client so its resourceVersion changes,
+// and returns the Lease as written. A conflict with another writer, such as an Adapter's
+// heartbeat, is retried on a fresh read.
+func (r *recorder) doBump(ctx context.Context, namespace, name string, b bumpSpec) (*coordinationv1.Lease, error) {
 	leases := r.raw.CoordinationV1().Leases(namespace)
-	l, err := leases.Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("harness: bump %s: %w", name, err)
+	for {
+		l, err := leases.Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("harness: bump %s: %w", name, err)
+		}
+		if l.Annotations == nil {
+			l.Annotations = map[string]string{}
+		}
+		n, _ := strconv.Atoi(l.Annotations[bumpAnnotation])
+		l.Annotations[bumpAnnotation] = strconv.Itoa(n + 1)
+		if !b.renewTime.IsZero() {
+			rt := metav1.NewMicroTime(b.renewTime)
+			l.Spec.RenewTime = &rt
+		}
+		l, err = leases.Update(ctx, l, metav1.UpdateOptions{})
+		if apierrors.IsConflict(err) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("harness: bump %s: %w", name, err)
+		}
+		return l, nil
 	}
-	if l.Annotations == nil {
-		l.Annotations = map[string]string{}
-	}
-	n, _ := strconv.Atoi(l.Annotations[bumpAnnotation])
-	l.Annotations[bumpAnnotation] = strconv.Itoa(n + 1)
-	if !b.renewTime.IsZero() {
-		rt := metav1.NewMicroTime(b.renewTime)
-		l.Spec.RenewTime = &rt
-	}
-	if _, err := leases.Update(ctx, l, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("harness: bump %s: %w", name, err)
-	}
-	return nil
 }
 
 // add records x and returns the record to update.
@@ -680,11 +694,12 @@ func (rt *recordingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		return failResponse(req), nil
 	}
 	if b, ok := r.takeBump(x); ok {
-		if err := r.doBump(ctx, x.namespace, x.name, b); err != nil {
+		l, err := r.doBump(ctx, x.namespace, x.name, b)
+		if err != nil {
 			finish(0, err)
 			return nil, err
 		}
-		r.update(p, func(p *request) { p.bumped = true })
+		r.update(p, func(p *request) { p.bumped, p.bumpedTo = true, l })
 	}
 
 	r.update(p, func(p *request) { p.sent = time.Now() })
