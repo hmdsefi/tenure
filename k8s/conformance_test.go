@@ -27,9 +27,9 @@ import (
 )
 
 // settle is the membershiptest fixture's Settle: a change reaches another Adapter's views through
-// its informer, so it may take a RetryPeriod of T, for a heartbeat or renewal that the change
-// waits behind, plus the default watch latency (K8S §5.12).
-const settle = 500*time.Millisecond + defaultWatchLatency
+// its informer's watch, within milliseconds on kind; a RetryPeriod of T leaves room for a loaded
+// runner. Settle 0 fails Watch/Coalesce, whose changes land after the Settle it waits.
+var settle = T.RetryPeriod
 
 // newClientFunc returns a new recorded client of the test's cluster.
 type newClientFunc func(t *testing.T) (kubernetes.Interface, *recorder)
