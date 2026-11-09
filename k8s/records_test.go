@@ -1230,6 +1230,105 @@ func TestK8S710SessionAfterWait(t *testing.T) {
 	}
 }
 
+// TestK8S710RecordOpsWait checks that Release, Confirm and CloseSession's releases wait for a
+// place of the record semaphore before any request on a record, and that Confirm checks the
+// session again once it has its place.
+func TestK8S710RecordOpsWait(t *testing.T) {
+	ctx := t.Context()
+	clock := newFakeClock()
+	client := newFake()
+	a := fakeAdapter(t, client, withClock(clock.now), WithRecordConcurrency(1))
+	closeAtEnd(t, a, "pod-0/1", "pod-1/1", "pod-2/1")
+	mustKeepAlive(t, a, "pod-0/1")
+	mustKeepAlive(t, a, "pod-1/1")
+	t0 := mustAcquire(t, a, "pod-0/1", "markets", 0)
+	t1 := mustAcquire(t, a, "pod-1/1", "markets", 1)
+	waitWaiting := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if _, waiting := a.records.load(); waiting == n {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%d calls wait for a place, want %d", func() int { _, w := a.records.load(); return w }(), n)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	// hold takes the only place of the record semaphore and returns the func that gives it back,
+	// also called at the end of the test.
+	hold := func() (free func()) {
+		t.Helper()
+		if err := a.records.acquire(ctx); err != nil {
+			t.Fatalf("acquire: %v", err)
+		}
+		var once sync.Once
+		free = func() { once.Do(a.records.release) }
+		t.Cleanup(free)
+		return free
+	}
+
+	free := hold()
+	client.ClearActions()
+	released := make(chan error, 1)
+	confirmed := make(chan error, 1)
+	go func() { released <- a.Release(ctx, "pod-0/1", "markets", 0, t0) }()
+	go func() {
+		_, err := a.Confirm(ctx, "pod-1/1", "markets", 1, t1)
+		confirmed <- err
+	}()
+	waitWaiting(2)
+	if got := client.Actions(); len(got) != 0 {
+		t.Errorf("requests %v while Release and Confirm wait, want none", got)
+	}
+	// pod-1/1's session expires while Confirm waits.
+	clock.advance(T.LeaseDuration)
+	free()
+	if err := <-released; err != nil {
+		t.Errorf("Release = %v, want nil", err)
+	}
+	if err := <-confirmed; err == nil || err.Error() != "k8s: session pod-1/1 expired: tenure: session lost" || !errors.Is(err, tenure.ErrSessionLost) {
+		t.Errorf("Confirm after the wait = %v, want k8s: session pod-1/1 expired: tenure: session lost", err)
+	}
+	// Release decides on the cache's state: one update, and Confirm sends nothing.
+	got := writes(client)
+	if update, ok := firstUpdate(got); len(got) != 1 || len(actions(client, "get")) != 0 || !ok || update.Name != shardName("g", "markets", 0) || holderOf(update) != "" {
+		t.Errorf("requests %v, want Release's update of %s alone", client.Actions(), shardName("g", "markets", 0))
+	}
+
+	// CloseSession lists the group's Leases, then waits for a place before it releases a record.
+	mustKeepAlive(t, a, "pod-2/1")
+	t2 := mustAcquire(t, a, "pod-2/1", "markets", 2)
+	free = hold()
+	client.ClearActions()
+	closed := make(chan error, 1)
+	go func() { closed <- a.CloseSession(ctx, "pod-2/1") }()
+	waitWaiting(1)
+	if got := append(actions(client, "get"), writes(client)...); len(got) != 0 {
+		t.Errorf("requests %v besides the LIST while CloseSession waits, want none", got)
+	}
+	free()
+	if err := <-closed; err != nil {
+		t.Errorf("CloseSession = %v, want nil", err)
+	}
+	l, err := client.CoordinationV1().Leases("default").Get(ctx, shardName("g", "markets", 2), metav1.GetOptions{})
+	if err != nil || holderOf(l) != "" || l.Annotations[annotationTerm] != encodeTerm(t2) {
+		t.Errorf("record after CloseSession: %v, %v; want no holder at %d", l, err, t2)
+	}
+}
+
+// firstUpdate returns the Lease of the first update action in xs.
+func firstUpdate(xs []k8stesting.Action) (*coordinationv1.Lease, bool) {
+	for _, x := range xs {
+		if u, ok := x.(k8stesting.UpdateAction); ok {
+			l, ok := u.GetObject().(*coordinationv1.Lease)
+			return l, ok
+		}
+	}
+	return nil, false
+}
+
 // wantCloseLists checks that the fake client's only requests are n LISTs of the Leases of group
 // g, as CloseSession sends to find the holder's records.
 func wantCloseLists(t testing.TB, client *fake.Clientset, n int) {
@@ -1735,13 +1834,15 @@ func TestATK8S22Holdings(t *testing.T) {
 // writes tenure.confirm 1, 2, 3, changing nothing else, from the cache's state with one update,
 // and returns the record written with a growing version; another holder's, or one at another
 // term, returns the record as stored after a GET with no write; for no record it returns
-// Holding{Space, Shard}; a conflict makes it read the record and write again; Release and a
-// re-grant remove the counter. race: a degraded owner, whose clock stands still so its sessions
+// Holding{Space, Shard}; a conflict makes it read the record and write again; a cache that shows
+// another term is checked by a GET; Release and a re-grant remove the counter. race: a degraded owner, whose clock stands still so its sessions
 // stay active by it while another Adapter sees them unchanged for their LeaseDuration, renews and
 // confirms while the other takes the shard over, in 10 rounds; each round has exactly one
 // outcome: the takeover commits first and Confirm shows it, or Confirm commits first and the
-// takeover, decided on an earlier state, fails and is held. The acceptance test's steps were
-// written from the issue's text: the original text is unavailable.
+// takeover, decided on an earlier state, fails and is held. in flight: in 3 rounds a takeover
+// decided before the owner's renewal is held back until the owner has renewed and confirmed;
+// its write then fails, and the takeover, decided again, is held. The acceptance test's steps
+// were written from the issue's text: the original text is unavailable.
 func TestATK8S37Confirm(t *testing.T) {
 	c := newCluster(t)
 	ctx := t.Context()
@@ -1831,6 +1932,20 @@ func TestATK8S37Confirm(t *testing.T) {
 			t.Errorf("annotations %v after a conflict, want %s=4 and the bump", l.Annotations, annotationConfirm)
 		}
 
+		// A cache that shows another term is checked by a GET, and the record written when it
+		// names the holder at the term.
+		name1 := shardName(g, "markets", 1)
+		t1b := mustAcquire(t, a, h, "markets", 1)
+		waitObserved(t, a, name1, rawGet(t, c, name1).ResourceVersion)
+		resume := recA.stall(on(verbWatch, ""))
+		t.Cleanup(resume) // before the sessions close
+		rawUpdate(t, c, name1, func(l *coordinationv1.Lease) { l.Annotations[annotationTerm] = encodeTerm(t1b + 1) })
+		got = confirm(t, a, recA, h, 1, t1b+1, "GET "+name1+" 200", "UPDATE "+name1+" 200")
+		resume()
+		if l := stored(t, got, 1); l.Annotations[annotationConfirm] != "1" || got.Term != t1b+1 {
+			t.Errorf("Confirm over a stale cache = %+v, annotations %v; want term %d and %s=1", got, l.Annotations, t1b+1, annotationConfirm)
+		}
+
 		if err := a.Release(ctx, h, "markets", 0, t1); err != nil {
 			t.Fatalf("Release: %v", err)
 		}
@@ -1915,6 +2030,76 @@ func TestATK8S37Confirm(t *testing.T) {
 			}
 		}
 		t.Logf("%d rounds with the takeover first, %d with Confirm first", taken, confirmed)
+	})
+
+	t.Run("in flight", func(t *testing.T) {
+		g := group()
+		clock := newFakeClock()
+		a, _ := c.adapter(t, g, withClock(clock.now))
+		b, recB := c.adapter(t, g)
+		const rounds = 3
+		const taker = "pod-10/1"
+		closeAtEnd(t, b, taker)
+		mustKeepAlive(t, b, taker)
+		startRenewer(t, b, taker)
+		owners := make([]string, rounds)
+		terms := make([]core.Term, rounds)
+		for i := range rounds {
+			owners[i] = fmt.Sprintf("pod-%d/1", i)
+			closeAtEnd(t, a, owners[i])
+			mustKeepAlive(t, a, owners[i])
+			terms[i] = mustAcquire(t, a, owners[i], "race", i)
+		}
+		for i := range rounds {
+			for _, name := range []string{memberName(g, memberOf(owners[i])), shardName(g, "race", i)} {
+				waitObserved(t, b, name, rawGet(t, c, name).ResourceVersion)
+			}
+		}
+		time.Sleep(T.LeaseDuration + 200*time.Millisecond)
+
+		// In each round the takeover is decided before the owner's renewal, its write held until
+		// the owner has renewed and Confirm has returned: the write must fail, and the takeover,
+		// decided again, must see the renewal.
+		for i := range rounds {
+			name := shardName(g, "race", i)
+			recB.reset()
+			resume := recB.stall(on(verbUpdate, name))
+			var takeTerm core.Term
+			var takeErr error
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				takeTerm, takeErr = b.Acquire(ctx, taker, "race", i)
+			}()
+			recB.waitFor(t, 5*time.Second, on(verbUpdate, name))
+			if err := a.KeepAlive(ctx, owners[i], T); err != nil {
+				resume()
+				<-done
+				t.Fatalf("round %d: KeepAlive: %v", i, err)
+			}
+			got, err := a.Confirm(ctx, owners[i], "race", i, terms[i])
+			l := rawGet(t, c, name)
+			resume()
+			<-done
+			if err != nil {
+				t.Fatalf("round %d: Confirm: %v", i, err)
+			}
+			want := tenure.Holding{Space: "race", Shard: i, Holder: owners[i], Term: terms[i], Version: version(t, l)}
+			if got != want || l.Annotations[annotationConfirm] != "1" {
+				t.Errorf("round %d: Confirm = %+v, record %s=%q; want %+v and 1", i, got, annotationConfirm, l.Annotations[annotationConfirm], want)
+			}
+			var held *tenure.HeldError
+			if !errors.As(takeErr, &held) || held.Holder != owners[i] || takeTerm != 0 {
+				t.Errorf("round %d: Acquire after Confirm = %d, %v; want a *tenure.HeldError naming %s", i, takeTerm, takeErr, owners[i])
+			}
+			if seq := requestStrings(recB.filter(on("", name))); strings.Join(seq, ", ") != "UPDATE "+name+" 409, GET "+name+" 200" {
+				t.Errorf("round %d: the takeover's requests %v, want [UPDATE %s 409, GET %s 200]", i, seq, name, name)
+			}
+			if after := rawGet(t, c, name); after.ResourceVersion != l.ResourceVersion {
+				t.Errorf("round %d: record written after Confirm: names %q at %s, resourceVersion %s; want %s", i,
+					holderOf(after), after.Annotations[annotationTerm], after.ResourceVersion, l.ResourceVersion)
+			}
+		}
 	})
 }
 
