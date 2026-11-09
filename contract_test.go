@@ -6,9 +6,11 @@ package tenure_test
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"math/rand/v2"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -40,27 +42,44 @@ import (
 //     2.5 s, past their deadline, for 40 s from each event that moves slots;
 //   - stale states: the store watch of every node re-delivers an earlier value now and then, and
 //     lags the store by up to 8 s for 10 s to 40 s, in commit order;
-//   - a lost session: from one instant on, the store answers every KeepAlive, Acquire, Confirm and
-//     ClaimSlot of one node's holder with ErrSessionLost; the node's watch lags 8 s from then on,
-//     and 3 s after the first grant to its next holder comes an outage (trap) that leaves a slow
-//     Holdings answer showing the record after the shards' Confirm went out;
+//   - a lost session: from one instant on, before its node is drained or closed, the store
+//     answers every KeepAlive, Acquire, Confirm and ClaimSlot of one node's holder with
+//     ErrSessionLost; it holds them back until the node steps the loss, but for one let through
+//     5 s on, so that calls are queued behind them then (loseSession), and the loop is held a
+//     second in that step (lossStep); the node's watch lags 8 s from then on, and 3 s after the
+//     first grant to its next holder comes an outage (trap) that leaves slow Holdings answers
+//     showing the record after the shards' Confirm went out, and Confirm answers slow enough that
+//     the next Confirm waits in its lane;
 //   - a paused membership: one node's views are held back for 5 s to 40 s;
 //   - a SetSlots to 1 or 3 through one node, a Drain of one node and a forced Close of another: a
-//     Close whose ctx is done already or ends within 5 s, mostly before the drain can complete.
+//     Close whose ctx is done already or ends within 5 s, while that node's CloseSession calls
+//     hang, so that the drain cannot complete first;
+//   - after each node's first released slot, slow slot reads and a member that joins the views
+//     for a second (slotTrap), so that a view comes while the slot data at hand is older than the
+//     release;
+//   - a slow loop: for 30 s each node's loop sleeps in a step until past the wake it armed
+//     (slowStep), so that the timer and other inputs are due at once (O2).
 //
 // The other nodes are closed at the end. Runs stop late now and then, some long enough to be
 // stuck, and the first Run of some shards returns an error and is restarted. Everything is
 // recorded through WithStepHook and the doubles, whose Seq stamps order the steps, the calls, the
-// watch values and the runs across the nodes.
+// watch values and the runs across the nodes. The node's own stamps (StepRecord.Read and Stamp,
+// and each call's tenure.CallStamp) order its readings, its steps and its calls exactly where O5
+// and O7 need it. A run fails when its Close was not forced or its session was not lost.
 //
-// The 20 runs are made once, by the first test that needs them, and each test checks its
-// obligation on every run. A failure names the seed, the node and the step.
+// The 20 runs are made by the first test that needs them, again in each round of go test
+// -count=n, and each test checks its obligation on every run. A failure names the seed, the node
+// and the step. -contract.seeds=n runs seeds 1 to n instead.
 
 // The scenario's parameters.
 const (
 	contractSeeds  = 20
 	contractLength = 300 * time.Second
 )
+
+// contractSweep, when set, runs seeds 1 to its value in place of 1 to contractSeeds, for a wider
+// sweep: go test -run '^TestDriverContract' -contract.seeds=400 .
+var contractSweep = flag.Uint64("contract.seeds", 0, "run the driver-contract scenario for seeds 1 to n")
 
 // contractIDs are the members of the scenario.
 var contractIDs = []string{"n1", "n2", "n3"}
@@ -120,6 +139,8 @@ type contractPlan struct {
 	closeNode int
 	closeAt   time.Duration
 	closeWait time.Duration // 0: Close's ctx is done at the call
+
+	slowAt [3]time.Duration // the start of each node's slow loop (slowStep)
 }
 
 // drawPlan draws the plan of seed from rng.
@@ -165,6 +186,18 @@ func drawPlan(rng *rand.Rand) contractPlan {
 	if rng.IntN(2) == 0 {
 		p.closeWait = sec(0.5, 5)
 	}
+	// The session is lost before its node is drained or closed, which would end it first.
+	if p.lossNode == p.drainNode {
+		p.lossAt = min(p.lossAt, p.drainAt-30*time.Second)
+	}
+	if p.lossNode == p.closeNode {
+		p.lossAt = min(p.lossAt, p.closeAt-30*time.Second)
+	}
+	// The Close is forced: its node's CloseSession calls hang until well past Close's ctx, so the
+	// drain cannot complete in time.
+	// It comes first, so that no other fault of CloseSession lets a call through.
+	p.faults[p.closeNode] = append([]fault{{from: p.closeAt, to: p.closeAt + p.closeWait + 10*time.Second,
+		method: "CloseSession", kind: faultHang}}, p.faults[p.closeNode]...)
 	// Slow slot reads while slots change hands, so that some read before a claim or a release
 	// answers after its result.
 	for i := range p.faults {
@@ -173,15 +206,18 @@ func drawPlan(rng *rand.Rand) contractPlan {
 				kind: faultStuck, d: 2500 * time.Millisecond})
 		}
 	}
+	for i := range p.slowAt {
+		p.slowAt[i] = sec(10, 250)
+	}
 	return p
 }
 
 // watchSend is one value a node's store watch handed to the node, with the stamp taken when it
-// was sent: the node counts a watch value as read when it receives it (RUN-175).
+// was sent. The node counts a watch value as read when it receives it (RUN-175), and its step
+// records that stamp of its own (StepRecord.Read).
 type watchSend struct {
 	h           tenure.Holding
 	seq         uint64
-	at          time.Time
 	redelivered bool
 }
 
@@ -203,11 +239,104 @@ type contractNode struct {
 	rng     *rand.Rand    // shared by the nodes of a run; guarded by rngMu
 	rngMu   *sync.Mutex
 	lost    map[string]bool
+
+	// The store holds a lost holder's calls back until the gate is closed (loseSession).
+	lossGate, lossOther, lossAny chan struct{}
+	lossOpen                     bool
+
 	sends   []watchSend
 	trapped bool // the outage after the first grant of a new incarnation has been added
 
+	// visit, shared by the nodes of a run, adds a member that is no node to the group's views,
+	// and removes it a second later: every node then steps a view that slot data has not
+	// changed. slotTrapped says the node's first released slot has set one off.
+	visit       func(id string)
+	slotTrapped bool
+
+	// slowAt is the start of the node's slow loop (slowStep). quiet holds one token while no
+	// goroutine but the loop may take the node's step lock: slowStep holds the loop in a step
+	// only with the token, and whoever calls a method of the node that takes that lock (Holder,
+	// Drain, Close) takes the token first. A goroutine waiting for a lock keeps the bubble's
+	// clock still, so the loop's sleep would never end.
+	slowAt   time.Duration
+	quiet    chan struct{}
+	silenced bool          // silence has taken the token for good; only the test goroutine uses it
+	epoch    time.Duration // the node's epoch as an offset from t0, set by the loop's first view
+	slept    time.Duration // when the latest slow step ended, as an offset from t0
+
 	closeSeq uint64 // the stamp taken right after Close returned
 	closeErr error
+}
+
+// slowFor is how long each node's loop is slow.
+const slowFor = 30 * time.Second
+
+// slowStep runs in the hook of each step of the node. In the node's slow loop, at the first step
+// of each instant, it holds the loop in the step until 100 ms past the wake the step armed, when
+// that wake is at most RetryPeriod away: the timer and the results, readings and views that came
+// meanwhile are then due at once, and the loop must step the Tick first (O2). The loop catches up
+// on all of them before the next instant.
+func (cn *contractNode) slowStep(rec tenure.StepRecord) {
+	if v, ok := rec.Input.(core.ViewChanged); ok && cn.epoch == 0 {
+		cn.epoch = v.Wall.Sub(cn.t0) - v.Now
+	}
+	now := time.Since(cn.t0)
+	w, ok := wakeOf(rec.Actions)
+	if !ok || now < cn.slowAt || now >= cn.slowAt+slowFor || cn.epoch == 0 || now == cn.slept {
+		return
+	}
+	until := cn.epoch + w + 100*time.Millisecond
+	if until-now > core.DefaultTiming.RetryPeriod+100*time.Millisecond {
+		return
+	}
+	select {
+	case <-cn.quiet:
+	default:
+		return
+	}
+	time.Sleep(until - now)
+	cn.slept = time.Since(cn.t0)
+	cn.quiet <- struct{}{}
+}
+
+// lossStep runs in the hook of each step of the node. After the step that loses the session it
+// lets the calls the store held back return, and holds the loop in the step for a second while
+// the lanes run on, so that a call of the lost holder that is queued, or waits for its lane or a
+// permit, would go out then (O7). It needs the quiet token, as slowStep does, and only yields
+// without it.
+func (cn *contractNode) lossStep(rec tenure.StepRecord) {
+	if rec.Before.Session == core.SessionStateLost || rec.After.Session != core.SessionStateLost {
+		return
+	}
+	cn.openLoss()
+	select {
+	case <-cn.quiet:
+		time.Sleep(time.Second)
+		cn.quiet <- struct{}{}
+	default:
+		for range 100 {
+			runtime.Gosched()
+		}
+	}
+}
+
+// silence takes the node's quiet token for good, waiting for a slow step to end, before the
+// test drains or closes the node. Only the test goroutine calls it.
+func (cn *contractNode) silence() {
+	if !cn.silenced {
+		<-cn.quiet
+		cn.silenced = true
+	}
+}
+
+// holder returns the node's holder, holding the quiet token meanwhile. Only the test goroutine
+// calls it.
+func (cn *contractNode) holder() string {
+	if !cn.silenced {
+		<-cn.quiet
+		defer func() { cn.quiet <- struct{}{} }()
+	}
+	return cn.n.Holder()
 }
 
 // faultAt returns the fault that hits a call of method now: an outage before any other.
@@ -256,10 +385,14 @@ func (cn *contractNode) addFault(f fault) {
 	cn.changed = make(chan struct{})
 }
 
-// trap adds, after the first grant to the holder of a new incarnation, an outage of 9 s that
+// trap adds, after the first grant to the holder of a new incarnation, an outage of 7 s that
 // starts 3 s later and hangs every call. The store watch lags 8 s from the loss on, so the outage
 // breaks the watch before it delivers the grant, and the record naming the new holder reaches the
 // node first through a resync or a Confirm, while its fenced shards are degraded or just after.
+// Holdings answers come 2.5 s after they read the store, and Confirm answers 3.5 s after, past
+// RetryPeriod: the machine's next Confirm then waits in its lane behind the one out, and a
+// Holdings read that starts meanwhile, after the Confirm action but before its call (O5), answers
+// once that call is out.
 func (cn *contractNode) trap(holder string) {
 	cn.mu.Lock()
 	first := !cn.trapped && len(cn.lost) > 0 && !cn.lost[holder]
@@ -271,16 +404,72 @@ func (cn *contractNode) trap(holder string) {
 		cn.addFault(fault{from: now + 3*time.Second, to: now + 13*time.Second, method: "KeepAlive", kind: faultFail})
 		cn.addFault(fault{from: now + 3*time.Second, to: now + 30*time.Second, method: "Holdings", kind: faultStuck,
 			d: 2500 * time.Millisecond})
-		cn.addFault(fault{from: now + 3*time.Second, to: now + 30*time.Second, method: "Confirm", kind: faultLate,
-			d: 1900 * time.Millisecond})
+		cn.addFault(fault{from: now + 3*time.Second, to: now + 30*time.Second, method: "Confirm", kind: faultStuck,
+			d: 3500 * time.Millisecond})
 	}
 }
 
-// loseSession makes the store lose the session of holder from now on.
+// slotTrap runs after the first ReleaseSlot of the node that the store answered: for 10 s, slot
+// reads go to the store and answer 2.5 s later, and 300 ms on, a member that is no node joins the
+// views for a second. The node steps the SlotReleased first and reads the slots again, so the
+// membership views come while that read is out, and the latest slot data at hand still shows the
+// node in the slot it gave back. A node that does not drop that data then (O8) steps a view that
+// shows the slot ours after SlotReleased. A draining node with a stuck run is still live then.
+func (cn *contractNode) slotTrap() {
+	cn.mu.Lock()
+	first := !cn.slotTrapped
+	cn.slotTrapped = true
+	cn.mu.Unlock()
+	if !first {
+		return
+	}
+	now := time.Since(cn.t0)
+	cn.addFault(fault{from: now, to: now + 10*time.Second, method: "Slots", kind: faultStuck, d: 2500 * time.Millisecond})
+	time.AfterFunc(300*time.Millisecond, func() { cn.visit("visitor-" + cn.id) })
+}
+
+// loseSession makes the store lose the session of holder from now on. The store holds every call
+// of that holder back (waitLoss) until the node steps the loss (lossStep), but for one, 5 s on,
+// that is no KeepAlive and that makes the node lose its session: the lanes behind the calls held
+// back then have calls queued, or waiting for a permit, which must not go out once the loss is
+// stepped (O7). From 9 s on, a KeepAlive may make the node lose it, when no other call came.
 func (cn *contractNode) loseSession(holder string) {
 	cn.mu.Lock()
 	defer cn.mu.Unlock()
 	cn.lost[holder] = true
+	cn.lossGate, cn.lossOther, cn.lossAny = make(chan struct{}), make(chan struct{}, 1), make(chan struct{}, 1)
+	other, anyCall := cn.lossOther, cn.lossAny
+	time.AfterFunc(5*time.Second, func() { other <- struct{}{} })
+	time.AfterFunc(9*time.Second, func() { anyCall <- struct{}{} })
+}
+
+// waitLoss holds a call of a lost holder back, as loseSession says. A call the node never steps
+// the loss for goes on after 30 s.
+func (cn *contractNode) waitLoss(keepAlive bool) {
+	cn.mu.Lock()
+	gate, other, anyCall := cn.lossGate, cn.lossOther, cn.lossAny
+	cn.mu.Unlock()
+	if keepAlive {
+		other = nil
+	}
+	t := time.NewTimer(30 * time.Second)
+	defer t.Stop()
+	select {
+	case <-gate:
+	case <-other:
+	case <-anyCall:
+	case <-t.C:
+	}
+}
+
+// openLoss lets every call of the lost holder go on.
+func (cn *contractNode) openLoss() {
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
+	if cn.lossGate != nil && !cn.lossOpen {
+		close(cn.lossGate)
+		cn.lossOpen = true
+	}
 }
 
 // isLost reports whether the store has lost the session of holder.
@@ -321,13 +510,17 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 func (cn *contractNode) answer(method string) answerFunc {
 	return func(ctx context.Context, args []any) ([]any, error) {
 		if slices.Contains(lostMethods, method) && cn.isLost(argAt[string](args, 0)) {
+			cn.waitLoss(method == "KeepAlive")
 			return nil, tenure.ErrSessionLost
 		}
 		res, err := cn.faulty(ctx, method, func(ctx context.Context) ([]any, error) {
 			return cn.fs.Forward(ctx, method, args)
 		})
-		if method == "Acquire" && err == nil {
+		switch {
+		case method == "Acquire" && err == nil:
 			cn.trap(argAt[string](args, 0))
+		case method == "ReleaseSlot" && err == nil:
+			cn.slotTrap()
 		}
 		return res, err
 	}
@@ -415,7 +608,7 @@ func (cn *contractNode) relay(in <-chan tenure.Holding, out chan tenure.Holding)
 		for len(queue) > 0 && !queue[0].due.After(now) {
 			q := queue[0]
 			queue = queue[1:]
-			if !cn.send(out, watchSend{h: q.h, seq: seq(), at: time.Now(), redelivered: q.redelivered}) {
+			if !cn.send(out, watchSend{h: q.h, seq: seq(), redelivered: q.redelivered}) {
 				return
 			}
 			if !q.redelivered {
@@ -518,17 +711,25 @@ type contractRun struct {
 	ok    bool
 }
 
-// contractCache holds the runs, made once.
+// contractCache holds the runs, and the tests that have checked them. The tests never run in
+// parallel.
 var contractCache struct {
-	once sync.Once
 	runs []*contractRun
+	used map[string]bool
 }
 
-// contractRuns returns the runs of seeds 1 to 20, making them the first time as subtests of t.
+// contractRuns returns the runs of seeds 1 to 20, making them as subtests of t the first time,
+// and again when t's test has had them already, as each test does in each round of go test
+// -count=n: every round checks runs of its own.
 func contractRuns(t *testing.T) []*contractRun {
 	t.Helper()
-	contractCache.once.Do(func() {
-		for seed := uint64(1); seed <= contractSeeds; seed++ {
+	if contractCache.runs == nil || contractCache.used[t.Name()] {
+		contractCache.runs, contractCache.used = nil, make(map[string]bool)
+		last := uint64(contractSeeds)
+		if *contractSweep > 0 {
+			last = *contractSweep
+		}
+		for seed := uint64(1); seed <= last; seed++ {
 			r := &contractRun{seed: seed}
 			t.Run("scenario/seed="+strconv.FormatUint(seed, 10), func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) { runContract(t, r) })
@@ -536,7 +737,8 @@ func contractRuns(t *testing.T) []*contractRun {
 			})
 			contractCache.runs = append(contractCache.runs, r)
 		}
-	})
+	}
+	contractCache.used[t.Name()] = true
 	for _, r := range contractCache.runs {
 		if !r.ok {
 			t.Fatalf("seed %d: the scenario failed", r.seed)
@@ -565,12 +767,27 @@ func runContract(t *testing.T, r *contractRun) {
 	ms := memstore.New(nil)
 	g := newGroup(t)
 	t0 := time.Now()
+	var visits sync.WaitGroup
+	var visitMu sync.Mutex // the group's helpers are not safe for concurrent use
+	visit := func(id string) {
+		visits.Go(func() {
+			visitMu.Lock()
+			g.Join(tenure.Member{ID: id, Addr: addrOf(id)})
+			visitMu.Unlock()
+			time.Sleep(time.Second)
+			visitMu.Lock()
+			g.Leave(id)
+			visitMu.Unlock()
+		})
+	}
 
 	nodes := make([]*contractNode, len(contractIDs))
 	for i, id := range contractIDs {
 		sleepUntil(t0.Add(time.Duration(i) * time.Second))
 		cn := &contractNode{id: id, t0: t0, faults: p.faults[i], changed: make(chan struct{}), fs: newRecStore(ms),
-			sm: g.Absent(id), runs: &runLog{}, log: &stepLog{}, rng: rng, rngMu: &rngMu, lost: make(map[string]bool)}
+			sm: g.Absent(id), runs: &runLog{}, log: &stepLog{}, rng: rng, rngMu: &rngMu, lost: make(map[string]bool), visit: visit,
+			slowAt: p.slowAt[i], quiet: make(chan struct{}, 1)}
+		cn.quiet <- struct{}{}
 		cn.runs.Script(contractRunScript)
 		for _, m := range faultMethods {
 			if m != "WatchHolders" {
@@ -590,7 +807,18 @@ func runContract(t *testing.T, r *contractRun) {
 			Rand: recoveryRand(),
 		}
 		cn.startSeq = seq()
-		cn.n = start(t, cn.log.ctx(context.Background()), cfg)
+		// The hook lets the lanes run on before the loop goes on. After the step that loses the
+		// session it holds the loop for a second (lossStep): a call of the lost holder still queued
+		// then, or waiting for a permit, would go out after the step (O7).
+		hook := tenure.WithStepHook(context.Background(), func(rec tenure.StepRecord) {
+			cn.log.add(rec)
+			for range 3 {
+				runtime.Gosched()
+			}
+			cn.lossStep(rec)
+			cn.slowStep(rec)
+		})
+		cn.n = start(t, hook, cfg)
 		nodes[i] = cn
 	}
 
@@ -608,7 +836,7 @@ func runContract(t *testing.T, r *contractRun) {
 			cn := nodes[p.lossNode]
 			cn.addFault(fault{from: p.lossAt, to: p.lossAt + time.Minute, method: watchLag, kind: faultDelay,
 				d: 8 * time.Second})
-			cn.loseSession(cn.n.Holder())
+			cn.loseSession(cn.holder())
 		}},
 		{p.pauseAt, func() { nodes[p.pauseNode].sm.Pause() }},
 		{p.pauseAt + p.pauseFor, func() { nodes[p.pauseNode].sm.Resume() }},
@@ -620,6 +848,7 @@ func runContract(t *testing.T, r *contractRun) {
 			})
 		}},
 		{p.drainAt, func() {
+			nodes[p.drainNode].silence()
 			wg.Go(func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 				defer cancel()
@@ -627,6 +856,7 @@ func runContract(t *testing.T, r *contractRun) {
 			})
 		}},
 		{p.closeAt, func() {
+			nodes[p.closeNode].silence()
 			wg.Go(func() {
 				ctx, cancel := context.WithTimeout(context.Background(), p.closeWait)
 				defer cancel()
@@ -645,6 +875,7 @@ func runContract(t *testing.T, r *contractRun) {
 		if cn.closeSeq != 0 {
 			continue
 		}
+		cn.silence()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		closeNode(cn, ctx)
 		cancel()
@@ -654,6 +885,7 @@ func runContract(t *testing.T, r *contractRun) {
 	}
 	time.Sleep(30 * time.Second) // runs that outlive a forced Close return
 	synctest.Wait()
+	visits.Wait()
 
 	for _, cn := range nodes {
 		steps, seqs := cn.log.records()
@@ -674,6 +906,15 @@ func runContract(t *testing.T, r *contractRun) {
 			}
 		}
 		r.nodes = append(r.nodes, nr)
+	}
+	// Every run has the forced Close and the lost session the scenario promises.
+	if !r.nodes[p.closeNode].forced {
+		t.Errorf("%s: the Close at %v was not forced", contractIDs[p.closeNode], p.closeAt)
+	}
+	if !slices.ContainsFunc(r.nodes[p.lossNode].steps, func(s tenure.StepRecord) bool {
+		return s.After.Session == core.SessionStateLost
+	}) {
+		t.Errorf("%s: the session lost at %v was never stepped as lost", contractIDs[p.lossNode], p.lossAt)
 	}
 	check()
 }
@@ -1027,9 +1268,14 @@ func TestDriverContractO4Freshness(t *testing.T) {
 // TestDriverContractO5Confirm checks O5 (RUN-175): each Restore comes after the call of the
 // shard's latest Confirm action started (Confirm calls are never dropped and go out in action
 // order on the shard's lane, so the k-th action is the k-th call), and its step is a HolderChanged
-// naming the generation's holder at the run's term that some reading of that record, started
-// after that call and ended before the step, shows: a Confirm answer, a Holdings answer or a
-// value of the store watch.
+// naming the generation's holder at the run's term that a reading of that record, started at or
+// after that call and ended before the step, shows: the Confirm answer itself, a later Holdings
+// answer or a value of the store watch that the node received later.
+//
+// Both are ordered by the node's own stamps, exactly: the start stamp of the Confirm call, and the
+// stamp of the reading the step records (StepRecord.Read). A Confirm or Holdings reading is the
+// call that carries that stamp. A watch value counts as read when the node received it, the stamp
+// rule of #55, so it is one the watch sent before the step.
 func TestDriverContractO5Confirm(t *testing.T) {
 	restores := 0
 	eachNode(t, func(t *testing.T, _ *contractRun, nr *nodeRecord) {
@@ -1065,41 +1311,44 @@ func checkRestore(t *testing.T, nr *nodeRecord, i int, a core.Restore, k int) {
 			confirms = append(confirms, c)
 		}
 	}
-	if k == 0 || len(confirms) < k || confirms[k-1].Seq > at {
+	if k == 0 || len(confirms) < k || confirms[k-1].Stamp == 0 || confirms[k-1].Seq > at {
 		t.Errorf("%s: %+v before the call of Confirm action %d went out (%d calls)", nr.where(i), a, k, len(confirms))
 		return
 	}
-	from, fromAt := confirms[k-1].Seq, confirms[k-1].Start
+	from, read := confirms[k-1].Stamp, nr.steps[i].Read
 	in, ok := nr.steps[i].Input.(core.HolderChanged)
 	if !ok || in.Space != a.Space || in.Shard != a.Shard || in.Holder != h || in.Term != a.Term {
 		t.Errorf("%s: %+v not on a HolderChanged naming %s at term %d", nr.where(i), a, h, a.Term)
 		return
 	}
+	if read < from {
+		t.Errorf("%s: %+v on a reading of stamp %d, before %v (stamp %d)", nr.where(i), a, read, confirms[k-1], from)
+		return
+	}
 	shows := func(x tenure.Holding) bool {
 		return x.Space == a.Space && x.Shard == a.Shard && x.Holder == h && x.Term == a.Term
 	}
-	// A reading at the instant the Confirm call started counts as after it: the node stamps the
-	// call when it hands it over, which the double does not see, and at one instant nothing else
-	// orders the two.
-	after := func(seq uint64, start time.Time) bool { return seq > from || start.Equal(fromAt) }
 	for _, c := range nr.calls {
-		if !c.Done || c.Err != nil || !after(c.Seq, c.Start) || c.EndSeq > at {
+		if c.Stamp != read {
 			continue
 		}
 		switch {
+		case !c.Done || c.Err != nil || c.EndSeq > at:
 		case isConfirm(c) && shows(resultAt[tenure.Holding](c.Result, 0)):
 			return
 		case c.Method == "Holdings" && slices.ContainsFunc(resultAt[[]tenure.Holding](c.Result, 0), shows):
 			return
 		}
+		t.Errorf("%s: %+v on the reading %v (stamp %d), which does not show the record before it", nr.where(i), a,
+			c, read)
+		return
 	}
 	for _, s := range nr.sends {
-		if after(s.seq, s.at) && s.seq < at && shows(s.h) {
-			return
+		if s.seq < at && shows(s.h) {
+			return // a watch value, which the node received at stamp read
 		}
 	}
-	t.Errorf("%s: %+v, but no reading of the record started after %v and ended before it", nr.where(i), a,
-		confirms[k-1])
+	t.Errorf("%s: %+v, but no reading of the record has stamp %d", nr.where(i), a, read)
 }
 
 // actionText returns the record a store action works on, and its canonical text with its
@@ -1256,20 +1505,19 @@ func TestDriverContractO6OrderAndRepeats(t *testing.T) {
 
 // TestDriverContractO7Closing checks O7 (RUN-130, RUN-180, RUN-530): per generation, the
 // CloseSession calls of its holder never outnumber its machine's CloseSession actions; no call of
-// the holder of a machine that lost its session starts after the step of the loss, but for a call
-// already in flight then; and no call of the store or the membership starts after Close returned,
-// also when Close's ctx ended first.
+// the holder of a machine that lost its session starts after the step of the loss; and no call of
+// the store or the membership starts after Close returned, also when Close's ctx ended first.
 //
-// A lane hands its next call over once it has checked the generation, so the double may see that
-// call start right after the step of the loss, at the same instant: nothing between the check and
-// the call waits. A lane has one such call at most, so per record the first call after the step,
-// at its instant, counts as in flight.
+// The loss is ordered by the node's own stamps, exactly: a call of the lost holder must carry a
+// start stamp below the stamp the step of the loss took once its actions were handed over
+// (StepRecord.Stamp). A call whose lane took its stamp before that went out while the step ran,
+// and is in flight; one whose lane took it later started after the step. A call without a stamp is
+// one Start made itself, which comes before any step.
 func TestDriverContractO7Closing(t *testing.T) {
 	var forced, losses int
 	eachNode(t, func(t *testing.T, _ *contractRun, nr *nodeRecord) {
 		actions := make(map[uint64]int)
-		loss := make(map[uint64]uint64) // the stamp of the step of the loss, by generation
-		lossAt := make(map[uint64]time.Time)
+		loss := make(map[uint64]int) // the step of the loss, by generation
 		for i, s := range nr.steps {
 			for _, a := range s.Actions {
 				if _, ok := a.(core.CloseSession); ok {
@@ -1277,13 +1525,12 @@ func TestDriverContractO7Closing(t *testing.T) {
 				}
 			}
 			if s.Before.Session != core.SessionStateLost && s.After.Session == core.SessionStateLost {
-				loss[s.Gen], lossAt[s.Gen] = nr.seqs[i], nr.at(i)
+				loss[s.Gen] = i
 				losses++
 			}
 		}
 		for gen := uint64(1); gen <= uint64(len(nr.holders)); gen++ {
 			h, n := nr.holder(gen), 0
-			inFlight := make(map[string]bool) // the records with a call in flight at the loss
 			for _, c := range nr.calls {
 				if holderOfCall(c) != h {
 					continue
@@ -1291,14 +1538,14 @@ func TestDriverContractO7Closing(t *testing.T) {
 				if c.Method == "CloseSession" {
 					n++
 				}
-				if at, ok := loss[gen]; ok && c.Seq > at {
-					lane, _ := callText(c)
-					if c.Start.Equal(lossAt[gen]) && !inFlight[lane] {
-						inFlight[lane] = true
-						continue
-					}
-					t.Errorf("gen %d: %v started at %v, after the loss at %v", gen, c, c.Start.Sub(nr.epoch),
-						lossAt[gen].Sub(nr.epoch))
+				i, ok := loss[gen]
+				switch {
+				case !ok:
+				case c.Stamp == 0 && c.Seq > nr.seqs[i]:
+					t.Errorf("gen %d: %v started after the loss in %s, and not from a lane", gen, c, nr.where(i))
+				case c.Stamp > nr.steps[i].Stamp:
+					t.Errorf("gen %d: %v started at %v (stamp %d), after the loss in %s (stamp %d)", gen, c,
+						c.Start.Sub(nr.epoch), c.Stamp, nr.where(i), nr.steps[i].Stamp)
 				}
 			}
 			if n > actions[gen] {
@@ -1320,55 +1567,76 @@ func TestDriverContractO7Closing(t *testing.T) {
 }
 
 // TestDriverContractO8Views checks O8 (RUN-210), in its strong form: no view stepped into a live
-// machine after a SlotClaimed{s} shows s vacant or held by another, until the machine gives s
-// back (ReleaseSlot{s}) or steps SlotReleased{s}; and none after a SlotReleased{s} shows s held by
-// the machine's holder, until it claims again. A view that no longer counts s shows nothing of it.
-// While the machine's session is live, the store's session is too, so its slot data cannot have
-// moved on.
+// machine after a SlotClaimed{s} shows s vacant or held by another, and no view stepped after a
+// SlotReleased{s} shows s held by the machine's holder. A view that no longer counts s shows
+// nothing of it. Only the holder's own calls may change s meanwhile, so each half holds until
+// one starts: after the claim, a ReleaseSlot(s) call, also one of a give-back the machine sent
+// before the claim, which the store may carry out after it; after the release, a ClaimSlot call.
+// The first half holds only while the machine's session is live: the store's session is live
+// then too, so it cannot have expired and freed s. The second holds whatever the session.
 func TestDriverContractO8Views(t *testing.T) {
-	var claims, views int
+	var claims, releases, views int
 	eachNode(t, func(t *testing.T, _ *contractRun, nr *nodeRecord) {
 		var gen uint64
-		var claimed, released map[int]bool
+		var h string
+		// claimed and released map a slot to the start stamp of the call behind its latest
+		// SlotClaimed or SlotReleased.
+		var claimed, released map[int]uint64
+		// latest returns the start stamp of the latest call of method by h on slot that succeeded
+		// before step i, 0 when there is none.
+		latest := func(i int, method string, slot int) uint64 {
+			var at uint64
+			for _, c := range nr.calls {
+				if c.Method != method || holderOfCall(c) != h || !c.Done || c.Err != nil || c.EndSeq > nr.seqs[i] {
+					continue
+				}
+				if method == "ClaimSlot" && resultAt[int](c.Result, 0) == slot ||
+					method == "ReleaseSlot" && argAt[int](c.Args, 1) == slot {
+					at = max(at, c.Seq)
+				}
+			}
+			return at
+		}
+		// since reports whether a call of method by h, on slot for ReleaseSlot, started after
+		// stamp from and before step i.
+		since := func(i int, method string, slot int, from uint64) bool {
+			return slices.ContainsFunc(nr.calls, func(c call) bool {
+				return c.Method == method && holderOfCall(c) == h && c.Seq > from && c.Seq < nr.seqs[i] &&
+					(method == "ClaimSlot" || argAt[int](c.Args, 1) == slot)
+			})
+		}
 		for i, s := range nr.steps {
 			if s.Gen != gen {
-				gen, claimed, released = s.Gen, make(map[int]bool), make(map[int]bool)
+				gen, h, claimed, released = s.Gen, nr.holder(s.Gen), make(map[int]uint64), make(map[int]uint64)
 			}
-			h := nr.holder(gen)
 			switch in := s.Input.(type) {
 			case core.SlotClaimed:
-				claimed[in.Slot], released[in.Slot] = true, false
+				claimed[in.Slot] = latest(i, "ClaimSlot", in.Slot)
+				delete(released, in.Slot)
 				claims++
 			case core.SlotReleased:
-				claimed[in.Slot], released[in.Slot] = false, true
+				released[in.Slot] = latest(i, "ReleaseSlot", in.Slot)
+				delete(claimed, in.Slot)
+				releases++
 			case core.ViewChanged:
-				if s.After.Session != core.SessionStateLive {
-					break
-				}
 				v := in.View
-				for slot, on := range claimed {
-					if on && slot < v.Slots && v.SlotHolders[slot] != h {
+				for slot, from := range claimed {
+					if s.After.Session == core.SessionStateLive && slot < v.Slots && v.SlotHolders[slot] != h &&
+						!since(i, "ReleaseSlot", slot, from) {
 						t.Errorf("%s: slot %d held by %q after SlotClaimed{%d}", nr.where(i), slot, v.SlotHolders[slot], slot)
 					}
 				}
-				for slot, on := range released {
-					if on && slot < v.Slots && v.SlotHolders[slot] == h {
+				for slot, from := range released {
+					if slot < v.Slots && v.SlotHolders[slot] == h && !since(i, "ClaimSlot", slot, from) {
 						t.Errorf("%s: slot %d still ours after SlotReleased{%d}", nr.where(i), slot, slot)
 					}
 				}
 				views++
 			}
-			for _, a := range s.Actions {
-				switch a := a.(type) {
-				case core.ReleaseSlot:
-					claimed[a.Slot] = false
-				case core.ClaimSlot:
-					clear(released)
-				}
-			}
 		}
 	})
-	if claims == 0 || views == 0 {
-		t.Errorf("%d SlotClaimed and %d views checked in all runs, want some of each", claims, views)
+	if claims == 0 || releases == 0 || views == 0 {
+		t.Errorf("%d SlotClaimed, %d SlotReleased and %d views checked in all runs, want some of each", claims,
+			releases, views)
 	}
 }

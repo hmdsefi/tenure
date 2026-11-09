@@ -77,12 +77,15 @@ type stepLog struct {
 
 // ctx returns ctx with the log's hook.
 func (l *stepLog) ctx(ctx context.Context) context.Context {
-	return tenure.WithStepHook(ctx, func(r tenure.StepRecord) {
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		l.recs = append(l.recs, r)
-		l.seqs = append(l.seqs, seq())
-	})
+	return tenure.WithStepHook(ctx, l.add)
+}
+
+// add records r with a seq stamp: the log's hook.
+func (l *stepLog) add(r tenure.StepRecord) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.recs = append(l.recs, r)
+	l.seqs = append(l.seqs, seq())
 }
 
 // records returns a copy of the records and their stamps.
