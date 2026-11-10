@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -330,6 +331,158 @@ func TestStoreNode(t *testing.T) {
 				if _, ok := s.reply(0, id).(lostReply); !ok {
 					t.Errorf("keepAlive #%d after the end got %v, want lost", id, s.reply(0, id))
 				}
+			}
+		})
+	})
+
+	t.Run("end timer follows renewals", func(t *testing.T) {
+		runWorld(t, fullTrace(30*time.Second), Scenario{Members: 1, Rho: 100_000}, func(fw *faultline.World, w *World) {
+			t := fw.T()
+			s := scripted(fw, w)
+			short := core.Timing{LeaseDuration: 3 * time.Second, RenewDeadline: 2 * time.Second, RetryPeriod: 500 * time.Millisecond}
+			fw.RunFor(5 * time.Millisecond)
+			s.send(10*time.Millisecond, 0, w.Store(), keepAlive(w, 1, 0, short))
+			s.send(time.Second, 0, w.Store(), keepAlive(w, 2, 0, short))
+			s.send(2*time.Second, 0, w.Store(), keepAlive(w, 3, 0, short))
+			fw.RunFor(8 * time.Second)
+
+			// Each renewal moves the end: the timer set before it is cancelled, so the only
+			// end event is the one of the expiry, LeaseDuration after the last renewal.
+			var ends []traceEvent
+			for _, e := range traceEvents(fw.Sim) {
+				if e.label == labelStoreEnd {
+					ends = append(ends, e)
+				}
+			}
+			if len(ends) != 1 {
+				t.Fatalf("%d session-end events, want 1", len(ends))
+			}
+			var renewed time.Duration
+			for _, r := range records(fw.Sim, kindSession) {
+				if attrValue(r, "op") == "renew" {
+					renewed = storeReading(w, r.At)
+				}
+			}
+			if got := storeReading(w, ends[0].at); got < renewed+short.LeaseDuration || got > renewed+short.LeaseDuration+time.Microsecond {
+				t.Errorf("the end is at the store's reading %v, want LeaseDuration after the last renewal at %v", got, renewed)
+			}
+			if got := ends[0].of(kindSession); len(got) != 1 || attrValue(got[0], "cause") != "expired" {
+				t.Errorf("the end event's sessions are %v, want one end, expired", got)
+			}
+			// Only the snapshot timer is left.
+			if n := len(w.clocks.of(w.Store()).timers); n != 1 || !w.storeSrv.snapshot.pending() {
+				t.Errorf("the store has %d pending timers, want the snapshot timer alone", n)
+			}
+		})
+	})
+
+	t.Run("receivers", func(t *testing.T) {
+		// A rollout that never activates: m1-r to m3-r stay on standby.
+		sc := Scenario{Members: 3, Slots: 3, Rollout: rollout}
+		runWorld(t, fullTrace(90*time.Second), sc, func(fw *faultline.World, w *World) {
+			t := fw.T()
+			s := scripted(fw, w)
+			ms := time.Millisecond
+			fw.RunFor(5 * ms)
+			s.send(10*ms, 0, w.Store(), keepAlive(w, 1, 0, core.DefaultTiming))
+			s.at(time.Second, func() {
+				w.Members()[1].phase = Exited
+				w.Members()[2].Node.Crash()
+			})
+			s.send(2500*ms, 0, w.Store(), acquireReq{reqHead{ID: 2, Holder: w.Members()[0].Holder()}, "book", 0})
+			fw.RunFor(5 * time.Second)
+
+			// Before 1 s the active members get the pushes; after it, m1 and m3, which is down
+			// and whose copies the network drops; never the exited m2 nor a replacement on
+			// standby.
+			pushed := 0
+			for _, e := range traceEvents(fw.Sim) {
+				for _, prefix := range []string{"holder ", "view ", "snapshot "} {
+					p := e.sends(storeName, prefix)
+					if len(p) == 0 {
+						continue
+					}
+					pushed++
+					want := []string{"m1", "m2", "m3"}
+					if e.at > at(time.Second) {
+						want = []string{"m1", "m3"}
+					}
+					if got := sendTargets(p); !slices.Equal(got, want) {
+						t.Errorf("%q pushes at %s go to %v, want %v", prefix, e.at, got, want)
+					}
+				}
+			}
+			if pushed < 4 { // a view, snapshots at 2 s and 4 s, a holder push
+				t.Errorf("%d events with pushes, want at least 4", pushed)
+			}
+			dropped := 0
+			for _, r := range records(fw.Sim, "net.drop") {
+				if attrValue(r, "to") == "m3" && attrValue(r, "reason") == "down" {
+					dropped++
+				}
+			}
+			if dropped < 3 {
+				t.Errorf("%d pushes to the crashed m3 dropped as down, want at least 3", dropped)
+			}
+		})
+	})
+
+	t.Run("close", func(t *testing.T) {
+		runWorld(t, fullTrace(30*time.Second), Scenario{Members: 3}, func(fw *faultline.World, w *World) {
+			t := fw.T()
+			s := scripted(fw, w)
+			ms := time.Millisecond
+			fw.RunFor(5 * ms)
+			h := func(i int) string { return w.Members()[i].Holder() }
+			s.send(10*ms, 0, w.Store(), keepAlive(w, 1, 0, core.DefaultTiming))
+			s.send(20*ms, 1, w.Store(), keepAlive(w, 2, 1, core.DefaultTiming))
+			s.send(100*ms, 0, w.Store(), acquireReq{reqHead{ID: 3, Holder: h(0)}, "book", 1})
+			s.send(150*ms, 0, w.Store(), acquireReq{reqHead{ID: 4, Holder: h(0)}, "book", 0})
+			s.send(500*ms, 0, w.Store(), closeSessionReq{reqHead{ID: 5, Holder: h(0)}})
+			fw.RunFor(3 * time.Second)
+
+			// The close clears book/0 and book/1, in shard order, and makes a view of m2: the
+			// reply, then each holder push to every member, then the view push.
+			var got []string
+			for _, e := range traceEvents(fw.Sim) {
+				if len(e.sends(storeName, "closed#5")) == 0 {
+					continue
+				}
+				for _, r := range e.sends(storeName, "") {
+					f := strings.Fields(attrValue(r, "payload"))
+					got = append(got, attrValue(r, "to")+" "+strings.Join(f[:min(len(f), 2)], " "))
+				}
+			}
+			want := []string{
+				"m1 closed#5",
+				"m1 holder book/0", "m2 holder book/0", "m3 holder book/0",
+				"m1 holder book/1", "m2 holder book/1", "m3 holder book/1",
+				"m1 view version=3", "m2 view version=3", "m3 view version=3",
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("the close's sends are\n%v\nwant\n%v", got, want)
+			}
+
+			// Every receiver gets its own slices.
+			last := func(i int, kind func(any) bool) any {
+				var out any
+				for _, r := range s.inbox[i] {
+					if kind(r.msg) {
+						out = r.msg
+					}
+				}
+				return out
+			}
+			isView := func(m any) bool { _, ok := m.(viewPush); return ok }
+			isSnap := func(m any) bool { _, ok := m.(snapshotPush); return ok }
+			v1, v2 := last(1, isView).(viewPush), last(2, isView).(viewPush)
+			if len(v1.View.Members) != 1 || &v1.View.Members[0] == &v2.View.Members[0] || &v1.Sessions[0] == &v2.Sessions[0] {
+				t.Errorf("the view pushes of m2 and m3 share their slices or are wrong: %+v", v1)
+			}
+			p1, p2 := last(1, isSnap).(snapshotPush), last(2, isSnap).(snapshotPush)
+			if len(p1.Records) != 2 || &p1.Records[0] == &p2.Records[0] ||
+				&p1.View.Members[0] == &p2.View.Members[0] || &p1.Sessions[0] == &p2.Sessions[0] {
+				t.Errorf("the snapshots of m2 and m3 share their slices or are wrong: %+v", p1)
 			}
 		})
 	})
