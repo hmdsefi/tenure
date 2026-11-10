@@ -113,7 +113,7 @@ type Checker struct {
 	spaces    []core.SpaceSpec         // a copy of cfg.Spaces, by name
 	fenced    map[string]bool          // whether each space of cfg.Spaces is fenced, by name
 	shards    map[shardKey]*shardState // the shards with an observation
-	shared    int                      // how many shards two or more runs own
+	contested []shardKey               // the shards two or more runs own, by space name then shard
 	readings  map[string]time.Duration // each holder's last reading
 	deadlines map[string]time.Duration // each holder's last reported session deadline
 	errs      map[string]error         // the first violation of each check, by name
@@ -253,7 +253,7 @@ func (c *Checker) StartRun(holder, space string, shard int, term core.Term) {
 	if !t.started {
 		t.started, t.starter = true, holder
 	}
-	c.own(s, holder, term)
+	c.own(s, key, holder, term)
 }
 
 // Accepted reports that a fenced downstream accepted a write.

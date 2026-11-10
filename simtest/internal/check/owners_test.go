@@ -284,12 +284,26 @@ func TestATSIM24G2(t *testing.T) {
 			want: past,
 		},
 		{
-			name: "a deadline survives Down",
+			name: "Down forgets the deadline",
+			// The holder comes back under the same string and has reported no deadline since.
 			moves: []move{
 				renewed(hA, 10*time.Second), mono(hA, 9*time.Second), down(hA),
 				own(hA, "book", 3, 4), own(hB, "book", 3, 5),
 			},
+			want: "g2: book/3: " + hA + " (term 4) owns it past its deadline 0.000000000s while " + hB + " (term 5) owns it",
+		},
+		{
+			name: "a deadline reported after Down is the one compared",
+			moves: []move{
+				renewed(hA, 20*time.Second), mono(hA, 9*time.Second), down(hA), renewed(hA, 10*time.Second),
+				own(hA, "book", 3, 4), own(hB, "book", 3, 5),
+			},
 			want: inside,
+		},
+		{
+			name:  "Down of another holder keeps the deadline",
+			moves: append(contested(9*time.Second), down(hC)),
+			want:  inside,
 		},
 		{
 			name: "observations of a run that does not own its shard change nothing",

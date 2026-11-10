@@ -44,11 +44,11 @@ func (s *shardState) find(holder string, term core.Term) (int, bool) {
 	return slices.BinarySearchFunc(s.owners, owner{holder: holder, term: term}, compareOwners)
 }
 
-// own makes holder's run in term an owner of the shard. A run that already owns the shard
-// stays as it is, degraded or not: a second start of it is g1's to report. A holder that
-// already owns the shard in another term owns it twice from now on, once per run, and each
-// run is degraded, restored and stopped by its own term.
-func (c *Checker) own(s *shardState, holder string, term core.Term) {
+// own makes holder's run in term an owner of the shard key, whose state is s. A run that
+// already owns the shard stays as it is, degraded or not: a second start of it is g1's to
+// report. A holder that already owns the shard in another term owns it twice from now on, once
+// per run, and each run is degraded, restored and stopped by its own term.
+func (c *Checker) own(s *shardState, key shardKey, holder string, term core.Term) {
 	i, found := s.find(holder, term)
 	if found {
 		return
@@ -60,16 +60,20 @@ func (c *Checker) own(s *shardState, holder string, term core.Term) {
 			s.gaps = append(s.gaps, gap{from: s.since, to: now})
 		}
 	case 1:
-		c.shared++
+		// The second run: g2 has this shard to look at from now on.
+		at, _ := slices.BinarySearchFunc(c.contested, key, compareShards)
+		c.contested = slices.Insert(c.contested, at, key)
 	}
 	s.owners = slices.Insert(s.owners, i, owner{holder: holder, term: term})
 }
 
-// disown updates the Checker after before owners of the shard became len(s.owners): the shard
-// may have stopped being shared, and an ownerless interval starts when the last owner left.
-func (c *Checker) disown(s *shardState, before int) {
+// disown updates the Checker after before owners of the shard key, whose state is s, became
+// len(s.owners): g2 has nothing to look at in a shard with fewer than two runs, and an
+// ownerless interval starts when the last owner left.
+func (c *Checker) disown(s *shardState, key shardKey, before int) {
 	if before >= 2 && len(s.owners) < 2 {
-		c.shared--
+		at, _ := slices.BinarySearchFunc(c.contested, key, compareShards)
+		c.contested = slices.Delete(c.contested, at, at+1)
 	}
 	if before > 0 && len(s.owners) == 0 {
 		s.since = c.cfg.Now()
@@ -79,8 +83,8 @@ func (c *Checker) disown(s *shardState, before int) {
 // owning returns the shard's state and the position of holder's run in term among its owners,
 // or nil when that run does not own the shard. It creates no state: an observation of a run
 // that owns nothing leaves the Checker as it was.
-func (c *Checker) owning(holder, space string, shard int, term core.Term) (*shardState, int) {
-	s := c.shards[shardKey{space, shard}]
+func (c *Checker) owning(key shardKey, holder string, term core.Term) (*shardState, int) {
+	s := c.shards[key]
 	if s == nil {
 		return nil, 0
 	}
@@ -103,7 +107,7 @@ func (c *Checker) Renewed(holder string, deadline time.Duration) {
 // Degrade changes nothing when the run does not own the shard (it was never started, it was
 // stopped, or holder went down) or is degraded already.
 func (c *Checker) Degrade(holder, space string, shard int, term core.Term) {
-	if s, i := c.owning(holder, space, shard, term); s != nil {
+	if s, i := c.owning(shardKey{space, shard}, holder, term); s != nil {
 		s.owners[i].degraded = true
 	}
 }
@@ -111,7 +115,7 @@ func (c *Checker) Degrade(holder, space string, shard int, term core.Term) {
 // Restore reports that holder's run of the shard in term is no longer degraded. It changes
 // nothing when the run does not own the shard or is not degraded.
 func (c *Checker) Restore(holder, space string, shard int, term core.Term) {
-	if s, i := c.owning(holder, space, shard, term); s != nil {
+	if s, i := c.owning(shardKey{space, shard}, holder, term); s != nil {
 		s.owners[i].degraded = false
 	}
 }
@@ -121,25 +125,28 @@ func (c *Checker) Restore(holder, space string, shard int, term core.Term) {
 // fails no check, when the run does not own the shard: it was never started, it was stopped
 // before, holder went down, or holder's run of the shard is in another term.
 func (c *Checker) StopRun(holder, space string, shard int, term core.Term) {
-	s, i := c.owning(holder, space, shard, term)
+	key := shardKey{space, shard}
+	s, i := c.owning(key, holder, term)
 	if s == nil {
 		return
 	}
 	before := len(s.owners)
 	s.owners = slices.Delete(s.owners, i, i+1)
-	c.disown(s, before)
+	c.disown(s, key, before)
 }
 
 // Down reports that holder's node crashed or exited: from now on none of holder's runs owns a
-// shard. The deadline and the last reading of holder stay, for a node that comes back with the
-// same holder string. Down changes nothing for a holder that owns no shard.
+// shard, and the deadline holder reported is forgotten with the process that held it. A holder
+// that comes back under the same string has reported no deadline until its next Renewed. Its
+// last reading stays: the check monotonic is about the clock, which outlives the process.
 func (c *Checker) Down(holder string) {
+	delete(c.deadlines, holder)
 	// The order of the shards does not matter: each one changes on its own, every ownerless
 	// interval that starts here starts at the same time, and nothing is reported.
-	for _, s := range c.shards {
+	for key, s := range c.shards {
 		before := len(s.owners)
 		s.owners = slices.DeleteFunc(s.owners, func(o owner) bool { return o.holder == holder })
-		c.disown(s, before)
+		c.disown(s, key, before)
 	}
 }
 
@@ -193,17 +200,10 @@ func (c *Checker) ownerless(key shardKey, at, now kernel.Time) (gap, bool) {
 // checkG2 decides g2 over the owners of this moment and records the first violation. Err
 // documents the rule.
 func (c *Checker) checkG2() {
-	if c.shared == 0 {
-		return
-	}
-	keys := make([]shardKey, 0, c.shared)
-	for key, s := range c.shards {
-		if len(s.owners) >= 2 {
-			keys = append(keys, key)
-		}
-	}
-	slices.SortFunc(keys, compareShards) // the map's order must not choose the violation reported
-	for _, key := range keys {
+	// Only the shards with two or more runs are looked at, in their kept order: the cost of a
+	// call does not grow with the shards nobody contests, and no map's order chooses the
+	// violation reported.
+	for _, key := range c.contested {
 		owners := c.shards[key].owners
 		newest := owners[len(owners)-1]
 		for _, o := range owners[:len(owners)-1] {
