@@ -490,34 +490,33 @@ func TestDriverViews(t *testing.T) {
 	})
 }
 
-// TestDriverRecords checks the stepping of pushed and snapshot records: a record whose holder
-// and term differ from the last HolderChanged stepped for the shard is stepped, with its src;
-// one that does not is not; a Confirm's answer is stepped whatever it repeats; a record naming
-// this holder while an Acquire of the shard is in flight is left to the Acquire's reply.
+// TestDriverRecords checks the stepping of pushed and snapshot records: a record of a version
+// above the last one stepped for the shard is stepped, with its src; one at or below it is not;
+// a Confirm's answer may repeat it; a record naming this holder while an Acquire of the shard
+// is in flight is left to the Acquire's reply, and delivers nothing.
 func TestDriverRecords(t *testing.T) {
 	isolated(t, func(t testing.TB, fw *faultline.World, d *driver) {
-		rec := func(shard int, holder string, term core.Term) tenure.Holding {
-			return tenure.Holding{Space: "book", Shard: shard, Holder: holder, Term: term, Version: uint64(term)}
+		rec := func(shard int, holder string, term core.Term, version uint64) tenure.Holding {
+			return tenure.Holding{Space: "book", Shard: shard, Holder: holder, Term: term, Version: version}
 		}
-		d.record(rec(0, "m2/0b", 5), "", srcPush)
-		d.record(rec(0, "m2/0b", 5), "", srcSnapshot)
-		d.record(rec(1, "m2/0b", 5), "", srcSnapshot)
-		d.record(rec(0, "", 5), "", srcPush)
-		d.record(rec(0, "m2/0b", 5), "", srcPush) // a stale state, stepped until 1.8-08's versions
+		d.record(rec(0, "m2/0b", 5, 3), "", srcPush)
+		d.record(rec(0, "m2/0b", 5, 3), "", srcSnapshot)
+		d.record(rec(1, "m2/0b", 5, 4), "", srcSnapshot)
+		d.record(rec(0, "", 5, 6), "", srcPush)
+		d.record(rec(0, "m2/0b", 5, 3), "", srcPush) // a stale state
 		c := d.callFor(core.Confirm{Space: "book", Shard: 1, Term: 5})
 		c.req = withID(c.req, reqHead{ID: 1, Holder: d.holder})
-		d.answer(c, confirmedReply{replyHead{1}, rec(1, "m2/0b", 5)})
-		d.record(rec(1, "m2/0b", 5), "", srcPush)
+		d.answer(c, confirmedReply{replyHead{1}, rec(1, "m2/0b", 5, 4)})
+		d.record(rec(1, "m2/0b", 5, 4), "", srcPush)
 
 		d.execute(core.Acquire{Space: "book", Shard: 2})
-		d.record(rec(2, d.holder, 9), "", srcPush)
-		d.record(rec(2, "m2/0b", 9), "", srcPush)
+		d.record(rec(2, d.holder, 9, 8), "", srcPush)
+		d.record(rec(2, "m2/0b", 9, 7), "", srcPush)
 		got := inputsAfter(fw.Sim, d, kernel.Time(time.Second), "shard", "holder", "term", "src")
 		want := []string{
 			"HolderChanged shard=0 holder=m2/0b term=5 src=push",
 			"HolderChanged shard=1 holder=m2/0b term=5 src=snapshot",
 			"HolderChanged shard=0 term=5 src=push",
-			"HolderChanged shard=0 holder=m2/0b term=5 src=push",
 			"HolderChanged shard=1 holder=m2/0b term=5 src=confirm",
 			"HolderChanged shard=2 holder=m2/0b term=9 src=push",
 		}
