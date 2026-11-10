@@ -1,0 +1,40 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *' # 03:17 UTC, every day
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  simtest:
+    name: simtest (2000 explored seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GOWORK: 'off'
+      FAULTLINE_SEEDS: '2000'
+      FAULTLINE_EXPLORE: '1'
+    steps:
+      - name: seed settings
+        run: echo "FAULTLINE_SEEDS=$FAULTLINE_SEEDS FAULTLINE_EXPLORE=$FAULTLINE_EXPLORE"
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: simtest/go.mod
+          cache-dependency-path: simtest/go.sum
+      - name: simulations with new seeds
+        env:
+          FAULTLINE_ARTIFACTS: ${{ runner.temp }}/faultline
+        run: go -C simtest test -count=1 -timeout 350m ./...
+      - name: upload the artifacts of the failing seeds
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: faultline-nightly
+          path: ${{ runner.temp }}/faultline

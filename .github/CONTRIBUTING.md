@@ -51,6 +51,17 @@ GOWORK=off go -C <dir> test -race ./...               # simtest: add -short (ful
 (cd <dir> && GOWORK=off golangci-lint run ./...)
 ```
 
+`simtest` runs each simulation on many seeds, and a seed must replay the same run every time. So
+`simtest` has one more command, which runs every passing seed twice and fails if the two runs
+differ:
+
+```shell
+FAULTLINE_CHECK_DETERMINISM=1 GOWORK=off go -C simtest test -count=1 ./...
+```
+
+CI runs `simtest` with `-short` on every pull request, with the full seed counts on every push to
+`main`, and with 2000 new seeds for each simulation every night.
+
 Each nested module requires the root module, and any other module of this repository it uses,
 through a `replace` directive that points at that module's directory in your checkout. That is
 why `GOWORK=off` works: a nested module builds against your local changes without a `go.work`
