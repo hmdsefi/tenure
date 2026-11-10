@@ -126,7 +126,8 @@ func (a *Adapter) lockLease(ctx context.Context, name string) (unlock func(), er
 // that incarnation's session. A renewal moves the Lease's renewTime on with
 // one write. KeepAlive returns an error matching tenure.ErrSessionLost, without a request, for a
 // holder whose session ended in this Adapter or expired, LeaseDuration after its latest
-// successful renewal was sent; and when a renewal finds the Lease deleted, naming another
+// successful renewal was sent; when a renewal's response comes back at or after that expiry,
+// although the renewal was written; and when a renewal finds the Lease deleted, naming another
 // holder or no holder. Any other failed renewal leaves the session as it was. holder must be
 // <member ID>/<incarnation>, and the LeaseDuration of timing a whole number of seconds.
 func (a *Adapter) KeepAlive(ctx context.Context, holder string, timing core.Timing) error {
@@ -238,7 +239,9 @@ func (a *Adapter) decideOpen(cur *coordinationv1.Lease, holder string, timing co
 // latest state the Adapter knows. The caller holds the Lease's lock.
 //
 // No write is sent once s has expired, however long the lock, a conflict or its GET took: such
-// a write could renew a session that other Adapters may already have seen end. A renewal that
+// a write could renew a session that other Adapters may already have seen end. For the same
+// reason a renewal whose response comes back at or after the expiry ends the session: it may
+// have committed after another Adapter's confirming read found the session gone. A renewal that
 // fails may still have been written, with timing's duration: when that is shorter than the
 // session's, the session's expiry comes forward to match.
 func (a *Adapter) renew(ctx context.Context, s session, timing core.Timing) error {
@@ -267,6 +270,15 @@ func (a *Adapter) renew(ctx context.Context, s session, timing core.Timing) erro
 			a.signalFreshLocked()
 		}
 		return err
+	}
+	if s.expired(a.now()) {
+		// The write succeeded, but its response came back at or after the session's expiry: it
+		// may have committed after another Adapter's confirming GET saw the session gone and
+		// took a shard over, so the renewal cannot extend the session (K8S-220). Its Lease still
+		// names the holder, for CloseSession to clear.
+		p.lease = written
+		a.endSessionLocked(p)
+		return fmt.Errorf("k8s: session %s lost: renewal returned at or after its expiry: %w", s.holder, tenure.ErrSessionLost)
 	}
 	if timing.RenewDeadline != p.timing.RenewDeadline {
 		// Freshness takes the largest RenewDeadline of the active sessions (cache.go).

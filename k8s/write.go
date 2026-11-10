@@ -76,7 +76,7 @@ func (a *Adapter) writeLease(ctx context.Context, op, name string, cur *coordina
 			return nil, fmt.Errorf("k8s: %s %s: %w", op, name, err)
 		}
 		if attempt == maxWriteAttempts {
-			return nil, fmt.Errorf("k8s: lease %s: %d conflicts: %w", name, maxWriteAttempts, err)
+			return nil, &conflictsError{name: name, err: err}
 		}
 		if gone {
 			cur = nil
@@ -87,6 +87,19 @@ func (a *Adapter) writeLease(ctx context.Context, op, name string, cur *coordina
 		}
 	}
 }
+
+// conflictsError is writeLease's error when maxWriteAttempts writes failed because the Lease
+// changed: "k8s: lease <name>: 3 conflicts: <last error>".
+type conflictsError struct {
+	name string
+	err  error // the last write's error
+}
+
+func (e *conflictsError) Error() string {
+	return fmt.Sprintf("k8s: lease %s: %d conflicts: %v", e.name, maxWriteAttempts, e.err)
+}
+
+func (e *conflictsError) Unwrap() error { return e.err }
 
 // getLease reads Lease name from the API server: nil, with no error, when there is none.
 func (a *Adapter) getLease(ctx context.Context, name string) (*coordinationv1.Lease, error) {

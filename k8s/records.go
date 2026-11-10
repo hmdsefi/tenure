@@ -55,8 +55,10 @@ var _ tenure.Store = (*Adapter)(nil)
 // Timing as RetryAfter. Acquire needs an active session of holder in this Adapter, opened by
 // KeepAlive; otherwise it returns an error matching tenure.ErrSessionLost without a request. A
 // malformed term reads as 0 once its holder is gone. Acquire never writes a Lease that lacks the
-// group's shard labels. It runs at most as many record operations at once as
-// WithRecordConcurrency allows.
+// group's shard labels. When its write loses to another, it reads the Lease and decides again;
+// after three lost writes it returns "k8s: lease <name>: 3 conflicts: …", unless the record's
+// term has grown meanwhile, other holders having been granted the shard, in which case it goes
+// on while holder's session is active. It runs at most as many record operations at once as WithRecordConcurrency allows.
 func (a *Adapter) Acquire(ctx context.Context, holder, space string, shard int) (core.Term, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -87,25 +89,53 @@ func (a *Adapter) Acquire(ctx context.Context, holder, space string, shard int) 
 	}
 	var term core.Term
 	last := cur
-	written, err := a.writeLease(ctx, "acquire", name, cur, func(cur *coordinationv1.Lease) (change, error) {
-		if cur == nil && last != nil {
-			// The record decided on before is gone, deleted before the informer told: its term
-			// is the term of a deleted shard Lease all the same.
-			if t, ok := decodeTerm(last.Annotations); ok && t > 0 {
-				a.terms.note(name, t)
+	for {
+		start := recordTerm(cur)
+		written, err := a.writeLease(ctx, "acquire", name, cur, func(cur *coordinationv1.Lease) (change, error) {
+			if cur == nil && last != nil {
+				// The record decided on before is gone, deleted before the informer told: its
+				// term is the term of a deleted shard Lease all the same.
+				if t, ok := decodeTerm(last.Annotations); ok && t > 0 {
+					a.terms.note(name, t)
+				}
 			}
+			last = cur
+			var ch change
+			var err error
+			ch, term, err = a.decideAcquire(ctx, s, space, name, cur)
+			return ch, err
+		})
+		var conflicts *conflictsError
+		if errors.As(err, &conflicts) && recordTerm(last) > start {
+			// The writes lost to grants of the shard to other holders, which were gone again
+			// each time this call read the record: the shard moves on, so the call tries again
+			// from the record as it is now, since the last write lost to a state it has not
+			// read. Only conflicts that leave the term as it is, such as renewals or foreign
+			// writes, use the attempts up. The session may have ended or expired over the
+			// attempts: a grant needs it active, as at the start.
+			if s, err = a.activeSession(holder); err != nil {
+				return 0, err
+			}
+			if cur, err = a.getLease(ctx, name); err != nil {
+				return 0, fmt.Errorf("k8s: acquire %s: %w", name, err)
+			}
+			continue
 		}
-		last = cur
-		var ch change
-		var err error
-		ch, term, err = a.decideAcquire(ctx, s, space, name, cur)
-		return ch, err
-	})
-	if err != nil {
-		return 0, err
+		if err != nil {
+			return 0, err
+		}
+		a.noteRead(written)
+		return term, nil
 	}
-	a.noteRead(written)
-	return term, nil
+}
+
+// recordTerm returns the term of shard record l: 0 when there is none, or a malformed one.
+func recordTerm(l *coordinationv1.Lease) core.Term {
+	if l == nil {
+		return 0
+	}
+	t, _ := decodeTerm(l.Annotations)
+	return t
 }
 
 // checkRecordArgs checks the arguments holder, space and shard of method (K8S-030) and returns
