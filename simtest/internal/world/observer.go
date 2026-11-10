@@ -23,10 +23,20 @@ import (
 // Observations. A driver keeps, per holder, the latest session version it saw and its own
 // reading when it first saw that version (firstSeen), from the sessions of every view push and
 // snapshot and from every getSession answer. A version below the one kept is an older message
-// and changes nothing. A holder is observed expired when the store said its session has ended
-// (a getSession answer), or when firstSeen is LeaseDuration of the member's monotonic clock in
-// the past: the LeaseDuration of the holder's session as the store reported it, else the
-// driver's own. The driver never observes its own holder: its machine knows its own session.
+// and changes nothing but an ended flag. A holder is observed expired when the store said its
+// session has ended (a getSession answer), or when firstSeen is LeaseDuration of the member's
+// monotonic clock in the past: the LeaseDuration of the holder's session as the store reported
+// it with the version kept, else the driver's own. The driver never judges its own holder: its
+// machine knows its own session.
+//
+// firstSeen is never earlier than the store's write of the version, so an observation errs only
+// towards waiting longer: a late or lost push, a pause, or a new incarnation's empty table
+// (a holder first seen then counts from then) delays a takeover and never hastens it. A driver
+// that hears nothing from the store counts the silence as the holder's, as the Kubernetes
+// adapter's Acquire does; what keeps that safe is the fresh getSession before the cas, which
+// shows any renewal the driver missed. Unlike that adapter, the views are not frozen while the
+// driver hears nothing: a cut-off driver drops the other members from its view, which changes
+// what it wants, never what it may take.
 //
 // Observer views (SIM-330). The view a driver steps is the store's latest view, minus every
 // member all of whose observed holders are observed expired, with every slot whose holder is
@@ -46,7 +56,8 @@ import (
 // record version read, the member's wall reading and the unseen time: how long the driver had
 // seen the version, 0 for no holder or its own. A granted answer steps Acquired; a stale one
 // steps AcquireFailed naming the holder of the record as the store has it now (Acquired with
-// no term when that is this driver's holder, a grant whose reply came late); a lost one
+// no term when the record names no holder, or this driver's, a grant whose reply came late,
+// and reaches the machine through the record filter); a lost one
 // steps Acquired with no term and SessionFailed{CauseLost}, as under the Server rule. One
 // RetryPeriod timeout, from the first request, covers the call: its timeout steps Acquired
 // with no term once, and any reply after it is late.
@@ -122,6 +133,12 @@ func (o *observer) note(s sessionInfo, now time.Duration) *observation {
 		o.table = slices.Insert(o.table, i, observation{holder: s.Holder, version: s.Version, firstSeen: now})
 	}
 	e := &o.table[i]
+	if s.Version < e.version {
+		// An older message: its lease may be of a timing the holder has since renewed away
+		// from, and a shorter one would make the version kept expire early.
+		e.ended = e.ended || s.Ended
+		return e
+	}
 	if s.Version > e.version {
 		e.version, e.firstSeen = s.Version, now
 	}
@@ -498,8 +515,8 @@ func (d *driver) sendNext(c *call, req request) {
 
 // takeAnswer steps how the takeover t, the call c, ended with the reply rep: the inputs t
 // decided; for a stale answer, the record it carries through the filter, then AcquireFailed
-// naming that record's holder (Acquired with no term when it is this driver's) or, for a slot,
-// nothing; for any other reply, what the reply means (answer).
+// naming that record's holder (Acquired with no term when it names none or this driver's)
+// or, for a slot, nothing; for any other reply, what the reply means (answer).
 func (d *driver) takeAnswer(c *call, t *takeover, rep reply) {
 	if t.final {
 		for _, in := range t.decided {
@@ -518,7 +535,10 @@ func (d *driver) takeAnswer(c *call, t *takeover, rep reply) {
 	rec := r.Record
 	rec.Space, rec.Shard = t.space, t.shard
 	d.observe(recReading{rec: rec, src: srcReply, text: r.Describe(), call: c})
-	if rec.Holder == d.holder {
+	if rec.Holder == "" || rec.Holder == d.holder {
+		// No other holder has the shard: a release cleared it, or an earlier grant of this
+		// driver whose reply came late wrote it. Neither is AcquireFailed's "another holder
+		// has the shard"; the machine tries again after RetryPeriod.
 		d.step(core.Acquired{Space: t.space, Shard: t.shard}, r.Describe(), "")
 		return
 	}
