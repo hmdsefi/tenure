@@ -371,6 +371,20 @@ func (m *storeModel) handle(now time.Duration, wall time.Time, req request) repl
 		panic(fmt.Sprintf("world: store model: unknown request %T", req))
 	}
 	m.refreshView()
+	return m.stampView(rep)
+}
+
+// stampView returns rep with the version of the latest view, for a reply to a slot request:
+// the driver discards a view read before it (MCH O8).
+func (m *storeModel) stampView(rep reply) reply {
+	switch r := rep.(type) {
+	case slotClaimedReply:
+		r.View = m.view.Version
+		return r
+	case slotReleasedReply:
+		r.View = m.view.Version
+		return r
+	}
 	return rep
 }
 
@@ -587,7 +601,7 @@ func (m *storeModel) claimSlot(now time.Duration, r claimSlotReq) reply {
 		if slot < m.slotCount {
 			result.Slot, result.Result = slot, slotKept
 			m.emit(result)
-			return slotClaimedReply{replyHead{r.ID}, slot}
+			return slotClaimedReply{replyHead: replyHead{r.ID}, Slot: slot}
 		}
 		result.Result = slotRetired
 	}
@@ -600,7 +614,7 @@ func (m *storeModel) claimSlot(now time.Duration, r claimSlotReq) reply {
 			m.writeSlot(slot, r.Holder)
 			result.Slot, result.Result = slot, slotClaimed
 			m.emit(result)
-			return slotClaimedReply{replyHead{r.ID}, slot}
+			return slotClaimedReply{replyHead: replyHead{r.ID}, Slot: slot}
 		}
 	}
 	m.emit(result)
@@ -697,7 +711,7 @@ func (m *storeModel) casSlot(now time.Duration, r casSlotReq) reply {
 	m.emit(seen)
 	m.writeSlot(r.Slot, r.Holder)
 	m.emit(slotEffect{Op: slotClaim, Holder: r.Holder, Slot: r.Slot, Count: m.slotCount, Result: slotClaimed})
-	return slotClaimedReply{replyHead{r.ID}, r.Slot}
+	return slotClaimedReply{replyHead: replyHead{r.ID}, Slot: r.Slot}
 }
 
 // tick moves the store's time to now when now is later: a reading smaller than an earlier one

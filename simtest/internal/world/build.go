@@ -131,6 +131,9 @@ type World struct {
 	// Everything the driver schedules on the member's node dies with the node, and the
 	// member's mono timers are dropped then.
 	startMember func(m *Member)
+
+	// drivers holds the drivers of the members' incarnations (driver.go).
+	drivers *drivers
 }
 
 // Build builds the world of sc in w, the world of one run, and returns it. It must be called
@@ -186,13 +189,14 @@ func Build(w *faultline.World, sc Scenario) *World {
 }
 
 // installHooks gives the nodes their behaviour: the store and the fence serve their models
-// (store.go, fence.go), and an active member's boot only draws its holder and emits
-// tenure.boot. The driver sets startMember here.
+// (store.go, fence.go), and each incarnation of an active member runs a driver (driver.go).
 func (w *World) installHooks() {
 	w.storeSrv = newStoreServer(w)
 	w.bootStore = w.storeSrv.boot
 	w.fenceSrv = newFenceServer(w)
 	w.bootFence = w.fenceSrv.boot
+	w.drivers = newDrivers(w)
+	w.startMember = w.drivers.start
 }
 
 // Bound returns the scenario's bound, as ComputeBound gives it: the longest time a shard may
