@@ -375,6 +375,9 @@ func (r holdingsReply) Describe() string {
 type slotClaimedReply struct {
 	replyHead
 	Slot int
+	// View is the version of the store's view after the request: a view of a lower version was
+	// read before it. Describe leaves it out; the tenure.view records hold the versions.
+	View uint64
 }
 
 // Describe returns, for example, "slotClaimed#13 slot=2".
@@ -398,6 +401,8 @@ type slotReleasedReply struct {
 	Slot int
 	// Cleared reports that the request cleared the slot's holder.
 	Cleared bool
+	// View is as in slotClaimedReply.
+	View uint64
 }
 
 // Describe returns, for example, "slotReleased#14 slot=2 cleared", and the same without
