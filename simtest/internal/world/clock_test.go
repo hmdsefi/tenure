@@ -125,6 +125,19 @@ func TestATSIM05Clocks(t *testing.T) {
 				byNodeAndTime := func(a, b step) int {
 					return cmp.Or(cmp.Compare(a.node, b.node), cmp.Compare(a.at, b.at))
 				}
+				perNode := map[kernel.NodeID]int{}
+				for _, s := range got {
+					perNode[s.node]++
+				}
+				steps := 0
+				if sc.WallSteps > 0 {
+					steps = 3
+				}
+				for _, m := range w.Members() {
+					if n := perNode[m.Node.ID()]; n != steps {
+						t.Errorf("%s: %d wall steps, want 3 with WallSteps, else none", m.Name, n)
+					}
+				}
 				slices.SortStableFunc(got, byNodeAndTime)
 				slices.SortStableFunc(want, byNodeAndTime)
 				if !slices.Equal(got, want) {
@@ -249,6 +262,132 @@ func TestMonoTimers(t *testing.T) {
 	}
 	if err := s.Err(); err != nil {
 		t.Errorf("the run failed: %v", err)
+	}
+}
+
+// TestMonoTimerEdges checks the timer API around a firing and the work of the look: inside its
+// callback a timer is no longer pending and cannot be cancelled, and the callback may cancel
+// another timer and set a new one; a look re-arms nothing while no drift changes, and re-arms
+// a node's timers in the order they were set; a timer that came due on a paused node and was
+// re-armed by a drift change fires once, at the resume.
+func TestMonoTimerEdges(t *testing.T) {
+	s, nodes, c := rawSim(t, 100_000)
+	n := nodes[1]
+	s.RunFor(time.Second)
+	var order []string
+	note := func(name string) func() { return func() { order = append(order, name) } }
+
+	var x, y *monoTimer
+	x = c.set(n, Mono(n)+time.Second, "test/x", func() {
+		order = append(order, "x")
+		if x.pending() || x.cancel() {
+			t.Errorf("inside its callback, the timer is still pending")
+		}
+		if !y.cancel() {
+			t.Errorf("a callback could not cancel a pending timer")
+		}
+		c.set(n, Mono(n)+time.Millisecond, "test/z", note("z"))
+	})
+	y = c.set(n, Mono(n)+time.Second+time.Millisecond/2, "test/y", note("y"))
+	s.RunFor(2 * time.Second)
+	if want := []string{"x", "z"}; !slices.Equal(order, want) {
+		t.Errorf("fired %v, want %v", order, want)
+	}
+
+	// No drift change: the kernel events of the timers stay as they were set.
+	order = nil
+	a := c.set(n, Mono(n)+2*time.Second, "test/a", note("a"))
+	b := c.set(n, Mono(n)+time.Second, "test/b", note("b"))
+	ea, eb := a.event, b.event
+	s.At(s.Now().Add(100*time.Millisecond), "test/other", func() {})
+	s.RunFor(200 * time.Millisecond)
+	if a.event != ea || b.event != eb {
+		t.Errorf("a look without a drift change re-armed the timers")
+	}
+	// A drift change re-arms them in the order they were set, not by their readings.
+	s.At(s.Now().Add(100*time.Millisecond), "test/drift", func() { n.SetDrift(300_000) })
+	s.RunFor(200 * time.Millisecond)
+	if a.event == ea || b.event == eb || a.event > b.event {
+		t.Errorf("after a drift change: events %d and %d, were %d and %d; want new ones in the order set", a.event, b.event, ea, eb)
+	}
+	s.RunFor(3 * time.Second)
+	if want := []string{"b", "a"}; !slices.Equal(order, want) {
+		t.Errorf("fired %v, want %v", order, want)
+	}
+
+	// A paused node: the timer comes due and waits; a drift change re-arms it; it fires once.
+	order = nil
+	due := Mono(n) + 200*time.Millisecond
+	var fired time.Duration
+	c.set(n, due, "test/paused", func() { order = append(order, "paused"); fired = Mono(n) })
+	start := s.Now()
+	s.At(start.Add(100*time.Millisecond), "test/pause", n.Pause)
+	s.At(start.Add(time.Second), "test/drift", func() { n.SetDrift(-100_000) })
+	s.At(start.Add(2*time.Second), "test/resume", n.Resume)
+	s.RunFor(3 * time.Second)
+	if want := []string{"paused"}; !slices.Equal(order, want) || fired < due {
+		t.Errorf("a re-armed timer of a paused node fired %v at %v, want once at its resume, after %v", order, fired, due)
+	}
+	if err := s.Err(); err != nil {
+		t.Errorf("the run failed: %v", err)
+	}
+}
+
+// TestLookNoFalseJump checks that the jump check of the look allows the kernel's rounding:
+// drifts that change at random times, inside events and between them, never fail the run.
+func TestLookNoFalseJump(t *testing.T) {
+	r := rand.New(rand.NewPCG(7, 8)) //nolint:gosec // a test's fixed stream
+
+	drift := func() int32 { return int32(r.Int64N(1_000_001)) - 500_000 } //nolint:gosec // in range
+	wait := func() time.Duration { return time.Duration(r.Int64N(int64(time.Second))) + 1 }
+	for i := range 300 {
+		s := kernel.New(kernel.Config{Seed: uint64(i)}) //nolint:gosec // i is small
+		n := s.AddNode("n", func(*kernel.Node) {}, kernel.WithClock(0, drift()))
+		newClocks(s).track()
+		for range 5 {
+			// An event at a random time, and a drift change in an event of its own.
+			a, b := wait(), wait()
+			s.At(s.Now().Add(a), "test/event", func() {})
+			ppm, same := drift(), r.IntN(2) == 0
+			s.At(s.Now().Add(b), "test/drift", func() {
+				if same {
+					ppm = n.Drift()
+				}
+				n.SetDrift(ppm)
+			})
+			s.RunFor(max(a, b) + wait())
+			// A change between two events, a while after the last one and before the next.
+			s.RunFor(wait())
+			ppm = drift()
+			if r.IntN(2) == 0 {
+				ppm = n.Drift() // the same drift again, which still restarts the kernel's count
+			}
+			n.SetDrift(ppm)
+			c := wait()
+			s.At(s.Now().Add(c), "test/event", func() {})
+			s.RunFor(c + wait())
+		}
+		if err := s.Err(); err != nil {
+			t.Fatalf("run %d failed: %v", i, err)
+		}
+	}
+}
+
+// TestWholeSeconds checks the rounding of the default quiet window.
+func TestWholeSeconds(t *testing.T) {
+	for d, want := range map[time.Duration]time.Duration{
+		1:                               time.Second,
+		time.Second:                     time.Second,
+		time.Second + 1:                 2 * time.Second,
+		21_045_000_000:                  22 * time.Second,
+		21 * time.Second:                21 * time.Second,
+		math.MaxInt64 - time.Second:     9_223_372_036 * time.Second,
+		math.MaxInt64 - time.Second + 1: math.MaxInt64 - time.Second + 1,
+		math.MaxInt64:                   math.MaxInt64,
+	} {
+		if got := wholeSeconds(d); got != want {
+			t.Errorf("wholeSeconds(%d) = %d, want %d", d, got, want)
+		}
 	}
 }
 

@@ -97,9 +97,10 @@ func (c *clocks) of(n *kernel.Node) *nodeClock {
 //
 // The kernel counts a drifting clock in whole nanoseconds from the last change of the drift,
 // which a look cannot see when the new drift equals the old one: a reading may be a nanosecond
-// ahead of what the last look predicts. When the drift changed since the last look, the change
-// happened somewhere in between, and the reading lies between what the old drift and the new
-// one predict, give or take the rounding. Jumps of those few nanoseconds pass.
+// ahead of what the last look predicts, and, after a change to the same drift between two
+// events, a nanosecond behind. When the drift changed since the last look, the change happened
+// somewhere in between, and the reading lies between what the old drift and the new one
+// predict, give or take the rounding. Jumps of those few nanoseconds pass.
 func (c *clocks) look() {
 	if c.off {
 		return
@@ -109,11 +110,11 @@ func (c *clocks) look() {
 	for _, nc := range c.nodes {
 		elapsed := now.Sub(nc.at)
 		reading, ppm := nc.node.LocalTime(), nc.node.Drift()
-		lo := nc.reading.Add(elapsed + gain(elapsed, nc.ppm))
-		hi := lo + 1
+		want := nc.reading.Add(elapsed + gain(elapsed, nc.ppm))
+		lo, hi := want-1, want+1
 		if ppm != nc.ppm {
 			other := nc.reading.Add(elapsed + gain(elapsed, ppm))
-			lo, hi = min(lo, other)-1, max(lo, other)+2
+			lo, hi = min(want, other)-1, max(want, other)+2
 		}
 		if reading < lo || reading > hi {
 			c.sim.Fail(errors.New(clockJumpText))

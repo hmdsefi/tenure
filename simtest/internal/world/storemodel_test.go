@@ -1350,3 +1350,127 @@ func TestStoreModelUnknownRequest(t *testing.T) {
 	}()
 	newStoreModel(Server, 0, 0).handle(0, time.Time{}, bogusReq{})
 }
+
+// TestStoreModelObserverConfirmTerm checks that under the observer rule a confirm writes only
+// at the term the record holds: the holder's confirm of an earlier term, after it took the
+// shard again, reads.
+func TestStoreModelObserverConfirmTerm(t *testing.T) {
+	m := newStoreModel(Observer, 0, 0)
+	runSteps(t, m, []modelStep{
+		{
+			clause: "open m1/a", req: reqKeepAlive(holderA, core.DefaultTiming),
+			reply: "renewed version=1 opened",
+			effects: []string{
+				"session open m1/a version=1",
+				"view version=1 members=m1 slots=0 sessions=m1/a:1",
+			},
+		},
+		{
+			clause: "take book/0", req: reqCas(holderA, "book", 0, 0, 1000, 0),
+			reply: "granted book/0 holder=m1/a term=1000 version=1",
+			effects: []string{
+				"observe cas m1/a book/0 holder=- term=0 version=0 expect=0 ok",
+				"grant book/0 holder=m1/a term=1000 version=1 prev=- ended=false unseen=0.000000000s lease=0.000000000s",
+				"record book/0 holder=m1/a term=1000 version=1",
+			},
+		},
+		{
+			clause: "take it again", req: reqCas(holderA, "book", 0, 1, 2000, 0),
+			reply: "granted book/0 holder=m1/a term=2000 version=2",
+			effects: []string{
+				"observe cas m1/a book/0 holder=m1/a term=1000 version=1 expect=1 ok",
+				"grant book/0 holder=m1/a term=2000 version=2 prev=m1/a ended=false unseen=0.000000000s lease=15.000000000s",
+				"record book/0 holder=m1/a term=2000 version=2",
+			},
+		},
+		{
+			clause: "a confirm of the earlier term reads", req: reqConfirm(holderA, "book", 0, 1000),
+			reply:   "confirmed book/0 holder=m1/a term=2000 version=2",
+			effects: []string{"confirm m1/a term=1000 book/0 holder=m1/a term=2000 version=2 read"},
+		},
+		{
+			clause: "a confirm of the record's term writes", req: reqConfirm(holderA, "book", 0, 2000),
+			reply: "confirmed book/0 holder=m1/a term=2000 version=3",
+			effects: []string{
+				"confirm m1/a term=2000 book/0 holder=m1/a term=2000 version=3 wrote",
+				"record book/0 holder=m1/a term=2000 version=3",
+			},
+		},
+	})
+}
+
+// TestStoreModelEndTie checks that a session whose expiry and EndAfter end fall on one reading
+// ends as expired under the server rule, whose clock judges it, and as end_after under the
+// observer rule, whose clock does not.
+func TestStoreModelEndTie(t *testing.T) {
+	for _, c := range []struct {
+		rule  Takeover
+		cause string
+	}{{Server, "expired"}, {Observer, "end_after"}} {
+		t.Run(c.rule.String(), func(t *testing.T) {
+			m := newStoreModel(c.rule, 0, 15*time.Second)
+			runSteps(t, m, []modelStep{
+				{
+					clause: "open", req: reqKeepAlive(holderA, core.DefaultTiming),
+					reply: "renewed version=1 opened",
+					effects: []string{
+						"session open m1/a version=1",
+						"view version=1 members=m1 slots=0 sessions=m1/a:1",
+					},
+					check: wantNextEnd(15 * time.Second),
+				},
+				{
+					clause: "the end", at: 15 * time.Second,
+					effects: []string{
+						"session end m1/a version=1 " + c.cause,
+						"view version=2 members= slots=0 sessions=",
+					},
+					check: wantNextEnd(-1),
+				},
+			})
+		})
+	}
+}
+
+// TestStoreModelObserverTwoSlots checks the view of a holder with two slots, which casSlot
+// allows: the member's Slot is the lowest, and releasing the other slot changes the slot
+// holders only, which is a new view all the same.
+func TestStoreModelObserverTwoSlots(t *testing.T) {
+	m := newStoreModel(Observer, 2, 0)
+	runSteps(t, m, []modelStep{
+		{
+			clause: "open m1/a", req: reqKeepAlive(holderA, core.DefaultTiming),
+			reply: "renewed version=1 opened",
+			effects: []string{
+				"session open m1/a version=1",
+				"view version=1 members=m1 slots=2:, sessions=m1/a:1",
+			},
+		},
+		{
+			clause: "take slot 1", req: reqCasSlot(holderA, 1, 0, 0),
+			reply: "slotClaimed slot=1",
+			effects: []string{
+				"observe cas m1/a slot=1 holder=- version=0 count=2 expect=0 ok",
+				"slot claim m1/a slot=1 count=2 claimed",
+				"view version=2 members=m1@1 slots=2:,m1/a sessions=m1/a:1",
+			},
+		},
+		{
+			clause: "take slot 0 too", req: reqCasSlot(holderA, 0, 0, 0),
+			reply: "slotClaimed slot=0",
+			effects: []string{
+				"observe cas m1/a slot=0 holder=- version=0 count=2 expect=0 ok",
+				"slot claim m1/a slot=0 count=2 claimed",
+				"view version=3 members=m1@0 slots=2:m1/a,m1/a sessions=m1/a:1",
+			},
+		},
+		{
+			clause: "release slot 1", req: reqReleaseSlot(holderA, 1),
+			reply: "slotReleased slot=1 cleared",
+			effects: []string{
+				"slot release m1/a slot=1 count=2 cleared",
+				"view version=4 members=m1@0 slots=2:m1/a, sessions=m1/a:1",
+			},
+		},
+	})
+}
