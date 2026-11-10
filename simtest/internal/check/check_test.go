@@ -68,7 +68,8 @@ func owns(term core.Term, holder string) step {
 	}
 }
 
-// newChecker returns a Checker whose global time stays 0: no check of this file reads it.
+// newChecker returns a Checker whose global time stays 0 and that does not assert g2: no check
+// this file tests depends on the time.
 func newChecker() *check.Checker {
 	return check.New(check.Config{Now: func() kernel.Time { return 0 }})
 }
@@ -434,11 +435,11 @@ func TestErrKeepsTheFirstViolation(t *testing.T) {
 	}
 }
 
-// TestErrNames checks the names Err takes: the four checks decided so far, g2, which is always
-// nil for now, and a panic for any other name.
+// TestErrNames checks the names Err takes: the four checks decided as observations arrive, g2,
+// which is nil for a Checker that does not assert it, and a panic for any other name.
 func TestErrNames(t *testing.T) {
 	c := newChecker()
-	// One violation of every decided check: g2 stays nil.
+	// One violation of every check decided as observations arrive: g2 stays nil.
 	grant(7, hA)(c)
 	grant(5, hB)(c)
 	accepted(9, hC)(c)
