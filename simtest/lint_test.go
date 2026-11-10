@@ -10,6 +10,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -191,6 +192,22 @@ func lintFile(f *ast.File, name string, line func(token.Pos) int) []finding {
 	return found
 }
 
+// unmatched returns the wanted findings that were not found and the found ones that were not
+// wanted, each in the order of its list.
+func unmatched(found, wanted []finding) (missing, extra []finding) {
+	for _, f := range wanted {
+		if !slices.Contains(found, f) {
+			missing = append(missing, f)
+		}
+	}
+	for _, f := range found {
+		if !slices.Contains(wanted, f) {
+			extra = append(extra, f)
+		}
+	}
+	return missing, extra
+}
+
 // TestATSIM03HarnessRules checks that the packages of the harness break no harness rule, and
 // that the rules find every line planted in the fixture and nothing else there.
 func TestATSIM03HarnessRules(t *testing.T) {
@@ -214,15 +231,12 @@ func TestATSIM03HarnessRules(t *testing.T) {
 	if files == 0 {
 		t.Fatalf("%s: no Go file to check", lintFixture)
 	}
-	for _, f := range wanted {
-		if !slices.Contains(found, f) {
-			t.Errorf("planted and not found: %v", f)
-		}
+	missing, extra := unmatched(found, wanted)
+	for _, f := range missing {
+		t.Errorf("planted and not found: %v", f)
 	}
-	for _, f := range found {
-		if !slices.Contains(wanted, f) {
-			t.Errorf("found and not planted: %v", f)
-		}
+	for _, f := range extra {
+		t.Errorf("found and not planted: %v", f)
 	}
 
 	// The fixture plants every rule: each forbidden import and function by name, and for
@@ -244,6 +258,100 @@ func TestATSIM03HarnessRules(t *testing.T) {
 	}
 	if !slices.ContainsFunc(wanted, func(f finding) bool { return strings.HasPrefix(f.rule, ruleRand) }) {
 		t.Errorf("%s plants no %q", lintFixture, ruleRand+"<function>")
+	}
+}
+
+// TestHarnessLintTree checks which files of a tree the rules read: every Go file that is not a
+// test, in the directory and below it, outside testdata. A directory that is missing or a file
+// that does not parse is an error, and a directory without such a file counts none, which
+// TestATSIM03HarnessRules fails on: a package that moved is never passed unread.
+func TestHarnessLintTree(t *testing.T) {
+	const (
+		imports = "package p\n\nimport \"sync\"\n\nvar mu sync.Mutex\n"
+		spawns  = "package p\n\nfunc f() {\n\tgo f()\n}\n"
+	)
+	write := func(dir, name, src string) {
+		t.Helper()
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dir := t.TempDir()
+	write(dir, "a.go", imports)
+	write(dir, "a_test.go", imports)
+	write(dir, "notes.txt", imports)
+	write(dir, "sub/c.go", spawns)
+	write(dir, "sub/deep/d.go", spawns)
+	write(dir, "sub/testdata/e.go", spawns)
+	write(dir, "testdata/b.go", imports)
+	found, wanted, files, err := lintTree(dir)
+	if err != nil {
+		t.Fatalf("lintTree: %v", err)
+	}
+	var got []string
+	for _, f := range found {
+		rel, ok := strings.CutPrefix(f.file, filepath.ToSlash(dir)+"/")
+		if !ok {
+			t.Errorf("finding %v is not below %s", f, dir)
+		}
+		got = append(got, finding{file: rel, line: f.line, rule: f.rule}.String())
+	}
+	want := []string{"a.go:3: import of sync", "sub/c.go:4: go statement", "sub/deep/d.go:4: go statement"}
+	if !slices.Equal(got, want) {
+		t.Errorf("lintTree found %q, want %q", got, want)
+	}
+	if files != 3 || len(wanted) != 0 {
+		t.Errorf("lintTree read %d files and %d markers, want 3 and 0", files, len(wanted))
+	}
+
+	if _, _, _, err := lintTree(filepath.Join(dir, "missing")); err == nil {
+		t.Error("lintTree of a missing directory returned no error")
+	}
+
+	empty := t.TempDir()
+	write(empty, "only_test.go", imports)
+	write(empty, "testdata/b.go", imports)
+	if found, _, files, err := lintTree(empty); err != nil || files != 0 || len(found) != 0 {
+		t.Errorf("lintTree of a directory with no file to read = %v, %d files, error %v; want nothing", found, files, err)
+	}
+
+	broken := t.TempDir()
+	write(broken, "sub/x.go", "package p\n\nfunc {\n")
+	if _, _, _, err := lintTree(broken); err == nil {
+		t.Error("lintTree of a file that does not parse returned no error")
+	}
+}
+
+// TestHarnessUnmatched checks how the fixture's findings are compared with its markers: a
+// finding matches a marker only by file, line and rule together.
+func TestHarnessUnmatched(t *testing.T) {
+	at := func(file string, line int, rule string) finding { return finding{file: file, line: line, rule: rule} }
+	found := []finding{
+		at("a.go", 3, ruleGo),
+		at("a.go", 5, ruleTime+"Now"),    // marked on another line
+		at("b.go", 7, ruleImport+"sync"), // marked in another file
+		at("b.go", 9, ruleRand+"IntN"),   // marked with another rule
+	}
+	wanted := []finding{
+		at("a.go", 3, ruleGo),
+		at("a.go", 6, ruleTime+"Now"),
+		at("c.go", 7, ruleImport+"sync"),
+		at("b.go", 9, ruleRand+"Int"),
+	}
+	missing, extra := unmatched(found, wanted)
+	if !slices.Equal(missing, wanted[1:]) {
+		t.Errorf("missing = %v, want %v", missing, wanted[1:])
+	}
+	if !slices.Equal(extra, found[1:]) {
+		t.Errorf("extra = %v, want %v", extra, found[1:])
+	}
+	if missing, extra := unmatched(found, found); missing != nil || extra != nil {
+		t.Errorf("unmatched(found, found) = %v, %v; want nothing", missing, extra)
 	}
 }
 
