@@ -24,9 +24,10 @@ type injectStep struct {
 	do func(t testing.TB, d *driver)
 }
 
-// injected runs sc, which has one member, with the member's node cut off from every other
-// node, so that only what the steps hand the driver reaches it, for the duration d (the run itself lasts 30 s, which the bound needs). The
-// requests the driver sends are lost; the steps answer them with replyTo.
+// injected runs sc, which has one member, for the duration d, with the member's node cut off
+// from every other node, so that only what the steps hand the driver reaches it (the run itself
+// lasts 30 s, which the bound needs). The requests the driver sends are lost; the steps answer
+// them with replyTo.
 func injected(t *testing.T, sc Scenario, d time.Duration, steps ...injectStep) {
 	t.Helper()
 	runWorld(t, fullTrace(30*time.Second), sc, func(fw *faultline.World, w *World) {
@@ -117,7 +118,7 @@ func holderChanges(sim *kernel.Sim, d *driver) []string {
 }
 
 // TestATSIM44Versions checks AT-SIM-44 with injected replies, in one member's world of a
-// fenced space of four shards, granted at terms 5 to 8 with versions 3 to 6. The runs were
+// fenced space of five shards, granted at terms 5 to 9 with versions 3 to 7. The runs were
 // written for this task from the issue, MCH O4 and O5 and the design note, since the original
 // acceptance-test text is lost:
 //
@@ -125,52 +126,59 @@ func holderChanges(sim *kernel.Sim, d *driver) []string {
 //     stepped; a newer record naming another holder is stepped as a loss; an older version
 //     after it is not stepped; an equal version is not stepped from a snapshot but is from a
 //     Confirm's answer; a newer version is stepped from a holdings answer, and the same version
-//     from a later snapshot is not.
+//     from a later snapshot is not, nor an older one from a Confirm's answer.
 //   - O5 (shard 0, degraded): after the renewal that sends the Confirm, a push of a newer
 //     own-term record, a holdings answer read after the Confirm went out and the answer of a
 //     Confirm that a later Confirm action follows are all not stepped; the answer of the latest
-//     Confirm is stepped and restores.
+//     Confirm is stepped and restores; once owned again, a newer own-term push is stepped.
 //   - O5 (shard 2, degraded): the latest Confirm's answer that repeats the delivered version,
 //     as under the Server rule, is stepped and restores.
-//   - Shard 3, degraded: a record naming another holder is stepped as a loss.
+//   - Shard 3, degraded: a record naming another holder is stepped as a loss, and a holdings
+//     answer that repeats its version is not stepped.
+//   - Shard 4, degraded: a record naming this holder at a larger term is stepped as a loss.
 func TestATSIM44Versions(t *testing.T) {
-	sc := Scenario{Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 4, Fenced: true}}}
+	sc := Scenario{Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 5, Fenced: true}}}
 	var got, actions []string
 	var owned0, owned2 bool
 	injected(t, sc, 12*time.Second,
 		injectStep{time.Second, func(t testing.TB, d *driver) {
 			renew(t, d)
 			d.view(soloView(1), "", srcPush)
-			for i := range 4 {
+			for i := range 5 {
 				grant(t, d, book(i, d.holder, core.Term(5+i), uint64(3+i)))
 			}
 			d.record(book(1, d.holder, 6, 4), "", srcPush)
 			d.record(book(1, "m2/0b", 9, 10), "", srcPush)
-			d.record(book(1, "m3/0c", 8, 7), "", srcPush)
+			d.record(book(1, "m3/0c", 8, 8), "", srcPush)
 			d.record(book(1, "m2/0b", 9, 10), "", srcSnapshot)
 			c := d.callFor(core.Confirm{Space: "book", Shard: 1, Term: 6})
 			c.req = withID(c.req, reqHead{ID: 1, Holder: d.holder})
 			d.answer(c, confirmedReply{replyHead{1}, book(1, "m2/0b", 9, 10)})
 		}},
 		injectStep{11 * time.Second, func(t testing.TB, d *driver) {
-			for _, i := range []int{0, 2, 3} {
+			for _, i := range []int{0, 2, 3, 4} {
 				if s := shardState(t, d, i); s != core.ShardStateDegraded {
 					t.Fatalf("book/%d is %v at 11 s, want degraded", i, s)
 				}
 			}
 			d.record(book(3, "m2/0b", 9, 20), "", srcPush)
+			d.record(book(4, d.holder, 12, 21), "", srcPush)
 			renew(t, d) // the keepAlive sent at 10 s: it follows failed renewals, so a resync starts
 			d.record(book(0, d.holder, 5, 12), "", srcPush)
 			replyTo(t, d, resyncLane(), func(h replyHead) reply {
 				return holdingsReply{replyHead: h, Space: "book", Records: []tenure.Holding{
-					book(0, d.holder, 5, 12), book(1, "", 9, 11),
+					book(0, d.holder, 5, 12), book(1, "", 9, 11), book(3, "m2/0b", 9, 20),
 				}}
 			})
+			c := d.callFor(core.Confirm{Space: "book", Shard: 1, Term: 6})
+			c.req = withID(c.req, reqHead{ID: 2, Holder: d.holder})
+			d.answer(c, confirmedReply{replyHead{2}, book(1, "m2/0b", 9, 10)})
 			d.execute(core.Confirm{Space: "book", Shard: 0, Term: 5}) // a later Confirm action
 			replyTo(t, d, shardLane("book", 0), func(h replyHead) reply { return confirmedReply{h, book(0, d.holder, 5, 12)} })
 			replyTo(t, d, shardLane("book", 0), func(h replyHead) reply { return confirmedReply{h, book(0, d.holder, 5, 14)} })
 			replyTo(t, d, shardLane("book", 2), func(h replyHead) reply { return confirmedReply{h, book(2, d.holder, 7, 5)} })
 			d.record(book(1, "", 9, 11), "", srcSnapshot)
+			d.record(book(0, d.holder, 5, 15), "", srcPush)
 			owned0 = shardState(t, d, 0) == core.ShardStateOwned
 			owned2 = shardState(t, d, 2) == core.ShardStateOwned
 			got = holderChanges(d.w.sim, d)
@@ -184,14 +192,18 @@ func TestATSIM44Versions(t *testing.T) {
 		"1 m2/0b@9 push",
 		"1 m2/0b@9 confirm",
 		"3 m2/0b@9 push",
+		"4 m1@12 push",
 		"1 @9 holdings",
 		"0 m1@5 confirm",
 		"2 m1@7 confirm",
+		"0 m1@5 push",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("HolderChanged\n\t%s\nwant\n\t%s", strings.Join(got, "\n\t"), strings.Join(want, "\n\t"))
 	}
-	wantActions := []string{"StopRun book/1@6 lost", "StopRun book/3@8 lost", "Restore book/0@5", "Restore book/2@7"}
+	wantActions := []string{
+		"StopRun book/1@6 lost", "StopRun book/3@8 lost", "StopRun book/4@9 lost", "Restore book/0@5", "Restore book/2@7",
+	}
 	if !slices.Equal(actions, wantActions) {
 		t.Errorf("actions %v, want %v", actions, wantActions)
 	}
@@ -429,4 +441,109 @@ func TestATSIM14SnapshotCatchUp(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestDriverResyncAgain checks that a resync is never run twice at once: a renewal that follows
+// a failure while a resync runs sends nothing more, and one more resync of every space starts
+// once the running one ends, and then the resyncs stop.
+func TestDriverResyncAgain(t *testing.T) {
+	sc := Scenario{Members: 1, Spaces: []core.SpaceSpec{{Name: "news", Shards: 1}, {Name: "book", Shards: 1}}}
+	answer := func(t testing.TB, d *driver, space string) {
+		t.Helper()
+		c := d.lanes.laneOf(resyncLane()).cur
+		if holdingsSpace(c) != space {
+			t.Fatalf("holdings %v in flight, want %s's", c, space)
+		}
+		replyTo(t, d, resyncLane(), func(h replyHead) reply { return holdingsReply{replyHead: h, Space: space} })
+	}
+	injected(t, sc, 9*time.Second,
+		injectStep{time.Second, renew},
+		// The keepAlive sent at 2 s times out at 4 s; the one sent at 4 s is answered, which
+		// starts a resync. The one sent at 6 s times out at 8 s.
+		injectStep{5 * time.Second, renew},
+		injectStep{8500 * time.Millisecond, func(t testing.TB, d *driver) {
+			if f := d.status().LastFailure; f != core.CauseUnreachable || !d.resync.running {
+				t.Fatalf("at 8.5 s last failure %v, resync running %v; want a failed renewal during the resync", f, d.resync.running)
+			}
+			renew(t, d)
+			if l := d.lanes.laneOf(resyncLane()); len(l.queue) != 0 {
+				t.Fatalf("a renewal during the resync queued %d more holdings requests", len(l.queue))
+			}
+			answer(t, d, "book")
+			answer(t, d, "news")
+			answer(t, d, "book") // the resync the renewal asked for
+			answer(t, d, "news")
+			if c := d.lanes.laneOf(resyncLane()).cur; c != nil || d.resync.running {
+				t.Errorf("after the second resync holdings %v, running %v; want none", c, d.resync.running)
+			}
+		}},
+	)
+}
+
+// TestDriverResyncLost checks that a resync ends when the session is lost: the holdings request
+// that times out after the loss is not sent again.
+func TestDriverResyncLost(t *testing.T) {
+	sc := Scenario{Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 1}}}
+	injected(t, sc, 8*time.Second,
+		injectStep{time.Second, renew},
+		injectStep{5 * time.Second, renew}, // follows the timed-out keepAlive of 2 s: a resync starts
+		injectStep{6500 * time.Millisecond, func(t testing.TB, d *driver) {
+			if c := d.lanes.laneOf(resyncLane()).cur; holdingsSpace(c) != "book" {
+				t.Fatalf("holdings %v in flight at 6.5 s, want book's", c)
+			}
+			replyTo(t, d, sessionLane, func(h replyHead) reply { return lostReply{h} })
+			if s := d.status().Session; s != core.SessionStateLost {
+				t.Fatalf("session %v after a lost reply, want lost", s)
+			}
+		}},
+		injectStep{7500 * time.Millisecond, func(t testing.TB, d *driver) {
+			if c := d.lanes.laneOf(resyncLane()).cur; c != nil || d.resync.running {
+				t.Errorf("after the loss holdings %v in flight, running %v; want the resync ended", c, d.resync.running)
+			}
+		}},
+	)
+}
+
+// TestDriverRecordAfterTick checks that the filter decides after the Tick due by the reading's
+// time (O2): the answer of a degraded shard's latest Confirm that comes when the machine is due
+// to send the next Confirm is no longer the answer of the latest one, so it does not restore.
+// The test holds back the wake timer and the Confirm's timeout, so that the answer arrives
+// before the wake timer fires, as it may in the same instant.
+func TestDriverRecordAfterTick(t *testing.T) {
+	sc := Scenario{Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 1, Fenced: true}}}
+	var restored bool
+	var confirms int
+	injected(t, sc, 14*time.Second,
+		injectStep{time.Second, func(t testing.TB, d *driver) {
+			renew(t, d)
+			d.view(soloView(1), "", srcPush)
+			grant(t, d, book(0, d.holder, 5, 3))
+		}},
+		injectStep{11 * time.Second, func(t testing.TB, d *driver) {
+			if s := shardState(t, d, 0); s != core.ShardStateDegraded {
+				t.Fatalf("book/0 is %v at 11 s, want degraded", s)
+			}
+			renew(t, d) // live again: the Confirm goes out, and the next is due RetryPeriod later
+			c := d.lanes.laneOf(shardLane("book", 0)).cur
+			if c == nil {
+				t.Fatal("nothing in flight on book/0 after the renewal, want a Confirm")
+			}
+			if _, ok := c.act.(core.Confirm); !ok {
+				t.Fatalf("%v in flight on book/0 after the renewal, want a Confirm", c.act)
+			}
+			c.timer.cancel()
+			d.wake.cancel()
+		}},
+		injectStep{13500 * time.Millisecond, func(t testing.TB, d *driver) {
+			replyTo(t, d, shardLane("book", 0), func(h replyHead) reply { return confirmedReply{h, book(0, d.holder, 5, 3)} })
+			restored = shardState(t, d, 0) == core.ShardStateOwned
+			confirms = len(actionsOf(d.w.sim, d, "Confirm"))
+		}},
+	)
+	if restored {
+		t.Error("book/0 restored by the answer of a Confirm that the Tick due before it followed")
+	}
+	if confirms != 2 {
+		t.Errorf("%d Confirm actions, want 2", confirms)
+	}
 }

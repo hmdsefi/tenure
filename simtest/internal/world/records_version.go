@@ -62,7 +62,8 @@ type recReading struct {
 
 // resync is the state of a driver's holdings resync (SIM-340): after a SessionRenewed that
 // follows one or more SessionFailed{CauseUnreachable}, holdings(space) for each space in name
-// order, one at a time, each resent every RetryPeriod until answered.
+// order, one at a time, each resent every RetryPeriod until answered, or until the session is
+// lost or the lanes close.
 type resync struct {
 	running bool
 	next    int  // the index in driver.spaceNames of the space being read
@@ -173,8 +174,9 @@ func (d *driver) startResync() {
 	d.readHoldings()
 }
 
-// readHoldings sends the holdings request of the resync's present space. Once the lanes close
-// (O7) the resync ends.
+// readHoldings sends the holdings request of the resync's present space. Once the session is
+// lost, or the lanes close (O7), the resync ends: a lost machine has no use for the records, and
+// a new incarnation's driver starts its own.
 func (d *driver) readHoldings() {
 	c := &call{
 		key:       resyncLane(),
@@ -182,7 +184,7 @@ func (d *driver) readHoldings() {
 		onReply:   d.holdingsAnswer,
 		onTimeout: d.holdingsTimeout,
 	}
-	if !d.lanes.admits(c) {
+	if d.status().Session == core.SessionStateLost || !d.lanes.admits(c) {
 		d.resync = resync{}
 		return
 	}
