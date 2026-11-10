@@ -13,6 +13,7 @@ import (
 	"github.com/hmdsefi/faultline"
 	"github.com/hmdsefi/faultline/kernel"
 
+	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/core"
 )
 
@@ -38,6 +39,8 @@ type rig struct {
 	grants  []grantEffect
 	served  []string
 	replies []string
+	// casAt is the driver's reading when the rig served its latest cas.
+	casAt time.Duration
 }
 
 // rigID is the first request ID of the requests the rig makes for other holders.
@@ -123,9 +126,18 @@ func (r *rig) pump() {
 			return
 		}
 		var hook func()
-		if _, ok := c.req.(casReq); ok && r.beforeWrite != nil {
-			hook, r.beforeWrite = r.beforeWrite, nil
-			hook()
+		if cas, ok := c.req.(casReq); ok {
+			// The cas went out in the event of the answer before it, which is this one: it
+			// carries the member's wall reading now.
+			d := r.driver()
+			if want := d.m.Wall(); !cas.Wall.Equal(want) {
+				r.fw.T().Errorf("%q carries wall %v, want the member's %v", cas.Describe(), cas.Wall, want)
+			}
+			r.casAt = d.m.Mono()
+			if r.beforeWrite != nil {
+				hook, r.beforeWrite = r.beforeWrite, nil
+				hook()
+			}
 		}
 		r.served = append(r.served, c.req.Describe())
 		rep := r.do(c.req, true)
@@ -161,8 +173,10 @@ func requestName(text string) string {
 //     driver's getSession and its cas make the cas stale: no grant, AcquireFailed naming the
 //     holder; a renewal alone does not (the confirmation is what closes that window, AT-SIM-43's
 //     Order 2);
-//   - ended: a closed session's record is taken in the next round, with no wait, and a replaced
-//     session's records are taken by the member's new incarnation at once, with ended=true.
+//   - ended: a closed session's record is taken in the next round, with no wait, a replaced
+//     session's records are taken by the member's new incarnation at once, with ended=true,
+//     and the record of a session the driver had observed live, which then ended and left the
+//     sessions list, is taken by another member in the next round, with ended=true.
 func TestATSIM11ObserverTakeover(t *testing.T) {
 	t.Run("live", testTakeoverLive)
 	t.Run("crashed", func(t *testing.T) {
@@ -174,6 +188,7 @@ func TestATSIM11ObserverTakeover(t *testing.T) {
 	t.Run("ended", func(t *testing.T) {
 		t.Run("closed", testTakeoverClosed)
 		t.Run("replaced", testTakeoverReplaced)
+		t.Run("unlisted", testTakeoverUnlisted)
 	})
 }
 
@@ -335,7 +350,13 @@ func testTakeoverRenewal(t *testing.T) {
 				}
 				if !tc.stale {
 					if requestName(r.hooked) != "granted" || r.grants[r.hookedGrants-1].Record.Holder != r.driver().holder {
-						t.Errorf("the cas was answered %q, grants %+v; want a grant to the driver", r.hooked, r.grants)
+						t.Fatalf("the cas was answered %q, grants %+v; want a grant to the driver", r.hooked, r.grants)
+					}
+					// a's version 1 reached the driver at its reading 5 ms (setup, no drift):
+					// the unseen time is the driver's, not the store's, which lags by 2 s.
+					g := r.grants[r.hookedGrants-1]
+					if want := r.casAt - 5*time.Millisecond; g.Unseen != want || g.Unseen < g.Lease {
+						t.Errorf("grant unseen %v, lease %v; want the driver's %v, at least the lease", g.Unseen, g.Lease, want)
 					}
 					return
 				}
@@ -381,6 +402,37 @@ func testTakeoverClosed(t *testing.T) {
 	}
 	runRig(t, 0, 8*time.Second, setup, check, rigStep{5 * time.Second, func(r *rig) {
 		r.other(closeSessionReq{reqHead{ID: rigID + 3, Holder: a}})
+	}})
+}
+
+// testTakeoverUnlisted is AT-SIM-11's fourth case for a session the driver has observed: a
+// holds the record; at 5 s a's member opens a new session, which ends a's, and closes it at
+// once, which clears only the new session's records. a's record stays and a's version is far
+// from LeaseDuration old on the driver's clock, but a has left the sessions list: the driver
+// reads a's session, finds it ended and takes the shard in the next round.
+func testTakeoverUnlisted(t *testing.T) {
+	const a, next = "m2/0b", "m2/0c"
+	setup := func(r *rig) {
+		r.other(keepAliveOf(a, 1))
+		r.other(casReq{reqHead: reqHead{ID: rigID + 2, Holder: a}, Space: "book", Wall: kernel.Epoch})
+	}
+	check := func(t testing.TB, r *rig) {
+		if len(r.grants) != 2 || r.grants[1].Record.Holder != r.driver().holder || r.grants[1].Prev != a || !r.grants[1].Ended {
+			t.Fatalf("grants %+v, want a's, then the driver's from a, ended", r.grants)
+		}
+		var at kernel.Time
+		for _, rec := range records(r.w.sim, kindInput) {
+			if isInput(rec, "Acquired") && attrValue(rec, "term") != "0" {
+				at = rec.At
+			}
+		}
+		if rp := core.DefaultTiming.RetryPeriod; at < kernel.Time(5*time.Second) || at > kernel.Time(5*time.Second+rp+500*time.Millisecond) {
+			t.Errorf("Acquired at %s, want within RetryPeriod of a's end at 5 s", at)
+		}
+	}
+	runRig(t, 0, 8*time.Second, setup, check, rigStep{5 * time.Second, func(r *rig) {
+		r.other(keepAliveOf(next, 3))
+		r.other(closeSessionReq{reqHead{ID: rigID + 4, Holder: next}})
 	}})
 }
 
@@ -586,6 +638,10 @@ func TestObserverTimeout(t *testing.T) {
 				t.Fatal("no Acquire")
 			}
 			sentAt = c.sentAt
+		}},
+		// The record comes 500 ms after the getShard went out: the timeout stays RetryPeriod
+		// after the getShard, not after the getSession.
+		injectStep{1500 * time.Millisecond, func(t testing.TB, d *driver) {
 			replyTo(t, d, lane, func(h replyHead) reply { return shardReply{h, book(0, "m2/0b", 3, 2)} })
 			if _, ok := c.req.(getSessionReq); !ok {
 				t.Fatalf("after the record, %q in flight, want getSession", c.req.Describe())
@@ -611,6 +667,100 @@ func TestObserverTimeout(t *testing.T) {
 	at, _ := strconv.ParseInt(strings.TrimPrefix(got[0], "Acquired term=0 at="), 10, 64)
 	if rp := core.DefaultTiming.RetryPeriod; time.Duration(at) < rp || time.Duration(at) > rp+time.Microsecond {
 		t.Errorf("Acquired %v after the getShard, want RetryPeriod %v", time.Duration(at), rp)
+	}
+}
+
+// TestObserverExpiry pins the observed expiry to the nanosecond of the member's clock: m2's
+// session, first seen at the reading 1 s, is not expired at 1 s + LeaseDuration − 1 ns and is
+// at 1 s + LeaseDuration, where the expiry timer is set; the unseen time is the reading less
+// 1 s, and an older message's lease changes nothing. The driver never judges its own holder,
+// whose version it also saw only at 1 s: its slot stays in the view. A ClaimSlot reads the
+// driver's own slot first.
+func TestObserverExpiry(t *testing.T) {
+	sc := Scenario{Takeover: Observer, Members: 1, Slots: 2, Spaces: []core.SpaceSpec{{Name: "book", Shards: 1}}}
+	lease := core.DefaultTiming.LeaseDuration
+	first := time.Second
+	var got []string
+	state := func(d *driver, at string) {
+		got = append(got, at+" expired="+strconv.FormatBool(d.observedExpired("m2/0b"))+
+			" take="+strconv.FormatBool(d.mayTake("m2/0b"))+
+			" unseen="+(d.unseen("m2/0b")-lease).String()+
+			" own="+strconv.FormatBool(d.observedExpired(d.holder))+
+			" slot="+strconv.Itoa(d.slotCandidate()))
+	}
+	injected(t, sc, first+lease+time.Second,
+		injectStep{first, func(t testing.TB, d *driver) {
+			got = nil
+			renew(t, d)
+			v := core.View{Version: 2, Members: []core.Member{{ID: "m1"}, {ID: "m2"}}, Slots: 2, SlotHolders: []string{"m2/0b", d.holder}}
+			for _, m2 := range []sessionInfo{
+				{Holder: "m2/0b", Version: 2, Lease: lease},
+				// An older message, of a timing m2 has renewed away from: its shorter lease
+				// is not m2's now.
+				{Holder: "m2/0b", Version: 1, Lease: lease / 3},
+			} {
+				d.handle(d.w.Store().ID(), viewPush{View: v, Sessions: []sessionInfo{{Holder: d.holder, Version: 1, Lease: lease}, m2}})
+			}
+			if tm := d.obs.timer; tm == nil || !tm.pending() || tm.target() != first+lease {
+				t.Errorf("expiry timer %+v, want one at %v", tm, first+lease)
+			}
+		}},
+		injectStep{first + lease - time.Nanosecond, func(t testing.TB, d *driver) { state(d, "-1ns") }},
+		injectStep{first + lease, func(t testing.TB, d *driver) { state(d, "0") }},
+		injectStep{first + lease + 10*time.Microsecond, func(t testing.TB, d *driver) {
+			v := d.obs.shown
+			got = append(got, "members="+strconv.Itoa(len(v.Members))+" slots="+
+				strings.ReplaceAll(strings.Join(v.SlotHolders, ","), d.holder, "self"))
+		}},
+	)
+	want := []string{
+		"-1ns expired=false take=false unseen=-1ns own=false slot=1",
+		"0 expired=true take=true unseen=0s own=false slot=1",
+		"members=1 slots=,self",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got\n\t%s\nwant\n\t%s", strings.Join(got, "\n\t"), strings.Join(want, "\n\t"))
+	}
+}
+
+// TestObserverStale checks the stale answers of a cas that name no other holder: a record
+// that names the driver's own holder (its earlier grant, whose reply came late) is stepped as a
+// HolderChanged with src reply, then Acquired with no term; a record a release cleared again
+// steps Acquired with no term. Neither steps AcquireFailed.
+func TestObserverStale(t *testing.T) {
+	sc := Scenario{Takeover: Observer, Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 2}}}
+	var got []string
+	injected(t, sc, 3*time.Second,
+		injectStep{time.Second, func(t testing.TB, d *driver) {
+			got = nil
+			renew(t, d)
+			d.view(soloView(2), "", srcPush)
+			for shard, stale := range []tenure.Holding{book(0, d.holder, 9, 7), book(1, "", 4, 6)} {
+				lane := shardLane("book", shard)
+				replyTo(t, d, lane, func(h replyHead) reply { return shardReply{h, book(shard, "", 4, 5)} })
+				c := d.lanes.laneOf(lane).cur
+				if c == nil || !strings.HasPrefix(c.req.Describe(), "cas#") || !strings.Contains(c.req.Describe(), "expect=5") {
+					t.Fatalf("book/%d: after a cleared record, %v in flight, want a cas expecting 5", shard, c)
+				}
+				replyTo(t, d, lane, func(h replyHead) reply { return staleReply{replyHead: h, Record: stale} })
+			}
+			for _, s := range inputsAfter(d.w.sim, d, 0, "shard", "holder", "term", "src") {
+				if strings.HasPrefix(s, "Acquire") || strings.HasPrefix(s, "HolderChanged") {
+					got = append(got, strings.ReplaceAll(s, d.holder, "self"))
+				}
+			}
+		}},
+	)
+	want := []string{
+		"HolderChanged shard=0 term=4 src=reply", // the cleared record read
+		"HolderChanged shard=0 holder=self term=9 src=reply",
+		"Acquired shard=0 term=0",
+		"HolderChanged shard=1 term=4 src=reply",
+		"HolderChanged shard=1 term=4 src=reply", // cleared again, at a newer version
+		"Acquired shard=1 term=0",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got\n\t%s\nwant\n\t%s", strings.Join(got, "\n\t"), strings.Join(want, "\n\t"))
 	}
 }
 
