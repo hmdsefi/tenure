@@ -1,2 +1,4 @@
 github.com/hmdsefi/faultline v0.2.0 h1:F7bbP3KBwVu4iOYBKiWdhGwcZpxDT8+gtryJEEtZ998=
 github.com/hmdsefi/faultline v0.2.0/go.mod h1:RkiSopWq2Z0cv4JMJTn7Zz7eEGT8olh/L+4Ucwi9/Ts=
+github.com/hmdsefi/gograph v0.8.2 h1:bVfkK4GVApb5ZZB/P0y9BjKo8Lt+D/kbJ+uCl4RpshM=
+github.com/hmdsefi/gograph v0.8.2/go.mod h1:ZrmXi8bO0eWG86DQ4F0kinG1+2zSgZVKIbhadwSCEag=
