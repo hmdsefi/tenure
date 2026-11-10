@@ -574,3 +574,155 @@ func TestDriverTimeouts(t *testing.T) {
 		}
 	})
 }
+
+// TestDriverTickFirst checks O2's tick-first rule on its own: an input that comes at a reading at
+// or after the machine's wake, before the wake timer has fired, is stepped after a Tick at that
+// reading, in the same event. The test cancels every timer of the driver, so that the input
+// reaches the driver with the wake unstepped, as an input can when it comes in the same instant
+// as the wake timer or in the few nanoseconds before the timer fires.
+func TestDriverTickFirst(t *testing.T) {
+	runWorld(t, fullTrace(25*time.Second), Scenario{Members: 1}, func(fw *faultline.World, w *World) {
+		t := fw.T()
+		m := w.Members()[0]
+		fw.Net.Isolate(m.Node.ID())
+		var at time.Duration // the reading at which the input is stepped
+		fw.Sim.At(kernel.Time(time.Second), "test/hold", func() {
+			d := w.drivers.current(m)
+			wake, ok := d.machine.NextWake()
+			if !ok {
+				t.Fatal("the machine has no wake")
+			}
+			d.wake.cancel()
+			for _, l := range d.lanes.all {
+				if l.cur != nil {
+					l.cur.timer.cancel()
+				}
+			}
+			w.setTimer(m.Node, wake, "test/input", func() {
+				at = m.Mono()
+				if next, ok := d.machine.NextWake(); !ok || next > at {
+					t.Fatalf("wake %v at %v: the input would not need a Tick first", next, at)
+				}
+				d.record(tenure.Holding{Space: defaultSpace, Shard: 0, Holder: "m2/0b", Term: 5, Version: 5}, "", srcPush)
+			})
+		})
+		fw.RunFor(5 * time.Second)
+		var got []string
+		for _, r := range records(fw.Sim, kindInput) {
+			if r.Node == m.Node.ID() && nanosAttr(t, r, "now_ns") == at {
+				got = append(got, attrValue(r, "type"))
+			}
+		}
+		if want := []string{"Tick", "HolderChanged"}; at == 0 || !slices.Equal(got, want) {
+			t.Errorf("inputs at the wake %v: %v, want %v", at, got, want)
+		}
+	})
+}
+
+// TestDriverOldReplies checks that a reply to a request of an earlier incarnation never reaches
+// the machine of a later one: m1 crashes and boots again while the replies to its first requests
+// are still on a slow link, which delivers them to the new incarnation's node. Every reply that
+// m1's machine steps must have been sent by the store after the boot of the incarnation that
+// steps it.
+func TestDriverOldReplies(t *testing.T) {
+	runWorld(t, fullTrace(25*time.Second), Scenario{Members: 1}, func(fw *faultline.World, w *World) {
+		t := fw.T()
+		m := w.Members()[0]
+		fw.Net.SetLink(w.Store().ID(), m.Node.ID(), simnet.Link{Latency: 300 * time.Millisecond})
+		fw.Sim.At(kernel.Time(100*time.Millisecond), "test/crash", m.Node.Crash)
+		fw.Sim.At(kernel.Time(150*time.Millisecond), "test/restart", m.Node.Restart)
+		fw.RunFor(3 * time.Second)
+
+		sentAt := map[string]kernel.Time{} // by msg: the time the message was sent
+		var boot kernel.Time
+		old, stepped := 0, 0
+		for _, e := range traceEvents(fw.Sim) {
+			from, delivered := kernel.Time(0), false
+			for _, r := range e.recs {
+				switch {
+				case r.Kind == "net.send":
+					sentAt[attrValue(r, "msg")] = e.at
+				case r.Kind == kindBoot && r.Node == m.Node.ID():
+					boot = e.at
+				case r.Kind == "net.deliver" && attrValue(r, "to") == m.Name && attrValue(r, "from") == storeName:
+					from, delivered = sentAt[attrValue(r, "msg")], true
+				}
+			}
+			if !delivered {
+				continue
+			}
+			if from < boot {
+				old++
+			}
+			for _, r := range e.of(kindInput) {
+				if _, isReply := payloadID(r.Text); r.Node != m.Node.ID() || !isReply {
+					continue
+				}
+				stepped++
+				if from < boot {
+					t.Errorf("at %s m1 stepped %s from %q, sent at %s, before its boot at %s", e.at, attrValue(r, "type"), r.Text, from, boot)
+				}
+			}
+		}
+		if old == 0 || stepped == 0 {
+			t.Errorf("%d replies to the old incarnation delivered after the boot and %d replies stepped, want some of each", old, stepped)
+		}
+	})
+}
+
+// TestDriverNewIncarnation checks that the driver of a new incarnation that starts while the
+// node is up, as a recovery does, stops the driver before it: the old machine steps nothing
+// more, and the old driver keeps no timer.
+func TestDriverNewIncarnation(t *testing.T) {
+	runWorld(t, fullTrace(25*time.Second), Scenario{Members: 1}, func(fw *faultline.World, w *World) {
+		t := fw.T()
+		m := w.Members()[0]
+		var prev *driver
+		var prevNow time.Duration
+		fw.Sim.At(kernel.Time(3*time.Second), "test/incarnate", func() {
+			prev = w.drivers.current(m)
+			w.incarnate(m, "recover")
+			prevNow = prev.status().Now
+		})
+		fw.RunFor(8 * time.Second)
+		if prev == nil || w.drivers.current(m) == prev {
+			t.Fatal("no new driver")
+		}
+		if now := prev.status().Now; now != prevNow {
+			t.Errorf("the old machine stepped on to %v after the new incarnation at %v", now, prevNow)
+		}
+		if prev.wake != nil && prev.wake.pending() {
+			t.Error("the old driver's wake timer is still pending")
+		}
+		if cur := w.drivers.current(m).status(); cur.Session != core.SessionStateLive {
+			t.Errorf("the new machine's session is %v, want live", cur.Session)
+		}
+	})
+}
+
+// TestDriverViewWall checks that a stepped view carries the member's wall reading: its
+// monotonic reading plus the offset of its wall clock.
+func TestDriverViewWall(t *testing.T) {
+	runWorld(t, fullTrace(25*time.Second), Scenario{Members: 3, WallSkew: time.Second}, func(fw *faultline.World, w *World) {
+		t := fw.T()
+		fw.RunFor(4 * time.Second)
+		views := 0
+		for _, m := range w.Members() {
+			if m.wall == 0 {
+				t.Fatalf("%s has no wall offset", m.Name)
+			}
+			for _, r := range records(fw.Sim, kindInput) {
+				if r.Node != m.Node.ID() || !isInput(r, "ViewChanged") {
+					continue
+				}
+				views++
+				if got, want := nanosAttr(t, r, "wall_ns"), nanosAttr(t, r, "now_ns")+m.wall; got != want {
+					t.Errorf("%s: ViewChanged wall %v, want %v", m.Name, got, want)
+				}
+			}
+		}
+		if views == 0 {
+			t.Error("no view stepped")
+		}
+	})
+}
