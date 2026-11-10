@@ -25,7 +25,7 @@ const (
 )
 
 // The src attribute of a HolderChanged or a ViewChanged: where the driver read the state.
-// 1.8-08 adds "holdings" and "reply".
+// records_version.go adds srcHoldings; "reply" is left for the Observer rule's reads (1.8-09).
 const (
 	srcPush     = "push"
 	srcSnapshot = "snapshot"
@@ -86,12 +86,6 @@ func (ds *drivers) current(m *Member) *driver {
 	return ds.of(m).cur
 }
 
-// recState is the part of a shard record a HolderChanged carries.
-type recState struct {
-	holder string
-	term   core.Term
-}
-
 // driver drives the machine of one incarnation of an active member, as the runtime's loop and
 // executor drive theirs (SIM-300 to SIM-330, MCH O1 to O8), with requests to the store over the
 // simulated network in place of store calls.
@@ -114,8 +108,11 @@ type recState struct {
 //
 // Pushes (SIM-330). A view newer than the last one stepped is stepped as ViewChanged with the
 // member's wall reading and each member's Slot per RUN-220, unless it was read before the
-// latest SlotClaimed or SlotReleased (O8). A record whose holder and term differ from the last
-// HolderChanged stepped for the shard is stepped as HolderChanged.
+// latest SlotClaimed or SlotReleased (O8). A record is stepped as HolderChanged through the
+// version and confirmation filter of records_version.go (O4, O5).
+//
+// Resync (SIM-340). After a SessionRenewed that follows failed renewals, the driver reads the
+// holdings of every space, in name order, through the same filter.
 type driver struct {
 	ds *drivers
 	w  *World
@@ -140,9 +137,14 @@ type driver struct {
 	viewVersion uint64
 	slotFloor   uint64
 
-	// records holds, by shard lane key, the record state of the last HolderChanged stepped for
-	// the shard. 1.8-08 replaces this filter with record versions (O4) and adds O5's.
-	records map[laneKey]recState
+	// records holds, by shard lane key, the filter state of each shard (records_version.go);
+	// looked up only.
+	records map[laneKey]*shardRecord
+
+	// spaceNames holds the names of the spaces, sorted, and resync the state of the holdings
+	// resync (SIM-340).
+	spaceNames []string
+	resync     resync
 
 	// runs holds the term of each shard's run from its StartRun to its StopRun; stops holds
 	// the timers of the runs stopping, which step RunStopped. 1.8-10 replaces both with Run
@@ -163,8 +165,10 @@ func newDriver(ds *drivers, md *memberDrive, m *Member) *driver {
 		timing:   sc.Timing,
 		inFlight: make(map[uint64]*call),
 		late:     make(map[uint64]bool),
-		records:  make(map[laneKey]recState),
+		records:  make(map[laneKey]*shardRecord),
 		runs:     make(map[laneKey]core.Term),
+
+		spaceNames: sortedSpaceNames(sc.Spaces),
 	}
 	d.machine = core.NewMachine(core.MachineConfig{Holder: m.holder, Member: m.Name, Spaces: sc.Spaces, Timing: sc.Timing})
 	d.lanes = newLanes(d.send)
@@ -323,6 +327,9 @@ func (d *driver) at(in core.Input, now time.Duration) core.Input {
 func (d *driver) execute(a core.Action) {
 	typ, fields := actionFields(a)
 	c := d.callFor(a)
+	if _, ok := a.(core.Confirm); ok {
+		d.noteConfirm(c)
+	}
 	if c == nil {
 		d.w.emitAction(d.m, "", typ, fields...)
 		switch a := a.(type) {
@@ -487,26 +494,37 @@ func replyName(rep reply) string {
 }
 
 // answer steps what the reply rep to the machine action of c means (SIM-320). A slot reply also
-// raises the view floor of O8 first. A reply the table has no row for fails the run.
+// raises the view floor of O8 first, and a granted reply the shard's delivered version. A
+// Confirm's answer goes through the record filter (O4, O5) as a reading with src confirm. A
+// renewal that ends a run of failed renewals starts a resync (SIM-340). A reply the table has
+// no row for fails the run.
 func (d *driver) answer(c *call, rep reply) {
 	switch r := rep.(type) {
 	case slotClaimedReply:
 		d.slotFloor = max(d.slotFloor, r.View)
 	case slotReleasedReply:
 		d.slotFloor = max(d.slotFloor, r.View)
+	case grantedReply:
+		d.noteGrant(c, r)
 	}
 	ins, ok := replyInputs(c.act, rep, c.sentAt)
 	if !ok {
 		d.w.sim.Fail(fmt.Errorf("world: driver %s: reply %q to %q", d.m.Name, rep.Describe(), c.req.Describe()))
 		return
 	}
+	_, renewal := c.act.(core.KeepAlive)
+	failing := renewal && d.status().LastFailure == core.CauseUnreachable
 	for _, in := range ins {
-		src := ""
-		if hc, ok := in.(core.HolderChanged); ok {
-			src = srcConfirm
-			d.records[shardLane(hc.Space, hc.Shard)] = recState{holder: hc.Holder, term: hc.Term}
+		if _, ok := in.(core.HolderChanged); ok {
+			a, _ := c.act.(core.Confirm)
+			r, _ := rep.(confirmedReply)
+			d.observe(confirmReading(c, a, r))
+			continue
 		}
-		d.step(in, rep.Describe(), src)
+		d.step(in, rep.Describe(), "")
+	}
+	if failing && !d.stopped && d.status().LastFailure == core.CauseNone {
+		d.startResync()
 	}
 }
 
@@ -603,25 +621,13 @@ func timeoutInputs(act core.Action) []core.Input {
 	return nil
 }
 
-// record steps the shard record rec, which came with a message whose text is text, as a
-// HolderChanged, unless its holder and term are those of the last HolderChanged stepped for
-// the shard. 1.8-08 replaces this filter with record versions (O4) and O5's.
-//
-// A record that names this holder while an Acquire of the shard is in flight is the grant of
-// that Acquire, or of one before it, and is not stepped: the reply steps the grant as Acquired,
-// so a StartRun follows the Acquired of its term. If the reply never comes, the next snapshot
-// still has the record, which is then stepped (MCH-550).
+// record steps the shard record rec of a push or a snapshot, which came with a message whose
+// text is text, as a HolderChanged if the record filter admits it (records_version.go: O4, O5,
+// and a record naming this holder while an Acquire of the shard is in flight is left to the
+// Acquire's reply). If that reply comes late, a later push, snapshot or resync has the record,
+// which is then stepped (MCH-550).
 func (d *driver) record(rec tenure.Holding, text, src string) {
-	key := shardLane(rec.Space, rec.Shard)
-	st := recState{holder: rec.Holder, term: rec.Term}
-	if prev, ok := d.records[key]; ok && prev == st {
-		return
-	}
-	if rec.Holder == d.holder && d.acquiring(key) {
-		return
-	}
-	d.records[key] = st
-	d.step(core.HolderChanged{Space: rec.Space, Shard: rec.Shard, Holder: rec.Holder, Term: rec.Term}, text, src)
+	d.observe(recReading{rec: rec, src: src, text: text})
 }
 
 // acquiring reports whether an Acquire is in flight on the lane of key.
