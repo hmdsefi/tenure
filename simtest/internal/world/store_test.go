@@ -464,28 +464,34 @@ func TestStoreNode(t *testing.T) {
 			}
 
 			// Every receiver gets its own slices.
-			last := func(i int, kind func(any) bool) any {
-				var out any
-				for _, r := range s.inbox[i] {
-					if kind(r.msg) {
-						out = r.msg
-					}
-				}
-				return out
+			v1, v2 := lastOf[viewPush](s, 1), lastOf[viewPush](s, 2)
+			if len(v1.View.Members) != 1 || len(v2.View.Members) != 1 || len(v1.Sessions) != 1 || len(v2.Sessions) != 1 {
+				t.Fatalf("the last view pushes of m2 and m3 are %+v and %+v, want a view of m2", v1, v2)
 			}
-			isView := func(m any) bool { _, ok := m.(viewPush); return ok }
-			isSnap := func(m any) bool { _, ok := m.(snapshotPush); return ok }
-			v1, v2 := last(1, isView).(viewPush), last(2, isView).(viewPush)
-			if len(v1.View.Members) != 1 || &v1.View.Members[0] == &v2.View.Members[0] || &v1.Sessions[0] == &v2.Sessions[0] {
-				t.Errorf("the view pushes of m2 and m3 share their slices or are wrong: %+v", v1)
+			if &v1.View.Members[0] == &v2.View.Members[0] || &v1.Sessions[0] == &v2.Sessions[0] {
+				t.Error("the view pushes of m2 and m3 share their slices")
 			}
-			p1, p2 := last(1, isSnap).(snapshotPush), last(2, isSnap).(snapshotPush)
-			if len(p1.Records) != 2 || &p1.Records[0] == &p2.Records[0] ||
-				&p1.View.Members[0] == &p2.View.Members[0] || &p1.Sessions[0] == &p2.Sessions[0] {
-				t.Errorf("the snapshots of m2 and m3 share their slices or are wrong: %+v", p1)
+			p1, p2 := lastOf[snapshotPush](s, 1), lastOf[snapshotPush](s, 2)
+			if len(p1.Records) != 2 || len(p2.Records) != 2 || len(p1.View.Members) != 1 || len(p2.View.Members) != 1 ||
+				len(p1.Sessions) != 1 || len(p2.Sessions) != 1 {
+				t.Fatalf("the last snapshots of m2 and m3 are %+v and %+v, want two records and m2", p1, p2)
+			}
+			if &p1.Records[0] == &p2.Records[0] || &p1.View.Members[0] == &p2.View.Members[0] || &p1.Sessions[0] == &p2.Sessions[0] {
+				t.Error("the snapshots of m2 and m3 share their slices")
 			}
 		})
 	})
+}
+
+// lastOf returns the last message of type M that member i of s received, or the zero M.
+func lastOf[M any](s *script, i int) M {
+	var out M
+	for _, r := range s.inbox[i] {
+		if m, ok := r.msg.(M); ok {
+			out = m
+		}
+	}
+	return out
 }
 
 // TestStoreCrashKeepsState checks that the store's sessions, records and slots survive a crash
