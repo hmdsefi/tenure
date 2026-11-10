@@ -232,6 +232,16 @@ func TestLanesO7Close(t *testing.T) {
 	}
 	r.wantSent(t, "the repeat", core.CloseSession{})
 
+	// A free session lane is not enough: the CloseSession waits for the shard lanes too.
+	r = newLaneRig()
+	r.submit(core.KeepAlive{})
+	r.submit(acq0)
+	r.submit(core.CloseSession{})
+	r.finish(t, core.KeepAlive{})
+	r.wantSent(t, "a shard request still in flight", core.KeepAlive{}, acq0)
+	r.finish(t, acq0)
+	r.wantSent(t, "the shard request answered", core.CloseSession{})
+
 	// With nothing in flight, CloseSession goes out at once.
 	r = newLaneRig()
 	r.submit(core.CloseSession{})
