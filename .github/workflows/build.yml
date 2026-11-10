@@ -31,6 +31,11 @@ jobs:
         with:
           version: v2.14.0
           working-directory: k8s
+      - name: golangci-lint (simtest)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+          working-directory: simtest
 
   build:
     name: Go build
@@ -156,6 +161,10 @@ jobs:
         run: |
           go test -count=1 ./core/...
           go test -count=1 -run '^TestCoreDigests$' ./internal/dettest
+      - name: 'simulation: every seed twice, equal trace hashes'
+        env:
+          FAULTLINE_CHECK_DETERMINISM: '1'
+        run: go -C simtest test -count=1 ./...
 
   api:
     name: API snapshot
@@ -216,6 +225,52 @@ jobs:
             fi
             echo "::endgroup::"
           done
+
+  simtest-short:
+    name: simtest (-short)
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: simtest/go.mod
+          cache-dependency-path: simtest/go.sum
+      - name: simulations with the short seed counts
+        env:
+          FAULTLINE_ARTIFACTS: ${{ runner.temp }}/faultline
+        run: go -C simtest test -race -short -count=1 ./...
+      - name: upload the artifacts of the failing seeds
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: faultline-short
+          path: ${{ runner.temp }}/faultline
+
+  simtest:
+    name: simtest (full seed counts)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: simtest/go.mod
+          cache-dependency-path: simtest/go.sum
+      - name: simulations with the full seed counts
+        env:
+          FAULTLINE_ARTIFACTS: ${{ runner.temp }}/faultline
+        run: go -C simtest test -count=1 -timeout 55m ./...
+      - name: upload the artifacts of the failing seeds
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: faultline-full
+          path: ${{ runner.temp }}/faultline
 
   k8s:
     name: k8s on kind
