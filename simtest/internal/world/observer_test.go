@@ -736,6 +736,7 @@ func TestObserverStale(t *testing.T) {
 			got = nil
 			renew(t, d)
 			d.view(soloView(2), "", srcPush)
+			granted(d, book(0, d.holder, 9, 7)) // the earlier grant the store made
 			for shard, stale := range []tenure.Holding{book(0, d.holder, 9, 7), book(1, "", 4, 6)} {
 				lane := shardLane("book", shard)
 				replyTo(t, d, lane, func(h replyHead) reply { return shardReply{h, book(shard, "", 4, 5)} })
