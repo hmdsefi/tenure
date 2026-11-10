@@ -96,14 +96,30 @@ func checkConverged(t testing.TB, w *World) {
 	}
 }
 
-// TestDriverSteady runs a world of five members under the Server rule with a stop delay: m5
-// crashes at 2 s and stays down until 25 s, so the others take its shards once the store has
-// ended its session and hand them back when it returns. It checks that the world converges,
-// every shard owned by the member every machine assigns it to, and that every RunStopped comes
-// within the stop delay of its StopRun.
+// rules are the two takeover rules, for the tests that hold under either.
+var rules = []Takeover{Server, Observer}
+
+// forRules runs fn as a subtest per takeover rule, named after the rule.
+func forRules(t *testing.T, fn func(t *testing.T, rule Takeover)) {
+	t.Helper()
+	for _, rule := range rules {
+		t.Run(rule.String(), func(t *testing.T) { fn(t, rule) })
+	}
+}
+
+// TestDriverSteady runs a world of five members under each rule with a stop delay: m5 crashes
+// at 2 s and stays down until 25 s, so the others take its shards once the store has ended its
+// session (Server rule) or they have observed it unrenewed for LeaseDuration (Observer rule),
+// and hand them back when it returns. It checks that the world converges, every shard owned by
+// the member every machine assigns it to, and that every RunStopped comes within the stop delay
+// of its StopRun.
 func TestDriverSteady(t *testing.T) {
+	forRules(t, testDriverSteady)
+}
+
+func testDriverSteady(t *testing.T, rule Takeover) {
 	const stopDelay = time.Second
-	runWorld(t, fullTrace(50*time.Second), Scenario{StopDelay: stopDelay}, func(fw *faultline.World, w *World) {
+	runWorld(t, fullTrace(50*time.Second), Scenario{Takeover: rule, StopDelay: stopDelay}, func(fw *faultline.World, w *World) {
 		t := fw.T()
 		m5 := w.Members()[4]
 		fw.Sim.At(kernel.Time(2*time.Second), "test/crash", m5.Node.Crash)
@@ -149,11 +165,16 @@ func TestDriverSteady(t *testing.T) {
 // the wake the step before it armed. The steps were written for this task from the issue and
 // the design note, since the original acceptance-test text is lost.
 func TestATSIM07WakeFollowsDrift(t *testing.T) {
+	forRules(t, testATSIM07WakeFollowsDrift)
+}
+
+func testATSIM07WakeFollowsDrift(t *testing.T, rule Takeover) {
 	opts := fullTrace(40 * time.Second)
 	opts.Seeds = 20
 	sc := Scenario{
-		Members: 3,
-		Rho:     100_000,
+		Takeover: rule,
+		Members:  3,
+		Rho:      100_000,
 		Faults: random(fault.Rule{
 			Kind: fault.KindClockDrift, Every: 2 * time.Second, Magnitude: 200_000, Target: roleMembers,
 		}),
@@ -207,7 +228,11 @@ func TestATSIM07WakeFollowsDrift(t *testing.T) {
 // The steps were written for this task from the issue and the design note, since the original
 // acceptance-test text is lost.
 func TestATSIM15InputActionOrder(t *testing.T) {
-	runWorld(t, fullTrace(25*time.Second), Scenario{}, func(fw *faultline.World, w *World) {
+	forRules(t, testATSIM15InputActionOrder)
+}
+
+func testATSIM15InputActionOrder(t *testing.T, rule Takeover) {
+	runWorld(t, fullTrace(25*time.Second), Scenario{Takeover: rule}, func(fw *faultline.World, w *World) {
 		t := fw.T()
 		fw.RunFor(25*time.Second - time.Nanosecond)
 		starts := 0
@@ -266,7 +291,11 @@ func TestATSIM15InputActionOrder(t *testing.T) {
 // SessionRenewed, and m2, on a normal link, renews. The steps were written for this task from
 // the issue and the design note, since the original acceptance-test text is lost.
 func TestATSIM16LateReplies(t *testing.T) {
-	runWorld(t, fullTrace(25*time.Second), Scenario{Members: 2}, func(fw *faultline.World, w *World) {
+	forRules(t, testATSIM16LateReplies)
+}
+
+func testATSIM16LateReplies(t *testing.T, rule Takeover) {
+	runWorld(t, fullTrace(25*time.Second), Scenario{Takeover: rule, Members: 2}, func(fw *faultline.World, w *World) {
 		t := fw.T()
 		m1, m2 := w.Members()[0], w.Members()[1]
 		fw.Net.SetLink(w.Store().ID(), m1.Node.ID(), simnet.Link{Latency: 3 * time.Second})
@@ -422,11 +451,11 @@ func TestWithSlots(t *testing.T) {
 	}
 }
 
-// isolated runs body in a world of one member with slots whose node the network cuts off, so
-// that only what the test hands the driver reaches its machine. body runs in an event of the
-// member's node at 1 s, with the member's driver.
-func isolated(t *testing.T, body func(t testing.TB, fw *faultline.World, d *driver)) {
-	runWorld(t, fullTrace(90*time.Second), Scenario{Members: 1, Slots: 2}, func(fw *faultline.World, w *World) {
+// isolated runs body in a world of one member with slots under rule whose node the network cuts
+// off, so that only what the test hands the driver reaches its machine. body runs in an event of
+// the member's node at 1 s, with the member's driver.
+func isolated(t *testing.T, rule Takeover, body func(t testing.TB, fw *faultline.World, d *driver)) {
+	runWorld(t, fullTrace(90*time.Second), Scenario{Takeover: rule, Members: 1, Slots: 2}, func(fw *faultline.World, w *World) {
 		m := w.Members()[0]
 		fw.Net.Isolate(m.Node.ID())
 		fw.Sim.At(kernel.Time(time.Second), "test/do", func() {
@@ -455,10 +484,13 @@ func inputsAfter(sim *kernel.Sim, d *driver, at kernel.Time, keys ...string) []s
 	return out
 }
 
-// TestDriverViews checks SIM-330 and O8: a view is stepped only when it is newer than the last
-// one stepped, and a view read before the latest SlotClaimed or SlotReleased is discarded.
+// TestDriverViews checks SIM-330 and O8 under the Server rule: a view is stepped only when it is
+// newer than the last one stepped, and a view read before the latest SlotClaimed or
+// SlotReleased is discarded. It is of the Server rule only: under the Observer rule the driver
+// steps views under its own versions, and only when their content changes, which
+// TestObserverViews checks.
 func TestDriverViews(t *testing.T) {
-	isolated(t, func(t testing.TB, fw *faultline.World, d *driver) {
+	isolated(t, Server, func(t testing.TB, fw *faultline.World, d *driver) {
 		view := func(version uint64) core.View {
 			return core.View{Version: version, Members: []core.Member{{ID: "m1"}}, Slots: 2, SlotHolders: []string{"", ""}}
 		}
@@ -495,7 +527,11 @@ func TestDriverViews(t *testing.T) {
 // a Confirm's answer may repeat it; a record naming this holder while an Acquire of the shard
 // is in flight is left to the Acquire's reply, and delivers nothing.
 func TestDriverRecords(t *testing.T) {
-	isolated(t, func(t testing.TB, fw *faultline.World, d *driver) {
+	forRules(t, testDriverRecords)
+}
+
+func testDriverRecords(t *testing.T, rule Takeover) {
+	isolated(t, rule, func(t testing.TB, fw *faultline.World, d *driver) {
 		rec := func(shard int, holder string, term core.Term, version uint64) tenure.Holding {
 			return tenure.Holding{Space: "book", Shard: shard, Holder: holder, Term: term, Version: version}
 		}
@@ -531,7 +567,11 @@ func TestDriverRecords(t *testing.T) {
 // comes after it is dropped with tenure.reply_late. m1's node is cut off from the store until
 // its first keepAlive has timed out.
 func TestDriverTimeouts(t *testing.T) {
-	runWorld(t, fullTrace(25*time.Second), Scenario{Members: 1}, func(fw *faultline.World, w *World) {
+	forRules(t, testDriverTimeouts)
+}
+
+func testDriverTimeouts(t *testing.T, rule Takeover) {
+	runWorld(t, fullTrace(25*time.Second), Scenario{Takeover: rule, Members: 1}, func(fw *faultline.World, w *World) {
 		t := fw.T()
 		m := w.Members()[0]
 		// The store gets m1's keepAlive, but its reply waits on the link for 2.5 s.
@@ -581,7 +621,11 @@ func TestDriverTimeouts(t *testing.T) {
 // reaches the driver with the wake unstepped, as an input can when it comes in the same instant
 // as the wake timer or in the few nanoseconds before the timer fires.
 func TestDriverTickFirst(t *testing.T) {
-	runWorld(t, fullTrace(25*time.Second), Scenario{Members: 1}, func(fw *faultline.World, w *World) {
+	forRules(t, testDriverTickFirst)
+}
+
+func testDriverTickFirst(t *testing.T, rule Takeover) {
+	runWorld(t, fullTrace(25*time.Second), Scenario{Takeover: rule, Members: 1}, func(fw *faultline.World, w *World) {
 		t := fw.T()
 		m := w.Members()[0]
 		fw.Net.Isolate(m.Node.ID())
@@ -625,7 +669,11 @@ func TestDriverTickFirst(t *testing.T) {
 // m1's machine steps must have been sent by the store after the boot of the incarnation that
 // steps it.
 func TestDriverOldReplies(t *testing.T) {
-	runWorld(t, fullTrace(25*time.Second), Scenario{Members: 1}, func(fw *faultline.World, w *World) {
+	forRules(t, testDriverOldReplies)
+}
+
+func testDriverOldReplies(t *testing.T, rule Takeover) {
+	runWorld(t, fullTrace(25*time.Second), Scenario{Takeover: rule, Members: 1}, func(fw *faultline.World, w *World) {
 		t := fw.T()
 		m := w.Members()[0]
 		fw.Net.SetLink(w.Store().ID(), m.Node.ID(), simnet.Link{Latency: 300 * time.Millisecond})
@@ -674,7 +722,11 @@ func TestDriverOldReplies(t *testing.T) {
 // node is up, as a recovery does, stops the driver before it: the old machine steps nothing
 // more, and the old driver keeps no timer.
 func TestDriverNewIncarnation(t *testing.T) {
-	runWorld(t, fullTrace(25*time.Second), Scenario{Members: 1}, func(fw *faultline.World, w *World) {
+	forRules(t, testDriverNewIncarnation)
+}
+
+func testDriverNewIncarnation(t *testing.T, rule Takeover) {
+	runWorld(t, fullTrace(25*time.Second), Scenario{Takeover: rule, Members: 1}, func(fw *faultline.World, w *World) {
 		t := fw.T()
 		m := w.Members()[0]
 		var prev *driver
@@ -703,7 +755,11 @@ func TestDriverNewIncarnation(t *testing.T) {
 // TestDriverViewWall checks that a stepped view carries the member's wall reading: its
 // monotonic reading plus the offset of its wall clock.
 func TestDriverViewWall(t *testing.T) {
-	runWorld(t, fullTrace(25*time.Second), Scenario{Members: 3, WallSkew: time.Second}, func(fw *faultline.World, w *World) {
+	forRules(t, testDriverViewWall)
+}
+
+func testDriverViewWall(t *testing.T, rule Takeover) {
+	runWorld(t, fullTrace(25*time.Second), Scenario{Takeover: rule, Members: 3, WallSkew: time.Second}, func(fw *faultline.World, w *World) {
 		t := fw.T()
 		fw.RunFor(4 * time.Second)
 		views := 0
