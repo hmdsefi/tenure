@@ -48,6 +48,11 @@ type call struct {
 	// The lane frees the call before either runs.
 	onReply   func(c *call, rep reply)
 	onTimeout func(c *call)
+
+	// next, when set, takes a reply first, for a call of several requests: when it sends the
+	// call's next request and reports true, the call stays in flight on its lane, under the
+	// timer of its first request, and onReply waits for a later reply.
+	next func(c *call, rep reply) bool
 }
 
 // lane holds the requests on one record: they go out one at a time, in the order they were

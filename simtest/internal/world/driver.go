@@ -25,7 +25,7 @@ const (
 )
 
 // The src attribute of a HolderChanged or a ViewChanged: where the driver read the state.
-// records_version.go adds srcHoldings; "reply" is left for the Observer rule's reads (1.8-09).
+// records_version.go adds srcHoldings, and observer.go srcReply and srcObserve.
 const (
 	srcPush     = "push"
 	srcSnapshot = "snapshot"
@@ -96,11 +96,12 @@ func (ds *drivers) current(m *Member) *driver {
 // incarnation is a Tick. Each step emits tenure.input, then one tenure.action per action, in
 // order, each carried out right after its record.
 //
-// Actions (SIM-310, the Server rule). KeepAlive, Acquire, Release, Confirm, ClaimSlot,
+// Actions (SIM-310). KeepAlive, Acquire, Release, Confirm, ClaimSlot,
 // ReleaseSlot and CloseSession become requests on the lanes; StartRun marks the shard's run
 // running, and StopRun of a running run steps RunStopped after a stop delay drawn from
 // tenure/run/<member>, uniform in [0, StopDelay] (1.8-10 puts a Run there); ExtendDeadline,
-// Degrade, Restore and Wake are only recorded.
+// Degrade, Restore and Wake are only recorded. Under the Observer rule, Acquire and ClaimSlot
+// are takeovers of several requests on one lane, and views are the driver's own (observer.go).
 //
 // Replies and timeouts (SIM-320). A request times out RetryPeriod of the member's clock after
 // it went out; replyInputs and timeoutInputs say what is stepped. A reply after its timeout is
@@ -151,6 +152,10 @@ type driver struct {
 	// instances.
 	runs  map[laneKey]core.Term
 	stops []*monoTimer
+
+	// obs is the state of the Observer rule (observer.go): the observations, the observer
+	// view and its timer. nil under the Server rule.
+	obs *observer
 }
 
 // newDriver returns the driver of m's present incarnation, with its machine.
@@ -169,6 +174,9 @@ func newDriver(ds *drivers, md *memberDrive, m *Member) *driver {
 		runs:     make(map[laneKey]core.Term),
 
 		spaceNames: sortedSpaceNames(sc.Spaces),
+	}
+	if sc.Takeover == Observer {
+		d.obs = &observer{}
 	}
 	d.machine = core.NewMachine(core.MachineConfig{Holder: m.holder, Member: m.Name, Spaces: sc.Spaces, Timing: sc.Timing})
 	d.lanes = newLanes(d.send)
@@ -198,6 +206,9 @@ func (d *driver) stop() {
 		t.cancel()
 	}
 	d.stops = nil
+	if d.obs != nil && d.obs.timer != nil {
+		d.obs.timer.cancel()
+	}
 }
 
 // status returns the machine's Status.
@@ -338,6 +349,8 @@ func (d *driver) execute(a core.Action) {
 		case core.StopRun:
 			d.stopRun(a)
 		case core.ExtendDeadline, core.Degrade, core.Restore, core.Wake:
+		case core.ClaimSlot:
+			// Under the Observer rule, a ClaimSlot with no slot to claim sends nothing.
 		default:
 			panic(fmt.Sprintf("world: driver: unknown action %T", a))
 		}
@@ -354,9 +367,14 @@ func (d *driver) execute(a core.Action) {
 }
 
 // callFor returns the call that carries out a, with its request still without its head, or nil
-// for an action that is no request. Under the Observer rule 1.8-09 replaces the rows of Acquire
-// and ClaimSlot.
+// for an action that is no request. Under the Observer rule observerCall makes the calls of
+// Acquire and ClaimSlot, which take several requests.
 func (d *driver) callFor(a core.Action) *call {
+	if d.obs != nil {
+		if c, ok := d.observerCall(a); ok {
+			return c
+		}
+	}
 	c := &call{act: a, onReply: d.answer, onTimeout: d.expire}
 	switch a := a.(type) {
 	case core.KeepAlive:
@@ -414,6 +432,21 @@ func withID(req request, h reqHead) request {
 	case setSlotsReq:
 		r.reqHead = h
 		return r
+	case getShardReq:
+		r.reqHead = h
+		return r
+	case getSlotReq:
+		r.reqHead = h
+		return r
+	case getSessionReq:
+		r.reqHead = h
+		return r
+	case casReq:
+		r.reqHead = h
+		return r
+	case casSlotReq:
+		r.reqHead = h
+		return r
 	}
 	panic(fmt.Sprintf("world: driver: cannot send %T", req))
 }
@@ -453,9 +486,15 @@ func (d *driver) handle(from kernel.NodeID, payload any) {
 	case holderPush:
 		d.record(p.Record, p.Describe(), srcPush)
 	case viewPush:
+		if d.obs != nil {
+			d.observeSessions(p.Sessions)
+		}
 		d.view(p.View, p.Describe(), srcPush)
 	case snapshotPush:
 		text := p.Describe()
+		if d.obs != nil {
+			d.observeSessions(p.Sessions)
+		}
 		for _, rec := range p.Records {
 			d.record(rec, text, srcSnapshot)
 		}
@@ -466,8 +505,9 @@ func (d *driver) handle(from kernel.NodeID, payload any) {
 }
 
 // reply takes the reply rep: it frees the lane of the request it answers and steps what it
-// means. A reply to a request that timed out is dropped with tenure.reply_late, and a reply to a
-// request of an earlier incarnation is dropped.
+// means. A call of several requests (the Observer rule's takeovers) may instead send its next
+// request, and keeps its lane and its timeout. A reply to a request that timed out is dropped
+// with tenure.reply_late, and a reply to a request of an earlier incarnation is dropped.
 func (d *driver) reply(rep reply) {
 	id := rep.requestID()
 	c := d.inFlight[id]
@@ -479,6 +519,9 @@ func (d *driver) reply(rep reply) {
 		return
 	}
 	delete(d.inFlight, id)
+	if c.next != nil && c.next(c, rep) {
+		return
+	}
 	c.timer.cancel()
 	d.lanes.finish(c)
 	if c.onReply != nil {
@@ -642,8 +685,13 @@ func (d *driver) acquiring(key laneKey) bool {
 
 // view steps the store's view v, which came with a message whose text is text, as a
 // ViewChanged when it is newer than the last view stepped, and was not read before the latest
-// SlotClaimed or SlotReleased (O8). Each member's Slot is set per RUN-220.
+// SlotClaimed or SlotReleased (O8). Each member's Slot is set per RUN-220. Under the Observer
+// rule v becomes the base of the observer view instead (observer.go).
 func (d *driver) view(v core.View, text, src string) {
+	if d.obs != nil {
+		d.observerBase(v, text, src)
+		return
+	}
 	if d.viewStepped && v.Version <= d.viewVersion {
 		return
 	}

@@ -26,11 +26,11 @@ type injectStep struct {
 
 // injected runs sc, which has one member, for the duration d, with the member's node cut off
 // from every other node, so that only what the steps hand the driver reaches it (the run itself
-// lasts 30 s, which the bound needs). The requests the driver sends are lost; the steps answer
-// them with replyTo.
+// lasts 30 s, or the bound and a second when that is longer, which the setup needs). The
+// requests the driver sends are lost; the steps answer them with replyTo.
 func injected(t *testing.T, sc Scenario, d time.Duration, steps ...injectStep) {
 	t.Helper()
-	runWorld(t, fullTrace(30*time.Second), sc, func(fw *faultline.World, w *World) {
+	runWorld(t, fullTrace(max(30*time.Second, ComputeBound(sc)+time.Second)), sc, func(fw *faultline.World, w *World) {
 		m := w.Members()[0]
 		fw.Net.Isolate(m.Node.ID())
 		for _, s := range steps {
@@ -137,7 +137,11 @@ func holderChanges(sim *kernel.Sim, d *driver) []string {
 //     answer that repeats its version is not stepped.
 //   - Shard 4, degraded: a record naming this holder at a larger term is stepped as a loss.
 func TestATSIM44Versions(t *testing.T) {
-	sc := Scenario{Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 5, Fenced: true}}}
+	forRules(t, testATSIM44Versions)
+}
+
+func testATSIM44Versions(t *testing.T, rule Takeover) {
+	sc := Scenario{Takeover: rule, Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 5, Fenced: true}}}
 	var got, actions []string
 	var owned0, owned2 bool
 	injected(t, sc, 12*time.Second,
@@ -217,7 +221,11 @@ func TestATSIM44Versions(t *testing.T) {
 // holdings request with no answer is sent again RetryPeriod after it went out, and its late
 // answer is dropped with tenure.reply_late; the resync ends once every space has been read.
 func TestDriverResync(t *testing.T) {
-	sc := Scenario{Members: 1, Spaces: []core.SpaceSpec{{Name: "news", Shards: 1}, {Name: "book", Shards: 1}}}
+	forRules(t, testDriverResync)
+}
+
+func testDriverResync(t *testing.T, rule Takeover) {
+	sc := Scenario{Takeover: rule, Members: 1, Spaces: []core.SpaceSpec{{Name: "news", Shards: 1}, {Name: "book", Shards: 1}}}
 	holdings := func(t testing.TB, d *driver) *call {
 		t.Helper()
 		return d.lanes.laneOf(resyncLane()).cur
@@ -291,24 +299,47 @@ func holdingsSpace(c *call) string {
 // a run in the grant's term. With a Drain in between, it releases that term instead. book/1,
 // granted at once, keeps the session open while draining. The steps were written for this task
 // from the issue and the design note, since the original acceptance-test text is lost.
+//
+// Under the Observer rule the store answers the requests of SIM-230 instead: the first
+// Acquire reads the record naming m2 (stepped as HolderChanged, src reply) and m2's session,
+// which it has not seen unrenewed for LeaseDuration, so it fails with no cas; the second reads
+// the cleared record and sends cas, whose grant is the late reply.
 func TestATSIM18LateGrant(t *testing.T) {
+	forRules(t, testATSIM18LateGrant)
+}
+
+func testATSIM18LateGrant(t *testing.T, rule Takeover) {
 	for _, drain := range []bool{false, true} {
 		t.Run("drain="+strconv.FormatBool(drain), func(t *testing.T) {
-			sc := Scenario{Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 2}}}
+			sc := Scenario{Takeover: rule, Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 2}}}
 			var acquire *call
 			var got []string
+			lane0 := shardLane("book", 0)
 			steps := []injectStep{
 				{time.Second, func(t testing.TB, d *driver) {
 					renew(t, d)
 					d.view(soloView(1), "", srcPush)
 					grant(t, d, book(1, d.holder, 6, 4))
-					replyTo(t, d, shardLane("book", 0), func(h replyHead) reply {
-						return heldReply{replyHead: h, Record: book(0, "m2/0b", 4, 2), RetryAfter: d.timing.RetryPeriod}
-					})
+					if rule == Server {
+						replyTo(t, d, lane0, func(h replyHead) reply {
+							return heldReply{replyHead: h, Record: book(0, "m2/0b", 4, 2), RetryAfter: d.timing.RetryPeriod}
+						})
+					} else {
+						replyTo(t, d, lane0, func(h replyHead) reply { return shardReply{h, book(0, "m2/0b", 4, 2)} })
+						replyTo(t, d, lane0, func(h replyHead) reply {
+							return sessionReply{h, sessionInfo{Holder: "m2/0b", Version: 1, Lease: d.timing.LeaseDuration}}
+						})
+					}
 					d.record(book(0, "", 4, 5), "", srcPush)
-					acquire = d.lanes.laneOf(shardLane("book", 0)).cur
+					acquire = d.lanes.laneOf(lane0).cur
 					if acquire == nil {
 						t.Fatal("no Acquire of book/0 after its record was cleared")
+					}
+					if rule == Observer {
+						replyTo(t, d, lane0, func(h replyHead) reply { return shardReply{h, book(0, "", 4, 5)} })
+						if _, ok := acquire.req.(casReq); !ok || d.lanes.laneOf(lane0).cur != acquire {
+							t.Fatalf("after the cleared record, %q in flight, want a cas", acquire.req.Describe())
+						}
 					}
 				}},
 				{4 * time.Second, func(t testing.TB, d *driver) {
@@ -332,6 +363,9 @@ func TestATSIM18LateGrant(t *testing.T) {
 			if drain {
 				want = slices.Insert(want, 5, "Drain")
 				want[len(want)-1] = "Release term=9"
+			}
+			if rule == Observer {
+				want = slices.Insert(want, 1, "HolderChanged holder=m2/0b term=4")
 			}
 			if !slices.Equal(got, want) {
 				t.Errorf("book/0\n\t%s\nwant\n\t%s", strings.Join(got, "\n\t"), strings.Join(want, "\n\t"))
@@ -381,8 +415,12 @@ func lateGrantTrace(d *driver) []string {
 // The steps were written for this task from the issue and the design note, since the original
 // acceptance-test text is lost.
 func TestATSIM14SnapshotCatchUp(t *testing.T) {
+	forRules(t, testATSIM14SnapshotCatchUp)
+}
+
+func testATSIM14SnapshotCatchUp(t *testing.T, rule Takeover) {
 	const rho = 10_000 // ppm
-	sc := Scenario{Rho: rho}
+	sc := Scenario{Takeover: rule, Rho: rho}
 	drop, heal := 5*time.Second, 17*time.Second
 	runWorld(t, fullTrace(30*time.Second), sc, func(fw *faultline.World, w *World) {
 		t := fw.T()
@@ -447,7 +485,11 @@ func TestATSIM14SnapshotCatchUp(t *testing.T) {
 // a failure while a resync runs sends nothing more, and one more resync of every space starts
 // once the running one ends, and then the resyncs stop.
 func TestDriverResyncAgain(t *testing.T) {
-	sc := Scenario{Members: 1, Spaces: []core.SpaceSpec{{Name: "news", Shards: 1}, {Name: "book", Shards: 1}}}
+	forRules(t, testDriverResyncAgain)
+}
+
+func testDriverResyncAgain(t *testing.T, rule Takeover) {
+	sc := Scenario{Takeover: rule, Members: 1, Spaces: []core.SpaceSpec{{Name: "news", Shards: 1}, {Name: "book", Shards: 1}}}
 	answer := func(t testing.TB, d *driver, space string) {
 		t.Helper()
 		c := d.lanes.laneOf(resyncLane()).cur
@@ -483,7 +525,11 @@ func TestDriverResyncAgain(t *testing.T) {
 // TestDriverResyncLost checks that a resync ends when the session is lost: the holdings request
 // that times out after the loss is not sent again.
 func TestDriverResyncLost(t *testing.T) {
-	sc := Scenario{Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 1}}}
+	forRules(t, testDriverResyncLost)
+}
+
+func testDriverResyncLost(t *testing.T, rule Takeover) {
+	sc := Scenario{Takeover: rule, Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 1}}}
 	injected(t, sc, 8*time.Second,
 		injectStep{time.Second, renew},
 		injectStep{5 * time.Second, renew}, // follows the timed-out keepAlive of 2 s: a resync starts
@@ -510,7 +556,11 @@ func TestDriverResyncLost(t *testing.T) {
 // The test holds back the wake timer and the Confirm's timeout, so that the answer arrives
 // before the wake timer fires, as it may in the same instant.
 func TestDriverRecordAfterTick(t *testing.T) {
-	sc := Scenario{Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 1, Fenced: true}}}
+	forRules(t, testDriverRecordAfterTick)
+}
+
+func testDriverRecordAfterTick(t *testing.T, rule Takeover) {
+	sc := Scenario{Takeover: rule, Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 1, Fenced: true}}}
 	var restored bool
 	var confirms int
 	injected(t, sc, 14*time.Second,
