@@ -113,6 +113,11 @@ type World struct {
 	members []*Member // m1 to mN, then their replacements in the same order
 	clocks  *clocks
 
+	// storeSrv and fenceSrv are the state of the store's node and of the fence's, which
+	// survives their crashes (store.go, fence.go).
+	storeSrv *storeServer
+	fenceSrv *fenceServer
+
 	// The hooks through which the parts of the world give the nodes their behaviour. Build
 	// installs them before the first event, in installHooks; a nil hook does nothing.
 	//
@@ -180,11 +185,15 @@ func Build(w *faultline.World, sc Scenario) *World {
 	return world
 }
 
-// installHooks gives the nodes their behaviour. Nothing has any yet: the store's and the
-// fence's boots do nothing, and an active member's boot only draws its holder and emits
-// tenure.boot. The store and fence nodes set bootStore and bootFence here, and the driver sets
-// startMember.
-func (w *World) installHooks() {}
+// installHooks gives the nodes their behaviour: the store and the fence serve their models
+// (store.go, fence.go), and an active member's boot only draws its holder and emits
+// tenure.boot. The driver sets startMember here.
+func (w *World) installHooks() {
+	w.storeSrv = newStoreServer(w)
+	w.bootStore = w.storeSrv.boot
+	w.fenceSrv = newFenceServer(w)
+	w.bootFence = w.fenceSrv.boot
+}
 
 // Bound returns the scenario's bound, as ComputeBound gives it: the longest time a shard may
 // stay without an owner once the world is left alone.
