@@ -59,8 +59,9 @@ differ:
 FAULTLINE_CHECK_DETERMINISM=1 GOWORK=off go -C simtest test -count=1 ./...
 ```
 
-CI runs `simtest` with `-short` on every pull request, with the full seed counts on every push to
-`main`, and with 2000 new seeds for each simulation every night.
+On every pull request, CI runs `simtest` with `-short` and the race detector, and it runs the
+command above on Linux and macOS with Go 1.26 and the newest stable Go. It runs the full seed
+counts on every push to `main`, and 2000 new seeds for each simulation every night.
 
 Each nested module requires the root module, and any other module of this repository it uses,
 through a `replace` directive that points at that module's directory in your checkout. That is
