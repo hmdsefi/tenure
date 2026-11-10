@@ -49,6 +49,7 @@ func TestSetupErrors(t *testing.T) {
 		{"set slots to below", Scenario{SetSlotsTo: -1}, 0, "SetSlotsTo -1 is outside [0, 10000]"},
 		{"set slots to above", Scenario{SetSlotsTo: 10_001}, 0, "SetSlotsTo 10001 is outside [0, 10000]"},
 		{"set slots without slots", Scenario{SetSlotsAt: time.Second, SetSlotsTo: 2}, 0, "SetSlotsAt without Slots"},
+		{"set slots to 0 without slots", Scenario{SetSlotsAt: time.Second}, 0, "SetSlotsAt without Slots"},
 		{"rollout without slots", Scenario{Rollout: rollout}, 0, "Rollout without Slots"},
 		{"rollout gap", Scenario{Slots: 2, Rollout: &Rollout{Surge: 1}}, 0, "Rollout.Gap 0s is not positive"},
 		{"rollout surge", Scenario{Slots: 2, Rollout: &Rollout{Gap: 1, Surge: -1}}, 0, "Rollout.Surge -1ns is not positive"},

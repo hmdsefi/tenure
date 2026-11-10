@@ -192,6 +192,16 @@ func TestATSIM08Holders(t *testing.T) {
 		for _, mb := range w.Members() {
 			m[mb.Name] = mb
 		}
+		// The driver starts after the holder was drawn and tenure.boot emitted.
+		var starts []string
+		w.startMember = func(mb *Member) {
+			recs := fw.Sim.Records()
+			last := recs[len(recs)-1]
+			if last.Kind != kindBoot || last.Node != mb.Node.ID() || attrValue(last, "holder") != mb.Holder() {
+				t.Errorf("%s started before its tenure.boot: the last record is %s %v", mb.Name, last.Kind, attrs(last))
+			}
+			starts = append(starts, mb.Holder())
+		}
 		var firstM1 string
 		crashAndRestart := func(name string, down, up time.Duration) {
 			fw.Sim.At(at(down), "test/crash", func() { m[name].Node.Crash() })
@@ -247,6 +257,9 @@ func TestATSIM08Holders(t *testing.T) {
 		}
 		if !slices.Equal(got, want) {
 			t.Errorf("tenure.boot records:\n got %v\nwant %v", got, want)
+		}
+		if len(starts) != len(want) {
+			t.Errorf("the driver started %d times, want once per incarnation, %d: %v", len(starts), len(want), starts)
 		}
 		seen := map[string]bool{}
 		for _, b := range got {
@@ -371,9 +384,12 @@ func TestATSIM06ClockJump(t *testing.T) {
 		}
 	})
 	t.Run("build", func(t *testing.T) {
-		// The child's output is matched by substring: go test adds lines of its own.
+		// The child's output is matched by substring: go test adds lines of its own. The child
+		// runs one seed of its own, so none of faultline's variables of this process reaches
+		// it: a seed list, a schedule to replay or a results file would change its run or have
+		// it write where this process does, and an artifact directory may not be writable.
 		cmd := exec.Command(os.Args[0], "-test.run=^TestATSIM06Child$", "-test.v") //nolint:gosec // the test binary itself
-		cmd.Env = append(os.Environ(), childEnv+"=1", "FAULTLINE_ARTIFACTS=off")
+		cmd.Env = append(childEnviron(), childEnv+"=1", "FAULTLINE_ARTIFACTS=off")
 		var out bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &out
 		err := cmd.Run()
@@ -398,6 +414,8 @@ func TestATSIM06ClockJump(t *testing.T) {
 		}{
 			{"jump forward", func(n *kernel.Node) { n.JumpClock(time.Millisecond) }, true},
 			{"jump back", func(n *kernel.Node) { n.JumpClock(-time.Microsecond) }, true},
+			{"jump forward 2ns", func(n *kernel.Node) { n.JumpClock(2) }, true},
+			{"jump back 3ns", func(n *kernel.Node) { n.JumpClock(-3) }, true},
 			{"drift change", func(n *kernel.Node) { n.SetDrift(-300_000) }, false},
 		} {
 			s, nodes, _ := rawSim(t, 77_777)
@@ -411,16 +429,29 @@ func TestATSIM06ClockJump(t *testing.T) {
 				t.Errorf("%s: the run failed with %v", tt.name, err)
 			}
 		}
-		// A drift changed between two events, by the body of a test, passes too.
-		s, nodes, _ := rawSim(t, 77_777)
+		// A drift changed between two events, by the body of a test, passes too: the look after
+		// the next event sees a reading between what the two drifts predict.
+		s, nodes, c := rawSim(t, 77_777)
 		s.At(at(1500*time.Millisecond), "test/event", func() {})
 		s.RunFor(1234567)
 		nodes[0].SetDrift(400_000)
 		s.RunFor(time.Second)
+		if c.of(nodes[0]).ppm != 0 {
+			t.Fatalf("the look ran before the event that should show the change")
+		}
+		s.RunFor(time.Second)
 		if err := s.Err(); err != nil {
 			t.Errorf("a drift changed between events failed the run: %v", err)
 		}
+		if nc := c.of(nodes[0]); nc.ppm != 400_000 || nc.at != at(1500*time.Millisecond) {
+			t.Errorf("the last look was at %v with %d ppm, want at 1.5s with 400000", nc.at, nc.ppm)
+		}
 	})
+}
+
+// childEnviron returns the environment of this process without faultline's variables.
+func childEnviron() []string {
+	return slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "FAULTLINE_") })
 }
 
 // TestATSIM06Child is the child process of TestATSIM06ClockJump: it builds a world with a
