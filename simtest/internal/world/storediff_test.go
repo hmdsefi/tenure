@@ -5,8 +5,8 @@ package world
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -35,7 +35,7 @@ import (
 
 // diffCases are the cases of AT-SIM-12; each sequence declares the ones it covers, and together
 // the sequences cover them all. The original list is lost, so this one was written from the
-// issue and the store rules. The last four go beyond it.
+// issue and the store rules. The last six go beyond it.
 var diffCases = []string{
 	"open",                    // a holder's first KeepAlive opens its session
 	"renew",                   // a KeepAlive in time renews the session
@@ -71,18 +71,25 @@ var diffCases = []string{
 	"slots-zero",     // Slots at a count of 0 reads no clock
 	"slot-expired",   // a slot whose holder's session expired is free
 	"release-absent", // Release of an absent record
+	"clock-read",     // KeepAlive, Acquire, Confirm and ClaimSlot read the clock
+	"no-clock-read",  // Release, ReleaseSlot, CloseSession, SetSlots and Holdings read none
 }
 
 // diffSequenceCount is the number of sequences the issue asks for.
 const diffSequenceCount = 40
 
-// The holders of the sequences: diffA2 is a later incarnation of diffA's member m1.
+// The holders of the sequences: diffA2 is a later incarnation of diffA's member m1, and diffC2 of
+// diffC's member m3.
 const (
 	diffA  = "m1/a"
 	diffA2 = "m1/b"
 	diffB  = "m2/b"
 	diffC  = "m3/c"
+	diffC2 = "m3/x"
 	diffD  = "m4/d"
+	diffE  = "m5/e"
+	diffF  = "m6/f"
+	diffG  = "m8/g"
 	diffZ  = "m9/z"
 )
 
@@ -434,7 +441,7 @@ func (r *diffRunner) step(i int, op diffOp) {
 			op.term -= core.Term(-op.delta)
 		}
 		if op.term == 0 || op.term > 1<<62 {
-			t.Fatalf("%s: term 0 is not a well-formed argument", where)
+			t.Fatalf("%s: term %d is not a well-formed argument", where, op.term)
 		}
 	}
 	mem := r.callMem(where, op)
@@ -443,9 +450,31 @@ func (r *diffRunner) step(i int, op diffOp) {
 	if op.want != "" && mem.text() != op.want {
 		t.Errorf("%s: memstore gives %q, the sequence wants %q", where, mem.text(), op.want)
 	}
+	if op.kind == diffClose {
+		r.checkNothingHeldBy(where, op.holder)
+	}
 	for _, space := range []string{diffBook, diffPage} {
 		check := diffOp{kind: diffHoldings, space: space}
 		r.compare(where+" then Holdings "+space, r.callModel(where, check), r.callMem(where, check))
+	}
+}
+
+// checkNothingHeldBy checks, after a CloseSession of holder, that no record of the model names it:
+// memstore removes the slot records of the holder, also those at or above the slot count, and
+// clears its shard records. The slot records cannot be seen through memstore's methods, because an
+// ended session never reopens and a slot of such a session reads as free, so the model's own
+// records are looked at. The shard records are compared through Holdings after every operation.
+func (r *diffRunner) checkNothingHeldBy(where, holder string) {
+	r.t.Helper()
+	for _, rec := range r.model.allRecords() {
+		if rec.Holder == holder {
+			r.t.Errorf("%s: the model still has the record %s", where, diffRecText(rec))
+		}
+	}
+	for _, slot := range slices.Sorted(maps.Keys(r.model.slots)) {
+		if r.model.slots[slot].Holder == holder {
+			r.t.Errorf("%s: the model still has slot %d for the closed holder", where, slot)
+		}
 	}
 }
 
@@ -515,17 +544,19 @@ func (r *diffRunner) callMem(where string, op diffOp) diffResult {
 	default:
 		t.Fatalf("%s: unknown operation %d", where, op.kind)
 	}
-	var held *tenure.HeldError
+	// The sentinels and the *tenure.HeldError are matched by identity and by type, not with
+	// errors.Is and errors.As: memstore returns them as they are, never wrapped.
+	held, isHeld := err.(*tenure.HeldError)
 	switch {
 	case err == nil:
-	case errors.Is(err, tenure.ErrSessionLost):
+	case err == tenure.ErrSessionLost:
 		res.err = "lost"
-	case errors.Is(err, tenure.ErrNoSlot):
+	case err == tenure.ErrNoSlot:
 		res.err = "noslot"
-	case errors.As(err, &held):
+	case isHeld && held != nil:
 		res.err, res.held = "held", *held
 	default:
-		t.Fatalf("%s: memstore: %v (a malformed operation)", where, err)
+		t.Fatalf("%s: memstore: %v (a malformed operation, or an error that is not returned as is)", where, err)
 	}
 	if err != nil && (res.term != 0 || (op.kind == diffClaimSlot && res.slot != -1)) {
 		t.Errorf("%s: memstore returns term %d and slot %d with %v", where, res.term, res.slot, err)
@@ -693,6 +724,61 @@ func diffSequences() []diffSequence {
 			diffMono(15*s - 2*ns),
 			diffKA(diffA, diffTimingShort).expect("lost"), // at expiry
 		}},
+		{"operations_that_read_no_clock", []string{"no-clock-read", "mono-back"}, []diffOp{
+			// memstore's Release, ReleaseSlot, CloseSession, SetSlots and Holdings read no clock:
+			// after them the store's time is still 0, so A's renewal at 1 s is in time. A model
+			// that took the reading of one of them would have 10 s and end A's session.
+			diffKA(diffA, diffTimingShort),
+			diffKA(diffB, diffTimingLong),
+			diffKA(diffC, diffTimingLong),
+			diffSet(2),
+			diffAcq(diffB, diffBook, 0).expect("term=1000"),
+			diffClaim(diffB).expect("slot 0"),
+			diffMono(10 * s),
+			diffRel(diffB, diffBook, 0, 0).expect("ok"),
+			diffRelSlot(diffB, 0).expect("ok"),
+			diffSet(3).expect("ok"),
+			diffHold(diffBook).expect("[book/0 - t1000 v2]"),
+			diffCloseS(diffC).expect("ok"),
+			diffMono(s),
+			diffKA(diffA, diffTimingShort).expect("ok"),
+		}},
+		{"operations_that_read_the_clock", []string{"clock-read", "mono-back", "after-end"}, []diffOp{
+			// Confirm, Acquire and ClaimSlot read the clock: the store's time becomes the reading
+			// and stays there when the clock goes back. Every round opens a session with a lease
+			// of 5 s, reads the clock far ahead with one operation of B (lease 30 s), and sets the
+			// clock back before the renewal of the session, which is late.
+			diffSet(1),
+			diffKA(diffB, diffTimingLong),
+			diffKA(diffA, diffTimingShort),
+			diffMono(10 * s),
+			diffConfT(diffB, diffBook, 0, 1).expect("book/0 - t0 v0"),
+			diffMono(s),
+			diffKA(diffA, diffTimingShort).expect("lost"),
+			diffMono(10 * s),
+			diffKA(diffC, diffTimingShort).expect("ok"),
+			diffMono(20 * s),
+			diffAcq(diffB, diffBook, 0).expect("term=1000"),
+			diffMono(11 * s),
+			diffKA(diffC, diffTimingShort).expect("lost"),
+			diffMono(20 * s),
+			diffKA(diffD, diffTimingShort).expect("ok"),
+			diffMono(29 * s),
+			diffClaim(diffB).expect("slot 0"),
+			diffMono(21 * s),
+			diffKA(diffD, diffTimingShort).expect("lost"),
+			// The first operation after the expiry of the caller's session finds it ended.
+			diffMono(29 * s),
+			diffKA(diffE, diffTimingShort).expect("ok"),
+			diffMono(35 * s),
+			diffConfT(diffE, diffBook, 0, 1).expect("lost"),
+			diffKA(diffF, diffTimingShort).expect("ok"),
+			diffMono(41 * s),
+			diffAcq(diffF, diffBook, 1).expect("lost"),
+			diffKA(diffG, diffTimingShort).expect("ok"),
+			diffMono(47 * s),
+			diffClaim(diffG).expect("lost"),
+		}},
 		{"slots_at_count_zero_read_no_clock", []string{"slots-zero", "mono-back", "setslots-up"}, []diffOp{
 			diffKA(diffA, diffTimingShort),
 			diffMono(10 * s),
@@ -705,7 +791,7 @@ func diffSequences() []diffSequence {
 			diffMono(4 * s),
 			diffKA(diffA, diffTimingShort).expect("lost"), // Slots read 10 s
 		}},
-		{"replaced_by_new_incarnation", []string{"replaced", "after-end", "regrant"}, []diffOp{
+		{"replaced_by_new_incarnation", []string{"replaced", "after-end"}, []diffOp{
 			diffKA(diffA, diffTiming),
 			diffAcq(diffA, diffBook, 0).expect("term=1000"),
 			diffAdv(s),
@@ -762,19 +848,18 @@ func diffSequences() []diffSequence {
 			diffAcq(diffA, diffBook, 0).expect("term=1002"),
 		}},
 		{"held_with_acquirer_retry_period", []string{"held-retry", "regrant"}, []diffOp{
-			diffKA(diffA, diffTiming),
-			diffKA(diffB, diffTimingRetry3),
-			diffAcq(diffA, diffBook, 0).expect("term=1000"),
-			diffAcq(diffB, diffBook, 0).expect("held by m1/a retry 3s"),
-			diffAcq(diffA, diffBook, 0).expect("term=1001"),
-		}},
-		{"held_retry_of_each_acquirer", []string{"held-retry"}, []diffOp{
+			// The RetryPeriods are 1 s for A, 3 s for B and 4 s for C: the error carries the
+			// acquirer's, not the holder's.
 			diffKA(diffA, diffTimingShort),
 			diffKA(diffB, diffTimingRetry3),
 			diffKA(diffC, diffTimingLong),
-			diffAcq(diffC, diffBook, 0).expect("term=1000"),
-			diffAcq(diffA, diffBook, 0).expect("held by m3/c retry 1s"),
-			diffAcq(diffB, diffBook, 0).expect("held by m3/c retry 3s"),
+			diffAcq(diffA, diffBook, 0).expect("term=1000"),
+			diffAcq(diffB, diffBook, 0).expect("held by m1/a retry 3s"),
+			diffAcq(diffC, diffBook, 0).expect("held by m1/a retry 4s"),
+			diffAcq(diffA, diffBook, 0).expect("term=1001"),
+			diffAcq(diffC, diffBook, 1).expect("term=1000"),
+			diffAcq(diffA, diffBook, 1).expect("held by m3/c retry 1s"),
+			diffAcq(diffB, diffBook, 1).expect("held by m3/c retry 3s"),
 		}},
 		{"takeover_exactly_at_expiry", []string{"takeover-at-expiry", "confirm-own"}, []diffOp{
 			diffKA(diffA, diffTiming),
@@ -878,21 +963,20 @@ func diffSequences() []diffSequence {
 			diffRelT(diffA, diffBook, 0, 1000).expect("ok"),
 			diffHold(diffBook).expect("[book/0 m2/b t16000 v2]"),
 		}},
-		{"release_by_ended_session", []string{"release-ended", "late-renewal", "after-end"}, []diffOp{
+		{"release_by_ended_session", []string{"release-ended", "late-renewal", "after-end", "replaced"}, []diffOp{
+			// A's session ends by a late renewal, C's by a newer incarnation of its member.
 			diffKA(diffA, diffTimingShort),
 			diffAcq(diffA, diffBook, 0),
 			diffAdv(5 * s),
 			diffKA(diffA, diffTimingShort).expect("lost"),
 			diffRel(diffA, diffBook, 0, 0).expect("ok"),
 			diffHold(diffBook).expect("[book/0 - t1000 v2]"),
-		}},
-		{"release_after_replacement", []string{"release-ended", "replaced"}, []diffOp{
-			diffKA(diffA, diffTiming),
-			diffAcq(diffA, diffBook, 0),
-			diffAcq(diffA, diffBook, 1),
-			diffKA(diffA2, diffTiming),
-			diffRel(diffA, diffBook, 0, 0).expect("ok"),
-			diffHold(diffBook).expect("[book/0 - t1000 v3, book/1 m1/a t1000 v2]"),
+			diffKA(diffC, diffTiming),
+			diffAcq(diffC, diffBook, 1).expect("term=6000"),
+			diffAcq(diffC, diffBook, 2).expect("term=6000"),
+			diffKA(diffC2, diffTiming),
+			diffRel(diffC, diffBook, 1, 0).expect("ok"),
+			diffHold(diffBook).expect("[book/0 - t1000 v2, book/1 - t6000 v5, book/2 m3/c t6000 v4]"),
 		}},
 
 		// Confirm.
@@ -1051,7 +1135,7 @@ func diffSequences() []diffSequence {
 			diffClaim(diffB).expect("slot 0"),
 			diffSlotsOp().expect("count 2 [m2/b -]"),
 		}},
-		{"setslots_down_and_up", []string{"setslots-down", "setslots-up", "claim-retired", "claim-own", "claim-none"}, []diffOp{
+		{"setslots_down_and_up", []string{"setslots-down", "setslots-up", "claim-retired", "claim-own", "release-slot"}, []diffOp{
 			diffSet(3),
 			diffKA(diffA, diffTiming),
 			diffKA(diffB, diffTiming),
@@ -1066,9 +1150,15 @@ func diffSequences() []diffSequence {
 			diffSet(3),
 			diffClaim(diffC).expect("slot 2"),
 			diffSlotsOp().expect("count 3 [m1/a m2/b m3/c]"),
-			diffRelSlot(diffC, 2).expect("ok"),
+			// C holds slot 2, which is retired after the count goes to 2: it gets none, also
+			// when slot 0 is free, until it releases the slot.
 			diffSet(2),
+			diffRelSlot(diffA, 0).expect("ok"),
+			diffSlotsOp().expect("count 2 [- m2/b]"),
 			diffClaim(diffC).expect("noslot"),
+			diffRelSlot(diffC, 2).expect("ok"),
+			diffClaim(diffC).expect("slot 0"),
+			diffSlotsOp().expect("count 2 [m3/c m2/b]"),
 		}},
 	}
 }
