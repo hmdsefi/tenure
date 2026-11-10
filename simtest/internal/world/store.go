@@ -114,6 +114,20 @@ func (s *storeServer) expire() {
 	s.armEnd()
 }
 
+// grant returns the grant of e as the checker takes it.
+func (e grantEffect) grant() check.Grant {
+	return check.Grant{
+		Space:  e.Record.Space,
+		Shard:  e.Record.Shard,
+		Term:   e.Record.Term,
+		Holder: e.Record.Holder,
+		Prev:   e.Prev,
+		Ended:  e.Ended,
+		Unseen: e.Unseen,
+		Lease:  e.Lease,
+	}
+}
+
 // storePushes is what one call of the model asks the store to push: the records written, in
 // order, and the view and sessions when the view or a session changed.
 type storePushes struct {
@@ -132,16 +146,7 @@ func (s *storeServer) apply(text string) storePushes {
 			s.w.emitSession(text, string(e.Op), e.Holder, e.Version, string(e.Cause))
 			sessions = true
 		case grantEffect:
-			g := check.Grant{
-				Space:  e.Record.Space,
-				Shard:  e.Record.Shard,
-				Term:   e.Record.Term,
-				Holder: e.Record.Holder,
-				Prev:   e.Prev,
-				Ended:  e.Ended,
-				Unseen: e.Unseen,
-				Lease:  e.Lease,
-			}
+			g := e.grant()
 			s.w.emitGrant(text, g, e.Record.Version)
 			if s.onGrant != nil {
 				s.onGrant(g)

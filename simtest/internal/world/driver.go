@@ -43,6 +43,9 @@ type drivers struct {
 	// have been emitted and its actions carried out, with the input as stepped and the
 	// actions. The checks of 1.8-10 feed the checker from it.
 	onStep func(d *driver, in core.Input, acts []core.Action)
+	// onRetire, when set, is called when a new incarnation of a member takes over from the
+	// driver of the one before, before that driver stops: its holder is gone from then on.
+	onRetire func(d *driver)
 }
 
 // memberDrive is what a member keeps across its incarnations.
@@ -74,6 +77,9 @@ func (ds *drivers) of(m *Member) *memberDrive {
 func (ds *drivers) start(m *Member) {
 	md := ds.of(m)
 	if md.cur != nil {
+		if ds.onRetire != nil {
+			ds.onRetire(md.cur)
+		}
 		md.cur.stop()
 	}
 	d := newDriver(ds, md, m)
@@ -97,10 +103,10 @@ func (ds *drivers) current(m *Member) *driver {
 // order, each carried out right after its record.
 //
 // Actions (SIM-310). KeepAlive, Acquire, Release, Confirm, ClaimSlot,
-// ReleaseSlot and CloseSession become requests on the lanes; StartRun marks the shard's run
-// running, and StopRun of a running run steps RunStopped after a stop delay drawn from
-// tenure/run/<member>, uniform in [0, StopDelay] (1.8-10 puts a Run there); ExtendDeadline,
-// Degrade, Restore and Wake are only recorded. Under the Observer rule, Acquire and ClaimSlot
+// ReleaseSlot and CloseSession become requests on the lanes; StartRun starts a run against the
+// fence and StopRun stops it, which steps RunStopped once the run has stopped (run.go);
+// ExtendDeadline moves the session deadline the runs check; Degrade, Restore and Wake are only
+// recorded. Under the Observer rule, Acquire and ClaimSlot
 // are takeovers of several requests on one lane, and views are the driver's own (observer.go).
 //
 // Replies and timeouts (SIM-320). A request times out RetryPeriod of the member's clock after
@@ -147,11 +153,13 @@ type driver struct {
 	spaceNames []string
 	resync     resync
 
-	// runs holds the term of each shard's run from its StartRun to its StopRun; stops holds
-	// the timers of the runs stopping, which step RunStopped. 1.8-10 replaces both with Run
-	// instances.
-	runs  map[laneKey]core.Term
-	stops []*monoTimer
+	// runs holds the runs of the incarnation (run.go) from their StartRun to their
+	// RunStopped, in the order they started; fenceCalls the run of each fence request in
+	// flight, by request ID, looked up only. deadline is the session deadline Check reads: the
+	// latest of StartRun and ExtendDeadline.
+	runs       []*run
+	fenceCalls map[uint64]*run
+	deadline   time.Duration
 
 	// obs is the state of the Observer rule (observer.go): the observations, the observer
 	// view and its timer. nil under the Server rule.
@@ -171,7 +179,6 @@ func newDriver(ds *drivers, md *memberDrive, m *Member) *driver {
 		inFlight: make(map[uint64]*call),
 		late:     make(map[uint64]bool),
 		records:  make(map[laneKey]*shardRecord),
-		runs:     make(map[laneKey]core.Term),
 
 		spaceNames: sortedSpaceNames(sc.Spaces),
 	}
@@ -202,10 +209,7 @@ func (d *driver) stop() {
 			l.cur.timer.cancel()
 		}
 	}
-	for _, t := range d.stops {
-		t.cancel()
-	}
-	d.stops = nil
+	d.stopRuns()
 	if d.obs != nil && d.obs.timer != nil {
 		d.obs.timer.cancel()
 	}
@@ -348,7 +352,9 @@ func (d *driver) execute(a core.Action) {
 			d.startRun(a)
 		case core.StopRun:
 			d.stopRun(a)
-		case core.ExtendDeadline, core.Degrade, core.Restore, core.Wake:
+		case core.ExtendDeadline:
+			d.extendDeadline(a)
+		case core.Degrade, core.Restore, core.Wake:
 		case core.ClaimSlot:
 			// Under the Observer rule, a ClaimSlot with no slot to claim sends nothing.
 		default:
@@ -475,12 +481,17 @@ func (d *driver) timeout(c *call) {
 	}
 }
 
-// handle takes one message delivered to the member's node: a reply, or a push of the store.
+// handle takes one message delivered to the member's node: a reply of the fence, which goes to
+// the run that sent the request (run.go), a reply of the store, or a push of the store.
 func (d *driver) handle(from kernel.NodeID, payload any) {
 	if d.stopped {
 		return
 	}
 	switch p := payload.(type) {
+	case raisedReply:
+		d.runReply(p)
+	case writtenReply:
+		d.runReply(p)
 	case reply:
 		d.reply(p)
 	case holderPush:
@@ -720,44 +731,6 @@ func withSlots(v core.View) core.View {
 		out.Members[i].Slot = lowest[out.Members[i].ID] - 1
 	}
 	return out
-}
-
-// startRun marks the shard's run running in a's term. 1.8-10 starts a Run instance here.
-func (d *driver) startRun(a core.StartRun) {
-	d.runs[shardLane(a.Space, a.Shard)] = a.Term
-}
-
-// stopRun stops the shard's run when it runs in a's term: after a delay drawn from
-// tenure/run/<member>, uniform in [0, StopDelay] (no draw for a StopDelay of 0), RunStopped is
-// stepped, in an event of its own. 1.8-10 stops the Run instance here.
-func (d *driver) stopRun(a core.StopRun) {
-	key := shardLane(a.Space, a.Shard)
-	if t, ok := d.runs[key]; !ok || t != a.Term {
-		return
-	}
-	delete(d.runs, key)
-	delay := time.Duration(0)
-	if sd := d.w.sc.StopDelay; sd > 0 {
-		delay = kernel.Uniform(d.md.runs, 0, sd)
-	}
-	var t *monoTimer
-	t = d.w.setTimer(d.m.Node, d.m.Mono()+delay, labelRunStop, func() {
-		d.forgetStop(t)
-		d.step(core.RunStopped{Space: a.Space, Shard: a.Shard, Term: a.Term}, "", "")
-	})
-	if t.pending() {
-		d.stops = append(d.stops, t)
-	}
-}
-
-// forgetStop takes t off the timers of the runs stopping.
-func (d *driver) forgetStop(t *monoTimer) {
-	for i, s := range d.stops {
-		if s == t {
-			d.stops = append(d.stops[:i], d.stops[i+1:]...)
-			return
-		}
-	}
 }
 
 // inputFields returns the type of the input and its fields as attributes of tenure.input, in
