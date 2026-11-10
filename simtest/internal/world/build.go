@@ -12,6 +12,8 @@ import (
 	"github.com/hmdsefi/faultline"
 	"github.com/hmdsefi/faultline/kernel"
 	"github.com/hmdsefi/faultline/kernel/fault"
+
+	"github.com/hmdsefi/tenure/simtest/internal/check"
 )
 
 // The names of the two nodes that are not members. Each is also the name of the role that holds
@@ -134,6 +136,10 @@ type World struct {
 
 	// drivers holds the drivers of the members' incarnations (driver.go).
 	drivers *drivers
+
+	// checker decides the invariants over what the store, the drivers and the fence observe
+	// (checks.go).
+	checker *check.Checker
 }
 
 // Build builds the world of sc in w, the world of one run, and returns it. It must be called
@@ -162,6 +168,11 @@ type World struct {
 // describe every run. The copy's Quiet, when it is 0, is the default that SetupError describes.
 // Build emits one global tenure.bound record with the rule, the recovery time, the bound and
 // whether the run asserts that no two members own a shard at once.
+//
+// Every StartRun of a member's machine starts a run that raises the fence of its shard and
+// writes to it in its term. A checker observes the store, the drivers and the fence, and Build
+// registers its checks as the invariants tenure/g1, tenure/g2 (only when the run asserts it),
+// tenure/g3, tenure/g4 and tenure/monotonic, which run after every event.
 func Build(w *faultline.World, sc Scenario) *World {
 	w.T().Helper()
 	st, err := newSetup(sc, w.End())
@@ -184,6 +195,7 @@ func Build(w *faultline.World, sc Scenario) *World {
 	world.planFaults()
 	world.planWallSteps()
 	world.installHooks()
+	world.installChecks()
 	world.emitBound()
 	return world
 }
@@ -198,6 +210,11 @@ func (w *World) installHooks() {
 	w.drivers = newDrivers(w)
 	w.startMember = w.drivers.start
 }
+
+// Checker returns the world's checker, which every observation of the run feeds: its checks
+// g1, g2 (when the run asserts it), g3, g4 and monotonic are the invariants tenure/g1 and so on
+// that Build registers, and its Liveness is for the final checks.
+func (w *World) Checker() *check.Checker { return w.checker }
 
 // Bound returns the scenario's bound, as ComputeBound gives it: the longest time a shard may
 // stay without an owner once the world is left alone.

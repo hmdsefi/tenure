@@ -15,6 +15,7 @@ import (
 
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/core"
+	"github.com/hmdsefi/tenure/simtest/internal/check"
 )
 
 // injectStep is one event of an injected run: do runs at the time at, in an event of the
@@ -62,9 +63,18 @@ func renew(t testing.TB, d *driver) {
 	replyTo(t, d, sessionLane, func(h replyHead) reply { return renewedReply{replyHead: h, Version: 1, Opened: true} })
 }
 
-// grant answers the Acquire in flight on shard of book with a grant of rec.
+// granted reports to the world's checker that the store granted rec: an injected world's store
+// never sees the requests, so its grants are the test's to report, before the driver learns of
+// them, as the store would have.
+func granted(d *driver, rec tenure.Holding) {
+	d.w.checker.Grant(check.Grant{Space: rec.Space, Shard: rec.Shard, Term: rec.Term, Holder: rec.Holder})
+}
+
+// grant answers the Acquire in flight on shard of book with a grant of rec, which it reports to
+// the checker first.
 func grant(t testing.TB, d *driver, rec tenure.Holding) {
 	t.Helper()
+	granted(d, rec)
 	replyTo(t, d, shardLane(rec.Space, rec.Shard), func(h replyHead) reply { return grantedReply{h, rec} })
 }
 
@@ -166,6 +176,7 @@ func testATSIM44Versions(t *testing.T, rule Takeover) {
 				}
 			}
 			d.record(book(3, "m2/0b", 9, 20), "", srcPush)
+			granted(d, book(4, d.holder, 12, 21))
 			d.record(book(4, d.holder, 12, 21), "", srcPush)
 			renew(t, d) // the keepAlive sent at 10 s: it follows failed renewals, so a resync starts
 			d.record(book(0, d.holder, 5, 12), "", srcPush)
@@ -344,6 +355,7 @@ func testATSIM18LateGrant(t *testing.T, rule Takeover) {
 				}},
 				{4 * time.Second, func(t testing.TB, d *driver) {
 					rec := book(0, d.holder, 9, 7)
+					granted(d, rec)
 					d.reply(grantedReply{replyHead{ID: acquire.req.head().ID}, rec})
 					d.record(rec, holderPush{rec}.Describe(), srcPush)
 					got = lateGrantTrace(d)
