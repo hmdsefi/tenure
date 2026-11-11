@@ -113,6 +113,14 @@ var rows = []row{
 		name: "TestSlotGrace", sc: world.Scenario{Slots: 5, Faults: &fault.Random{Quiet: graceRun - graceCrash}},
 		seeds: 20, duration: graceRun, net: defaultNet, g2: true,
 	},
+	{
+		name: "TestSlotRollout", sc: world.Scenario{Slots: 5, Rollout: rolloutPlan},
+		seeds: 20, duration: rolloutRun, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestSlotRolloutFaults", sc: world.Scenario{Slots: 5, Rollout: rolloutPlan, Faults: rolloutFaults()},
+		seeds: 100, duration: rolloutRun, net: defaultNet, g2: true,
+	},
 	// The row's Outage.For is the first of outageLengths; TestFencedStoreOutage runs each.
 	{
 		name: "TestFencedStoreOutage", sc: outageScenario(outageLengths()[0]),

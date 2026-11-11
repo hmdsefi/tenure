@@ -4,9 +4,14 @@
 package simtest
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -229,4 +234,330 @@ func setRecordErr(recs []kernel.Record, retry time.Duration) error {
 		return nil
 	}
 	return errors.New("the store never set the slot count")
+}
+
+// The rollout rows (SIM-600): Slots 5 and Rollout{Start: 20 s, Gap: B + 5 s, Surge: 5 s}, for
+// a run of Start + 5·Gap + B + 10 s. B is world.ComputeBound of the scenario, which counts
+// SlotGrace; it is larger under the Observer rule, whose takeover takes more messages, and both
+// rules run one scenario, so the rows take the larger of the two. TestSlotRolloutFaults adds
+// TestCrashRestart's crashes of the active members, one every 20 s on average.
+var (
+	rolloutBound = max(world.ComputeBound(world.Scenario{Slots: 5, Takeover: world.Server}),
+		world.ComputeBound(world.Scenario{Slots: 5, Takeover: world.Observer}))
+	rolloutPlan = &world.Rollout{Start: 20 * time.Second, Gap: rolloutBound + 5*time.Second, Surge: 5 * time.Second}
+	rolloutRun  = rolloutPlan.Start + 5*rolloutPlan.Gap + rolloutBound + 10*time.Second
+)
+
+// rolloutFaults returns the fault plan of TestSlotRolloutFaults: TestCrashRestart's rule, with
+// Every 20 s.
+func rolloutFaults() *fault.Random {
+	return &fault.Random{MaxDown: 2, Rules: []fault.Rule{
+		{Kind: fault.KindCrash, Target: "members", Every: 20 * time.Second, MinFor: time.Second, MaxFor: 20 * time.Second},
+	}}
+}
+
+// TestSlotRollout replaces each of the five members once, under each rule (SIM-600): m1-r is
+// activated at 20 s, m1 drains 5 s later, and so on every Gap. Each replacement claims the slot
+// of the member it replaces and takes its shards, each shard once (tenure/rollout); every shard
+// has an owner again within B of the last drain (tenure/g5), and at the end the five
+// replacements agree on the placement and run it (tenure/converged). Every invariant holds after
+// every event.
+func TestSlotRollout(t *testing.T) {
+	runRow(t, rowNamed(t, "TestSlotRollout"), nil)
+}
+
+// TestSlotRolloutFaults is TestSlotRollout with members crashing during the rollout (SIM-600):
+// the final checks hold for every seed, under each rule.
+func TestSlotRolloutFaults(t *testing.T) {
+	runRow(t, rowNamed(t, "TestSlotRolloutFaults"), nil)
+}
+
+// rolloutChildEnv makes TestRolloutChild run.
+const rolloutChildEnv = "TENURE_SIM_ROLLOUT_CHILD"
+
+// TestATSIM35RolloutMessage is AT-SIM-35: a child process runs one seed of TestSlotRollout's
+// row under the Server rule, in which the world counts a second start of one of m1-r's shards
+// (World.PlantStart) after m1-r took them over, and the run fails with tenure/rollout's
+// message "rollout: replacement 1: book/<n> started 2 times on m1-r". Its steps were written for
+// this task from the issue and the design note, since the original text of the acceptance test
+// is lost.
+func TestATSIM35RolloutMessage(t *testing.T) {
+	if os.Getenv(rolloutChildEnv) != "" {
+		t.Skip("in the child process")
+	}
+	// The child's output is matched by substring, and none of faultline's variables of this
+	// process reaches it.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRolloutChild$", "-test.v") //nolint:gosec // the test binary itself
+	cmd.Env = append(slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "FAULTLINE_") }),
+		rolloutChildEnv+"=1", "FAULTLINE_ARTIFACTS=off")
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() == 0 {
+		t.Fatalf("child exited with %v, want a failure; output:\n%s", err, out.String())
+	}
+	want := regexp.MustCompile(`(?s)tenure/rollout.*rollout: replacement 1: book/\d+ started 2 times on m1-r`)
+	if !want.MatchString(out.String()) {
+		t.Errorf("child's output does not match %q:\n%s", want, out.String())
+	}
+}
+
+// TestRolloutChild is the child process of TestATSIM35RolloutMessage: one seed of
+// TestSlotRollout's row under the Server rule, with a second start of a shard of m1-r planted
+// just before m2-r is activated, when m1-r has long held m1's slot and its shards.
+func TestRolloutChild(t *testing.T) {
+	if os.Getenv(rolloutChildEnv) == "" {
+		t.Skip("runs only as the child process of TestATSIM35RolloutMessage")
+	}
+	r := rowNamed(t, "TestSlotRollout")
+	opts := r.options()
+	opts.Seeds = 1
+	faultline.Run(t, opts, r.body(world.Server, func(fw *faultline.World, w *world.World) {
+		at := kernel.Time(rolloutPlan.Start + rolloutPlan.Gap - time.Second)
+		fw.Sim.At(at, "test/plant_start", func() {
+			m1r := w.Members()[5]
+			shard, err := shardOf(w, m1r.Name)
+			if err != nil {
+				fw.Sim.Fail(err)
+				return
+			}
+			w.PlantStart(m1r, "book", shard)
+		})
+	}))
+}
+
+// shardOf returns the first shard of book that the machine of the member name assigns to the
+// slot it holds.
+func shardOf(w *world.World, name string) (int, error) {
+	places, err := w.Placements()
+	if err != nil {
+		return 0, err
+	}
+	for _, p := range places {
+		if p.Member != name {
+			continue
+		}
+		key := fmt.Sprintf("slot-%d", p.Slot)
+		for shard, k := range p.Assignment("book") {
+			if k == key {
+				return shard, nil
+			}
+		}
+		return 0, fmt.Errorf("%s holds %s, which has no shard of book", name, key)
+	}
+	return 0, fmt.Errorf("%s is not active and up", name)
+}
+
+// TestSlotRolloutRecords checks the records of TestSlotRollout's runs, with a full trace, under
+// each rule: AT-SIM-09, AT-SIM-19 and AT-SIM-41 (see rolloutRecordsErr). Their steps were
+// written for this task from the issue and the design note, since the original texts of the
+// acceptance tests are lost.
+func TestSlotRolloutRecords(t *testing.T) {
+	r := rowNamed(t, "TestSlotRollout")
+	opts := r.options()
+	opts.Seeds = 3
+	opts.Trace = kernel.TraceConfig{Level: kernel.TraceFull}
+	for _, rule := range r.takeovers() {
+		t.Run(rule.String(), func(t *testing.T) {
+			faultline.Run(t, opts, r.body(rule, func(fw *faultline.World, w *world.World) {
+				fw.Final("test/rollout_records", func() error {
+					return rolloutRecordsErr(w, fw.Sim.Records())
+				})
+			}))
+		})
+	}
+}
+
+// The kinds of records that only the rollout tests read.
+const (
+	kindSlot = "tenure.slot"
+	kindView = "tenure.view"
+)
+
+// rolloutRecordsErr checks the records of a rollout without faults, replacement by replacement,
+// with mi the member that mi-r replaces, activated at A = Start + (i−1)·Gap and told to drain
+// at D = A + Surge:
+//
+//   - AT-SIM-09 (activation, SIM-150): mi-r has no tenure record before A; at A it has exactly
+//     one tenure.boot, cause activate, whose holder is its holder at the end; it boots no more.
+//   - AT-SIM-41 (the handover, D16): mi's holder last claimed some slot k before D; at or after
+//     D the store records mi releasing slot k, then mi exits with cause drain; the first slot
+//     mi-r's holder claims is k, after that exit. Each shard of book is started once at or
+//     after Start, on the replacement of the member that ran it before Start.
+//   - AT-SIM-19 (the view, SIM-270): no view lists mi-r before A; a view between A and D
+//     lists it as a member that holds no slot, the surge pod waiting as a standby (D16); from
+//     D on, slot k of the store's views is held by mi's holder, then by nobody, then by mi-r's
+//     holder, and by no one else; the last view lists the five replacements and no replaced
+//     member.
+func rolloutRecordsErr(w *world.World, recs []kernel.Record) error {
+	ro := w.Scenario().Rollout
+	n := w.Scenario().Members
+	ms := w.Members()
+	store := w.Store().ID()
+	for i := range n {
+		old, rep := ms[i], ms[n+i]
+		activate := kernel.Time(ro.Start + time.Duration(i)*ro.Gap)
+		drain := activate.Add(ro.Surge)
+		if err := activationErr(recs, rep, activate); err != nil {
+			return err
+		}
+		k, err := handoverErr(recs, store, old, rep, drain)
+		if err != nil {
+			return err
+		}
+		if err := standbyViewErr(recs, store, rep, activate, drain); err != nil {
+			return err
+		}
+		if err := viewSlotErr(recs, store, k, old, rep, drain); err != nil {
+			return err
+		}
+	}
+	if err := movesErr(recs, w); err != nil {
+		return err
+	}
+	var last kernel.Record
+	for _, r := range recs {
+		if r.Node == store && r.Kind == kindView {
+			last = r
+		}
+	}
+	if got, want := attr(last, "members"), "m1-r,m2-r,m3-r,m4-r,m5-r"; got != want {
+		return fmt.Errorf("the last view lists the members %q, want %q", got, want)
+	}
+	return nil
+}
+
+// activationErr checks AT-SIM-09 for the replacement rep, activated at at.
+func activationErr(recs []kernel.Record, rep *world.Member, at kernel.Time) error {
+	boots := 0
+	for _, r := range recs {
+		if r.Node != rep.Node.ID() || !strings.HasPrefix(r.Kind, "tenure.") {
+			continue
+		}
+		if boots == 0 && r.Kind != kindBoot {
+			return fmt.Errorf("%s: %s at %s before its activation", rep.Name, r.Kind, r.At)
+		}
+		if r.Kind != kindBoot {
+			continue
+		}
+		boots++
+		if r.At != at || attr(r, "cause") != "activate" || attr(r, "holder") != rep.Holder() {
+			return fmt.Errorf("%s: tenure.boot at %s cause=%q holder=%q, want %s, activate and %s",
+				rep.Name, r.At, attr(r, "cause"), attr(r, "holder"), at, rep.Holder())
+		}
+	}
+	if boots != 1 {
+		return fmt.Errorf("%s booted %d times, want once", rep.Name, boots)
+	}
+	return nil
+}
+
+// handoverErr checks AT-SIM-41's slot clauses for old and its replacement rep, with old told to
+// drain at drain, and returns the slot handed over.
+func handoverErr(recs []kernel.Record, store kernel.NodeID, old, rep *world.Member, drain kernel.Time) (int, error) {
+	k, released, exited := "", kernel.Time(-1), false
+	for _, r := range recs {
+		claimed := r.Node == store && r.Kind == kindSlot && attr(r, "op") == "claim" && attr(r, "result") == "claimed"
+		switch {
+		case claimed && attr(r, "holder") == old.Holder() && r.At < drain:
+			k = attr(r, "slot")
+		case r.Node == store && r.Kind == kindSlot && attr(r, "op") == "release" && attr(r, "holder") == old.Holder() &&
+			released < 0:
+			if r.At < drain || k == "" || attr(r, "slot") != k {
+				return 0, fmt.Errorf("%s released slot %s at %s, want slot %q at or after %s", old.Name, attr(r, "slot"), r.At, k, drain)
+			}
+			released = r.At
+		case r.Node == old.Node.ID() && r.Kind == kindExit:
+			if released < 0 || attr(r, "cause") != "drain" {
+				return 0, fmt.Errorf("%s exited at %s with cause %q, want drain after it released its slot", old.Name, r.At, attr(r, "cause"))
+			}
+			exited = true
+		case claimed && attr(r, "holder") == rep.Holder():
+			if !exited || attr(r, "slot") != k {
+				return 0, fmt.Errorf("%s claimed slot %s at %s, want slot %q after %s released it and exited", rep.Name, attr(r, "slot"), r.At, k, old.Name)
+			}
+			return strconv.Atoi(k)
+		}
+	}
+	return 0, fmt.Errorf("%s never claimed %s's slot %q (released at %s, exited %v)", rep.Name, old.Name, k, released, exited)
+}
+
+// standbyViewErr checks AT-SIM-19's standby clause for the replacement rep, activated at
+// activate and whose member is told to drain at drain: no view lists rep before activate, and
+// some view in [activate, drain) lists it as a member with no slot.
+func standbyViewErr(recs []kernel.Record, store kernel.NodeID, rep *world.Member, activate, drain kernel.Time) error {
+	waited := false
+	for _, r := range recs {
+		if r.Node != store || r.Kind != kindView || r.At >= drain {
+			continue
+		}
+		listed := slices.Contains(strings.Split(attr(r, "members"), ","), rep.Name)
+		if r.At < activate {
+			if listed {
+				return fmt.Errorf("view at %s lists %s before its activation at %s", r.At, rep.Name, activate)
+			}
+			continue
+		}
+		_, list, _ := strings.Cut(attr(r, "slots"), ":")
+		if listed && !slices.Contains(strings.Split(list, ","), rep.Holder()) {
+			waited = true
+		}
+	}
+	if !waited {
+		return fmt.Errorf("no view from %s to %s lists %s as a member without a slot", activate, drain, rep.Name)
+	}
+	return nil
+}
+
+// viewSlotErr checks AT-SIM-19 for slot k, handed over from old to rep, from drain on.
+func viewSlotErr(recs []kernel.Record, store kernel.NodeID, k int, old, rep *world.Member, drain kernel.Time) error {
+	var seen []string // the holders of slot k, without repeats
+	for _, r := range recs {
+		if r.Node != store || r.Kind != kindView || r.At < drain {
+			continue
+		}
+		_, list, ok := strings.Cut(attr(r, "slots"), ":")
+		holders := strings.Split(list, ",")
+		if !ok || k >= len(holders) {
+			return fmt.Errorf("view at %s: slots %q has no slot %d", r.At, attr(r, "slots"), k)
+		}
+		if h := holders[k]; len(seen) == 0 || seen[len(seen)-1] != h {
+			seen = append(seen, h)
+		}
+	}
+	if want := []string{old.Holder(), "", rep.Holder()}; !slices.Equal(seen, want) && !slices.Equal(seen, want[1:]) {
+		return fmt.Errorf("slot %d in the views from %s: holders %q, want %s's, none, then %s's", k, drain, seen, old.Name, rep.Name)
+	}
+	return nil
+}
+
+// movesErr checks that each shard of book is started once from the first activation on, on the
+// replacement of the member that ran it before.
+func movesErr(recs []kernel.Record, w *world.World) error {
+	start := kernel.Time(w.Scenario().Rollout.Start)
+	names := map[kernel.NodeID]string{}
+	for _, m := range w.Members() {
+		names[m.Node.ID()] = m.Name
+	}
+	before := map[string]string{}  // by shard: the member that last started it before start
+	after := map[string][]string{} // by shard: the members that started it from start on
+	for _, r := range recs {
+		if r.Kind != kindRun || attr(r, "op") != "start" || attr(r, "space") != "book" {
+			continue
+		}
+		if s := attr(r, "shard"); r.At < start {
+			before[s] = names[r.Node]
+		} else {
+			after[s] = append(after[s], names[r.Node])
+		}
+	}
+	for shard := range 16 {
+		s := strconv.Itoa(shard)
+		if want := []string{before[s] + "-r"}; before[s] == "" || !slices.Equal(after[s], want) {
+			return fmt.Errorf("book/%d ran on %q before the rollout and started on %q from it, want once, on %q",
+				shard, before[s], after[s], want)
+		}
+	}
+	return nil
 }
