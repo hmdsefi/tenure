@@ -50,7 +50,7 @@ var defaultNet = simnet.Config{Default: simnet.Link{Latency: time.Millisecond, J
 // also reachable by name from the tests that pin its traces or replay its seeds.
 var rows = []row{
 	{
-		name: "TestSteady", sc: world.Scenario{StopDelay: time.Second},
+		name: "TestSteady", sc: world.Scenario{StopDelay: 2 * time.Second},
 		seeds: 20, duration: 60 * time.Second, net: defaultNet, g2: true,
 	},
 	// The store ends each first session once, at about 40 s, and the members recover. The run
