@@ -39,6 +39,7 @@ const (
 	kindInput     = "tenure.input"
 	kindAction    = "tenure.action"
 	kindReplyLate = "tenure.reply_late"
+	kindTimeout   = "tenure.timeout"
 	kindRun       = "tenure.run"
 	kindExit      = "tenure.exit"
 )
@@ -211,8 +212,7 @@ func (w *World) emitWrite(text string, wr check.Write, result string) {
 // emitInput emits tenure.input at m, for an input its machine is stepped with: type, such as
 // "Tick", then the fields of the input in the order its type declares them. A HolderChanged and
 // a ViewChanged end their fields with src, where the driver read the state: "push", "snapshot",
-// "reply", "confirm" or "holdings"; a HolderChanged then has version, the version of the record
-// state it steps.
+// "reply", "confirm" or "holdings".
 func (w *World) emitInput(m *Member, text, typ string, fields ...kernel.Attr) {
 	w.emit(kindInput, m.Node, text, recTyped(typ, fields)...)
 }
@@ -227,6 +227,14 @@ func (w *World) emitAction(m *Member, text, typ string, fields ...kernel.Attr) {
 // and is dropped: req, the request ID; type, the reply's type.
 func (w *World) emitReplyLate(m *Member, text string, req uint64, typ string) {
 	w.emit(kindReplyLate, m.Node, text, recAttr("req", recUint(req)), recAttr("type", typ))
+}
+
+// emitTimeout emits tenure.timeout at m, for a request that had no reply for RetryPeriod, in
+// the event that steps what its timeout means: req, the request ID; act, the type of the
+// machine action the request carries out, as "Acquire", or "" for a request the driver makes
+// on its own account. text is the request's.
+func (w *World) emitTimeout(m *Member, text string, req uint64, act string) {
+	w.emit(kindTimeout, m.Node, text, recAttr("req", recUint(req)), recAttr("act", act))
 }
 
 // emitRun emits tenure.run at m: op, "start", "raise", "return", "restart", "stop" or

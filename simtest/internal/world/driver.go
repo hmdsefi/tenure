@@ -110,8 +110,8 @@ func (ds *drivers) current(m *Member) *driver {
 // are takeovers of several requests on one lane, and views are the driver's own (observer.go).
 //
 // Replies and timeouts (SIM-320). A request times out RetryPeriod of the member's clock after
-// it went out; replyInputs and timeoutInputs say what is stepped. A reply after its timeout is
-// dropped with tenure.reply_late.
+// it went out, with tenure.timeout; replyInputs and timeoutInputs say what is stepped. A reply
+// after its timeout is dropped with tenure.reply_late.
 //
 // Pushes (SIM-330). A view newer than the last one stepped is stepped as ViewChanged with the
 // member's wall reading and each member's Slot per RUN-220, unless it was read before the
@@ -237,8 +237,8 @@ func (d *driver) status() core.Status { return d.machine.Status() }
 
 // step steps in, which came with a message whose text is text, at the member's present reading,
 // after a Tick at that reading when the machine's wake is at or before it (O2). src is the src
-// attribute of a HolderChanged or a ViewChanged, "" for other inputs; extra are attributes the
-// input's record ends with.
+// attribute of a HolderChanged or a ViewChanged, "" for other inputs; extra are attributes of
+// tenure.input after it.
 func (d *driver) step(in core.Input, text, src string, extra ...kernel.Attr) {
 	if d.stopped {
 		return
@@ -271,7 +271,7 @@ func (d *driver) onWake() {
 
 // stepOne steps in, whose Now is set, and carries the step out: tenure.input, then, for each
 // action in order, its tenure.action and what it asks for. Then it sets the wake timer for the
-// machine's NextWake. The input's record ends with src, when it is not "", then extra.
+// machine's NextWake.
 func (d *driver) stepOne(in core.Input, text, src string, extra ...kernel.Attr) {
 	if d.stepping {
 		panic("world: driver: a step inside a step")
@@ -486,8 +486,8 @@ func (d *driver) send(c *call) {
 	d.w.fw.Net.Send(d.m.Node, d.w.store.ID(), c.req)
 }
 
-// timeout runs when c has had no reply for RetryPeriod: the lane goes on, and the timeout is
-// stepped. A reply that comes later is late.
+// timeout runs when c has had no reply for RetryPeriod: it emits tenure.timeout, the lane goes
+// on, and the timeout is stepped. A reply that comes later is late.
 func (d *driver) timeout(c *call) {
 	if d.stopped {
 		return
@@ -495,6 +495,11 @@ func (d *driver) timeout(c *call) {
 	id := c.req.head().ID
 	delete(d.inFlight, id)
 	d.late[id] = true
+	act := ""
+	if c.act != nil {
+		act, _ = actionFields(c.act)
+	}
+	d.w.emitTimeout(d.m, c.req.Describe(), id, act)
 	d.lanes.finish(c)
 	if c.onTimeout != nil {
 		c.onTimeout(c)

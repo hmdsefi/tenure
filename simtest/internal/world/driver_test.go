@@ -604,6 +604,14 @@ func testDriverTimeouts(t *testing.T, rule Takeover) {
 		if attrValue(recs[failIdx], "cause") != "unreachable" {
 			t.Errorf("SessionFailed %v, want cause unreachable", attrs(recs[failIdx]))
 		}
+		// The timeout is recorded first, in the event that steps it, with the request's text.
+		if tos := records(fw.Sim, kindTimeout); len(tos) == 0 {
+			t.Error("no tenure.timeout")
+		} else if to := tos[0]; to.Node != m.Node.ID() || to.At != recs[failIdx].At || to.Seq > recs[failIdx].Seq ||
+			!strings.HasPrefix(to.Text, "keepAlive#") || attrValue(to, "act") != "KeepAlive" ||
+			!strings.HasPrefix(to.Text, "keepAlive#"+attrValue(to, "req")+" ") {
+			t.Errorf("tenure.timeout %q %v at %v, want the keepAlive's, before SessionFailed at %v", to.Text, attrs(to), to.At, recs[failIdx].At)
+		}
 		if lateIdx == 0 || lateIdx < failIdx {
 			t.Errorf("tenure.reply_late at %d, SessionFailed at %d: want a late reply after the timeout", lateIdx, failIdx)
 		} else if got := attrs(recs[lateIdx]); got[1] != "type=renewed" {

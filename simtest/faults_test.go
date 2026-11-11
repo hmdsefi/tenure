@@ -17,10 +17,10 @@ import "testing"
 func TestCrashRestart(t *testing.T) { runRow(t, rowNamed(t, "TestCrashRestart"), nil) }
 
 // TestPartitions splits the nodes into two groups every 15 s on average, for up to 20 s, and
-// slows the link from a member to another to 100 ms plus up to 50 ms of jitter every 10 s, for
-// up to 15 s; the bound counts a one-way delay of 150 ms. faultline draws the peer of a link
-// rule from the servers, the members, which send each other nothing, so the slow links delay
-// no message of this world; the partitions, which also cut the store and the fence off, do.
+// slows the link between the store and a member, both ways, to 100 ms plus up to 50 ms of
+// jitter every 10 s, for up to 15 s; the bound counts a one-way delay of 150 ms. The link rule
+// targets the store, not the members: faultline draws a link's peer from the servers, the
+// members, which send each other nothing, so a rule on the members would delay no message.
 func TestPartitions(t *testing.T) { runRow(t, rowNamed(t, "TestPartitions"), nil) }
 
 // TestDrift draws initial drifts of up to 10 % and sets a member's drift to up to 15 % either
