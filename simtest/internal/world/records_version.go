@@ -85,7 +85,8 @@ func (d *driver) shardRecord(key laneKey) *shardRecord {
 	return sr
 }
 
-// observe steps rd as HolderChanged if the filter admits it. It first steps the Tick due by
+// observe steps rd as HolderChanged if the filter admits it, with the record's version as the
+// last attribute of its tenure.input (version, after src). It first steps the Tick due by
 // now, so the filter sees the Status after every wake due and no Confirm action comes between
 // its decision and the step.
 func (d *driver) observe(rd recReading) {
@@ -97,7 +98,8 @@ func (d *driver) observe(rd recReading) {
 		return
 	}
 	d.shardRecord(shardLane(rd.rec.Space, rd.rec.Shard)).delivered = rd.rec.Version
-	d.step(core.HolderChanged{Space: rd.rec.Space, Shard: rd.rec.Shard, Holder: rd.rec.Holder, Term: rd.rec.Term}, rd.text, rd.src)
+	d.step(core.HolderChanged{Space: rd.rec.Space, Shard: rd.rec.Shard, Holder: rd.rec.Holder, Term: rd.rec.Term},
+		rd.text, rd.src, recAttr("version", recUint(rd.rec.Version)))
 }
 
 // admit reports whether rd is stepped. In order:

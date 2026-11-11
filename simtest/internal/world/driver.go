@@ -220,14 +220,15 @@ func (d *driver) status() core.Status { return d.machine.Status() }
 
 // step steps in, which came with a message whose text is text, at the member's present reading,
 // after a Tick at that reading when the machine's wake is at or before it (O2). src is the src
-// attribute of a HolderChanged or a ViewChanged, "" for other inputs.
-func (d *driver) step(in core.Input, text, src string) {
+// attribute of a HolderChanged or a ViewChanged, "" for other inputs; extra are attributes the
+// input's record ends with.
+func (d *driver) step(in core.Input, text, src string, extra ...kernel.Attr) {
 	if d.stopped {
 		return
 	}
 	now := d.m.Mono()
 	d.tickUntil(now)
-	d.stepOne(d.at(in, now), text, src)
+	d.stepOne(d.at(in, now), text, src, extra...)
 }
 
 // tickUntil steps a Tick at now while the machine's wake is at or before now. The machine arms
@@ -253,8 +254,8 @@ func (d *driver) onWake() {
 
 // stepOne steps in, whose Now is set, and carries the step out: tenure.input, then, for each
 // action in order, its tenure.action and what it asks for. Then it sets the wake timer for the
-// machine's NextWake.
-func (d *driver) stepOne(in core.Input, text, src string) {
+// machine's NextWake. The input's record ends with src, when it is not "", then extra.
+func (d *driver) stepOne(in core.Input, text, src string, extra ...kernel.Attr) {
 	if d.stepping {
 		panic("world: driver: a step inside a step")
 	}
@@ -264,6 +265,7 @@ func (d *driver) stepOne(in core.Input, text, src string) {
 	if src != "" {
 		fields = append(fields, recAttr("src", src))
 	}
+	fields = append(fields, extra...)
 	d.w.emitInput(d.m, text, typ, fields...)
 	for _, a := range acts {
 		d.execute(a)

@@ -74,6 +74,9 @@ func (w *World) liveMembers() []liveMember {
 			continue
 		}
 		st := d.status()
+		if st.Session == core.SessionStateLost { // gone for good; a new incarnation replaces it (SIM-145)
+			continue
+		}
 		live = append(live, liveMember{
 			name: m.Name, holder: d.holder, draining: st.Draining, slot: st.Slot,
 			assign: d.machine.Assignment,

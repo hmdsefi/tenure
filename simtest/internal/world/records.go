@@ -204,7 +204,8 @@ func (w *World) emitWrite(text string, wr check.Write, result string) {
 // emitInput emits tenure.input at m, for an input its machine is stepped with: type, such as
 // "Tick", then the fields of the input in the order its type declares them. A HolderChanged and
 // a ViewChanged end their fields with src, where the driver read the state: "push", "snapshot",
-// "reply", "confirm" or "holdings".
+// "reply", "confirm" or "holdings"; a HolderChanged then has version, the version of the record
+// state it steps.
 func (w *World) emitInput(m *Member, text, typ string, fields ...kernel.Attr) {
 	w.emit(kindInput, m.Node, text, recTyped(typ, fields)...)
 }
