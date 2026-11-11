@@ -3,11 +3,13 @@
 
 // Package bubble runs the real tenure runtime, three nodes on one in-memory store, inside
 // testing/synctest bubbles, and checks the ownership invariants while members crash, lose the
-// store, drain and roll out one by one.
+// store, drain and roll out one by one. The same group also runs as processes of faultline's
+// goroutine mode, which crashes the members and cuts them off from the store and the fence at
+// random times drawn from each seed.
 //
 // The package has no API: it is a set of tests. Unlike the event-mode simulations, the code
 // runs on real goroutines with real timers in virtual time, so a run is not a function of a
-// seed: the tests check invariants only.
+// seed (a goroutine-mode seed replays on a best-effort basis): the tests check invariants only.
 package bubble
 
 import (
@@ -17,6 +19,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -57,21 +60,31 @@ var memberIDs = []string{"m1", "m2", "m3"}
 // errRejected is the error a Run returns when the fence rejects its write.
 var errRejected = errors.New("bubble: fence rejected the write")
 
-// options configures a harness. The zero value runs the group without slots, with every call
-// let through and crypto/rand naming the sessions.
+// options configures a harness. The zero value runs the group without slots.
 type options struct {
 	// slots is Config.Slots of every node.
 	slots int
+}
 
-	// gate gates every call of a member to the store and the fence; nil runs every call.
+// hooks are what one incarnation reaches the world through, besides the shared store, fence
+// and group. The zero value lets every call through, names the sessions from crypto/rand and
+// records nothing: the synctest tests start every incarnation with it, and a faultline process
+// passes its own (see gate.go).
+type hooks struct {
+	// gate gates every call of the incarnation to the store and the fence; nil runs every call.
 	gate gateFunc
 
-	// rand returns Config.Rand of a member's next incarnation; nil (or a nil result) means
-	// crypto/rand.
-	rand func(member string) io.Reader
+	// rand is Config.Rand of the incarnation; nil means crypto/rand.
+	rand io.Reader
 
-	// onEvent, when not nil, hears every event of every node, after the harness used it.
-	onEvent func(member string, e tenure.Event)
+	// fenceRecord, when not nil, records one call of the fence: kind is "tenure.fence" or
+	// "tenure.write". It is called from inside the gated call, so a faultline gate records it
+	// inside Process.Do.
+	fenceRecord func(kind, text string, attrs ...kernel.Attr)
+
+	// onEvent, when not nil, hears every event of the incarnation's node, after the harness used
+	// it.
+	onEvent func(e tenure.Event)
 }
 
 // harness is one group of real nodes on one memstore and one static group, with a fence every
@@ -80,7 +93,6 @@ type options struct {
 type harness struct {
 	t     testing.TB
 	opts  options
-	gate  gateFunc
 	start time.Time // time 0 of the checker
 
 	store   *memstore.Store
@@ -126,17 +138,23 @@ type checkPass struct {
 
 // member is one member of the group across its incarnations.
 type member struct {
-	h     *harness
-	id    string
-	store *memberStore
-	inc   *incarnation // the running incarnation, nil while the member is down
+	h  *harness
+	id string
+
+	// inc is the running incarnation, nil while the member is down. It is written under h.mu;
+	// the goroutine that starts and stops the member's incarnations (the test's, or the member's
+	// faultline process) may read it without the lock, any other through current.
+	inc *incarnation
 }
 
-// incarnation is one node of a member: one static handle, one Start, one Close.
+// incarnation is one node of a member: one static handle, one store view, one Start, one Close.
 type incarnation struct {
 	m     *member
 	share *static.Membership
+	store *memberStore
+	hooks hooks
 	node  *tenure.Node
+	gone  chan struct{} // closed once the incarnation is down
 
 	mu     sync.Mutex
 	active int           // Runs in progress
@@ -150,15 +168,11 @@ func newHarness(t testing.TB, opts options) *harness {
 	h := &harness{
 		t:       t,
 		opts:    opts,
-		gate:    opts.gate,
 		start:   time.Now(),
 		store:   memstore.New(nil),
 		started: make(map[runKey]bool),
 		passes:  make(map[shardKey][]checkPass),
 		holders: make(map[*incarnation][]string),
-	}
-	if h.gate == nil {
-		h.gate = runGate
 	}
 	group, err := static.New(nil)
 	if err != nil {
@@ -177,9 +191,7 @@ func newHarness(t testing.TB, opts options) *harness {
 	h.grants, h.stopGrants = grants, cancel
 
 	for _, id := range memberIDs {
-		m := &member{h: h, id: id}
-		m.store = newMemberStore(h, id)
-		h.members = append(h.members, m)
+		h.members = append(h.members, &member{h: h, id: id})
 	}
 	t.Cleanup(h.cleanup)
 	return h
@@ -190,8 +202,8 @@ func newHarness(t testing.TB, opts options) *harness {
 // The bubble runs it before it waits for its goroutines.
 func (h *harness) cleanup() {
 	for _, m := range h.members {
-		if m.inc != nil {
-			m.crash()
+		if inc := m.current(); inc != nil {
+			inc.crash()
 		}
 	}
 	h.mu.Lock()
@@ -391,7 +403,7 @@ func (h *harness) finish(r time.Duration) {
 		if m.inc == nil {
 			continue
 		}
-		if m.store.isCut() {
+		if m.inc.store.isCut() {
 			m.crash()
 			continue
 		}
@@ -412,24 +424,34 @@ func (h *harness) finish(r time.Duration) {
 	}
 }
 
-// errs returns the violations of the checks the bubble asserts.
-func (h *harness) errs() []error {
+// safetyChecks are the names of the safety checks the bubble asserts, for errOf: g1 and g3 of
+// the checker, no overlap of two holders' passing Checks of an unfenced shard, no Run whose
+// context ended while Check passed, and the harness's watch of the store open while needed.
+var safetyChecks = []string{"g1", "g3", "overlap", "stop", "watch"}
+
+// errOf returns the violation of the safety check name, nil while it holds.
+func (h *harness) errOf(name string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	switch name {
+	case "overlap":
+		return h.overlap
+	case "stop":
+		return h.stopErr
+	case "watch":
+		return h.watchErr
+	default:
+		return h.checker.Err(name)
+	}
+}
+
+// errs returns the violations of the checks the bubble asserts.
+func (h *harness) errs() []error {
 	var out []error
-	for _, name := range []string{"g1", "g3"} {
-		if err := h.checker.Err(name); err != nil {
+	for _, name := range safetyChecks {
+		if err := h.errOf(name); err != nil {
 			out = append(out, err)
 		}
-	}
-	if h.overlap != nil {
-		out = append(out, h.overlap)
-	}
-	if h.stopErr != nil {
-		out = append(out, h.stopErr)
-	}
-	if h.watchErr != nil {
-		out = append(out, h.watchErr)
 	}
 	return out
 }
@@ -444,8 +466,8 @@ func (h *harness) converged() error {
 	}
 	var tables []nodeTable
 	for _, m := range h.members {
-		if m.inc != nil {
-			tables = append(tables, nodeTable{m.id, m.inc.node.Table()})
+		if inc := m.current(); inc != nil {
+			tables = append(tables, nodeTable{m.id, inc.node.Table()})
 		}
 	}
 	if len(tables) == 0 {
@@ -495,13 +517,21 @@ func (h *harness) mustConverge(when string) {
 	}
 }
 
+// current returns m's running incarnation, nil while m is down.
+func (m *member) current() *incarnation {
+	m.h.mu.Lock()
+	defer m.h.mu.Unlock()
+	return m.inc
+}
+
 // owned returns how many shards m's running node has in state owned, 0 while m is down.
 func (m *member) owned() int {
-	if m.inc == nil {
+	inc := m.current()
+	if inc == nil {
 		return 0
 	}
 	n := 0
-	for _, sp := range m.inc.node.Table().Spaces {
+	for _, sp := range inc.node.Table().Spaces {
 		for _, row := range sp.Rows {
 			if row.State == "owned" {
 				n++
@@ -511,24 +541,31 @@ func (m *member) owned() int {
 	return n
 }
 
-// start starts a new incarnation of m: a new static handle and a new node on m's store.
+// start starts a new incarnation of m with the zero hooks; see startWith.
 func (m *member) start(ctx context.Context) error {
-	if m.inc != nil {
-		return fmt.Errorf("bubble: %s is running", m.id)
+	_, err := m.startWith(ctx, hooks{})
+	return err
+}
+
+// startWith starts a new incarnation of m with hk: a new static handle, a new view of the store
+// and a new node. It fails while m is running.
+func (m *member) startWith(ctx context.Context, hk hooks) (*incarnation, error) {
+	if m.current() != nil {
+		return nil, fmt.Errorf("bubble: %s is running", m.id)
 	}
 	h := m.h
-	inc := &incarnation{m: m, share: h.group.Share()}
-	var rnd io.Reader
-	if h.opts.rand != nil {
-		rnd = h.opts.rand(m.id)
+	if hk.gate == nil {
+		hk.gate = runGate
 	}
+	inc := &incarnation{m: m, share: h.group.Share(), hooks: hk, gone: make(chan struct{})}
+	inc.store = newMemberStore(h, hk.gate)
 	cfg := tenure.Config{
 		Self:       tenure.Member{ID: m.id, Addr: m.id + ":7000"},
 		Membership: inc.share,
-		Store:      m.store,
+		Store:      inc.store,
 		Slots:      h.opts.slots,
 		Timing:     timing,
-		Rand:       rnd,
+		Rand:       hk.rand,
 		OnEvent:    inc.onEvent,
 	}
 	for _, sp := range spaces {
@@ -538,21 +575,25 @@ func (m *member) start(ctx context.Context) error {
 	}
 	node, err := tenure.Start(ctx, cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	inc.node = node
+	h.mu.Lock()
 	m.inc = inc
-	return nil
+	h.mu.Unlock()
+	return inc, nil
 }
 
 // close drains m's node and closes it, which leaves the group.
-func (m *member) close() error {
-	inc := m.inc
+func (m *member) close() error { return m.inc.close() }
+
+// close closes inc's node, draining it first, which leaves the group.
+func (inc *incarnation) close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*leaseDuration)
 	defer cancel()
 	err := inc.node.Close(ctx)
 	inc.waitRuns()
-	m.down(inc)
+	inc.down()
 	return err
 }
 
@@ -566,12 +607,16 @@ func (m *member) drain() error {
 	return m.close()
 }
 
-// crash crashes m: it cuts m off from the store, closes the node with a context done already, so
-// that the node neither releases its shards nor closes its session, and leaves the group with
-// the incarnation's handle. The store expires the session; m stays cut off until heal.
-func (m *member) crash() {
-	inc := m.inc
-	m.store.Cut()
+// crash crashes m's running incarnation; see incarnation.crash.
+func (m *member) crash() { m.inc.crash() }
+
+// crash crashes inc: it cuts inc off from the store, closes the node with a context done
+// already, so that the node neither releases its shards nor closes its session, and leaves the
+// group with the incarnation's handle. The store expires the session. inc stays cut off: a new
+// incarnation of the member has a store view of its own.
+func (inc *incarnation) crash() {
+	m := inc.m
+	inc.store.Cut()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := inc.node.Close(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -581,12 +626,13 @@ func (m *member) crash() {
 		m.h.t.Errorf("leave %s: %v", m.id, err)
 	}
 	inc.waitRuns()
-	m.down(inc)
+	inc.down()
 }
 
-// down reports the holders of inc down and marks m down.
-func (m *member) down(inc *incarnation) {
-	h := m.h
+// down reports the holders of inc down, marks its member down unless a newer incarnation runs,
+// and closes inc.gone.
+func (inc *incarnation) down() {
+	m, h := inc.m, inc.m.h
 	holder := inc.node.Table().Holder
 	h.mu.Lock()
 	holders := h.holders[inc]
@@ -597,13 +643,21 @@ func (m *member) down(inc *incarnation) {
 		h.checker.Down(hd)
 	}
 	delete(h.holders, inc)
+	if m.inc == inc {
+		m.inc = nil
+	}
 	h.mu.Unlock()
-	m.inc = nil
+	close(inc.gone)
 }
 
-// cut cuts m off from the store; heal ends it.
-func (m *member) cut()  { m.store.Cut() }
-func (m *member) heal() { m.store.Heal() }
+// cut cuts m's running incarnation off from the store; heal ends the cut of the running one.
+func (m *member) cut() { m.inc.store.Cut() }
+
+func (m *member) heal() {
+	if inc := m.current(); inc != nil {
+		inc.store.Heal()
+	}
+}
 
 // run returns the Run of the space for inc: it reports the ownership to the checker, raises the
 // fence to the shard's term, then writes with the term at intervals uniform in [0, RetryPeriod],
@@ -615,7 +669,7 @@ func (inc *incarnation) run(sp core.SpaceSpec) func(ctx context.Context, s *tenu
 	return func(ctx context.Context, s *tenure.Shard) error {
 		inc.enter()
 		defer inc.leave()
-		holder, ok := m.store.holderOf(s.Space, s.ID, s.Term)
+		holder, ok := inc.store.holderOf(s.Space, s.ID, s.Term)
 		if !ok {
 			// The node runs a term this member never acquired: the checker reports it.
 			holder = m.id + "/unknown"
@@ -627,7 +681,12 @@ func (inc *incarnation) run(sp core.SpaceSpec) func(ctx context.Context, s *tenu
 			}
 		}()
 
-		if err := h.gate(m.id, "fence.raise", func() { h.fence.raise(s.Space, s.ID, s.Term) }); err != nil {
+		if err := inc.hooks.gate("fence.raise", func() {
+			raised := h.fence.raise(s.Space, s.ID, s.Term)
+			inc.fenceRecord(kindFence, fmt.Sprintf("raise %s/%d to term %d", s.Space, s.ID, s.Term),
+				recAttr("space", s.Space), recAttr("shard", strconv.Itoa(s.ID)),
+				recAttr("term", recTerm(s.Term)), recAttr("raised", recTerm(raised)))
+		}); err != nil {
 			return err
 		}
 		rng := rand.New(rand.NewPCG(uint64(s.Term), uint64(s.ID))) //nolint:gosec // G404: write intervals, not secrets
@@ -652,8 +711,15 @@ func (inc *incarnation) run(sp core.SpaceSpec) func(ctx context.Context, s *tenu
 				h.passed(holder, s.Space, s.ID, s.Term)
 			}
 			var accepted bool
-			if err := h.gate(m.id, "fence.write", func() {
+			if err := inc.hooks.gate("fence.write", func() {
 				accepted = h.fence.write(holder, s.Space, s.ID, s.Term)
+				result := "accepted"
+				if !accepted {
+					result = "rejected"
+				}
+				inc.fenceRecord(kindWrite, fmt.Sprintf("write %s/%d in term %d by %s: %s", s.Space, s.ID, s.Term, holder, result),
+					recAttr("space", s.Space), recAttr("shard", strconv.Itoa(s.ID)), recAttr("term", recTerm(s.Term)),
+					recAttr("holder", holder), recAttr("result", result))
 			}); err != nil {
 				return err
 			}
@@ -673,12 +739,19 @@ func (inc *incarnation) onEvent(e tenure.Event) {
 	m := inc.m
 	switch e.Kind {
 	case tenure.EventShardStopping, tenure.EventShardExpired, tenure.EventShardLost, tenure.EventShardReleased:
-		if holder, ok := m.store.holderOf(e.Space, e.Shard, e.Term); ok {
+		if holder, ok := inc.store.holderOf(e.Space, e.Shard, e.Term); ok {
 			m.h.stopRun(holder, e.Space, e.Shard, e.Term)
 		}
 	}
-	if m.h.opts.onEvent != nil {
-		m.h.opts.onEvent(m.id, e)
+	if inc.hooks.onEvent != nil {
+		inc.hooks.onEvent(e)
+	}
+}
+
+// fenceRecord records one call of the fence through inc's hooks, if they record.
+func (inc *incarnation) fenceRecord(kind, text string, attrs ...kernel.Attr) {
+	if inc.hooks.fenceRecord != nil {
+		inc.hooks.fenceRecord(kind, text, attrs...)
 	}
 }
 

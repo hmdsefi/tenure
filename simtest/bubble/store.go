@@ -17,35 +17,37 @@ import (
 // context.DeadlineExceeded: to the node, a cut store looks like one whose calls time out.
 var errCut = fmt.Errorf("bubble: store cut: %w", context.DeadlineExceeded)
 
-// gateFunc gates one call of a member to the store or the fence: it runs call, or refuses it with
-// an error and does not run it. op names the call, such as "store.Acquire" or "fence.write". The
-// default gate runs every call; a faultline process gates each call through Process.Do.
-type gateFunc func(member, op string, call func()) error
+// gateFunc gates one call of an incarnation to the store or the fence: it runs call, or refuses
+// it with an error and does not run it. op names the call, such as "store.Acquire" or
+// "fence.write". The default gate runs every call; a faultline process gates each call through
+// Process.Do (gate.go).
+type gateFunc func(op string, call func()) error
 
 // runGate is the default gate: it runs every call.
-func runGate(_, _ string, call func()) error {
+func runGate(_ string, call func()) error {
 	call()
 	return nil
 }
 
-// memberStore is one member's view of the shared memstore: a tenure.Store, tenure.SlotStore and
-// tenure.Watcher that forwards every call, through the harness's gate, unless it is cut. Every
-// incarnation of the member uses the same memberStore.
+// memberStore is one incarnation's view of the shared memstore: a tenure.Store,
+// tenure.SlotStore and tenure.Watcher that forwards every call, through the incarnation's gate,
+// unless it is cut. Each incarnation has its own, so that a cut or a gate of a crashed
+// incarnation keeps refusing the calls of its leftover goroutines after the member restarted.
 //
 // After every forwarded call it lets the harness read the store's record writes (syncGrants), so
 // the checker hears of a grant before the call returns to the node. It also keeps the term of
 // every successful Acquire with the holder that made it, from which the harness tells which
-// holder a Run of this member serves.
+// holder a Run of this incarnation serves.
 type memberStore struct {
-	h      *harness
-	member string
-	mem    *memstore.Store
+	h    *harness
+	gate gateFunc
+	mem  *memstore.Store
 
 	mu       sync.Mutex // held across the store call of Acquire, see Acquire
 	cut      bool
 	watches  map[int]context.CancelFunc // the open watches, cancelled by Cut
 	nextW    int
-	acquired map[termKey]string // (space, shard, term) -> holder, for this member's grants
+	acquired map[termKey]string // (space, shard, term) -> holder, for this incarnation's grants
 }
 
 // termKey names one term of one shard.
@@ -61,10 +63,10 @@ var (
 	_ tenure.Watcher   = (*memberStore)(nil)
 )
 
-func newMemberStore(h *harness, member string) *memberStore {
+func newMemberStore(h *harness, gate gateFunc) *memberStore {
 	return &memberStore{
 		h:        h,
-		member:   member,
+		gate:     gate,
 		mem:      h.store,
 		watches:  make(map[int]context.CancelFunc),
 		acquired: make(map[termKey]string),
@@ -117,7 +119,7 @@ func (s *memberStore) do(ctx context.Context, op string, call func() error) erro
 		return errCut
 	}
 	var err error
-	if gerr := s.h.gate(s.member, "store."+op, func() { err = call() }); gerr != nil {
+	if gerr := s.gate("store."+op, func() { err = call() }); gerr != nil {
 		return gerr
 	}
 	s.h.syncGrants()
