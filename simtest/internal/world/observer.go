@@ -34,9 +34,13 @@ import (
 // (a holder first seen then counts from then) delays a takeover and never hastens it. A driver
 // that hears nothing from the store counts the silence as the holder's, as the Kubernetes
 // adapter's Acquire does; what keeps that safe is the fresh getSession before the cas, which
-// shows any renewal the driver missed. Unlike that adapter, the views are not frozen while the
-// driver hears nothing: a cut-off driver drops the other members from its view, which changes
-// what it wants, never what it may take.
+// shows any renewal the driver missed. As in that adapter, the views are frozen while the
+// driver's own session is not live (K8S-150): a cut-off driver keeps the members and slot
+// holders of its latest view, since it cannot tell their silence from its own, and its fenced
+// runs, degraded, keep their shards until a sign of loss (1.8-16; before, a cut-off driver
+// dropped the other members after LeaseDuration, which moved shards between the members left
+// and stopped fenced runs in the middle of a store outage). The verdicts of a takeover are not
+// frozen, as the adapter's Acquire's are not.
 //
 // Observer views (SIM-330). The view a driver steps is the store's latest view, minus every
 // member all of whose observed holders are observed expired, with every slot whose holder is
@@ -209,25 +213,61 @@ func (d *driver) observeSessions(list []sessionInfo) {
 // observerView returns the view the driver would step now, without its Version: the base
 // view, with the members and slots its observations drop (see the comment at the top of the
 // file), and each member's Slot per RUN-220.
+//
+// While the view is frozen (frozen), time alone changes nothing in it, as the Kubernetes
+// adapter's views stay while its cache is not fresh (K8S-150): a member the latest view stepped
+// lists stays unless every observed holder of it has ended, a member it does not list comes
+// back only by a newer session version, and a slot holder is shown vacant only when its session
+// has ended, or when the latest view stepped showed that slot vacant already.
 func (d *driver) observerView() core.View {
 	b := d.obs.base
+	frozen := d.frozen()
 	v := core.View{Slots: b.Slots, SlotHolders: slices.Clone(b.SlotHolders)}
 	for s, h := range v.SlotHolders {
-		if h != "" && d.observedExpired(h) {
+		if h != "" && d.slotGone(s, h, frozen) {
 			v.SlotHolders[s] = ""
 		}
 	}
 	for _, m := range b.Members {
-		if !d.memberExpired(m.ID) {
+		if !d.memberExpired(m.ID, frozen && d.shownHas(m.ID)) {
 			v.Members = append(v.Members, m)
 		}
 	}
 	return withSlots(v)
 }
 
+// frozen reports whether the driver's view is frozen: a view has been stepped, and the
+// driver's own session is not live, so its latest renewal answered was sent RenewDeadline ago
+// or more. That is the simulated form of the Kubernetes adapter's stale cache (K8S-150), whose
+// freshness needs an own write sent within RenewDeadline to have come back: a driver cut off
+// from the store cannot tell a member that stopped renewing from a store it does not hear.
+func (d *driver) frozen() bool {
+	return d.obs.hasShown && d.status().Session != core.SessionStateLive
+}
+
+// shownHas reports whether the latest view stepped lists the member id.
+func (d *driver) shownHas(id string) bool {
+	return slices.ContainsFunc(d.obs.shown.Members, func(m core.Member) bool { return m.ID == id })
+}
+
+// slotGone reports whether the slot s, which the base view shows held by h, is shown vacant:
+// h is observed expired, or, while frozen, h's session has ended or the latest view stepped
+// showed s vacant already.
+func (d *driver) slotGone(s int, h string, frozen bool) bool {
+	if !frozen {
+		return d.observedExpired(h)
+	}
+	if e := d.obs.find(h); e != nil && e.ended && h != d.holder {
+		return true
+	}
+	shown := d.obs.shown.SlotHolders
+	return s < len(shown) && shown[s] == "" && d.observedExpired(h)
+}
+
 // memberExpired reports whether the member id, not this driver's, has at least one observed
-// holder and every observed holder of it is observed expired.
-func (d *driver) memberExpired(id string) bool {
+// holder and every observed holder of it is observed expired; with endedOnly, every one of them
+// has ended, which a frozen view asks of the members it lists.
+func (d *driver) memberExpired(id string, endedOnly bool) bool {
 	if id == d.m.Name {
 		return false
 	}
@@ -237,7 +277,7 @@ func (d *driver) memberExpired(id string) bool {
 		if sessionMember(e.holder) != id {
 			continue
 		}
-		if !d.expiredAt(e, now) {
+		if endedOnly && !e.ended || !endedOnly && !d.expiredAt(e, now) {
 			return false
 		}
 		found = true
