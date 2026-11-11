@@ -55,6 +55,16 @@ func (b *auditTrace) late(n int) *auditTrace {
 	return b.add(kernel.Record{Kind: kindReplyLate, Node: 3, Attrs: pairs([]string{"req", strconv.Itoa(n), "type", "renewed"})})
 }
 
+// timeout records the timeout of the request n, which carries out an action of type act.
+func (b *auditTrace) timeout(n int, act string) *auditTrace {
+	return b.add(kernel.Record{Kind: kindTimeout, Node: 3, Attrs: pairs([]string{"req", strconv.Itoa(n), "act", act})})
+}
+
+// unreachable steps the SessionFailed{CauseUnreachable} of a KeepAlive's timeout at now.
+func (b *auditTrace) unreachable(now time.Duration) *auditTrace {
+	return b.input("SessionFailed", now, "", "cause", "unreachable")
+}
+
 func pairs(kv []string) []kernel.Attr {
 	attrs := make([]kernel.Attr, 0, len(kv)/2)
 	for i := 0; i+1 < len(kv); i += 2 {
@@ -96,14 +106,29 @@ func TestDriverAuditCatches(t *testing.T) {
 			event().holder(4*time.Second, 5, "push").holder(4*time.Second, 5, "confirm").
 			event().input("Acquired", 4*time.Second, "granted#9 book/3 holder=m1/0a term=6 version=8", "space", "book", "shard", "3", "term", "6").
 			holder(4*time.Second, 9, "snapshot"), ""},
+		{"timed out", started().event().timeout(1, "KeepAlive").unreachable(ms).
+			event().late(1).
+			event().input("Tick", 2*time.Second, "").action("Acquire", "acquire#2 m1/0a book/3", "space", "book", "shard", "3").
+			event().timeout(2, "Acquire").input("Acquired", 3*time.Second, "", "space", "book", "shard", "3", "term", "0").
+			event().late(2).
+			event().timeout(3, ""), ""},
+		{"answered after a timeout", started().event().timeout(1, "KeepAlive").unreachable(ms).
+			event().input("SessionRenewed", 2*ms, "renewed#1 version=1"), "after it timed out"},
+		{"timed out after an answer", started().event().input("SessionRenewed", ms, "renewed#1 version=1").
+			event().timeout(1, "KeepAlive").unreachable(2 * ms), "timed out after it was answered"},
+		{"timed out twice", started().event().timeout(1, "KeepAlive").unreachable(ms).
+			event().timeout(1, "KeepAlive").unreachable(2 * ms), "timed out after it was answered or timed out"},
+		{"timeout steps nothing", started().event().timeout(1, "KeepAlive").event(), "stepped no SessionFailed"},
+		{"timeout steps nothing at the end", started().event().input("Tick", ms, "").action("Acquire", "acquire#2 m1/0a book/3").
+			event().timeout(2, "Acquire").input("Acquired", 3*time.Second, "", "space", "book", "shard", "3", "term", "7"), "stepped no Acquired"},
 		{"first input", (&auditTrace{}).boot().event().input("SessionRenewed", 0, ""), "want a Tick"},
 		{"reading back", started().event().input("Tick", -ms, ""), "after reading"},
 		{"no tick at the wake", started().event().input("SessionRenewed", 2*time.Second, "renewed#1 version=1"), "with no Tick first"},
 		{"action alone", started().event().action("KeepAlive", ""), "no input before it"},
 		{"answered twice", started().event().input("SessionRenewed", ms, "renewed#1 version=1").
 			event().input("SessionRenewed", 2*ms, "renewed#1 version=1"), "again, in a later event"},
-		{"answered after late", started().late(1).event().input("SessionRenewed", ms, "renewed#1 version=1"), "after its reply came late"},
-		{"late twice", started().late(1).late(1), "answered or late before"},
+		{"late with no timeout", started().late(1), "did not time out"},
+		{"late twice", started().event().timeout(1, "KeepAlive").unreachable(ms).late(1).late(1), "was late before"},
 		{"sent twice", started().event().input("Tick", ms, "").action("KeepAlive", "keepAlive#1 m1/0a"), "sent twice"},
 		{"release in flight", started().event().input("Tick", ms, "").release(2).
 			event().input("Tick", time.Second, "").release(3), "while request 2 of it is in flight"},

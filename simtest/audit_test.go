@@ -14,6 +14,8 @@ import (
 
 	"github.com/hmdsefi/faultline"
 	"github.com/hmdsefi/faultline/kernel"
+	"github.com/hmdsefi/faultline/kernel/fault"
+	"github.com/hmdsefi/faultline/kernel/simnet"
 
 	"github.com/hmdsefi/tenure/core"
 	"github.com/hmdsefi/tenure/simtest/internal/world"
@@ -24,6 +26,7 @@ import (
 const (
 	kindWallStep  = "tenure.wall_step"
 	kindReplyLate = "tenure.reply_late"
+	kindTimeout   = "tenure.timeout"
 )
 
 // auditSeeds is the number of seeds of each rule the audits run, each with every record kept.
@@ -175,29 +178,68 @@ func nodeNames(recs []kernel.Record) map[kernel.NodeID]string {
 
 // TestATSIM48DriverAudit checks AT-SIM-48 under each rule, with every record kept, over the
 // faulty worlds of TestCrashRestart (crashes and restarts, so many incarnations),
-// TestPartitions (lost sessions and recoveries, late replies), TestPauses (pauses, after which
-// a member's events come due at once) and TestStoreFaults (a store that crashes and is cut
-// off, so timeouts and resyncs): every tenure.input,
-// tenure.action and tenure.reply_late record of every member is audited against the driver
-// contract (MCH O1 to O8, SIM-300 to SIM-340). The steps were written for this task from the
+// TestPartitions (lost sessions and recoveries, slow links), TestPauses (pauses, after which a
+// member's events come due at once) and TestStoreFaults (a store that crashes and is cut off,
+// so timeouts and resyncs): every tenure.input, tenure.action, tenure.timeout and
+// tenure.reply_late record of every member is audited against the driver contract (MCH O1 to
+// O8, SIM-300 to SIM-340). The steps were written for this task from the
 // issue and the design note, since the original acceptance-test text is lost. auditDriver
 // lists the audit.
 func TestATSIM48DriverAudit(t *testing.T) {
+	var audited []row
 	for _, name := range []string{"TestCrashRestart", "TestPartitions", "TestPauses", "TestStoreFaults"} {
-		r := rowNamed(t, name)
+		audited = append(audited, rowNamed(t, name))
+	}
+	audited = append(audited, lateReplies)
+	for _, r := range audited {
 		for _, rule := range r.takeovers() {
-			t.Run(name+"/"+rule.String(), func(t *testing.T) {
+			t.Run(r.name+"/"+rule.String(), func(t *testing.T) {
 				opts := r.options()
 				opts.Seeds = auditSeeds
 				opts.Trace = kernel.TraceConfig{Level: kernel.TraceFull}
+				// By seed, the timeouts and the late replies: a seed that runs twice counts once.
+				timeouts, late := map[uint64]int{}, map[uint64]int{}
 				faultline.Run(t, opts, r.body(rule, func(fw *faultline.World, w *world.World) {
 					fw.Final("test/driver_audit", func() error {
-						return auditDriver(fw.Sim.Records(), w.Members(), w.Scenario().Timing)
+						recs := fw.Sim.Records()
+						timeouts[fw.Seed()], late[fw.Seed()] = countKind(recs, kindTimeout), countKind(recs, kindReplyLate)
+						return auditDriver(recs, w.Members(), w.Scenario().Timing)
 					})
 				}))
+				var nt, nl int
+				for seed := range timeouts {
+					nt, nl = nt+timeouts[seed], nl+late[seed]
+				}
+				t.Logf("%d timeouts, %d late replies", nt, nl)
+				if r.name == lateReplies.name && !t.Failed() && nl == 0 {
+					t.Errorf("%s: no late reply; want some", r.name)
+				}
 			})
 		}
 	}
+}
+
+// lateReplies is the world in which TestATSIM48DriverAudit sees late replies, which no row of
+// the table has: the links between the store and a member slow to 1.5 s plus up to 1.5 s of
+// jitter, both ways, every 10 s on average for up to 10 s, so that many replies come after
+// their requests' RetryPeriod of 2 s. The bound counts a one-way delay of 3 s.
+var lateReplies = row{
+	name: "LateReplies", sc: world.Scenario{Delta: 3 * time.Second, Faults: &fault.Random{Rules: []fault.Rule{{
+		Kind: fault.KindLink, Target: "store", Every: 10 * time.Second, MaxFor: 10 * time.Second,
+		Link: &simnet.Link{Latency: 1500 * time.Millisecond, Jitter: 1500 * time.Millisecond},
+	}}}},
+	seeds: auditSeeds, duration: 150 * time.Second, net: defaultNet, g2: true,
+}
+
+// countKind returns the number of records of the kind.
+func countKind(recs []kernel.Record, kind string) int {
+	n := 0
+	for _, r := range recs {
+		if r.Kind == kind {
+			n++
+		}
+	}
+	return n
 }
 
 // The parts of the texts the audit reads: a request's or a reply's name and request ID, at the
@@ -223,16 +265,20 @@ var coalescing = map[string]bool{"Release": true, "ReleaseSlot": true, "ClaimSlo
 //     disarms the wake (MCH O2, SIM-300).
 //  4. Actions follow their input: every tenure.action comes in the event of an input of the
 //     same member, after it.
-//  5. One answer per call: the inputs whose text is a reply to request N (its name and #N)
-//     all come in one event, never after a tenure.reply_late for N; N has at most one
-//     tenure.reply_late, and none once answered; and no two actions send the same request ID
-//     (SIM-320). A reply that answers several inputs, as a lost reply to an Acquire, steps
-//     them in that one event.
+//  5. One answer per call: request N is answered once, by its reply or by its timeout
+//     (tenure.timeout for N), never both. The inputs whose text is a reply to N (its name and
+//     #N) all come in one event, and never after N timed out; a reply that answers several
+//     inputs, as a lost reply to an Acquire, steps them in that one event. The timeout of a
+//     KeepAlive steps SessionFailed{CauseUnreachable} and that of an Acquire steps Acquired
+//     with no term, in the event of the timeout (MCH O3). A tenure.reply_late for N comes only
+//     after N timed out, at most once. No two actions send the same request ID (SIM-320).
 //  6. No repeated Release, ReleaseSlot, ClaimSlot or CloseSession: such an action that goes
 //     out (its record has the request's text) is never equal, in type and fields, to one that
 //     went out earlier in the incarnation and is still in flight: neither answered by an input
-//     nor late, and sent less than RetryPeriod of the member's clock before (a request times
-//     out RetryPeriod after it goes out, which is no earlier than the step that made it) (MCH
+//     nor timed out, and sent less than RetryPeriod of the member's clock before. The last
+//     condition covers a call of several requests, the Observer rule's ClaimSlot, whose
+//     answer and timeout name its last request, not the one its action sent; a request times
+//     out RetryPeriod after it goes out, which is no earlier than the step that made it (MCH
 //     O6).
 //  7. Versions only grow: within an incarnation, per shard, the version of every stepped
 //     HolderChanged is above the latest version the machine has had for the shard, from a
@@ -271,8 +317,36 @@ type coalesced struct {
 
 // auditRequest is what auditMember keeps of one request ID of a member.
 type auditRequest struct {
-	answered uint64 // the Seq of the kernel.event of its answer, 0 before one
+	answered uint64 // the Seq of the kernel.event of its reply's inputs, 0 before one
+	timedOut bool
 	late     bool
+}
+
+// timeoutStep is the input that the timeout of a KeepAlive or an Acquire steps in its event:
+// its type and, for each key, the value it must have.
+type timeoutStep struct {
+	req uint64
+	typ string
+	kv  []string
+}
+
+// timeoutSteps are the inputs the timeouts step, by the action of the request (MCH O3).
+var timeoutSteps = map[string]timeoutStep{
+	"KeepAlive": {typ: "SessionFailed", kv: []string{"cause", "unreachable"}},
+	"Acquire":   {typ: "Acquired", kv: []string{"term", "0"}},
+}
+
+// matches reports whether the input r is the one s wants.
+func (s timeoutStep) matches(r kernel.Record) bool {
+	if attr(r, "type") != s.typ {
+		return false
+	}
+	for i := 0; i+1 < len(s.kv); i += 2 {
+		if attr(r, s.kv[i]) != s.kv[i+1] {
+			return false
+		}
+	}
+	return true
 }
 
 // auditMember audits the records of the member whose node is id and whose name is name; see
@@ -291,8 +365,13 @@ func auditMember(recs []kernel.Record, id kernel.NodeID, name string, retry time
 	fail := func(r kernel.Record, format string, args ...any) error {
 		return fmt.Errorf("%s at %v (seq %d): %s", name, r.At, r.Seq, fmt.Sprintf(format, args...))
 	}
+	var owed []timeoutStep // the inputs the timeouts of the present event still owe
+	var owedAt kernel.Record
 	for _, r := range recs {
 		if r.Kind == kindEvent {
+			if len(owed) > 0 {
+				return fail(owedAt, "the timeout of request %d stepped no %s", owed[0].req, owed[0].typ)
+			}
 			event = r.Seq
 			inc.inEvent = false
 			continue
@@ -331,13 +410,16 @@ func auditMember(recs []kernel.Record, id kernel.NodeID, name string, retry time
 			if n, ok := requestID(r.Text); ok {
 				q := request(n)
 				switch {
-				case q.late:
-					return fail(r, "%s answers request %d after its reply came late", typ, n)
+				case q.timedOut:
+					return fail(r, "%s answers request %d after it timed out", typ, n)
 				case q.answered != 0 && q.answered != event:
 					return fail(r, "%s answers request %d again, in a later event", typ, n)
 				}
 				q.answered = event
 				inc.out = doneOut(inc.out, n)
+			}
+			if len(owed) > 0 && owed[0].matches(r) {
+				owed = owed[1:]
 			}
 			// 7. Versions only grow.
 			if err := auditVersion(&inc, r, typ); err != nil {
@@ -373,7 +455,7 @@ func auditMember(recs []kernel.Record, id kernel.NodeID, name string, retry time
 			}
 			key := actionKey(r)
 			for _, o := range inc.out {
-				if o.key == key && inc.stepNow < o.sentAt+retry && !request(o.id).late && request(o.id).answered == 0 {
+				if o.key == key && inc.stepNow < o.sentAt+retry && !request(o.id).timedOut && request(o.id).answered == 0 {
 					return fail(r, "%s sent as request %d while request %d of it is in flight", key, n, o.id)
 				}
 			}
@@ -383,13 +465,32 @@ func auditMember(recs []kernel.Record, id kernel.NodeID, name string, retry time
 			if err != nil {
 				return fail(r, "reply_late req %q: %v", attr(r, "req"), err)
 			}
-			// 5. At most one late reply, and none for a request answered.
+			// 5. A late reply only after a timeout, at most once.
 			q := request(n)
-			if q.late || q.answered != 0 {
-				return fail(r, "late reply %s to request %d, which was answered or late before", attr(r, "type"), n)
+			if !q.timedOut || q.late {
+				return fail(r, "late reply %s to request %d, which did not time out or was late before", attr(r, "type"), n)
 			}
 			q.late = true
+		case kindTimeout:
+			n, err := strconv.ParseUint(attr(r, "req"), 10, 64)
+			if err != nil {
+				return fail(r, "timeout req %q: %v", attr(r, "req"), err)
+			}
+			// 5. A timeout answers a request no reply answered, once, and steps what it means.
+			q := request(n)
+			if q.timedOut || q.answered != 0 {
+				return fail(r, "request %d timed out after it was answered or timed out", n)
+			}
+			q.timedOut = true
+			inc.out = doneOut(inc.out, n)
+			if s, ok := timeoutSteps[attr(r, "act")]; ok {
+				s.req = n
+				owed, owedAt = append(owed, s), r
+			}
 		}
+	}
+	if len(owed) > 0 {
+		return fail(owedAt, "the timeout of request %d stepped no %s", owed[0].req, owed[0].typ)
 	}
 	return nil
 }
