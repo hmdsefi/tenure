@@ -509,6 +509,9 @@ func TestObserverViews(t *testing.T) {
 			p.Sessions = sessions(d, 2, 1)
 			d.handle(store(d), p)
 		}},
+		// The driver's own session stays live, so its view is not frozen.
+		injectStep{9 * time.Second, func(t testing.TB, d *driver) { renew(t, d) }},
+		injectStep{15 * time.Second, func(t testing.TB, d *driver) { renew(t, d) }},
 		// m3 expires at 16 s by the timer. A slot reply at 17 s raises the floor to 5, so m2's
 		// expiry at 18 s steps nothing until the view of version 5 comes at 19 s.
 		injectStep{17 * time.Second, func(t testing.TB, d *driver) {
@@ -706,6 +709,9 @@ func TestObserverExpiry(t *testing.T) {
 				t.Errorf("expiry timer %+v, want one at %v", tm, first+lease)
 			}
 		}},
+		// The driver's own session stays live, so its view is not frozen.
+		injectStep{9 * time.Second, func(t testing.TB, d *driver) { renew(t, d) }},
+		injectStep{15 * time.Second, func(t testing.TB, d *driver) { renew(t, d) }},
 		injectStep{first + lease - time.Nanosecond, func(t testing.TB, d *driver) { state(d, "-1ns") }},
 		injectStep{first + lease, func(t testing.TB, d *driver) { state(d, "0") }},
 		injectStep{first + lease + 10*time.Microsecond, func(t testing.TB, d *driver) {
@@ -718,6 +724,59 @@ func TestObserverExpiry(t *testing.T) {
 		"-1ns expired=false take=false unseen=-1ns own=false slot=1",
 		"0 expired=true take=true unseen=0s own=false slot=1",
 		"members=1 slots=,self",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got\n\t%s\nwant\n\t%s", strings.Join(got, "\n\t"), strings.Join(want, "\n\t"))
+	}
+}
+
+// TestObserverFrozen checks the frozen views (K8S-150's rule in the driver, 1.8-16): with no
+// renewal answered after the one sent at 0, the driver's session is not live from 10 s, so when
+// m2's session, first seen at 1 s, expires at 16 s, the view still lists m2 and its slot,
+// although a takeover would read m2's session; a renewal at 17 s makes the session live again,
+// and the view drops m2 and shows its slot vacant in that step. An ended session is an observed
+// change, which a frozen view does take: m3, whose getSession said ended, is dropped at once.
+func TestObserverFrozen(t *testing.T) {
+	sc := Scenario{Takeover: Observer, Members: 1, Slots: 2, Spaces: []core.SpaceSpec{{Name: "book", Shards: 1}}}
+	lease := core.DefaultTiming.LeaseDuration
+	var got []string
+	shown := func(d *driver, at string) {
+		v := d.obs.shown
+		ids := make([]string, len(v.Members))
+		for i, m := range v.Members {
+			ids[i] = m.ID
+		}
+		got = append(got, at+" frozen="+strconv.FormatBool(d.frozen())+" take="+strconv.FormatBool(d.mayTake("m2/0b"))+
+			" members="+strings.Join(ids, ",")+" slots="+strings.ReplaceAll(strings.Join(v.SlotHolders, ","), d.holder, "self"))
+	}
+	injected(t, sc, 18*time.Second,
+		injectStep{time.Second, func(t testing.TB, d *driver) {
+			got = nil
+			renew(t, d)
+			v := core.View{Version: 2, Members: []core.Member{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}, Slots: 2, SlotHolders: []string{"m2/0b", d.holder}}
+			d.handle(d.w.Store().ID(), viewPush{View: v, Sessions: []sessionInfo{
+				{Holder: d.holder, Version: 1, Lease: lease},
+				{Holder: "m2/0b", Version: 2, Lease: lease},
+				{Holder: "m3/0c", Version: 2, Lease: lease},
+			}})
+			shown(d, "1s")
+		}},
+		injectStep{12 * time.Second, func(t testing.TB, d *driver) {
+			d.obs.note(sessionInfo{Holder: "m3/0c", Version: 2, Ended: true}, d.m.Mono())
+			d.showObserved("", srcObserve)
+			shown(d, "12s")
+		}},
+		injectStep{16*time.Second + 10*time.Microsecond, func(t testing.TB, d *driver) { shown(d, "16s") }},
+		injectStep{17 * time.Second, func(t testing.TB, d *driver) {
+			renew(t, d)
+			shown(d, "17s")
+		}},
+	)
+	want := []string{
+		"1s frozen=false take=false members=m1,m2,m3 slots=m2/0b,self",
+		"12s frozen=true take=false members=m1,m2 slots=m2/0b,self",
+		"16s frozen=true take=true members=m1,m2 slots=m2/0b,self",
+		"17s frozen=false take=true members=m1 slots=,self",
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("got\n\t%s\nwant\n\t%s", strings.Join(got, "\n\t"), strings.Join(want, "\n\t"))
