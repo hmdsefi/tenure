@@ -35,7 +35,8 @@ func TestBubbleConverge(t *testing.T) {
 	})
 }
 
-// TestBubbleCrash crashes m2 at 10 s and restarts it at 20 s.
+// TestBubbleCrash crashes m2 at 10 s and restarts it at 20 s: m1 and m3 take its shards over
+// while it is down.
 func TestBubbleCrash(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, options{})
@@ -43,8 +44,21 @@ func TestBubbleCrash(t *testing.T) {
 		m2 := h.member("m2")
 
 		h.sleepUntil(disturbAt)
+		h.mustConverge("before the crash")
+		if m2.owned() == 0 {
+			t.Fatal("m2 owns no shard before the crash")
+		}
+		crashAt := h.elapsed()
 		m2.crash()
+
+		// While m2 is down, m1 and m3 take its shards over within the bound.
 		h.sleepUntil(2 * disturbAt)
+		if err := h.converged(); err != nil {
+			t.Errorf("while m2 is down: %v", err)
+		}
+		if err := h.liveness(crashAt, h.bound()); err != nil {
+			t.Errorf("while m2 is down: %v", err)
+		}
 		m2.heal()
 		if err := m2.start(context.Background()); err != nil {
 			t.Fatalf("restart m2: %v", err)
@@ -59,7 +73,8 @@ func TestBubbleCrash(t *testing.T) {
 	})
 }
 
-// TestBubbleStorePartition cuts m3 off from the store at 10 s for 2·LeaseDuration and heals it.
+// TestBubbleStorePartition cuts m3 off from the store at 10 s for 2·LeaseDuration and heals it:
+// the store ends m3's session, and m3 comes back under a new holder.
 func TestBubbleStorePartition(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, options{})
@@ -67,6 +82,11 @@ func TestBubbleStorePartition(t *testing.T) {
 		m3 := h.member("m3")
 
 		h.sleepUntil(disturbAt)
+		h.mustConverge("before the cut")
+		if m3.owned() == 0 {
+			t.Fatal("m3 owns no shard before the cut")
+		}
+		before := m3.inc.node.Table().Holder
 		m3.cut()
 		h.sleepUntil(disturbAt + 2*leaseDuration)
 		m3.heal()
@@ -75,6 +95,11 @@ func TestBubbleStorePartition(t *testing.T) {
 		h.sleepUntil(r + settle)
 		if err := h.converged(); err != nil {
 			t.Error(err)
+		}
+		// The cut outlasted the lease, so the store ended m3's session and m3 came back under a
+		// new holder.
+		if after := m3.inc.node.Table().Holder; after == before {
+			t.Errorf("m3's holder is still %s after a cut of 2·LeaseDuration", after)
 		}
 		h.finish(r)
 	})
@@ -85,9 +110,14 @@ func TestBubbleDrain(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, options{})
 		h.startAll()
+		m1 := h.member("m1")
 
 		h.sleepUntil(disturbAt)
-		if err := h.member("m1").drain(); err != nil {
+		h.mustConverge("before the drain")
+		if m1.owned() == 0 {
+			t.Fatal("m1 owns no shard before the drain")
+		}
+		if err := m1.drain(); err != nil {
 			t.Fatalf("drain m1: %v", err)
 		}
 		r := h.elapsed()
@@ -107,14 +137,13 @@ func TestBubbleSlotRollout(t *testing.T) {
 		h := newHarness(t, options{slots: 3})
 		h.startAll()
 		h.sleepUntil(disturbAt)
-		if err := h.converged(); err != nil {
-			t.Fatalf("before the rollout: %v", err)
-		}
+		h.mustConverge("before the rollout")
 
 		var r time.Duration
 		for i, m := range h.members {
 			h.sleepUntil(disturbAt + time.Duration(i)*5*time.Second)
-			slot := m.inc.node.Table().Slot
+			old := m.inc.node.Table()
+			slot := old.Slot
 			if slot < 0 {
 				t.Fatalf("%s holds no slot before its replacement", m.id)
 			}
@@ -126,8 +155,9 @@ func TestBubbleSlotRollout(t *testing.T) {
 			}
 			r = h.elapsed()
 			h.sleepUntil(r + 2*retryPeriod)
-			if got := m.inc.node.Table().Slot; got != slot {
-				t.Errorf("%s's new incarnation holds slot %d, want its old slot %d", m.id, got, slot)
+			if got := m.inc.node.Table(); got.Slot != slot || got.Holder == old.Holder {
+				t.Errorf("%s's new incarnation %s holds slot %d, want a new holder (not %s) in its old slot %d",
+					m.id, got.Holder, got.Slot, old.Holder, slot)
 			}
 		}
 

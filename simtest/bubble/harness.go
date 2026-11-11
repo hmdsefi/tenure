@@ -98,6 +98,7 @@ type harness struct {
 	started    map[runKey]bool           // the ownerships whose StartRun was reported
 	passes     map[shardKey][]checkPass  // the passing Checks of unfenced shards
 	overlap    error                     // the first overlap of two holders' passing Checks
+	stopErr    error                     // the first Run whose context ended while Check passed
 	holders    map[*incarnation][]string // the holders each incarnation ran shards under
 	closing    bool                      // the harness stopped its watch
 	counts     counts
@@ -180,7 +181,23 @@ func newHarness(t testing.TB, opts options) *harness {
 		m.store = newMemberStore(h, id)
 		h.members = append(h.members, m)
 	}
+	t.Cleanup(h.cleanup)
 	return h
+}
+
+// cleanup crashes every member still running and stops the harness's watch, so that every
+// goroutine of the bubble ends also when the test stopped before finish, with t.Fatal for example.
+// The bubble runs it before it waits for its goroutines.
+func (h *harness) cleanup() {
+	for _, m := range h.members {
+		if m.inc != nil {
+			m.crash()
+		}
+	}
+	h.mu.Lock()
+	h.closing = true
+	h.mu.Unlock()
+	h.stopGrants()
 }
 
 // now is the checker's clock: the bubble's time since the harness was made.
@@ -334,6 +351,15 @@ func (h *harness) passed(holder, space string, shard int, term core.Term) {
 	}
 }
 
+// violation keeps err as the first Run whose context ended while its Check still passed.
+func (h *harness) violation(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.stopErr == nil {
+		h.stopErr = err
+	}
+}
+
 // liveness returns the check g5 at r + b.
 func (h *harness) liveness(r, b time.Duration) error {
 	h.mu.Lock()
@@ -399,6 +425,9 @@ func (h *harness) errs() []error {
 	if h.overlap != nil {
 		out = append(out, h.overlap)
 	}
+	if h.stopErr != nil {
+		out = append(out, h.stopErr)
+	}
 	if h.watchErr != nil {
 		out = append(out, h.watchErr)
 	}
@@ -456,6 +485,30 @@ func (h *harness) converged() error {
 		}
 	}
 	return nil
+}
+
+// mustConverge stops the test when the group has not converged; when names the moment.
+func (h *harness) mustConverge(when string) {
+	h.t.Helper()
+	if err := h.converged(); err != nil {
+		h.t.Fatalf("%s: %v", when, err)
+	}
+}
+
+// owned returns how many shards m's running node has in state owned, 0 while m is down.
+func (m *member) owned() int {
+	if m.inc == nil {
+		return 0
+	}
+	n := 0
+	for _, sp := range m.inc.node.Table().Spaces {
+		for _, row := range sp.Rows {
+			if row.State == "owned" {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // start starts a new incarnation of m: a new static handle and a new node on m's store.
@@ -583,6 +636,12 @@ func (inc *incarnation) run(sp core.SpaceSpec) func(ctx context.Context, s *tenu
 			select {
 			case <-ctx.Done():
 				timer.Stop()
+				// The node cancels ctx only after the ownership stopped, so Check fails from then
+				// on.
+				if s.Check() == nil {
+					h.violation(fmt.Errorf("stop: %s/%d: %s's context ended (%v) in term %d, but Check passes",
+						s.Space, s.ID, holder, context.Cause(ctx), s.Term))
+				}
 				return context.Cause(ctx)
 			case <-timer.C:
 			}
