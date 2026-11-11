@@ -129,7 +129,8 @@ func TestATSIM27ComputeBound(t *testing.T) {
 }
 
 // TestAssertsG2Rule checks when a scenario asserts g2: its largest drift is strictly below the
-// bound of its timing, and no fault rule pauses a member.
+// bound of its timing, no fault rule pauses a member, and the store ends no session out of
+// band (EndAfter).
 func TestAssertsG2Rule(t *testing.T) {
 	// DefaultTiming tolerates (15 s − 10 s) / (15 s + 10 s) = 200 000 ppm, exclusive.
 	if got := core.DefaultTiming.DriftBound(); got != 0.2 {
@@ -188,6 +189,12 @@ func TestAssertsG2Rule(t *testing.T) {
 		{"a pause of the fence", Scenario{Faults: random(pause("fence"))}, true},
 		{"pauses of the store and of the members", Scenario{Faults: random(pause("store"), crash, pause("members"))}, false},
 		{"a pause of the store and drift above the bound", Scenario{Rho: 300_000, Faults: random(pause("store"))}, false},
+
+		{"sessions that end out of band", Scenario{EndAfter: 40 * time.Second}, false},
+		{"sessions that end 1 ns after they open", Scenario{EndAfter: 1}, false},
+		{"a zero EndAfter ends no session", Scenario{EndAfter: 0}, true},
+		{"sessions that end, under the observer rule", Scenario{Takeover: Observer, EndAfter: time.Minute}, false},
+		{"sessions that end and crashes", Scenario{EndAfter: time.Minute, Faults: random(crash)}, false},
 
 		{"faults without rules", Scenario{Faults: random()}, true},
 		{"crashes", Scenario{Faults: random(crash)}, true},

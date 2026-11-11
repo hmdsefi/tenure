@@ -324,6 +324,8 @@ func TestBuildRecovery(t *testing.T) {
 		{"wall steps", Scenario{WallSteps: time.Second}, 60 * time.Second, 38 * time.Second, 21_045_000_000, true},
 		{"observer, member pauses", Scenario{Takeover: Observer, Faults: random(pause(roleMembers))},
 			60 * time.Second, 38 * time.Second, 21_090_000_000, false},
+		{"sessions that end out of band", Scenario{EndAfter: 20 * time.Second},
+			60 * time.Second, 20*time.Second + 10*time.Millisecond, 21_045_000_000, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -27,9 +27,11 @@ const (
 
 // TestSessionEnds runs SIM-600's session-end row under each rule (AT-SIM-31): the store ends
 // every session 40 s after it opened, so each member's first session ends once, at about 40 s,
-// and each member recovers with a new holder (SIM-145). Every invariant holds after every
-// event, the finals tenure/g5, tenure/converged and tenure/recovered pass, and m1 recovers
-// exactly once. Every seed runs twice with equal trace hashes.
+// and each member recovers with a new holder (SIM-145). Every invariant but G2 holds after
+// every event; G2 is not asserted, because the store may grant an ended session's shard while
+// its holder, not yet aware, still owns it inside its deadline. The finals tenure/g5,
+// tenure/converged and tenure/recovered pass, and m1 recovers exactly once. Every seed runs
+// twice with equal trace hashes.
 func TestSessionEnds(t *testing.T) {
 	runRow(t, rowNamed(t, "TestSessionEnds"), func(fw *faultline.World, w *world.World) {
 		m1 := w.Members()[0]
@@ -278,7 +280,7 @@ const slowStops = 10 * time.Second
 func TestDrainSessionLost(t *testing.T) {
 	r := row{
 		name: "TestDrainSessionLost", sc: world.Scenario{EndAfter: 40 * time.Second, StopDelay: slowStops},
-		seeds: 5, duration: 75 * time.Second, net: defaultNet, g2: true,
+		seeds: 5, duration: 75 * time.Second, net: defaultNet, g2: false,
 	}
 	for _, rule := range r.takeovers() {
 		t.Run(rule.String(), func(t *testing.T) {
@@ -313,7 +315,7 @@ func TestDrainSessionLost(t *testing.T) {
 func TestSessionEndCrash(t *testing.T) {
 	r := row{
 		name: "TestSessionEndCrash", sc: world.Scenario{EndAfter: 40 * time.Second, StopDelay: slowStops, NoLiveness: true},
-		seeds: 5, duration: 75 * time.Second, net: defaultNet, g2: true,
+		seeds: 5, duration: 75 * time.Second, net: defaultNet, g2: false,
 	}
 	for _, rule := range r.takeovers() {
 		t.Run(rule.String(), func(t *testing.T) {
