@@ -33,12 +33,16 @@ func TestTraceReplay(t *testing.T) {
 	opts := r.options()
 	opts.Trace = kernel.TraceConfig{Level: kernel.TraceFull}
 	opts.CheckDeterminism = false // the test compares the two runs itself
-	var runs []traceRun
-	for i := range 2 {
+	// Each subtest keeps the trace of its first run only: FAULTLINE_CHECK_DETERMINISM=1, which
+	// an option cannot turn off, runs the seed a second time with the hash alone.
+	var runs [2]*traceRun
+	for i := range runs {
 		t.Run(fmt.Sprintf("run%d", i+1), func(t *testing.T) {
 			faultline.RunSeeds(t, opts, r.body(world.Server, func(fw *faultline.World, _ *world.World) {
 				fw.Final("test/keep_trace", func() error {
-					runs = append(runs, traceRun{records: cloneRecords(fw.Sim.Records()), hash: fw.Sim.TraceHash()})
+					if runs[i] == nil {
+						runs[i] = &traceRun{records: cloneRecords(fw.Sim.Records()), hash: fw.Sim.TraceHash()}
+					}
 					return nil
 				})
 			}), replaySeed)
@@ -47,11 +51,10 @@ func TestTraceReplay(t *testing.T) {
 	if t.Failed() {
 		return
 	}
-	if len(runs) != 2 {
-		t.Fatalf("%d runs kept their trace, want 2", len(runs))
-	}
-	if len(runs[0].records) == 0 {
-		t.Fatal("the first run kept no records")
+	for i, run := range runs {
+		if run == nil || len(run.records) == 0 {
+			t.Fatalf("run %d kept no records", i+1)
+		}
 	}
 	if err := firstDifference(runs[0].records, runs[1].records); err != nil {
 		t.Errorf("seed %#x run twice: %v", uint64(replaySeed), err)
