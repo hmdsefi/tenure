@@ -275,11 +275,10 @@ var coalescing = map[string]bool{"Release": true, "ReleaseSlot": true, "ClaimSlo
 //  6. No repeated Release, ReleaseSlot, ClaimSlot or CloseSession: such an action that goes
 //     out (its record has the request's text) is never equal, in type and fields, to one that
 //     went out earlier in the incarnation and is still in flight: neither answered by an input
-//     nor timed out, and sent less than RetryPeriod of the member's clock before. The last
-//     condition covers a call of several requests, the Observer rule's ClaimSlot, whose
-//     answer and timeout name its last request, not the one its action sent; a request times
-//     out RetryPeriod after it goes out, which is no earlier than the step that made it (MCH
-//     O6).
+//     nor timed out (MCH O6). A ClaimSlot also counts as done RetryPeriod of the member's clock
+//     after the step that sent it: its noSlot answer steps no input, and under the Observer
+//     rule its answer and its timeout name its last request, not the one its action sent; a
+//     request times out RetryPeriod after it goes out, which is no earlier than that step.
 //  7. Versions only grow: within an incarnation, per shard, the version of every stepped
 //     HolderChanged is above the latest version the machine has had for the shard, from a
 //     HolderChanged or the granted reply of an Acquired, or equal to it for the answer of a
@@ -455,7 +454,7 @@ func auditMember(recs []kernel.Record, id kernel.NodeID, name string, retry time
 			}
 			key := actionKey(r)
 			for _, o := range inc.out {
-				if o.key == key && inc.stepNow < o.sentAt+retry && !request(o.id).timedOut && request(o.id).answered == 0 {
+				if o.key == key && !request(o.id).timedOut && request(o.id).answered == 0 && (typ != "ClaimSlot" || inc.stepNow < o.sentAt+retry) {
 					return fail(r, "%s sent as request %d while request %d of it is in flight", key, n, o.id)
 				}
 			}

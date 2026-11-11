@@ -102,10 +102,13 @@ func TestDriverAuditCatches(t *testing.T) {
 	}{
 		{"kept", started().event().input("SessionRenewed", 5*ms, "renewed#1 version=1").wake(2*time.Second).
 			event().input("Tick", 2*time.Second, "").release(2).wake(4*time.Second).
+			event().timeout(2, "Release").
 			event().input("Tick", 4*time.Second, "").release(3).
-			event().holder(4*time.Second, 5, "push").holder(4*time.Second, 5, "confirm").
-			event().input("Acquired", 4*time.Second, "granted#9 book/3 holder=m1/0a term=6 version=8", "space", "book", "shard", "3", "term", "6").
-			holder(4*time.Second, 9, "snapshot"), ""},
+			action("ClaimSlot", "claimSlot#4 m1/0a").wake(6*time.Second).
+			event().input("Tick", 6*time.Second, "").action("ClaimSlot", "claimSlot#5 m1/0a").
+			event().holder(6*time.Second, 5, "push").holder(6*time.Second, 5, "confirm").
+			event().input("Acquired", 6*time.Second, "granted#9 book/3 holder=m1/0a term=6 version=8", "space", "book", "shard", "3", "term", "6").
+			holder(6*time.Second, 9, "snapshot"), ""},
 		{"timed out", started().event().timeout(1, "KeepAlive").unreachable(ms).
 			event().late(1).
 			event().input("Tick", 2*time.Second, "").action("Acquire", "acquire#2 m1/0a book/3", "space", "book", "shard", "3").
@@ -132,6 +135,10 @@ func TestDriverAuditCatches(t *testing.T) {
 		{"sent twice", started().event().input("Tick", ms, "").action("KeepAlive", "keepAlive#1 m1/0a"), "sent twice"},
 		{"release in flight", started().event().input("Tick", ms, "").release(2).
 			event().input("Tick", time.Second, "").release(3), "while request 2 of it is in flight"},
+		{"release in flight past RetryPeriod", started().event().input("Tick", ms, "").release(2).
+			event().input("Tick", time.Minute, "").release(3), "while request 2 of it is in flight"},
+		{"claim in flight", started().event().input("Tick", ms, "").action("ClaimSlot", "claimSlot#2 m1/0a").
+			event().input("Tick", time.Second, "").action("ClaimSlot", "claimSlot#3 m1/0a"), "while request 2 of it is in flight"},
 		{"version repeated", started().event().holder(ms, 5, "push").holder(ms, 5, "snapshot"), "at version 5, the machine had version 5"},
 		{"version below a grant", started().event().input("Acquired", ms, "granted#9 book/3 holder=m1/0a term=6 version=8", "space", "book", "shard", "3", "term", "6").
 			holder(ms, 7, "push"), "at version 7, the machine had version 8"},
