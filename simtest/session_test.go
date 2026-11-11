@@ -5,6 +5,8 @@ package simtest
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -46,7 +48,8 @@ func TestSessionEnds(t *testing.T) {
 //  1. the store ends the member's first session: tenure.session op=end cause=end_after;
 //  2. the member steps SessionFailed with cause lost;
 //  3. every run of the first incarnation stops: tenure.run op=stopped for each op=start;
-//  4. tenure.boot cause=recover names a new holder, after the last of those stops;
+//  4. tenure.boot cause=recover names a new holder, after the last of those stops, in the
+//     event of the old incarnation's last input (SIM-145: in one event);
 //  5. the store opens the new holder's session: tenure.session op=open;
 //  6. the store grants a shard to the new holder: tenure.grant.
 //
@@ -87,11 +90,14 @@ func recoveryOrder(recs []kernel.Record, store kernel.NodeID, m *world.Member) e
 	)
 	step := wantEnd
 	var first, second string
-	running := 0 // the runs of the first incarnation started and not stopped
+	running := 0              // the runs of the first incarnation started and not stopped
+	var lastInput kernel.Time // the time of the latest input of the first incarnation
 	for _, r := range recs {
 		switch {
 		case r.Node == id && r.Kind == kindBoot && first == "":
 			first = attr(r, "holder")
+		case r.Node == id && r.Kind == kindInput && step <= wantRecover:
+			lastInput = r.At
 		case r.Node == id && r.Kind == kindRun && step <= wantRecover:
 			switch attr(r, "op") {
 			case "start":
@@ -119,6 +125,9 @@ func recoveryOrder(recs []kernel.Record, store kernel.NodeID, m *world.Member) e
 				}
 				if running != 0 {
 					return fmt.Errorf("%s at %v: recovered with %d runs of %s not stopped", m.Name, r.At, running, first)
+				}
+				if lastInput != r.At {
+					return fmt.Errorf("%s at %v: recovered after its last input at %v, want the same event", m.Name, r.At, lastInput)
 				}
 				second = attr(r, "holder")
 				if second == first || second == "" {
@@ -185,13 +194,17 @@ func TestDrainExit(t *testing.T) {
 
 // exitOrder checks the trace of a drained member m: one boot, the store's close of its
 // session, then one tenure.exit with cause drain and m's holder, and no tenure record of m
-// after it (the kernel's and the network's records of the node, as its crash, may follow).
+// after it (the kernel's and the network's records of the node, as its crash, may follow), and
+// no message of the store to m after it: the store pushes to active members only.
 func exitOrder(recs []kernel.Record, store kernel.NodeID, m *world.Member) error {
 	id := m.Node.ID()
 	boots, closed, exited := 0, false, false
 	for _, r := range recs {
 		if r.Node == store && r.Kind == kindSession && attr(r, "op") == "close" && attr(r, "holder") == m.Holder() {
 			closed = true
+		}
+		if exited && r.Node == store && r.Kind == "net.send" && attr(r, "to") == m.Name {
+			return fmt.Errorf("%s at %v: the store sent %q after its exit", m.Name, r.At, attr(r, "payload"))
 		}
 		if r.Node != id || !strings.HasPrefix(r.Kind, "tenure.") {
 			continue
@@ -237,6 +250,115 @@ func TestDrainWhileDown(t *testing.T) {
 		fw.Final("test/exit", func() error {
 			if m1.Phase() != world.Exited || m1.Recoveries() != 0 {
 				return fmt.Errorf("m1 is %v after %d recoveries at the end, want exited after none", m1.Phase(), m1.Recoveries())
+			}
+			return nil
+		})
+	})
+}
+
+// steppedLost reports whether the trace has m's SessionFailed with cause lost.
+func steppedLost(recs []kernel.Record, m *world.Member) bool {
+	for _, r := range recs {
+		if r.Node == m.Node.ID() && r.Kind == kindInput && attr(r, "type") == "SessionFailed" && attr(r, "cause") == "lost" {
+			return true
+		}
+	}
+	return false
+}
+
+// slowStops is the StopDelay of TestDrainSessionLost and TestSessionEndCrash: runs take up to
+// 10 s to stop, so a member whose session ends while its runs stop waits for seconds.
+const slowStops = 10 * time.Second
+
+// TestDrainSessionLost drains m1 at 39 s, under each rule, in TestSessionEnds's world with runs
+// that take up to 10 s to stop: the store ends m1's session at about 40 s, while m1 still
+// waits for its runs, and m1 exits instead of recovering (RUN-190). In every seed m1 is exited
+// at the end with no recovery, and the finals hold, tenure/recovered among them, which owes m1
+// nothing; in at least one seed of each rule m1 stepped SessionFailed{lost} before its exit.
+func TestDrainSessionLost(t *testing.T) {
+	r := row{
+		name: "TestDrainSessionLost", sc: world.Scenario{EndAfter: 40 * time.Second, StopDelay: slowStops},
+		seeds: 5, duration: 75 * time.Second, net: defaultNet, g2: true,
+	}
+	for _, rule := range r.takeovers() {
+		t.Run(rule.String(), func(t *testing.T) {
+			lost := map[uint64]bool{}
+			opts := r.options()
+			opts.Trace = kernel.TraceConfig{Level: kernel.TraceFull}
+			faultline.Run(t, opts, r.body(rule, func(fw *faultline.World, w *world.World) {
+				m1 := w.Members()[0]
+				fw.Sim.At(kernel.Time(39*time.Second), "test/drain", func() { w.Drain(m1) })
+				fw.Final("test/exit", func() error {
+					if m1.Phase() != world.Exited || m1.Recoveries() != 0 {
+						return fmt.Errorf("m1 is %v after %d recoveries at the end, want exited after none", m1.Phase(), m1.Recoveries())
+					}
+					lost[fw.Seed()] = steppedLost(fw.Sim.Records(), m1)
+					return nil
+				})
+			}))
+			if !slices.Contains(slices.Collect(maps.Values(lost)), true) {
+				t.Errorf("m1 lost its session during the drain in none of %d seeds", len(lost))
+			}
+		})
+	}
+}
+
+// TestSessionEndCrash crashes m1's node at 41 s and restarts it at 42 s, under each rule, in
+// TestSessionEnds's world with runs that take up to 10 s to stop: m1's session ends at about
+// 40 s, and the crash comes while m1 waits for its runs, so no recovery follows: the new
+// incarnation is the boot's. tenure/recovered owes m1 nothing for that end, and the finals
+// hold. The crash is not a fault of the world's plan, so the liveness final, which would judge
+// its ownerless shards, is left out. In at least one seed of each rule m1 crashed while it
+// waited: it had stepped SessionFailed{lost} and never recovered.
+func TestSessionEndCrash(t *testing.T) {
+	r := row{
+		name: "TestSessionEndCrash", sc: world.Scenario{EndAfter: 40 * time.Second, StopDelay: slowStops, NoLiveness: true},
+		seeds: 5, duration: 75 * time.Second, net: defaultNet, g2: true,
+	}
+	for _, rule := range r.takeovers() {
+		t.Run(rule.String(), func(t *testing.T) {
+			waited := map[uint64]bool{}
+			opts := r.options()
+			opts.Trace = kernel.TraceConfig{Level: kernel.TraceFull}
+			faultline.Run(t, opts, r.body(rule, func(fw *faultline.World, w *world.World) {
+				m1 := w.Members()[0]
+				fw.Sim.At(kernel.Time(41*time.Second), "test/crash", m1.Node.Crash)
+				fw.Sim.At(kernel.Time(42*time.Second), "test/restart", m1.Node.Restart)
+				fw.Final("test/crash", func() error {
+					if m1.Recoveries() > 1 {
+						return fmt.Errorf("m1 recovered %d times, want at most once", m1.Recoveries())
+					}
+					waited[fw.Seed()] = m1.Recoveries() == 0 && steppedLost(fw.Sim.Records(), m1)
+					return nil
+				})
+			}))
+			if !slices.Contains(slices.Collect(maps.Values(waited)), true) {
+				t.Errorf("m1 crashed while it waited for its runs in none of %d seeds", len(waited))
+			}
+		})
+	}
+}
+
+// TestDrainAll drains all three members at 20 s, under each rule: each hands its shards over
+// to nobody, closes its session and exits. With no member active at the end, tenure/converged
+// checks that no shard is owned, and passes; the liveness final, which would want owners, is
+// left out.
+func TestDrainAll(t *testing.T) {
+	r := row{
+		name: "TestDrainAll", sc: world.Scenario{Members: 3, StopDelay: time.Second, NoLiveness: true},
+		seeds: 3, duration: 40 * time.Second, net: defaultNet, g2: true,
+	}
+	runRow(t, r, func(fw *faultline.World, w *world.World) {
+		fw.Sim.At(kernel.Time(drainAt), "test/drain", func() {
+			for _, m := range w.Members() {
+				w.Drain(m)
+			}
+		})
+		fw.Final("test/exit", func() error {
+			for _, m := range w.Members() {
+				if m.Phase() != world.Exited {
+					return fmt.Errorf("%s is %v at the end, want exited", m.Name, m.Phase())
+				}
 			}
 			return nil
 		})
