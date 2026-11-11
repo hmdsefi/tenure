@@ -124,6 +124,9 @@ func TestConvergedMessages(t *testing.T) {
 		{"owned by the assignee and another", func(r *convergedRig) {
 			r.owners["book/2"] = []string{"m1/01", "m3/03"}
 		}, `converged: book/2 assigned to m3, owned by m1/01, m3/03`},
+		{"owned by the assignee and a later one", func(r *convergedRig) {
+			r.owners["book/2"] = []string{"m3/03", "m1/01"}
+		}, `converged: book/2 assigned to m3, owned by m3/03, m1/01`},
 		{"no assignee", func(r *convergedRig) {
 			// Without a live member that is eligible, every key is "": the members agree on
 			// placing nothing, which is no convergence.
@@ -199,7 +202,8 @@ const finalEnv = "TENURE_SIM_FINAL"
 // TestFinalsRegistered checks that Build registers tenure/g5 and then tenure/converged as final
 // checks, and leaves tenure/g5 out with NoLiveness: a child process takes every run off the
 // checker's shards at 1 s of a steady world, which nothing starts again, and its run fails
-// both finals, in that order, or only tenure/converged with NoLiveness.
+// both finals, in that order, or only tenure/converged with NoLiveness. tenure/g5 judges the
+// world's recovery time, not the start of the run.
 func TestFinalsRegistered(t *testing.T) {
 	if os.Getenv(finalEnv) != "" {
 		t.Skip("in the child process")
@@ -213,6 +217,10 @@ func TestFinalsRegistered(t *testing.T) {
 			`final check "tenure/g5" failed after the run at t=30.000000000s`,
 			"g5: book/0 has no owner from 1.000000000s to 30.000000001s, which contains 21.045000000s (recovery 0.000000000s + bound 21.045000000s)",
 			`also failed: "tenure/converged"`,
+		}, ""},
+		{"g5-recovery", []string{
+			`final check "tenure/g5" failed after the run at t=60.000000000s`,
+			"g5: book/0 has no owner from 1.000000000s to 60.000000001s, which contains 59.045000000s (recovery 38.000000000s + bound 21.045000000s)",
 		}, ""},
 		{"converged", []string{
 			`final check "tenure/converged" failed after the run at t=30.000000000s`,
@@ -246,14 +254,20 @@ func TestFinalsRegistered(t *testing.T) {
 
 // TestFinalsChild is the child process of TestFinalsRegistered: in a steady world of 30 s, it
 // reports every member's holder Down to the checker at 1 s, so the checker sees no shard owned
-// from then on. With TENURE_SIM_FINAL=converged the scenario has NoLiveness.
+// from then on. With TENURE_SIM_FINAL=converged the scenario has NoLiveness; with
+// TENURE_SIM_FINAL=g5-recovery the run lasts 60 s and the wall clocks step, which puts the
+// recovery time at 38 s, so that tenure/g5 is seen to judge the world's R and not the start.
 func TestFinalsChild(t *testing.T) {
 	child := os.Getenv(finalEnv)
 	if child == "" {
 		t.Skip("runs only as the child process of TestFinalsRegistered")
 	}
 	sc := Scenario{NoLiveness: child == "converged"}
-	faultline.Run(t, faultline.Options{Seeds: 1, Duration: 30 * time.Second}, func(fw *faultline.World) {
+	duration := 30 * time.Second
+	if child == "g5-recovery" {
+		sc.WallSteps, duration = time.Second, 60*time.Second
+	}
+	faultline.Run(t, faultline.Options{Seeds: 1, Duration: duration}, func(fw *faultline.World) {
 		w := Build(fw, sc)
 		fw.Sim.At(kernel.Time(time.Second), "test/down", func() {
 			for _, m := range w.Members() {
