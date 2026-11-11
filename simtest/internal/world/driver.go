@@ -186,9 +186,25 @@ func newDriver(ds *drivers, md *memberDrive, m *Member) *driver {
 	if sc.Takeover == Observer {
 		d.obs = &observer{}
 	}
-	d.machine = core.NewMachine(core.MachineConfig{Holder: m.holder, Member: m.Name, Spaces: sc.Spaces, Timing: sc.Timing})
+	d.machine = core.NewMachine(core.MachineConfig{Holder: m.holder, Member: m.Name, Spaces: sc.Spaces, Timing: machineTiming(sc)})
 	d.lanes = newLanes(d.send)
 	return d
+}
+
+// machineTiming returns the timing of the machines of sc's members: the scenario's. With the
+// planted bug LateDeadline (mutants_on.go) the machine's RenewDeadline is twice the
+// scenario's, so each renewal moves its session deadline RenewDeadline further than the
+// scenario allows, and its LeaseDuration (and its SlotGrace, when it would fall below it)
+// grows by that RenewDeadline, which keeps the timing valid. The store and the driver keep the
+// scenario's timing.
+func machineTiming(sc Scenario) core.Timing {
+	t := sc.Timing
+	if sc.Mutation.plants(LateDeadline) {
+		t.LeaseDuration += t.RenewDeadline
+		t.RenewDeadline *= 2
+		t.SlotGrace = max(t.SlotGrace, t.LeaseDuration)
+	}
+	return t
 }
 
 // begin installs the driver's handler on the member's node and steps the first input, a Tick.
