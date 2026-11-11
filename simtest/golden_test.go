@@ -51,7 +51,10 @@ type goldenScenario struct {
 // goldenScenarios are the scenarios TestGoldenHashes pins, each the matching row of the table,
 // run as the row runs: for the row's duration, on its network. A shorter run would pin less: at
 // 30 s, the fault rows leave their planners 7 s or 8 s before the recovery time, less than one
-// interval of their rules, and no fault happens.
+// interval of their rules, and no fault happens. For the same reason outage/observer cuts the
+// store off for LeaseDuration + 2·RetryPeriod, the third of TestFencedStoreOutage's lengths, and
+// not for the row's RenewDeadline/2, which no session deadline outlasts: in the longer outage
+// the sessions end at the store, the fenced shards degrade and the observer views freeze.
 var goldenScenarios = []goldenScenario{
 	{"steady/server", "TestSteady", world.Server, nil},
 	{"steady/observer", "TestSteady", world.Observer, nil},
@@ -60,7 +63,7 @@ var goldenScenarios = []goldenScenario{
 	{"partitions/server", "TestPartitions", world.Server, nil},
 	{"wallclock/observer", "TestWallClock", world.Observer, nil},
 	{"rollout/server", "TestSlotRollout", world.Server, nil},
-	{"outage/observer", "TestFencedStoreOutage", world.Observer, nil},
+	{"outage/observer", "TestFencedStoreOutage", world.Observer, outageFor(outageLengths()[2])},
 }
 
 // goldenSkip returns why TestGoldenHashes does not run with the Go version version and the
