@@ -31,7 +31,8 @@ const (
 //     time and the bound: every shard has an owner at R + B, so none stays ownerless for
 //     longer than B once the world is left alone (SIM-540);
 //   - tenure/converged: the members agree on where the shards go, and each shard runs there
-//     (SIM-545; see convergedErr).
+//     (SIM-545; see convergedErr); when no member is active, as after every member drained
+//     and exited, that no shard is owned (unownedErr).
 //
 // Finals see the world as the last event left it: no settling time is added, so a scenario's
 // run must last until the bound has passed after the recovery time, as SetupError demands.
@@ -48,12 +49,42 @@ func (w *World) installFinals() {
 		if w.finalsOff {
 			return nil
 		}
+		if w.noneActive() {
+			return unownedErr(w.sc.Spaces, w.checker.Owners)
+		}
 		live, err := w.liveMembers()
 		if err != nil {
 			return err
 		}
 		return convergedErr(w.sc.Spaces, w.storeSrv.model.slotCount, live, w.checker.Owners)
 	})
+}
+
+// noneActive reports that no member is active: every member exited, or waits on standby. Then
+// nothing may run, and tenure/converged checks only that (unownedErr).
+func (w *World) noneActive() bool {
+	for _, m := range w.members {
+		if m.phase == Active {
+			return false
+		}
+	}
+	return true
+}
+
+// unownedErr decides tenure/converged when no member is active: every shard of spaces, by space
+// name and then shard, must be owned by nobody, by the checker's ownership owners. The first
+// owned one is reported as `converged: book/3 owned by m1/<32 hex>, but no member is active`.
+func unownedErr(spaces []core.SpaceSpec, owners func(space string, shard int) []string) error {
+	sorted := slices.Clone(spaces)
+	slices.SortFunc(sorted, func(a, b core.SpaceSpec) int { return cmp.Compare(a.Name, b.Name) })
+	for _, sp := range sorted {
+		for shard := range sp.Shards {
+			if got := owners(sp.Name, shard); len(got) > 0 {
+				return fmt.Errorf("converged: %s/%d owned by %s, but no member is active", sp.Name, shard, strings.Join(got, ", "))
+			}
+		}
+	}
+	return nil
 }
 
 // liveMember is what tenure/converged reads of a member that is active and up.

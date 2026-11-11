@@ -4,6 +4,7 @@
 package world
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 
@@ -62,11 +63,13 @@ func (d *driver) afterStep() {
 	}
 }
 
-// lose runs after the step that lost the session: it abandons the lanes and steps Acquired with
-// no term for every shard whose Acquire waits for its answer, which will never come now.
+// lose runs after the step that lost the session: it abandons the lanes, ends a resync, and
+// steps Acquired with no term for every shard whose Acquire waits for its answer, which will
+// never come now.
 func (d *driver) lose(st core.Status) {
 	d.lanes.abandon()
 	clear(d.inFlight)
+	d.resync = resync{} // its holdings request was dropped with the rest, and none follows
 	var owed []core.Acquired
 	for _, sp := range st.Spaces {
 		for i, sh := range sp.Shards {
@@ -173,6 +176,9 @@ type endOwed struct {
 type sessionWatch struct {
 	w    *World
 	ends [][]endOwed // by the member's place in w.members
+	// owed counts the session ends that were owed a recovery when they happened, those
+	// excused later included: a run with EndAfter in which none happened judged nothing.
+	owed int
 }
 
 // installRecovered keeps the session watch and, when the scenario ends sessions by EndAfter,
@@ -181,7 +187,9 @@ type sessionWatch struct {
 // new holder's session the store opened or renewed. An end of a session that a newer
 // incarnation of the member replaced, of an incarnation that is not the member's present
 // one, or of a member whose node is down, is owed nothing, and so is an end after which the
-// node crashed or the member was told to drain before it recovered.
+// node crashed or the member was told to drain before it recovered. A member whose node is
+// paused owes the recovery: it learns of the end once it resumes. The check never passes for
+// want of anything to judge: a run in which no end was owed fails it.
 func (w *World) installRecovered() {
 	w.sessions = &sessionWatch{w: w, ends: make([][]endOwed, len(w.members))}
 	w.sim.OnCrash(func(n *kernel.Node) {
@@ -236,9 +244,10 @@ func (sw *sessionWatch) session(e sessionEffect) {
 			return
 		}
 		m := sw.member(e.Holder)
-		if m == nil || m.holder != e.Holder || m.draining || m.phase != Active || m.Node.State() != kernel.NodeUp {
+		if m == nil || m.holder != e.Holder || m.draining || m.phase != Active || m.Node.State() == kernel.NodeDown {
 			return
 		}
+		sw.owed++
 		i := sw.index(m)
 		sw.ends[i] = append(sw.ends[i], endOwed{holder: e.Holder, at: sw.w.sim.Now()})
 	}
@@ -279,8 +288,11 @@ func (sw *sessionWatch) exited(m *Member) { sw.excuse(m) }
 // recovered from exactly once, or whose recovery's session the store never opened:
 // "recovered: m1: session m1/<hex> ended at 41.207000000s, recovered 0 times", or
 // "recovered: m1: session m1/<hex> ended at 41.207000000s, recovered as m1/<hex>, which never
-// renewed".
+// renewed". With no end owed at all it returns "recovered: no session of a member ended".
 func (sw *sessionWatch) err() error {
+	if sw.owed == 0 {
+		return errors.New("recovered: no session of a member ended")
+	}
 	for i, ends := range sw.ends {
 		name := sw.w.members[i].Name
 		for _, e := range ends {
