@@ -535,13 +535,15 @@ func testDriverResyncAgain(t *testing.T, rule Takeover) {
 }
 
 // TestDriverResyncLost checks that a resync ends when the session is lost: the holdings request
-// that times out after the loss is not sent again.
+// that times out after the loss is not sent again. The member's one shard is idle, so it
+// recovers at once; the check reads the driver that lost its session.
 func TestDriverResyncLost(t *testing.T) {
 	forRules(t, testDriverResyncLost)
 }
 
 func testDriverResyncLost(t *testing.T, rule Takeover) {
 	sc := Scenario{Takeover: rule, Members: 1, Spaces: []core.SpaceSpec{{Name: "book", Shards: 1}}}
+	var lost *driver // the driver that lost its session; the member recovers with a new one
 	injected(t, sc, 8*time.Second,
 		injectStep{time.Second, renew},
 		injectStep{5 * time.Second, renew}, // follows the timed-out keepAlive of 2 s: a resync starts
@@ -549,14 +551,15 @@ func testDriverResyncLost(t *testing.T, rule Takeover) {
 			if c := d.lanes.laneOf(resyncLane()).cur; holdingsSpace(c) != "book" {
 				t.Fatalf("holdings %v in flight at 6.5 s, want book's", c)
 			}
+			lost = d
 			replyTo(t, d, sessionLane, func(h replyHead) reply { return lostReply{h} })
 			if s := d.status().Session; s != core.SessionStateLost {
 				t.Fatalf("session %v after a lost reply, want lost", s)
 			}
 		}},
-		injectStep{7500 * time.Millisecond, func(t testing.TB, d *driver) {
-			if c := d.lanes.laneOf(resyncLane()).cur; c != nil || d.resync.running {
-				t.Errorf("after the loss holdings %v in flight, running %v; want the resync ended", c, d.resync.running)
+		injectStep{7500 * time.Millisecond, func(t testing.TB, _ *driver) {
+			if c := lost.lanes.laneOf(resyncLane()).cur; c != nil || lost.resync.running {
+				t.Errorf("after the loss holdings %v in flight, running %v; want the resync ended", c, lost.resync.running)
 			}
 		}},
 	)
