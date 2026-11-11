@@ -5,7 +5,9 @@ package world
 
 import (
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"strconv"
 	"time"
 
@@ -60,6 +62,9 @@ type rolloutWatch struct {
 	// drainAt holds when each replaced member was told to drain, by its Index − 1; a member
 	// not told yet has a negative time.
 	drainAt []kernel.Time
+	// drainSlot holds the slot that each replaced member's machine held when its drain began,
+	// by its Index − 1; −1 when it held none, was down, or was not told yet.
+	drainSlot []int
 	// late is the first start of a shard on a replaced member after its drain began, "" when
 	// there was none.
 	late string
@@ -92,9 +97,16 @@ type spaceShard struct {
 // whose machine held a slot: when that incarnation is still the replacement's present one at
 // the end, its node up, each shard that its machine assigns to that slot was started on it
 // exactly once, and no other shard more than once; when it is not, as after a crash, no shard
-// was started on it more than once. Then no shard was started on a replaced member after its
+// was started on it more than once. No later incarnation of the replacement started a shard
+// more than once either. In a run that nothing but the rollout disturbs, that incarnation also
+// took the slot its replaced member held when its drain began (D16), still runs at the end, and
+// has some shard assigned to its slot. Then no shard was started on a replaced member after its
 // drain began. The messages are "rollout: replacement 1: m1-r never held a slot",
-// "rollout: replacement 1: book/3 started 2 times on m1-r" (or 0 times), and
+// "rollout: replacement 1: book/3 started 2 times on m1-r" (or 0 times),
+// "rollout: replacement 1: m1-r took slot 3, not m1's slot 0",
+// "rollout: replacement 1: m1-r took slot 0, but m1 held no slot when its drain began",
+// "rollout: replacement 1: m1-r/<hex>, which took slot 0, does not run at the end",
+// "rollout: replacement 1: no shard is assigned to slot-0 on m1-r", and
 // "rollout: m1: book/3 started at 25.010000000s, after its drain began at 25.000000000s".
 func (w *World) planRollout() {
 	ro := w.sc.Rollout
@@ -102,7 +114,7 @@ func (w *World) planRollout() {
 		return
 	}
 	n := w.sc.Members
-	rw := &rolloutWatch{w: w, reps: make([]*replacementWatch, n), drainAt: make([]kernel.Time, n)}
+	rw := &rolloutWatch{w: w, reps: make([]*replacementWatch, n), drainAt: make([]kernel.Time, n), drainSlot: make([]int, n)}
 	spaces := make(map[string]core.SpaceSpec, len(w.sc.Spaces))
 	for _, sp := range w.sc.Spaces {
 		spaces[sp.Name] = sp
@@ -110,11 +122,14 @@ func (w *World) planRollout() {
 	for i := range n {
 		old, rep := w.members[i], w.members[n+i]
 		rw.reps[i] = &replacementWatch{m: rep, slot: -1, starts: map[string]map[spaceShard]int{}, spaces: spaces}
-		rw.drainAt[i] = -1
+		rw.drainAt[i], rw.drainSlot[i] = -1, -1
 		at := ro.Start + time.Duration(i)*ro.Gap
 		w.sim.At(kernel.Time(at), labelRolloutActivate, func() { w.activate(rep) })
 		w.sim.At(kernel.Time(at+ro.Surge), labelRolloutDrain, func() {
 			rw.drainAt[i] = w.sim.Now()
+			if d := w.drivers.current(old); d != nil && !d.stopped && old.Node.State() == kernel.NodeUp {
+				rw.drainSlot[i] = d.status().Slot
+			}
 			w.Drain(old)
 		})
 	}
@@ -190,7 +205,7 @@ func (rw *rolloutWatch) step(d *driver, acts []core.Action) {
 // err decides tenure/rollout at the end of the run (see planRollout).
 func (rw *rolloutWatch) err() error {
 	for i, r := range rw.reps {
-		if err := r.err(rw.w, i+1); err != nil {
+		if err := r.err(rw.w, i+1, rw.drainSlot[i]); err != nil {
 			return err
 		}
 	}
@@ -200,16 +215,37 @@ func (rw *rolloutWatch) err() error {
 	return nil
 }
 
-// err judges the replacement r, the replacement number index, at the end of the run.
-func (r *replacementWatch) err(w *World, index int) error {
+// err judges the replacement r, the replacement number index, at the end of the run;
+// drainSlot is the slot its replaced member held when its drain began, −1 for none.
+//
+// In a run that nothing but the rollout disturbs, the replacement must also have taken the
+// replaced member's slot, its first slot-holding incarnation must still run at the end, and
+// some shard must be assigned to that slot: otherwise the count of starts could pass on a
+// replacement that took another slot, or on nothing. A fault can make a replacement take
+// another member's expired slot, or end its first incarnation, so those three are not judged
+// under faults. Every incarnation of the replacement, the first or a later one, starts each
+// shard at most once.
+func (r *replacementWatch) err(w *World, index, drainSlot int) error {
 	m := r.m
 	if r.holder == "" {
 		return fmt.Errorf("rollout: replacement %d: %s never held a slot", index, m.Name)
 	}
+	quiet := !w.sc.disturbed()
+	old := w.members[index-1].Name
+	if quiet && drainSlot < 0 {
+		return fmt.Errorf("rollout: replacement %d: %s took slot %d, but %s held no slot when its drain began", index, m.Name, r.slot, old)
+	}
+	if quiet && r.slot != drainSlot {
+		return fmt.Errorf("rollout: replacement %d: %s took slot %d, not %s's slot %d", index, m.Name, r.slot, old, drainSlot)
+	}
 	d := w.drivers.current(m)
 	alive := m.phase == Active && m.Node.State() == kernel.NodeUp && m.holder == r.holder &&
 		d != nil && !d.stopped && d.holder == r.holder
+	if quiet && !alive {
+		return fmt.Errorf("rollout: replacement %d: %s, which took slot %d, does not run at the end", index, r.holder, r.slot)
+	}
 	key := "slot-" + strconv.Itoa(r.slot)
+	assigned := 0
 	for _, name := range sortedSpaceNames(w.sc.Spaces) {
 		var assign []string
 		if alive {
@@ -217,9 +253,24 @@ func (r *replacementWatch) err(w *World, index int) error {
 		}
 		for shard := range r.spaces[name].Shards {
 			got := r.starts[r.holder][spaceShard{name, shard}]
-			assigned := shard < len(assign) && assign[shard] == key
-			if (assigned && got != 1) || got > 1 {
+			mine := shard < len(assign) && assign[shard] == key
+			if mine {
+				assigned++
+			}
+			if mine && got != 1 { // more than once on any incarnation is judged below
 				return fmt.Errorf("rollout: replacement %d: %s/%d started %d times on %s", index, name, shard, got, m.Name)
+			}
+		}
+	}
+	if quiet && assigned == 0 {
+		return fmt.Errorf("rollout: replacement %d: no shard is assigned to %s on %s", index, key, m.Name)
+	}
+	for _, holder := range slices.Sorted(maps.Keys(r.starts)) {
+		for _, name := range sortedSpaceNames(w.sc.Spaces) {
+			for shard := range r.spaces[name].Shards {
+				if got := r.starts[holder][spaceShard{name, shard}]; got > 1 {
+					return fmt.Errorf("rollout: replacement %d: %s/%d started %d times on %s", index, name, shard, got, m.Name)
+				}
 			}
 		}
 	}

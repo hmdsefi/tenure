@@ -198,13 +198,13 @@ type World struct {
 // each shard with an assignee is owned by that member alone. A scenario with EndAfter also gets
 // the final tenure/recovered, after those two: every end of a session of a member that was not
 // told to drain is followed by exactly one recovery of the member, whose new session the store
-// opened. A scenario with a Rollout gets the final tenure/rollout, after those: each replacement
-// took the shards of the slot it claimed once, and no replaced member started a shard after
-// it was told to drain. A scenario with an Outage cuts the store off from every node at
-// Outage.At and heals the network Outage.For later, which is its recovery time, and gets the
-// final tenure/outage, after those: an unfenced shard stops at its session deadline, and a fenced
-// one degrades and runs on through the outage until a sign that it is lost, and then restores or
-// is lost.
+// opened. A scenario with a Rollout gets the final tenure/rollout, after those: each
+// replacement took the shards of the slot it claimed once, and no replaced member started a
+// shard after it was told to drain. A scenario with an Outage cuts the store off from every
+// node at Outage.At and heals the network Outage.For later, which is its recovery time, and gets
+// the final tenure/outage, last: an unfenced shard stops at its session deadline, and a fenced
+// one degrades and runs on through the outage until a sign that it is lost, and then restores
+// or is lost.
 //
 // With a Rollout, the replacement mi-r is activated at Start + (i−1)·Gap, which starts its
 // first incarnation, and mi is told to drain Surge later.
