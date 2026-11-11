@@ -152,6 +152,9 @@ func recoveryStart(sc Scenario, quiet time.Duration, end kernel.Time) kernel.Tim
 	if sc.EndAfter > 0 {
 		r = max(r, sessionEndTime(sc))
 	}
+	if sc.Rollout != nil {
+		r = max(r, lastDrain(sc)) // the last member is told to drain then (rollout.go)
+	}
 	return max(r, outageHeal(sc)) // the store's outage heals then (outage.go)
 }
 

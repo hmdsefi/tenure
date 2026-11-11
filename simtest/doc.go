@@ -18,4 +18,17 @@
 // and, to check that every seed replays, run each passing seed twice with
 //
 //	FAULTLINE_CHECK_DETERMINISM=1 go test -count=1 ./...
+//
+// The file testdata/hashes.txt pins the trace hashes of eight scenarios at three fixed seeds,
+// under Go 1.26, so a change that alters a run fails TestGoldenHashes. When the change is
+// intended, rewrite the file with
+//
+//	go test -run TestGoldenHashes -update .
+//
+// and give the commit a "Golden-Update: <reason>" line. Seeds that once exposed a bug run as
+// TestRegression tests.
+//
+// Built with the tag tenure_mutants, the simulations can also plant bugs into the protocol: each
+// TestMutant test plants one and must fail the check the bug breaks. TestMutantsCaught, in the
+// ordinary build, runs each of them in a child process and checks that it does.
 package simtest

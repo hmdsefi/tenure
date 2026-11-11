@@ -1,0 +1,251 @@
+// Copyright 2026 Hamed Yousefi
+// SPDX-License-Identifier: MPL-2.0
+
+package world
+
+import (
+	"fmt"
+	"math"
+	"strconv"
+	"time"
+
+	"github.com/hmdsefi/faultline/kernel"
+
+	"github.com/hmdsefi/tenure/core"
+)
+
+// bootCauseActivate is the cause of tenure.boot for the first incarnation of a replacement,
+// which starts when the replacement is activated.
+const bootCauseActivate = "activate"
+
+// The labels of a rollout's events: the global ones at the times of the plan, and the post on
+// the replacement's node that activates it. The drain posts recover.go's tenure/drain.
+const (
+	labelActivate        = "tenure/activate"
+	labelRolloutActivate = "tenure/rollout/activate"
+	labelRolloutDrain    = "tenure/rollout/drain"
+)
+
+// finalRollout is the name of the final check of a rollout (SIM-640).
+const finalRollout = invariantPrefix + "rollout"
+
+// A rolling deploy (SIM-150, architecture §8.2, D16): the replacement mi-r of each member mi
+// waits on standby from the start; at Start + (i−1)·Gap a global event posts tenure/activate
+// on its node, which makes it active and starts its first incarnation, tenure.boot
+// cause=activate. Its machine asks for a slot, and gets none while every slot is held. Surge
+// later mi is told to drain (World.Drain): it hands its shards over, releases its slot, closes
+// its session and exits. The replacement then claims the slot that mi released and takes the
+// same shards, so that each shard moves once. R is at least the last drain, Start + (N−1)·Gap +
+// Surge (see recoveryStart).
+
+// lastDrain returns the time at which the last member of a scenario with a Rollout is told to
+// drain, Start + (Members−1)·Gap + Surge, or the largest time when that does not fit.
+func lastDrain(sc Scenario) kernel.Time {
+	ro := sc.Rollout
+	rest := time.Duration(math.MaxInt64) - ro.Start - ro.Surge // Start and Surge are not negative
+	if rest < 0 {
+		return kernel.Time(math.MaxInt64)
+	}
+	if n := time.Duration(sc.Members - 1); n > 0 && ro.Gap > rest/n {
+		return kernel.Time(math.MaxInt64)
+	}
+	return kernel.Time(ro.Start + time.Duration(sc.Members-1)*ro.Gap + ro.Surge)
+}
+
+// rolloutWatch keeps what the final tenure/rollout judges, from the steps of the drivers.
+type rolloutWatch struct {
+	w *World
+	// reps holds what each replacement did, by its Index − 1.
+	reps []*replacementWatch
+	// drainAt holds when each replaced member was told to drain, by its Index − 1; a member
+	// not told yet has a negative time.
+	drainAt []kernel.Time
+	// late is the first start of a shard on a replaced member after its drain began, "" when
+	// there was none.
+	late string
+}
+
+// replacementWatch is what one replacement did: the first of its incarnations whose machine
+// held a slot, the slot, and how many times each incarnation started each shard. A machine may
+// start a shard before the reply to its claim is stepped, when a view showed it the slot first,
+// so the starts of every incarnation are counted from its first step.
+type replacementWatch struct {
+	m      *Member
+	holder string                        // the first incarnation that held a slot, "" before
+	slot   int                           // the slot it held
+	starts map[string]map[spaceShard]int // by holder; looked up only
+	spaces map[string]core.SpaceSpec     // looked up only
+}
+
+// spaceShard names one shard of one space.
+type spaceShard struct {
+	space string
+	shard int
+}
+
+// planRollout plans the rollout of a scenario with a Rollout and installs the final
+// tenure/rollout, which runs after the finals of installFinals and installRecovered. A scenario
+// without a Rollout plans nothing. Each run of the world function has its own state, kept in
+// the World.
+//
+// tenure/rollout (SIM-640) judges each replacement, in order, by the first of its incarnations
+// whose machine held a slot: when that incarnation is still the replacement's present one at
+// the end, its node up, each shard that its machine assigns to that slot was started on it
+// exactly once, and no other shard more than once; when it is not, as after a crash, no shard
+// was started on it more than once. Then no shard was started on a replaced member after its
+// drain began. The messages are "rollout: replacement 1: m1-r never held a slot",
+// "rollout: replacement 1: book/3 started 2 times on m1-r" (or 0 times), and
+// "rollout: m1: book/3 started at 25.010000000s, after its drain began at 25.000000000s".
+func (w *World) planRollout() {
+	ro := w.sc.Rollout
+	if ro == nil {
+		return
+	}
+	n := w.sc.Members
+	rw := &rolloutWatch{w: w, reps: make([]*replacementWatch, n), drainAt: make([]kernel.Time, n)}
+	spaces := make(map[string]core.SpaceSpec, len(w.sc.Spaces))
+	for _, sp := range w.sc.Spaces {
+		spaces[sp.Name] = sp
+	}
+	for i := range n {
+		old, rep := w.members[i], w.members[n+i]
+		rw.reps[i] = &replacementWatch{m: rep, slot: -1, starts: map[string]map[spaceShard]int{}, spaces: spaces}
+		rw.drainAt[i] = -1
+		at := ro.Start + time.Duration(i)*ro.Gap
+		w.sim.At(kernel.Time(at), labelRolloutActivate, func() { w.activate(rep) })
+		w.sim.At(kernel.Time(at+ro.Surge), labelRolloutDrain, func() {
+			rw.drainAt[i] = w.sim.Now()
+			w.Drain(old)
+		})
+	}
+	w.rollout = rw
+
+	prev := w.drivers.onStep
+	w.drivers.onStep = func(d *driver, in core.Input, acts []core.Action) {
+		if prev != nil {
+			prev(d, in, acts)
+		}
+		rw.step(d, acts)
+	}
+	w.fw.Final(finalRollout, func() error {
+		if w.finalsOff {
+			return nil
+		}
+		return rw.err()
+	})
+}
+
+// activate makes the replacement m active, in a global event at its time. On a node that is up
+// it posts tenure/activate, which makes m active and starts its first incarnation, cause
+// "activate". A node that is down, which only a fault that picks among every server can make
+// it, makes m active at once, and its next boot starts the incarnation, cause "boot".
+func (w *World) activate(m *Member) {
+	if m.phase != Standby {
+		return
+	}
+	if m.Node.State() == kernel.NodeDown {
+		m.phase = Active
+		return
+	}
+	m.Node.Post(labelActivate, func() {
+		if m.phase != Standby {
+			return
+		}
+		m.phase = Active
+		w.incarnate(m, bootCauseActivate)
+	})
+}
+
+// step takes one step of the driver d, whose actions are acts: the first slot a replacement's
+// machine holds and the runs each of its incarnations starts, and the runs a replaced member
+// starts after its drain began.
+func (rw *rolloutWatch) step(d *driver, acts []core.Action) {
+	i := d.m.Index - 1
+	if d.m.Replacement {
+		r := rw.reps[i]
+		if r.holder == "" {
+			if slot := d.status().Slot; slot >= 0 {
+				r.holder, r.slot = d.holder, slot
+			}
+		}
+		for _, a := range acts {
+			if s, ok := a.(core.StartRun); ok {
+				r.count(d.holder, spaceShard{s.Space, s.Shard})
+			}
+		}
+		return
+	}
+	if rw.drainAt[i] < 0 || rw.late != "" {
+		return
+	}
+	for _, a := range acts {
+		if s, ok := a.(core.StartRun); ok {
+			rw.late = fmt.Sprintf("rollout: %s: %s/%d started at %s, after its drain began at %s",
+				d.m.Name, s.Space, s.Shard, rw.w.sim.Now(), rw.drainAt[i])
+			return
+		}
+	}
+}
+
+// err decides tenure/rollout at the end of the run (see planRollout).
+func (rw *rolloutWatch) err() error {
+	for i, r := range rw.reps {
+		if err := r.err(rw.w, i+1); err != nil {
+			return err
+		}
+	}
+	if rw.late != "" {
+		return fmt.Errorf("%s", rw.late)
+	}
+	return nil
+}
+
+// err judges the replacement r, the replacement number index, at the end of the run.
+func (r *replacementWatch) err(w *World, index int) error {
+	m := r.m
+	if r.holder == "" {
+		return fmt.Errorf("rollout: replacement %d: %s never held a slot", index, m.Name)
+	}
+	d := w.drivers.current(m)
+	alive := m.phase == Active && m.Node.State() == kernel.NodeUp && m.holder == r.holder &&
+		d != nil && !d.stopped && d.holder == r.holder
+	key := "slot-" + strconv.Itoa(r.slot)
+	for _, name := range sortedSpaceNames(w.sc.Spaces) {
+		var assign []string
+		if alive {
+			assign = d.machine.Assignment(name)
+		}
+		for shard := range r.spaces[name].Shards {
+			got := r.starts[r.holder][spaceShard{name, shard}]
+			assigned := shard < len(assign) && assign[shard] == key
+			if (assigned && got != 1) || got > 1 {
+				return fmt.Errorf("rollout: replacement %d: %s/%d started %d times on %s", index, name, shard, got, m.Name)
+			}
+		}
+	}
+	return nil
+}
+
+// count counts a start of s by holder.
+func (r *replacementWatch) count(holder string, s spaceShard) {
+	if r.starts[holder] == nil {
+		r.starts[holder] = map[spaceShard]int{}
+	}
+	r.starts[holder][s]++
+}
+
+// PlantStart counts one more start of a shard on the present incarnation of the replacement m,
+// as if its machine had started the shard's run again, and starts nothing. It is for the tests
+// that show what the rollout's final check reports; a scenario never calls it. It does nothing
+// in a world without a rollout, for a member that is not a replacement, and before m's machine
+// held a slot.
+func (w *World) PlantStart(m *Member, space string, shard int) {
+	if w.rollout == nil || !m.Replacement {
+		return
+	}
+	r := w.rollout.reps[m.Index-1]
+	if r.holder == "" || r.holder != m.holder {
+		return
+	}
+	r.count(r.holder, spaceShard{space, shard})
+}

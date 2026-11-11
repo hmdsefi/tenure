@@ -59,6 +59,9 @@ type storeModel struct {
 	rule Takeover
 	// endAfter, when positive, ends every session that long after it opened.
 	endAfter time.Duration
+	// mutation is the scenario's Mutation: GrantHeld and ReadConfirm plant their bugs here in
+	// a build with the tag tenure_mutants (mutants_on.go), and no build without it plants any.
+	mutation Mutation
 
 	// now is the store's time: the largest reading seen. seen reports that there has been one.
 	now  time.Duration
@@ -504,7 +507,7 @@ func (m *storeModel) acquire(now time.Duration, wall time.Time, r acquireReq) re
 		return lostReply{replyHead{r.ID}}
 	}
 	rec := m.record(r.Space, r.Shard)
-	if rec.Holder != "" && rec.Holder != r.Holder && !m.gone(rec.Holder) {
+	if rec.Holder != "" && rec.Holder != r.Holder && !m.gone(rec.Holder) && !m.mutation.plants(GrantHeld) {
 		return heldReply{replyHead: replyHead{r.ID}, Record: rec, RetryAfter: s.timing.RetryPeriod}
 	}
 	unseen := time.Duration(0)
@@ -538,7 +541,8 @@ func (m *storeModel) confirm(now time.Duration, r confirmReq) reply {
 		return lostReply{replyHead{r.ID}}
 	}
 	rec := m.record(r.Space, r.Shard)
-	wrote := m.rule == Observer && rec.Version != 0 && rec.Holder == r.Holder && rec.Term == r.Term
+	wrote := m.rule == Observer && rec.Version != 0 && rec.Holder == r.Holder && rec.Term == r.Term &&
+		!m.mutation.plants(ReadConfirm)
 	if wrote {
 		rec = m.write(rec)
 	}

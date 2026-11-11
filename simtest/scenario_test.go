@@ -61,12 +61,65 @@ var rows = []row{
 		seeds: 20, duration: 75 * time.Second, net: defaultNet, g2: true,
 	},
 	{
+		name: "TestCrashRestart", sc: world.Scenario{Faults: &fault.Random{MaxDown: 2, Rules: []fault.Rule{
+			{Kind: fault.KindCrash, Target: "members", Every: 10 * time.Second, MinFor: time.Second, MaxFor: 20 * time.Second},
+		}}},
+		seeds: 50, duration: 150 * time.Second, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestPartitions", sc: world.Scenario{Delta: 150 * time.Millisecond, Faults: &fault.Random{MaxDown: 2, Rules: []fault.Rule{
+			{Kind: fault.KindPartition, Every: 15 * time.Second, MaxFor: 20 * time.Second},
+			{
+				Kind: fault.KindLink, Target: "store", Every: 10 * time.Second, MaxFor: 15 * time.Second,
+				Link: &simnet.Link{Latency: 100 * time.Millisecond, Jitter: 50 * time.Millisecond},
+			},
+		}}},
+		seeds: 50, duration: 150 * time.Second, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestDrift", sc: world.Scenario{Rho: 100_000, Faults: &fault.Random{MaxDown: 2, Rules: []fault.Rule{
+			{Kind: fault.KindClockDrift, Target: "members", Every: 10 * time.Second, Magnitude: 150_000},
+		}}},
+		seeds: 50, duration: 150 * time.Second, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestDriftBeyondBound", sc: world.Scenario{NoLiveness: true, Faults: &fault.Random{MaxDown: 2, Rules: []fault.Rule{
+			{Kind: fault.KindClockDrift, Target: "members", Every: 10 * time.Second, Magnitude: 400_000},
+		}}},
+		seeds: 50, duration: 150 * time.Second, net: defaultNet, g2: false,
+	},
+	{
+		name: "TestPauses", sc: world.Scenario{Faults: &fault.Random{MaxDown: 2, Rules: []fault.Rule{
+			{Kind: fault.KindPause, Target: "members", Every: 10 * time.Second, MinFor: time.Second, MaxFor: 20 * time.Second},
+		}}},
+		seeds: 50, duration: 150 * time.Second, net: defaultNet, g2: false,
+	},
+	{
+		name: "TestWallClock", sc: world.Scenario{WallSkew: time.Hour, WallSteps: 10 * time.Minute},
+		seeds: 50, duration: 150 * time.Second, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestStoreFaults", sc: world.Scenario{Faults: &fault.Random{MaxDown: 1, Rules: []fault.Rule{
+			{Kind: fault.KindCrash, Target: "store", Every: 20 * time.Second, MaxFor: 10 * time.Second},
+			{Kind: fault.KindIsolate, Target: "store", Every: 30 * time.Second, MaxFor: 10 * time.Second},
+		}}},
+		seeds: 50, duration: 150 * time.Second, net: defaultNet, g2: true,
+	},
+	{
 		name: "TestSlotScaleDown", sc: world.Scenario{Slots: 5, SetSlotsAt: scaleDownAt, SetSlotsTo: scaleDownTo},
 		seeds: 20, duration: 125 * time.Second, net: defaultNet, g2: true,
 	},
 	{
 		name: "TestSlotGrace", sc: world.Scenario{Slots: 5, Faults: &fault.Random{Quiet: graceRun - graceCrash}},
 		seeds: 20, duration: graceRun, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestSlotRollout", sc: world.Scenario{Slots: 5, Rollout: rolloutPlan},
+		seeds: 20, duration: rolloutRun, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestSlotRolloutFaults", sc: world.Scenario{Slots: 5, Rollout: rolloutPlan, Faults: rolloutFaults()},
+		seeds: 100, duration: rolloutRun, net: defaultNet, g2: true,
 	},
 	// The row's Outage.For is the first of outageLengths; TestFencedStoreOutage runs each.
 	{

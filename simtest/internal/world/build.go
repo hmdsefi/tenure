@@ -145,6 +145,9 @@ type World struct {
 	// sessions keeps the session ends the members owe a recovery for (recover.go).
 	sessions *sessionWatch
 
+	// rollout keeps what the final tenure/rollout judges (rollout.go); nil without a Rollout.
+	rollout *rolloutWatch
+
 	// checker decides the invariants over what the store, the drivers and the fence observe
 	// (checks.go).
 	checker *check.Checker
@@ -195,10 +198,16 @@ type World struct {
 // each shard with an assignee is owned by that member alone. A scenario with EndAfter also gets
 // the final tenure/recovered, after those two: every end of a session of a member that was not
 // told to drain is followed by exactly one recovery of the member, whose new session the store
-// opened. A scenario with an Outage cuts the store off from every node at Outage.At and heals
-// the network Outage.For later, which is its recovery time, and gets the final tenure/outage,
-// after those: an unfenced shard stops at its session deadline, and a fenced one degrades and
-// runs on through the outage until a sign that it is lost, and then restores or is lost.
+// opened. A scenario with a Rollout gets the final tenure/rollout, after those: each replacement
+// took the shards of the slot it claimed once, and no replaced member started a shard after
+// it was told to drain. A scenario with an Outage cuts the store off from every node at
+// Outage.At and heals the network Outage.For later, which is its recovery time, and gets the
+// final tenure/outage, after those: an unfenced shard stops at its session deadline, and a fenced
+// one degrades and runs on through the outage until a sign that it is lost, and then restores or
+// is lost.
+//
+// With a Rollout, the replacement mi-r is activated at Start + (i−1)·Gap, which starts its
+// first incarnation, and mi is told to drain Surge later.
 //
 // A member whose session is lost starts a new incarnation, cause "recover", once its machine is
 // done and every run has returned, in the event of the last of them. A member told to drain
@@ -229,6 +238,7 @@ func Build(w *faultline.World, sc Scenario) *World {
 	world.installChecks()
 	world.installFinals()
 	world.installRecovered()
+	world.planRollout()
 	world.installOutage()
 	world.emitBound()
 	return world
@@ -379,6 +389,10 @@ func (w *World) membersRole() []kernel.NodeID {
 // planFaults plans the scenario's random faults. The plan is a copy, whose Quiet is the quiet
 // window of the setup: the function that builds the world runs once for every run, a passing
 // seed may run twice, and the caller's value must stay as it is.
+//
+// Link rules run apart, in twoWayLinks, so that each link fault slows both directions of its
+// link; the other rules then run as a Random of their own, and the copy stays the world's
+// Scenario().Faults, all rules in order. A plan without link rules is the copy itself.
 func (w *World) planFaults() {
 	if w.sc.Faults == nil {
 		return
@@ -389,7 +403,16 @@ func (w *World) planFaults() {
 		Quiet:   w.quiet,
 	}
 	w.sc.Faults = plan
-	w.fw.Plan(plan)
+	others, links := splitLinks(plan.Rules)
+	if len(links) == 0 {
+		w.fw.Plan(plan)
+		return
+	}
+	w.fw.Plan(&fault.Random{Rules: others, MaxDown: plan.MaxDown, Quiet: plan.Quiet})
+	w.fw.Plan(&twoWayLinks{
+		plan:  &fault.Random{Rules: links, MaxDown: plan.MaxDown},
+		until: w.end - kernel.Time(w.quiet),
+	})
 }
 
 // planWallSteps schedules the wall-clock steps of a scenario with WallSteps (SIM-110). Each

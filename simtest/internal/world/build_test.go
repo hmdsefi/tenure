@@ -84,8 +84,10 @@ func stream(seed uint64, label string) *rand.Rand {
 // at returns a time of the run.
 func at(d time.Duration) kernel.Time { return kernel.Time(d) }
 
-// rollout is a rollout that a test never activates.
-var rollout = &Rollout{Start: 10 * time.Second, Gap: 5 * time.Second, Surge: 2 * time.Second}
+// rollout is a rollout that a test never activates: the tests that use it stop before 20 s.
+// Its last drain, at 32 s, is the recovery time of their worlds, so they last 120 s, which
+// leaves the bound after it.
+var rollout = &Rollout{Start: 20 * time.Second, Gap: 5 * time.Second, Surge: 2 * time.Second}
 
 // TestATSIM04NodeOrder checks the order of the nodes: the store (NodeID 1), the fence (2), the
 // members m1 … mN from NodeID 3 and, with a Rollout, the replacements m1-r … mN-r after them;

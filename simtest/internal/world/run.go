@@ -160,11 +160,16 @@ func (r *run) emit(text, op string) {
 // now returns the member's monotonic reading.
 func (r *run) now() time.Duration { return r.d.m.Mono() }
 
-// call starts a call of the run: it raises the fence of the shard to the run's term.
+// call starts a call of the run: it raises the fence of the shard to the run's term. With the
+// planted bug SkipRaise (mutants_on.go) it goes straight to its first write instead.
 func (r *run) call() {
 	r.inCall = true
 	r.callAt = r.now()
 	d := r.d
+	if d.w.sc.Mutation.plants(SkipRaise) {
+		r.waitWrite()
+		return
+	}
 	d.md.lastID++
 	req := raiseReq{reqHead: reqHead{ID: d.md.lastID, Holder: d.holder}, Space: r.space, Shard: r.shard, Term: r.term}
 	r.emit(req.Describe(), runOpRaise)

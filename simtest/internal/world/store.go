@@ -77,9 +77,11 @@ type storeServer struct {
 }
 
 // newStoreServer returns the store of w, with an empty model under the scenario's rule, with
-// its slot count and its EndAfter.
+// its slot count, its EndAfter and its Mutation.
 func newStoreServer(w *World) *storeServer {
-	return &storeServer{w: w, model: newStoreModel(w.sc.Takeover, w.sc.Slots, w.sc.EndAfter)}
+	model := newStoreModel(w.sc.Takeover, w.sc.Slots, w.sc.EndAfter)
+	model.mutation = w.sc.Mutation
+	return &storeServer{w: w, model: model}
 }
 
 // boot runs at every boot of the store's node: it installs the handler and sets the mono
