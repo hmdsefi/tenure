@@ -78,7 +78,8 @@ func newProcNet(w *faultline.World) *procNet {
 //     errStoreUnreachable or errFenceUnreachable, at once;
 //   - otherwise the call runs, and the gate returns nil.
 //
-// A call of op "fence.raise" or "fence.write" goes to the fence, every other one to the store.
+// A call of op "fence.raise" or "fence.write" goes to the fence, every other one to the store:
+// the store's methods, and "store.watch", one value of a watch on its way to the member.
 func (pn *procNet) gate(p *faultline.Process) gateFunc {
 	self := p.Node.ID()
 	return func(op string, call func()) error {

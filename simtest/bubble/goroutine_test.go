@@ -230,6 +230,77 @@ func TestATSIM45Gates(t *testing.T) {
 	})
 }
 
+// TestWatchGate checks that a process's store watch is gated as its calls are: a record the store
+// commits while the member and the store reach each other arrives; one committed while they do
+// not is not delivered, and the watch ends; a new watch opened after the heal receives the next
+// record.
+func TestWatchGate(t *testing.T) {
+	skipUnderDeterminismCheck(t)
+	sec := func(s float64) kernel.Time { return kernel.Time(s * float64(time.Second)) }
+	opts := faultline.Options{Mode: faultline.ModeGoroutine, Seeds: 1, Duration: 10 * time.Second}
+	faultline.Run(t, opts, func(w *faultline.World) {
+		pn := newProcNet(w)
+		h := newHarness(w.T(), options{})
+		start := time.Now()
+		var (
+			mu  sync.Mutex
+			got []string
+		)
+		note := func(format string, args ...any) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, fmt.Sprintf("%v ", time.Since(start))+fmt.Sprintf(format, args...))
+		}
+		w.AddProcess("m1", func(ctx context.Context, p *faultline.Process) error {
+			st := newMemberStore(h, pn.gate(p), true)
+			for watch := 1; watch <= 2; watch++ {
+				if watch == 2 {
+					time.Sleep(time.Duration(sec(4)) - time.Since(start))
+				}
+				ch, err := st.WatchHolders(ctx)
+				if err != nil {
+					return err
+				}
+				for rec := range ch {
+					note("watch %d: %s/%d", watch, rec.Space, rec.Shard)
+				}
+				note("watch %d: closed", watch)
+			}
+			return nil
+		})
+		// A writer on the driver: open a session, then grant book/0, book/1 and book/2.
+		ctx := context.Background()
+		w.Sim.At(0, "session", func() {
+			if err := h.store.KeepAlive(ctx, "w/1", timing); err != nil {
+				t.Errorf("KeepAlive: %v", err)
+			}
+		})
+		for i, at := range []float64{1, 3, 5} {
+			w.Sim.At(sec(at), "grant", func() {
+				if err := h.store.KeepAlive(ctx, "w/1", timing); err != nil {
+					t.Errorf("KeepAlive: %v", err)
+				}
+				if _, err := h.store.Acquire(ctx, "w/1", "book", i); err != nil {
+					t.Errorf("Acquire book/%d: %v", i, err)
+				}
+			})
+		}
+		w.Plan(fault.Script(
+			fault.Event{At: sec(2), Kind: fault.KindCut, Node: storeNode, Peer: "m1"},
+			fault.Event{At: sec(3.5), Kind: fault.KindHealLink, Node: storeNode, Peer: "m1"},
+		))
+		want := []string{"1s watch 1: book/0", "3s watch 1: closed", "5s watch 2: book/2"}
+		w.Final("watch gate", func() error {
+			mu.Lock()
+			defer mu.Unlock()
+			if !slices.Equal(got, want) {
+				return fmt.Errorf("watch: %q, want %q", got, want)
+			}
+			return nil
+		})
+	})
+}
+
 // TestEventRecordAttrs checks eventAttrs against package debughttp: for every event a node
 // emits, in a group that converges and then loses a member, the record's attributes after seq
 // are the keys and values of the event's object in debughttp's events body after seq, time and

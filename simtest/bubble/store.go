@@ -35,13 +35,15 @@ func runGate(_ string, call func()) error {
 // incarnation keeps refusing the calls of its leftover goroutines after the member restarted.
 //
 // After every forwarded call it lets the harness read the store's record writes (syncGrants), so
-// the checker hears of a grant before the call returns to the node. It also keeps the term of
-// every successful Acquire with the holder that made it, from which the harness tells which
-// holder a Run of this incarnation serves.
+// the checker hears of a grant before the call returns to the node. When gateWatch is set, every
+// value of an open watch also goes through the gate on its way to the node (see gatedWatch). It
+// also keeps the term of every successful Acquire with the holder that made it, from which the
+// harness tells which holder a Run of this incarnation serves.
 type memberStore struct {
-	h    *harness
-	gate gateFunc
-	mem  *memstore.Store
+	h         *harness
+	gate      gateFunc
+	gateWatch bool // the values of the open watches go through gate too
+	mem       *memstore.Store
 
 	mu       sync.Mutex // held across the store call of Acquire, see Acquire
 	cut      bool
@@ -63,13 +65,16 @@ var (
 	_ tenure.Watcher   = (*memberStore)(nil)
 )
 
-func newMemberStore(h *harness, gate gateFunc) *memberStore {
+// newMemberStore returns a view of h's store whose calls go through gate, and with gateWatch the
+// values of its watches too.
+func newMemberStore(h *harness, gate gateFunc, gateWatch bool) *memberStore {
 	return &memberStore{
-		h:        h,
-		gate:     gate,
-		mem:      h.store,
-		watches:  make(map[int]context.CancelFunc),
-		acquired: make(map[termKey]string),
+		h:         h,
+		gate:      gate,
+		gateWatch: gateWatch,
+		mem:       h.store,
+		watches:   make(map[int]context.CancelFunc),
+		acquired:  make(map[termKey]string),
 	}
 }
 
@@ -233,11 +238,17 @@ func (s *memberStore) SetSlots(ctx context.Context, count int) error {
 }
 
 // WatchHolders opens a watch of the store under a context of its own, which a Cut cancels: the
-// store then closes the channel, as a store closes a watch it cannot serve.
+// store then closes the channel, as a store closes a watch it cannot serve. With gateWatch, the
+// node reads the watch through gatedWatch.
 func (s *memberStore) WatchHolders(ctx context.Context) (<-chan tenure.Holding, error) {
-	var ch <-chan tenure.Holding
+	var (
+		ch   <-chan tenure.Holding
+		wctx context.Context
+		id   int
+	)
 	err := s.do(ctx, "WatchHolders", func() error {
-		wctx, cancel := context.WithCancel(ctx)
+		var cancel context.CancelFunc
+		wctx, cancel = context.WithCancel(ctx)
 		s.mu.Lock()
 		if s.cut {
 			// Cut between do's check and the call: the watch would outlive the cut.
@@ -245,7 +256,7 @@ func (s *memberStore) WatchHolders(ctx context.Context) (<-chan tenure.Holding, 
 			cancel()
 			return errCut
 		}
-		id := s.nextW
+		id = s.nextW
 		s.nextW++
 		s.watches[id] = cancel
 		s.mu.Unlock()
@@ -262,7 +273,35 @@ func (s *memberStore) WatchHolders(ctx context.Context) (<-chan tenure.Holding, 
 	if err != nil {
 		return nil, err
 	}
+	if s.gateWatch {
+		return s.gatedWatch(wctx, id, ch), nil
+	}
 	return ch, nil
+}
+
+// gatedWatch returns a channel that receives the values of src, the store's channel of watch id,
+// each one after the gate let a call "store.watch" through: a value reaches the node only while
+// the gate would let a call's answer through. A refused value ends the watch: the value is
+// dropped, the watch is cancelled, as a Cut cancels it, and the channel is closed, so that the
+// node opens a new watch, through the gate, and resyncs. The forwarding goroutine ends when src
+// is closed (ctx done, the store closing it, or the watch cancelled) or ctx is done.
+func (s *memberStore) gatedWatch(ctx context.Context, id int, src <-chan tenure.Holding) <-chan tenure.Holding {
+	out := make(chan tenure.Holding, cap(src))
+	go func() {
+		defer close(out)
+		for rec := range src {
+			if err := s.gate("store.watch", func() {}); err != nil {
+				s.forget(id)
+				return
+			}
+			select {
+			case out <- rec:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
 }
 
 // forget cancels and drops the watch id, if it is still open.

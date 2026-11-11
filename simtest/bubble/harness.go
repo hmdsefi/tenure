@@ -554,11 +554,14 @@ func (m *member) startWith(ctx context.Context, hk hooks) (*incarnation, error) 
 		return nil, fmt.Errorf("bubble: %s is running", m.id)
 	}
 	h := m.h
+	// A gate of the hooks gates the values of the watch too; with the zero hooks only a Cut ends
+	// a watch.
+	gateWatch := hk.gate != nil
 	if hk.gate == nil {
 		hk.gate = runGate
 	}
 	inc := &incarnation{m: m, share: h.group.Share(), hooks: hk, gone: make(chan struct{})}
-	inc.store = newMemberStore(h, hk.gate)
+	inc.store = newMemberStore(h, hk.gate, gateWatch)
 	cfg := tenure.Config{
 		Self:       tenure.Member{ID: m.id, Addr: m.id + ":7000"},
 		Membership: inc.share,
