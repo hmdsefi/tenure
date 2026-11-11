@@ -146,6 +146,9 @@ type Scenario struct {
 	// time drawn from [0, StopDelay].
 	StopDelay time.Duration
 	// EndAfter, when positive, makes the store end every session EndAfter after it opened.
+	// The recovery time is raised to the latest end of a session opened at the start, so a
+	// run with EndAfter should end before 2·EndAfter, when the recovered sessions would end in
+	// their turn.
 	EndAfter time.Duration
 	// Faults plans random faults, or none when it is nil. The world plans a copy of it and
 	// leaves the caller's value as it is.
