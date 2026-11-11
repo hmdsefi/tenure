@@ -53,9 +53,6 @@ var rows = []row{
 		name: "TestSteady", sc: world.Scenario{StopDelay: time.Second},
 		seeds: 20, duration: 60 * time.Second, net: defaultNet, g2: true,
 	},
-	// The store ends each first session once, at about 40 s, and the members recover. The run
-	// lasts 75 s, not 90 s: the recovered sessions, opened at about 40 s, would end at about
-	// 80 s, and that second round of ends leaves no bound to recover in before 90 s.
 	{
 		name: "TestCrashRestart", sc: world.Scenario{Faults: &fault.Random{MaxDown: 2, Rules: []fault.Rule{
 			{Kind: fault.KindCrash, Target: "members", Every: 10 * time.Second, MinFor: time.Second, MaxFor: 20 * time.Second},
@@ -66,7 +63,7 @@ var rows = []row{
 		name: "TestPartitions", sc: world.Scenario{Delta: 150 * time.Millisecond, Faults: &fault.Random{MaxDown: 2, Rules: []fault.Rule{
 			{Kind: fault.KindPartition, Every: 15 * time.Second, MaxFor: 20 * time.Second},
 			{
-				Kind: fault.KindLink, Target: "members", Every: 10 * time.Second, MaxFor: 15 * time.Second,
+				Kind: fault.KindLink, Target: "store", Every: 10 * time.Second, MaxFor: 15 * time.Second,
 				Link: &simnet.Link{Latency: 100 * time.Millisecond, Jitter: 50 * time.Millisecond},
 			},
 		}}},
@@ -101,6 +98,9 @@ var rows = []row{
 		}}},
 		seeds: 50, duration: 150 * time.Second, net: defaultNet, g2: true,
 	},
+	// The store ends each first session once, at about 40 s, and the members recover. The run
+	// lasts 75 s, not 90 s: the recovered sessions, opened at about 40 s, would end at about
+	// 80 s, and that second round of ends leaves no bound to recover in before 90 s.
 	{
 		name: "TestSessionEnds", sc: world.Scenario{EndAfter: 40 * time.Second},
 		seeds: 20, duration: 75 * time.Second, net: defaultNet, g2: true,

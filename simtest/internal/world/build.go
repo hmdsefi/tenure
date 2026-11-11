@@ -371,6 +371,10 @@ func (w *World) membersRole() []kernel.NodeID {
 // planFaults plans the scenario's random faults. The plan is a copy, whose Quiet is the quiet
 // window of the setup: the function that builds the world runs once for every run, a passing
 // seed may run twice, and the caller's value must stay as it is.
+//
+// Link rules run apart, in twoWayLinks, so that each link fault slows both directions of its
+// link; the other rules then run as a Random of their own, and the copy stays the world's
+// Scenario().Faults, all rules in order. A plan without link rules is the copy itself.
 func (w *World) planFaults() {
 	if w.sc.Faults == nil {
 		return
@@ -381,7 +385,16 @@ func (w *World) planFaults() {
 		Quiet:   w.quiet,
 	}
 	w.sc.Faults = plan
-	w.fw.Plan(plan)
+	others, links := splitLinks(plan.Rules)
+	if len(links) == 0 {
+		w.fw.Plan(plan)
+		return
+	}
+	w.fw.Plan(&fault.Random{Rules: others, MaxDown: plan.MaxDown, Quiet: plan.Quiet})
+	w.fw.Plan(&twoWayLinks{
+		plan:  &fault.Random{Rules: links, MaxDown: plan.MaxDown},
+		until: w.end - kernel.Time(w.quiet),
+	})
 }
 
 // planWallSteps schedules the wall-clock steps of a scenario with WallSteps (SIM-110). Each
