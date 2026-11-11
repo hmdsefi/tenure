@@ -4,6 +4,12 @@
 package simtest
 
 import (
+	"bytes"
+	"errors"
+	"os"
+	"os/exec"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +53,9 @@ var rows = []row{
 		name: "TestSteady", sc: world.Scenario{StopDelay: time.Second},
 		seeds: 20, duration: 60 * time.Second, net: defaultNet, g2: true,
 	},
+	// The store ends each first session once, at about 40 s, and the members recover. The run
+	// lasts 75 s, not 90 s: the recovered sessions, opened at about 40 s, would end at about
+	// 80 s, and that second round of ends leaves no bound to recover in before 90 s.
 	{
 		name: "TestCrashRestart", sc: world.Scenario{Faults: &fault.Random{MaxDown: 2, Rules: []fault.Rule{
 			{Kind: fault.KindCrash, Target: "members", Every: 10 * time.Second, MinFor: time.Second, MaxFor: 20 * time.Second},
@@ -99,7 +108,7 @@ var rows = []row{
 }
 
 // rowNamed returns the row of the table whose name is name, and fails t when there is none.
-func rowNamed(t testing.TB, name string) row {
+func rowNamed(t testing.TB, name string) row { //nolint:unparam // the rows of 1.8-12 on look up their own names
 	t.Helper()
 	for _, r := range rows {
 		if r.name == name {
@@ -180,4 +189,62 @@ func TestRowsNamed(t *testing.T) {
 	if got := rowNamed(t, "TestSteady").seeds; got != 20 {
 		t.Errorf("TestSteady has %d seeds, want 20", got)
 	}
+}
+
+// TestRowOptions checks that a row's options are its seeds, its duration and its network, with
+// determinism checking on, and that the row runs under both rules, Server then Observer, unless
+// it names its rules.
+func TestRowOptions(t *testing.T) {
+	r := rowNamed(t, "TestSteady")
+	got := r.options()
+	if got.Seeds != r.seeds || got.Duration != r.duration || got.Net != r.net || !got.CheckDeterminism {
+		t.Errorf("options() = Seeds %d, Duration %v, Net %+v, CheckDeterminism %v; want %d, %v, %+v, true",
+			got.Seeds, got.Duration, got.Net, got.CheckDeterminism, r.seeds, r.duration, r.net)
+	}
+	if got, want := r.takeovers(), []world.Takeover{world.Server, world.Observer}; !slices.Equal(got, want) {
+		t.Errorf("takeovers() = %v, want %v", got, want)
+	}
+	r.rules = []world.Takeover{world.Observer}
+	if got, want := r.takeovers(), []world.Takeover{world.Observer}; !slices.Equal(got, want) {
+		t.Errorf("takeovers() with rules = %v, want %v", got, want)
+	}
+}
+
+// rowChildEnv makes TestRowChild run.
+const rowChildEnv = "TENURE_SIM_ROW_CHILD"
+
+// TestRowAssertsG2 checks that a row's body fails the run when the world's AssertsG2 is not the
+// row's G2 column: a child process runs TestSteady's row with the column set to false.
+func TestRowAssertsG2(t *testing.T) {
+	if os.Getenv(rowChildEnv) != "" {
+		t.Skip("in the child process")
+	}
+	// The child's output is matched by substring, and none of faultline's variables of this
+	// process reaches it.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRowChild$", "-test.v") //nolint:gosec // the test binary itself
+	cmd.Env = append(slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "FAULTLINE_") }),
+		rowChildEnv+"=1", "FAULTLINE_ARTIFACTS=off")
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() == 0 {
+		t.Fatalf("child exited with %v, want a failure; output:\n%s", err, out.String())
+	}
+	if want := "row TestSteady: AssertsG2 true, want false"; !strings.Contains(out.String(), want) {
+		t.Errorf("child's output does not contain %q:\n%s", want, out.String())
+	}
+}
+
+// TestRowChild is the child process of TestRowAssertsG2: one seed of TestSteady's row, under
+// the Server rule, with a G2 column that the world does not have.
+func TestRowChild(t *testing.T) {
+	if os.Getenv(rowChildEnv) == "" {
+		t.Skip("runs only as the child process of TestRowAssertsG2")
+	}
+	r := rowNamed(t, "TestSteady")
+	r.g2 = false
+	opts := r.options()
+	opts.Seeds = 1
+	faultline.Run(t, opts, r.body(world.Server, nil))
 }
