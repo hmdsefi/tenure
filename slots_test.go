@@ -1145,6 +1145,10 @@ func TestATRUN24SetSlotsErrors(t *testing.T) {
 			if !errors.Is(err, context.Canceled) || time.Since(at) != 0 {
 				t.Errorf("Close(canceled ctx) = %v after %v, want context.Canceled at once", err, time.Since(at))
 			}
+			// Close waits for SetSlots, which counts as one of the node's goroutines, but the
+			// goroutine above sends its result only after SetSlots has returned: let it run. The
+			// bubble's clock does not move meanwhile.
+			synctest.Wait()
 			select {
 			case err := <-set:
 				if err != tenure.ErrClosed {
