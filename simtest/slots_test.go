@@ -80,7 +80,11 @@ func TestATSIM29ScaleDown(t *testing.T) {
 			faultline.Run(t, opts, r.body(rule, func(fw *faultline.World, w *world.World) {
 				var former string // the member that held slot 3 just before the change
 				fw.Sim.At(kernel.Time(scaleDownAt-5*time.Second), "test/former_holder", func() {
-					for _, p := range w.Placements() {
+					places, err := w.Placements()
+					if err != nil {
+						fw.Sim.Fail(err)
+					}
+					for _, p := range places {
 						if p.Slot == scaleDownTo {
 							former = p.Member
 						}
@@ -106,7 +110,10 @@ func scaleDownErr(w *world.World, recs []kernel.Record, former string) error {
 	if err := setRecordErr(recs, w.Scenario().Timing.RetryPeriod); err != nil {
 		return err
 	}
-	places := w.Placements()
+	places, err := w.Placements()
+	if err != nil {
+		return err
+	}
 	if len(places) == 0 {
 		return errors.New("no member is up at the end")
 	}

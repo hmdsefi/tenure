@@ -90,13 +90,18 @@ type Placement struct {
 	Assignment func(space string) []string
 }
 
-// Placements returns the placement of each member that is active and up and whose present
-// incarnation has a running driver, in NodeID order: the members whose machines the final
-// checks judge. Call it from a final check or from an event of the run.
-func (w *World) Placements() []Placement {
-	var out []Placement
-	for _, lm := range w.liveMembers() {
+// Placements returns the placement of each member that is active and up, in NodeID order: the
+// members whose machines the final checks judge. It fails, as tenure/converged does, for an
+// active member that is up but drives no machine for its holder. Call it from a final check or
+// from an event of the run.
+func (w *World) Placements() ([]Placement, error) {
+	live, err := w.liveMembers()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Placement, 0, len(live))
+	for _, lm := range live {
 		out = append(out, Placement{Member: lm.name, Holder: lm.holder, Slot: lm.slot, Assignment: lm.assign})
 	}
-	return out
+	return out, nil
 }
