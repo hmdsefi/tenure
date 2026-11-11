@@ -102,7 +102,10 @@ func readRegressionCall(fn *ast.FuncDecl) (regressionCall, string) {
 	}
 	c.row = name
 	sel, ok := call.Args[2].(*ast.SelectorExpr)
-	if x, isIdent := sel.X.(*ast.Ident); !ok || !isIdent || x.Name != "world" {
+	if !ok {
+		return c, "the rule is not world.Server or world.Observer"
+	}
+	if x, isIdent := sel.X.(*ast.Ident); !isIdent || x.Name != "world" {
 		return c, "the rule is not world.Server or world.Observer"
 	}
 	c.rule = sel.Sel.Name
@@ -186,6 +189,8 @@ func TestRegressionF(t *testing.T) { run(t, "TestSteady", world.Server, 0x000000
 func TestRegressionG(t *testing.T) { regression(t, "TestSteady", world.Server, 0x0000000000000001); t.Log() }
 func TestRegressionSteadyServer00000001(t *testing.T) { regression(t, "TestSteady", world.Server, 0x0000000000000001) }
 func TestRegressionSteadyObserver00000000(t *testing.T) { regression(t, "TestSteady", world.Observer, 0x0000000000000001) }
+func TestRegressionH(t *testing.T) { regression(t, "TestSteady", Server, 0x0000000000000001) }
+func TestRegressionI(t *testing.T) { regression(t, "TestSteady", other.Server, 0x0000000000000001) }
 func TestOther(t *testing.T) { t.Log() }
 func helper() {}
 `
@@ -199,6 +204,8 @@ func helper() {}
 		"x.go:8: TestRegressionF: the body is not one call of regression with a row, a rule and a seed",
 		"x.go:9: TestRegressionG: the body is not one call of regression",
 		"x.go:10: TestRegressionSteadyServer00000001 runs TestSteady, Server, seed 0x0000000000000001: want the name TestRegressionSteadyServer00000000",
+		"x.go:12: TestRegressionH: the rule is not world.Server or world.Observer",
+		"x.go:13: TestRegressionI: the rule is not world.Server or world.Observer",
 	}
 	if !slices.Equal(errs, want) {
 		t.Errorf("errors:\n%s\nwant:\n%s", strings.Join(errs, "\n"), strings.Join(want, "\n"))

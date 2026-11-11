@@ -20,10 +20,10 @@
 //	FAULTLINE_CHECK_DETERMINISM=1 go test -count=1 ./...
 //
 // The file testdata/hashes.txt pins the trace hashes of eight scenarios at three fixed seeds,
-// under Go 1.26, so a change that alters a run fails TestGoldenHashes. When the change is
-// intended, rewrite the file with
+// under Go 1.26, so a change that alters a run fails TestGoldenHashes; under another Go minor
+// version the test skips. When the change is intended, rewrite the file under Go 1.26 with
 //
-//	go test -run TestGoldenHashes -update .
+//	GOTOOLCHAIN=go1.26.0 go test -count=1 -run '^TestGoldenHashes$' -update .
 //
 // and give the commit a "Golden-Update: <reason>" line. Seeds that once exposed a bug run as
 // TestRegression tests.

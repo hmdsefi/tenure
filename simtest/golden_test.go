@@ -5,6 +5,7 @@ package simtest
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,9 +42,10 @@ const (
 
 // goldenScenario is one golden scenario: a row of the scenario table under one rule.
 type goldenScenario struct {
-	name string // the name in the golden file
-	row  string // the row's test name
-	rule world.Takeover
+	name   string // the name in the golden file
+	row    string // the row's test name
+	rule   world.Takeover
+	change func(*row) // a change to the row, or nil
 }
 
 // goldenScenarios are the scenarios TestGoldenHashes pins, each the matching row of the table,
@@ -51,14 +53,14 @@ type goldenScenario struct {
 // 30 s, the fault rows leave their planners 7 s or 8 s before the recovery time, less than one
 // interval of their rules, and no fault happens.
 var goldenScenarios = []goldenScenario{
-	{"steady/server", "TestSteady", world.Server},
-	{"steady/observer", "TestSteady", world.Observer},
-	{"crash/server", "TestCrashRestart", world.Server},
-	{"crash/observer", "TestCrashRestart", world.Observer},
-	{"partitions/server", "TestPartitions", world.Server},
-	{"wallclock/observer", "TestWallClock", world.Observer},
-	{"rollout/server", "TestSlotRollout", world.Server},
-	{"outage/observer", "TestFencedStoreOutage", world.Observer},
+	{"steady/server", "TestSteady", world.Server, nil},
+	{"steady/observer", "TestSteady", world.Observer, nil},
+	{"crash/server", "TestCrashRestart", world.Server, nil},
+	{"crash/observer", "TestCrashRestart", world.Observer, nil},
+	{"partitions/server", "TestPartitions", world.Server, nil},
+	{"wallclock/observer", "TestWallClock", world.Observer, nil},
+	{"rollout/server", "TestSlotRollout", world.Server, nil},
+	{"outage/observer", "TestFencedStoreOutage", world.Observer, nil},
 }
 
 // goldenSkip returns why TestGoldenHashes does not run with the Go version version and the
@@ -84,32 +86,55 @@ func TestGoldenHashes(t *testing.T) {
 		t.Skip(why)
 	}
 	var got []dettest.Entry
+	var ran []string
 	for _, g := range goldenScenarios {
 		t.Run(g.name, func(t *testing.T) {
+			ran = append(ran, g.name)
 			got = append(got, goldenEntries(t, g)...)
 		})
 	}
 	if t.Failed() {
 		return
 	}
+	if failure := checkGolden(goldenFile, got, ran, *update); failure != "" {
+		t.Fatal(failure)
+	}
 	if *update {
-		if err := os.WriteFile(goldenFile, dettest.FormatGolden(got), 0o644); err != nil { //nolint:gosec // a file of the repository
-			t.Fatal(err)
-		}
 		t.Logf("wrote %s: %d entries", goldenFile, len(got))
-		return
 	}
-	data, err := os.ReadFile(goldenFile)
-	if err != nil {
-		t.Fatalf("%v\n%s", err, goldenHint)
+}
+
+// checkGolden compares got, the entries of the golden scenarios named ran, with the golden file
+// at path, or with update rewrites the file with got. It returns the failure message, or "" when
+// the test passes. A run that a -run pattern limited to some of the scenarios is compared with
+// their entries alone, and may not rewrite the file.
+func checkGolden(path string, got []dettest.Entry, ran []string, update bool) string {
+	partial := len(ran) < len(goldenScenarios)
+	if update {
+		if partial {
+			return fmt.Sprintf("-update rewrites all of %s, but %d of the %d golden scenarios ran: run TestGoldenHashes without a subtest pattern",
+				path, len(ran), len(goldenScenarios))
+		}
+		if err := os.WriteFile(path, dettest.FormatGolden(got), 0o644); err != nil { //nolint:gosec // a file of the repository
+			return err.Error()
+		}
+		return ""
 	}
-	want, err := dettest.ParseGolden(goldenFile, data)
+	data, err := os.ReadFile(path) //nolint:gosec // a file of the repository
 	if err != nil {
-		t.Fatalf("%v\n%s", err, goldenHint)
+		return err.Error() + "\n" + goldenHint
+	}
+	want, err := dettest.ParseGolden(path, data)
+	if err != nil {
+		return err.Error() + "\n" + goldenHint
+	}
+	if partial {
+		want = slices.DeleteFunc(want, func(e dettest.Entry) bool { return !slices.Contains(ran, e.Name) })
 	}
 	if lines := dettest.CompareGolden(got, want); lines != nil {
-		t.Errorf("%s\n%s", strings.Join(lines, "\n"), goldenHint)
+		return strings.Join(lines, "\n") + "\n" + goldenHint
 	}
+	return ""
 }
 
 // goldenEntries runs the golden seeds of g, with faultline's results written to a file of its
@@ -118,6 +143,9 @@ func TestGoldenHashes(t *testing.T) {
 func goldenEntries(t *testing.T, g goldenScenario) []dettest.Entry {
 	t.Helper()
 	r := rowNamed(t, g.row)
+	if g.change != nil {
+		g.change(&r)
+	}
 	opts := r.options()
 	results := filepath.Join(t.TempDir(), "results.jsonl")
 	t.Setenv("FAULTLINE_RESULTS", results)
@@ -144,6 +172,73 @@ func goldenEntries(t *testing.T, g goldenScenario) []dettest.Entry {
 		t.Fatalf("%d results, want one per seed (%d)", len(entries), len(goldenSeeds))
 	}
 	return entries
+}
+
+// TestCheckGolden checks TestGoldenHashes' compare and update paths on a file of its own: a
+// full run rewrites the file and then matches it; a changed hash, a missing entry and an extra
+// one are reported with the hint; a run of some of the scenarios is compared with their entries
+// alone and may not rewrite the file; a missing file is reported with the hint.
+func TestCheckGolden(t *testing.T) {
+	var all []string
+	var entries []dettest.Entry
+	for i, g := range goldenScenarios {
+		all = append(all, g.name)
+		for _, seed := range goldenSeeds {
+			entries = append(entries, dettest.Entry{Name: g.name, Seed: seed, Hash: uint64(i)<<8 | seed, Count: 100 + seed})
+		}
+	}
+	path := filepath.Join(t.TempDir(), "hashes.txt")
+	if failure := checkGolden(path, entries, all, true); failure != "" {
+		t.Fatalf("update: %s", failure)
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // the test's own temporary file
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := dettest.FormatGolden(entries); string(data) != string(want) {
+		t.Fatalf("update wrote\n%s\nwant\n%s", data, want)
+	}
+	if failure := checkGolden(path, entries, all, false); failure != "" {
+		t.Errorf("after update: %s", failure)
+	}
+
+	changed := slices.Clone(entries)
+	changed[0].Hash = 0xabc
+	if got, want := checkGolden(path, changed, all, false),
+		"golden: steady/server seed 0x0000000000000001: got hash 0x0000000000000abc count 101, want hash 0x0000000000000001 count 101\n"+goldenHint; got != want {
+		t.Errorf("changed hash:\n got %q\nwant %q", got, want)
+	}
+	if got, want := checkGolden(path, entries[1:], all, false),
+		"golden: steady/server seed 0x0000000000000001: in the golden file but not produced\n"+goldenHint; got != want {
+		t.Errorf("missing entry:\n got %q\nwant %q", got, want)
+	}
+	extra := append(slices.Clone(entries), dettest.Entry{Name: "steady/server", Seed: 4, Hash: 1, Count: 1})
+	if got, want := checkGolden(path, extra, all, false),
+		"golden: steady/server seed 0x0000000000000004: missing from the golden file\n"+goldenHint; got != want {
+		t.Errorf("extra entry:\n got %q\nwant %q", got, want)
+	}
+
+	// A -run pattern that chose the first scenario alone.
+	first := entries[:len(goldenSeeds)]
+	if failure := checkGolden(path, first, all[:1], false); failure != "" {
+		t.Errorf("some scenarios: %s", failure)
+	}
+	if got, want := checkGolden(path, changed[:len(goldenSeeds)], all[:1], false),
+		"golden: steady/server seed 0x0000000000000001: got hash 0x0000000000000abc count 101, want hash 0x0000000000000001 count 101\n"+goldenHint; got != want {
+		t.Errorf("some scenarios, changed hash:\n got %q\nwant %q", got, want)
+	}
+	if got, want := checkGolden(path, first, all[:1], true),
+		"-update rewrites all of "+path+", but 1 of the 8 golden scenarios ran: run TestGoldenHashes without a subtest pattern"; got != want {
+		t.Errorf("update of some scenarios:\n got %q\nwant %q", got, want)
+	}
+	if after, err := os.ReadFile(path); err != nil || string(after) != string(data) { //nolint:gosec // the test's own temporary file
+		t.Errorf("update of some scenarios changed the file to\n%s(%v)", after, err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "none.txt")
+	if got := checkGolden(missing, entries, all, false); !strings.HasSuffix(got, "\n"+goldenHint) || !strings.Contains(got, "none.txt") {
+		t.Errorf("missing file: %q", got)
+	}
 }
 
 // TestGoldenSkip checks when TestGoldenHashes skips, and with which message.
