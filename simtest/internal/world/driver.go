@@ -589,6 +589,10 @@ func (d *driver) answer(c *call, rep reply) {
 	if failing && !d.stopped && d.status().LastFailure == core.CauseNone {
 		d.startResync()
 	}
+	if renewal && d.obs != nil {
+		// A renewal may make the session live again, which thaws the observer view.
+		d.showObserved("", srcObserve)
+	}
 }
 
 // expire steps what the timeout of c means (SIM-320).

@@ -410,7 +410,7 @@ func auditMember(recs []kernel.Record, id kernel.NodeID, name string, retry time
 			inc.inputs++
 			inc.lastNow, inc.stepNow = now, now
 			// 5. One answer per request, in one event.
-			if n, ok := requestID(r.Text); ok {
+			if n, ok := auditRequestID(r.Text); ok {
 				q := request(n)
 				switch {
 				case q.timedOut:
@@ -444,7 +444,7 @@ func auditMember(recs []kernel.Record, id kernel.NodeID, name string, retry time
 			if r.Text == "" {
 				continue // no request, or one the lanes dropped
 			}
-			n, ok := requestID(r.Text)
+			n, ok := auditRequestID(r.Text)
 			if !ok {
 				return fail(r, "action %s with the text %q, which names no request", typ, r.Text)
 			}
@@ -524,11 +524,11 @@ func auditVersion(inc *auditIncarnation, r kernel.Record, typ string) error {
 	return nil
 }
 
-// requestID returns the request ID at the start of text: of the request whose text an
+// auditRequestID returns the request ID at the start of text: of the request whose text an
 // action's record has, or of the request a reply answers, whose text an input's record has. An
 // input's text is that of a reply, a push or a snapshot, never a request's, and only a reply's
 // starts with a name and #N.
-func requestID(text string) (uint64, bool) {
+func auditRequestID(text string) (uint64, bool) {
 	m := textID.FindStringSubmatch(text)
 	if m == nil {
 		return 0, false
