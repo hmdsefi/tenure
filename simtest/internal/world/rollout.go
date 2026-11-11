@@ -257,7 +257,7 @@ func (r *replacementWatch) err(w *World, index, drainSlot int) error {
 			if mine {
 				assigned++
 			}
-			if (mine && got != 1) || got > 1 {
+			if mine && got != 1 { // more than once on any incarnation is judged below
 				return fmt.Errorf("rollout: replacement %d: %s/%d started %d times on %s", index, name, shard, got, m.Name)
 			}
 		}

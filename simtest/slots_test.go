@@ -385,9 +385,11 @@ const (
 //     D the store records mi releasing slot k, then mi exits with cause drain; the first slot
 //     mi-r's holder claims is k, after that exit. Each shard of book is started once at or
 //     after Start, on the replacement of the member that ran it before Start.
-//   - AT-SIM-19 (the view, SIM-270): from D on, slot k of the store's views is held by mi's
-//     holder, then by nobody, then by mi-r's holder, and by no one else; the last view lists
-//     the five replacements and no replaced member.
+//   - AT-SIM-19 (the view, SIM-270): no view lists mi-r before A; a view between A and D
+//     lists it as a member that holds no slot, the surge pod waiting as a standby (D16); from
+//     D on, slot k of the store's views is held by mi's holder, then by nobody, then by mi-r's
+//     holder, and by no one else; the last view lists the five replacements and no replaced
+//     member.
 func rolloutRecordsErr(w *world.World, recs []kernel.Record) error {
 	ro := w.Scenario().Rollout
 	n := w.Scenario().Members
@@ -402,6 +404,9 @@ func rolloutRecordsErr(w *world.World, recs []kernel.Record) error {
 		}
 		k, err := handoverErr(recs, store, old, rep, drain)
 		if err != nil {
+			return err
+		}
+		if err := standbyViewErr(recs, store, rep, activate, drain); err != nil {
 			return err
 		}
 		if err := viewSlotErr(recs, store, k, old, rep, drain); err != nil {
@@ -476,6 +481,33 @@ func handoverErr(recs []kernel.Record, store kernel.NodeID, old, rep *world.Memb
 		}
 	}
 	return 0, fmt.Errorf("%s never claimed %s's slot %q (released at %s, exited %v)", rep.Name, old.Name, k, released, exited)
+}
+
+// standbyViewErr checks AT-SIM-19's standby clause for the replacement rep, activated at
+// activate and whose member is told to drain at drain: no view lists rep before activate, and
+// some view in [activate, drain) lists it as a member with no slot.
+func standbyViewErr(recs []kernel.Record, store kernel.NodeID, rep *world.Member, activate, drain kernel.Time) error {
+	waited := false
+	for _, r := range recs {
+		if r.Node != store || r.Kind != kindView || r.At >= drain {
+			continue
+		}
+		listed := slices.Contains(strings.Split(attr(r, "members"), ","), rep.Name)
+		if r.At < activate {
+			if listed {
+				return fmt.Errorf("view at %s lists %s before its activation at %s", r.At, rep.Name, activate)
+			}
+			continue
+		}
+		_, list, _ := strings.Cut(attr(r, "slots"), ":")
+		if listed && !slices.Contains(strings.Split(list, ","), rep.Holder()) {
+			waited = true
+		}
+	}
+	if !waited {
+		return fmt.Errorf("no view from %s to %s lists %s as a member without a slot", activate, drain, rep.Name)
+	}
+	return nil
 }
 
 // viewSlotErr checks AT-SIM-19 for slot k, handed over from old to rep, from drain on.

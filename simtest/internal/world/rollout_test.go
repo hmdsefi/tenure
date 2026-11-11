@@ -6,6 +6,8 @@ package world
 import (
 	"fmt"
 	"math"
+	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -120,6 +122,18 @@ func TestRolloutQuiet(t *testing.T) {
 				}
 				r1.holder, r1.slot, rw.drainSlot[0] = holder, slot, drainSlot
 			}
+			// A shard of the slot that was never started on it.
+			shard := slices.Index(w.drivers.current(r1.m).machine.Assignment("book"), "slot-"+strconv.Itoa(k))
+			if shard < 0 {
+				return fmt.Errorf("no shard of book is assigned to slot-%d", k)
+			}
+			s := spaceShard{"book", shard}
+			r1.starts[r1.holder][s] = 0
+			want0 := fmt.Sprintf("rollout: replacement 1: book/%d started 0 times on m1-r", shard)
+			if err := rw.err(); err == nil || err.Error() != want0 {
+				return fmt.Errorf("no start: %v, want %q", err, want0)
+			}
+			r1.starts[r1.holder][s] = 1
 			m1 := &driver{m: w.members[0]}
 			start := []core.Action{core.StartRun{Space: "book", Shard: 3}}
 			drainAt := rw.drainAt[0]
