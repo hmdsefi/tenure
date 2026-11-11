@@ -4,6 +4,7 @@
 package check_test
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -692,4 +693,36 @@ func TestNewRejectsDuplicateSpaces(t *testing.T) {
 		Now:    func() kernel.Time { return 0 },
 		Spaces: []core.SpaceSpec{{Name: "book", Shards: 2}, {Name: "atlas", Shards: 1}, {Name: "book", Shards: 3, Fenced: true}},
 	})
+}
+
+// TestOwners checks that Owners lists the holders whose runs own a shard now, each once, by
+// term then holder, and nil for a shard nobody owns or no observation named.
+func TestOwners(t *testing.T) {
+	s := newSim(check.Config{Spaces: spaces})
+	for _, m := range []move{
+		at(sec), own(hB, "book", 0, 4),
+		own(hA, "book", 0, 5),
+		own(hB, "book", 0, 6), // hB's second run: hB is listed once, by its first
+		own(hA, "book", 1, 2),
+		at(2 * sec), stopRun(hA, "book", 1, 2),
+	} {
+		m(s)
+	}
+	tests := []struct {
+		shard int
+		want  []string
+	}{
+		{0, []string{hB, hA}},
+		{1, nil}, // owned, then stopped
+		{2, nil}, // never named
+	}
+	for _, tt := range tests {
+		if got := s.c.Owners("book", tt.shard); !slices.Equal(got, tt.want) {
+			t.Errorf("Owners(book, %d) = %q, want %q", tt.shard, got, tt.want)
+		}
+	}
+	down(hB)(s)
+	if got, want := s.c.Owners("book", 0), []string{hA}; !slices.Equal(got, want) {
+		t.Errorf("after Down(%s): Owners(book, 0) = %q, want %q", hB, got, want)
+	}
 }

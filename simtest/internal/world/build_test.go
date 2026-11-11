@@ -24,7 +24,9 @@ import (
 )
 
 // runWorld runs Build for sc in every run of a faultline test with opts, which checks
-// determinism, then body with the world. A failure of body goes to fw.T().
+// determinism, then body with the world. A failure of body goes to fw.T(). The final checks are
+// off: these tests disturb the world by hand after its recovery time, which the finals cannot
+// know of, and the finals have tests of their own (finals_test.go).
 func runWorld(t *testing.T, opts faultline.Options, sc Scenario, body func(fw *faultline.World, w *World)) {
 	t.Helper()
 	opts.CheckDeterminism = true
@@ -32,7 +34,9 @@ func runWorld(t *testing.T, opts faultline.Options, sc Scenario, body func(fw *f
 		opts.Seeds = 3
 	}
 	faultline.Run(t, opts, func(fw *faultline.World) {
-		body(fw, Build(fw, sc))
+		w := Build(fw, sc)
+		w.finalsOff = true
+		body(fw, w)
 	})
 }
 
