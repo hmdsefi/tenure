@@ -46,6 +46,10 @@ var rows = []row{
 		name: "TestSteady", sc: world.Scenario{StopDelay: time.Second},
 		seeds: 20, duration: 60 * time.Second, net: defaultNet, g2: true,
 	},
+	{
+		name: "TestSessionEnds", sc: world.Scenario{EndAfter: 40 * time.Second},
+		seeds: 20, duration: 75 * time.Second, net: defaultNet, g2: true,
+	},
 }
 
 // rowNamed returns the row of the table whose name is name, and fails t when there is none.

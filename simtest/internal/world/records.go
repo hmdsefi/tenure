@@ -40,6 +40,7 @@ const (
 	kindAction    = "tenure.action"
 	kindReplyLate = "tenure.reply_late"
 	kindRun       = "tenure.run"
+	kindExit      = "tenure.exit"
 )
 
 // bootCauseBoot is the cause of tenure.boot for an incarnation that starts because its node
@@ -70,6 +71,12 @@ func (w *World) emitBound() {
 // holder string; cause, what started it ("boot", "recover" or "activate").
 func (w *World) emitBoot(m *Member, cause string) {
 	w.emit(kindBoot, m.Node, "", recAttr("holder", m.holder), recAttr("cause", cause))
+}
+
+// emitExit emits tenure.exit at m, which has just left for good: holder, the holder of its
+// last incarnation; cause, why it left ("drain").
+func (w *World) emitExit(m *Member, cause string) {
+	w.emit(kindExit, m.Node, "", recAttr("holder", m.holder), recAttr("cause", cause))
 }
 
 // emitWallStep emits tenure.wall_step at m, whose wall clock has just stepped: delta_ns, the

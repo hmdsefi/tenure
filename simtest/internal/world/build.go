@@ -78,6 +78,9 @@ type Member struct {
 	phase  Phase
 	holder string        // the holder of the present incarnation; "" before the first
 	wall   time.Duration // the offset of the wall clock from the monotonic one
+	// draining reports that the member was told to drain (recover.go): it hands its shards
+	// over and exits instead of recovering, and a boot of its node exits it at once.
+	draining bool
 }
 
 // Phase returns the member's phase.
@@ -136,6 +139,9 @@ type World struct {
 
 	// drivers holds the drivers of the members' incarnations (driver.go).
 	drivers *drivers
+
+	// sessions keeps the session ends the members owe a recovery for (recover.go).
+	sessions *sessionWatch
 
 	// checker decides the invariants over what the store, the drivers and the fence observe
 	// (checks.go).
@@ -206,6 +212,7 @@ func Build(w *faultline.World, sc Scenario) *World {
 	world.installHooks()
 	world.installChecks()
 	world.installFinals()
+	world.installRecovered()
 	world.emitBound()
 	return world
 }
@@ -395,8 +402,13 @@ func (w *World) planWallSteps() {
 
 // boot runs at every boot of a member's node. Only an active member starts an incarnation
 // (SIM-150): a replacement on standby waits for its turn, and a member that exited stays out.
+// A member told to drain whose node crashed exits when the node boots again (recover.go).
 func (w *World) boot(m *Member) {
 	if m.phase != Active {
+		return
+	}
+	if m.draining {
+		w.exit(m)
 		return
 	}
 	w.incarnate(m, bootCauseBoot)
