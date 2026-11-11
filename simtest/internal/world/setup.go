@@ -141,10 +141,14 @@ func wholeSeconds(d time.Duration) time.Duration {
 // change of the slot count or a rollout does, raises R here, so that the setup check, the
 // tenure.bound record and the final checks agree on it.
 func recoveryStart(sc Scenario, quiet time.Duration, end kernel.Time) kernel.Time {
-	if !sc.disturbed() {
-		return 0
+	r := kernel.Time(0)
+	if sc.disturbed() {
+		r = end.Add(-quiet)
 	}
-	return end.Add(-quiet)
+	if sc.SetSlotsAt > 0 {
+		r = max(r, kernel.Time(sc.SetSlotsAt)) // the slot count changes at SetSlotsAt (1.8-14)
+	}
+	return r
 }
 
 // problem returns the first thing that is wrong with the fields of sc, which has its defaults,
