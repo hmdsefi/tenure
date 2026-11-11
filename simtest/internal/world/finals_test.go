@@ -6,6 +6,7 @@ package world
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"slices"
@@ -92,7 +93,7 @@ func TestConvergedMessages(t *testing.T) {
 		want  string
 	}{
 		{"converged", func(*convergedRig) {}, ""},
-		{"no live member", func(r *convergedRig) { r.live = nil }, ""},
+		{"no live member", func(r *convergedRig) { r.live = nil }, "converged: no member is active and up"},
 		{"members disagree", func(r *convergedRig) {
 			r.set("m1", "m1", "m2", "m3", "m4")
 			r.set("m3", "m1", "m2", "m3", "m5")
@@ -124,12 +125,22 @@ func TestConvergedMessages(t *testing.T) {
 			r.owners["book/2"] = []string{"m1/01", "m3/03"}
 		}, `converged: book/2 assigned to m3, owned by m1/01, m3/03`},
 		{"no assignee", func(r *convergedRig) {
-			// Without a live member that is eligible, every key is "" and nothing is owed.
+			// Without a live member that is eligible, every key is "": the members agree on
+			// placing nothing, which is no convergence.
 			for i := range r.live {
 				r.live[i].draining = true
 			}
 			r.balance["book"] = []string{"", "", "", ""}
-		}, ""},
+		}, "converged: none of the 3 live members takes shards"},
+		{"every slot vacant", func(r *convergedRig) {
+			r.slots = 3
+			r.balance["book"] = []string{"", "", "", ""}
+		}, "converged: none of the 3 live members takes shards"},
+		{"two members hold one slot", func(r *convergedRig) {
+			r.slots = 3
+			r.live[0].slot, r.live[1].slot, r.live[2].slot = 1, 0, 1
+			r.balance["book"] = []string{"slot-0", "slot-1", "slot-0", "slot-1"}
+		}, "converged: m1 and m3 both hold slot-1"},
 		{"spaces by name", func(r *convergedRig) {
 			r.spaces = append(r.spaces, core.SpaceSpec{Name: "atlas", Shards: 4})
 			r.balance["atlas"] = []string{"m2", "m2", "m3", "m1"}
@@ -262,7 +273,10 @@ func TestConvergedSlots(t *testing.T) {
 		faultline.Run(t, opts, func(fw *faultline.World) {
 			w := Build(fw, sc)
 			fw.RunFor(90*time.Second - time.Nanosecond)
-			live := w.liveMembers()
+			live, err := w.liveMembers()
+			if err != nil {
+				fw.T().Fatal(err)
+			}
 			if len(live) != 5 {
 				fw.T().Fatalf("%d live members, want 5", len(live))
 			}
@@ -271,6 +285,57 @@ func TestConvergedSlots(t *testing.T) {
 					fw.T().Errorf("%s holds no slot", m.name)
 				}
 			}
+		})
+	})
+}
+
+// TestConvergedMemberDown runs a steady world under each rule in which m5 crashes at 1 s and
+// never comes back, with the finals on: tenure/converged leaves m5 out, and the four others
+// agree on the balanced placement over themselves, each shard running on its assignee. A final
+// registered after Build's checks that m5 was indeed left out and that every live machine's
+// assignment names only the four.
+func TestConvergedMemberDown(t *testing.T) {
+	forRules(t, func(t *testing.T, rule Takeover) {
+		sc := Scenario{Takeover: rule, StopDelay: time.Second}
+		opts := faultline.Options{Seeds: 2, Duration: 60 * time.Second, CheckDeterminism: true}
+		faultline.Run(t, opts, func(fw *faultline.World) {
+			w := Build(fw, sc)
+			m5 := w.Members()[4]
+			fw.Sim.At(kernel.Time(time.Second), "test/crash", m5.Node.Crash)
+			fw.Final("test/left_out", func() error {
+				live, err := w.liveMembers()
+				if err != nil {
+					return err
+				}
+				if len(live) != 4 {
+					return fmt.Errorf("%d live members, want 4", len(live))
+				}
+				for _, m := range live {
+					if slices.Contains(m.assign("book"), m5.Name) {
+						return fmt.Errorf("%s assigns a shard to %s, which is down", m.name, m5.Name)
+					}
+				}
+				return nil
+			})
+		})
+	})
+}
+
+// TestConvergedNoDriver checks that an active member that is up but drives no machine for its
+// holder fails tenure/converged rather than being left out.
+func TestConvergedNoDriver(t *testing.T) {
+	faultline.Run(t, faultline.Options{Seeds: 1, Duration: 30 * time.Second, CheckDeterminism: true}, func(fw *faultline.World) {
+		w := Build(fw, Scenario{})
+		w.finalsOff = true
+		fw.Final("test/no_driver", func() error {
+			m := w.Members()[2]
+			w.drivers.current(m).stopped = true
+			_, err := w.liveMembers()
+			want := "converged: m3 is active and up but drives no machine for its holder " + m.Holder()
+			if err == nil || err.Error() != want {
+				return fmt.Errorf("liveMembers: %v, want %q", err, want)
+			}
+			return nil
 		})
 	})
 }

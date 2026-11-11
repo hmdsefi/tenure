@@ -5,6 +5,7 @@ package world
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -47,7 +48,11 @@ func (w *World) installFinals() {
 		if w.finalsOff {
 			return nil
 		}
-		return convergedErr(w.sc.Spaces, w.storeSrv.model.slotCount, w.liveMembers(), w.checker.Owners)
+		live, err := w.liveMembers()
+		if err != nil {
+			return err
+		}
+		return convergedErr(w.sc.Spaces, w.storeSrv.model.slotCount, live, w.checker.Owners)
 	})
 }
 
@@ -60,10 +65,13 @@ type liveMember struct {
 	assign   func(space string) []string // the machine's Assignment
 }
 
-// liveMembers returns, in NodeID order, the members that are active, whose node is up and whose
-// present incarnation has a driver: the members tenure/converged judges. A member that is down
-// at the end, or one that left, owes nothing.
-func (w *World) liveMembers() []liveMember {
+// liveMembers returns, in NodeID order, the members that are active and whose node is up: the
+// members tenure/converged judges. A member that is down at the end, a standby or one that
+// exited owes nothing. An active member that is up must drive its present incarnation: one
+// whose driver is missing, stopped or of an earlier holder is reported as
+// `converged: m3 is active and up but drives no machine for its holder m3/<32 hex>`, since
+// leaving it out would let a member that never came back pass.
+func (w *World) liveMembers() ([]liveMember, error) {
 	var live []liveMember
 	for _, m := range w.members {
 		if m.phase != Active || m.Node.State() != kernel.NodeUp {
@@ -71,7 +79,7 @@ func (w *World) liveMembers() []liveMember {
 		}
 		d := w.drivers.current(m)
 		if d == nil || d.stopped || d.holder != m.holder {
-			continue
+			return nil, fmt.Errorf("converged: %s is active and up but drives no machine for its holder %s", m.Name, m.holder)
 		}
 		st := d.status()
 		live = append(live, liveMember{
@@ -79,12 +87,16 @@ func (w *World) liveMembers() []liveMember {
 			assign: d.machine.Assignment,
 		})
 	}
-	return live
+	return live, nil
 }
 
 // convergedErr decides tenure/converged (SIM-545) at the end of a run, over live, the members
 // that are active and up in NodeID order, a store with slots slot count, and owners, the
-// checker's ownership. For each space, by name:
+// checker's ownership. It never passes for want of anything to judge: with no live member it
+// reports `converged: no member is active and up`, and when the live members give no placement
+// key (every one draining, or every slot vacant) `converged: none of the 3 live members takes
+// shards`. With slots, two live members whose machines hold one slot are reported as
+// `converged: m2 and m4 both hold slot-1`. Then, for each space, by name:
 //
 //  1. Every member's machine computes the same assignment: the first member whose Assignment
 //     differs from the first member's is reported at the first shard that differs,
@@ -107,10 +119,23 @@ func convergedErr(spaces []core.SpaceSpec, slots int, live []liveMember,
 	owners func(space string, shard int) []string,
 ) error {
 	if len(live) == 0 {
-		return nil
+		return errors.New("converged: no member is active and up")
+	}
+	for i, m := range live {
+		if m.slot < 0 || m.slot >= slots {
+			continue
+		}
+		for _, o := range live[i+1:] {
+			if o.slot == m.slot {
+				return fmt.Errorf("converged: %s and %s both hold slot-%d", m.name, o.name, m.slot)
+			}
+		}
 	}
 	view, expired := referenceView(slots, live)
 	keys, keySlots := core.PlacementKeys(view, time.Time{}, expired)
+	if len(keys) == 0 {
+		return fmt.Errorf("converged: none of the %d live members takes shards", len(live))
+	}
 	slotOf := make(map[string]int, len(keySlots)) // looked up only
 	for i, k := range keySlots {
 		slotOf[keys[i]] = k
@@ -156,8 +181,8 @@ func convergedErr(spaces []core.SpaceSpec, slots int, live []liveMember,
 
 // referenceView returns the view of the live members that tenure/converged places the shards
 // by, and the expiry marks of its slots. Its members are the live members, sorted by ID, each
-// with its Draining and its Slot. With slots, each slot's holder is the holder of the first live
-// member, in NodeID order, whose machine holds the slot, and a slot that no live member holds
+// with its Draining and its Slot. With slots, each slot's holder is the holder of the live member
+// whose machine holds the slot (convergedErr has ruled out two), and a slot that no live member holds
 // is vacant and marked expired: the run lasts until the bound, which counts the timing's
 // SlotGrace, has passed after the recovery time, so every vacancy has lasted that long by the
 // end. A member's machine that holds a slot at or above the count holds a retired slot, which
