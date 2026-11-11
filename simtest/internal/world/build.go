@@ -204,6 +204,7 @@ func Build(w *faultline.World, sc Scenario) *World {
 	world.planFaults()
 	world.planWallSteps()
 	world.installHooks()
+	world.planSetSlots()
 	world.installChecks()
 	world.installFinals()
 	world.emitBound()

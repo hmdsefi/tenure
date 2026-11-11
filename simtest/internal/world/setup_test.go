@@ -68,6 +68,8 @@ func TestSetupErrors(t *testing.T) {
 			"recovery 50.000000000s + bound 21.045000000s is after the end 60.000000000s"},
 		{"recovery + bound, no faults", Scenario{}, at(21 * time.Second),
 			"recovery 0.000000000s + bound 21.045000000s is after the end 21.000000000s"},
+		{"recovery + bound, set slots", Scenario{Slots: 5, SetSlotsAt: 40 * time.Second, SetSlotsTo: 3}, at(90 * time.Second),
+			"recovery 40.000000000s + bound 81.045000000s is after the end 90.000000000s"},
 
 		// The order of the rows: the earlier one wins.
 		{"takeover before members", Scenario{Takeover: 2, Members: 99}, 0, "unknown Takeover 2"},
