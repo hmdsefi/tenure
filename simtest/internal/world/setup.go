@@ -149,6 +149,9 @@ func recoveryStart(sc Scenario, quiet time.Duration, end kernel.Time) kernel.Tim
 	if sc.EndAfter > 0 {
 		r = max(r, sessionEndTime(sc))
 	}
+	if sc.SetSlotsAt > 0 {
+		r = max(r, kernel.Time(sc.SetSlotsAt)) // the slot count changes at SetSlotsAt (1.8-14)
+	}
 	return r
 }
 
