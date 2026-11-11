@@ -54,6 +54,8 @@ func (w *World) installChecks() {
 		}
 	})
 
+	// A planted invariant that always fails, for a scratch check of the failing-seed artifact.
+	w.fw.Invariant(invariantPrefix+"scratch", func() error { return fmt.Errorf("scratch: always fails") })
 	for _, name := range invariantChecks {
 		if name == "g2" && !w.g2 {
 			continue
