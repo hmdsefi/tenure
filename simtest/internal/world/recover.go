@@ -94,9 +94,17 @@ func (d *driver) settle(st core.Status) {
 
 // recoverMember starts the new incarnation of m, whose machine is done after a lost session.
 func (w *World) recoverMember(m *Member) {
+	m.recoveries++
 	w.incarnate(m, bootCauseRecover)
 	w.sessions.recovered(m)
 }
+
+// Recoveries returns how many incarnations of the member started because the session of the
+// one before was lost.
+func (m *Member) Recoveries() int { return m.recoveries }
+
+// Draining reports whether the member was told to drain.
+func (m *Member) Draining() bool { return m.draining }
 
 // Drain tells the member m to drain: it hands its shards over, closes its session and exits.
 // The machine of m's present incarnation steps Drain in an event of m's node at the present

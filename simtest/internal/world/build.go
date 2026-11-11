@@ -81,6 +81,8 @@ type Member struct {
 	// draining reports that the member was told to drain (recover.go): it hands its shards
 	// over and exits instead of recovering, and a boot of its node exits it at once.
 	draining bool
+	// recoveries counts the incarnations that started after a lost session (recover.go).
+	recoveries int
 }
 
 // Phase returns the member's phase.
@@ -187,7 +189,14 @@ type World struct {
 // scenario has NoLiveness, checks that every shard has an owner at the recovery time plus the
 // bound; tenure/converged checks that the members that are active and up agree on where each
 // shard goes, that this is where the balanced placement over those members puts it, and that
-// each shard with an assignee is owned by that member alone.
+// each shard with an assignee is owned by that member alone. A scenario with EndAfter also gets
+// the final tenure/recovered, after those two: every end of a session of a member that was not
+// told to drain is followed by exactly one recovery of the member, whose new session the store
+// opened.
+//
+// A member whose session is lost starts a new incarnation, cause "recover", once its machine is
+// done and every run has returned, in the event of the last of them. A member told to drain
+// (Drain) exits once its machine is done, and never boots again.
 func Build(w *faultline.World, sc Scenario) *World {
 	w.T().Helper()
 	st, err := newSetup(sc, w.End())
