@@ -88,7 +88,7 @@ func (b *auditTrace) release(n int) *auditTrace {
 // holder steps a HolderChanged of book/3 at the reading now with the version v from src.
 func (b *auditTrace) holder(now time.Duration, v int, src string) *auditTrace {
 	return b.input("HolderChanged", now, "holder book/3", "space", "book", "shard", "3", "holder", "m1/0a",
-		"term", "5", "src", src, "version", strconv.Itoa(v))
+		"term", "5", "src", src, "record_version", strconv.Itoa(v))
 }
 
 // TestDriverAuditCatches checks that auditMember accepts a trace that keeps the driver contract

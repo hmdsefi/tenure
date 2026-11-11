@@ -283,7 +283,7 @@ var coalescing = map[string]bool{"Release": true, "ReleaseSlot": true, "ClaimSlo
 //     after the step that sent it: its noSlot answer steps no input, and under the Observer
 //     rule its answer and its timeout name its last request, not the one its action sent; a
 //     request times out RetryPeriod after it goes out, which is no earlier than that step.
-//  7. Versions only grow: within an incarnation, per shard, the version of every stepped
+//  7. Versions only grow: within an incarnation, per shard, the record_version of every stepped
 //     HolderChanged is above the latest version the machine has had for the shard, from a
 //     HolderChanged or the granted reply of an Acquired, or equal to it for the answer of a
 //     Confirm (src=confirm) (MCH O4, SIM-335).
@@ -511,9 +511,9 @@ func auditVersion(inc *auditIncarnation, r kernel.Record, typ string) error {
 			inc.delivered[shard] = max(inc.delivered[shard], v)
 		}
 	case "HolderChanged":
-		v, err := strconv.ParseUint(attr(r, "version"), 10, 64)
+		v, err := strconv.ParseUint(attr(r, "record_version"), 10, 64)
 		if err != nil {
-			return fmt.Errorf("HolderChanged version %q: %w", attr(r, "version"), err)
+			return fmt.Errorf("HolderChanged record_version %q: %w", attr(r, "record_version"), err)
 		}
 		d := inc.delivered[shard]
 		if v < d || v == d && attr(r, "src") != "confirm" {
