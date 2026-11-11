@@ -59,6 +59,11 @@ var rows = []row{
 		name: "TestSessionEnds", sc: world.Scenario{EndAfter: 40 * time.Second},
 		seeds: 20, duration: 75 * time.Second, net: defaultNet, g2: true,
 	},
+	// The row's Outage.For is the first of outageLengths; TestFencedStoreOutage runs each.
+	{
+		name: "TestFencedStoreOutage", sc: outageScenario(outageLengths()[0]),
+		seeds: 10, duration: 150 * time.Second, net: defaultNet, g2: true,
+	},
 }
 
 // rowNamed returns the row of the table whose name is name, and fails t when there is none.
