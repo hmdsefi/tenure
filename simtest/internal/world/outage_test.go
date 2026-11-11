@@ -34,9 +34,10 @@ const (
 func sec(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
 
 // started returns a watch of the outage in which testOutageHolder runs book/0 and ledger/0 in
-// term 5, with the session deadline 48 s.
+// term 5, with the session deadline 48 s. Its RenewDeadline is the outage's length, so the
+// outage is not longer than RenewDeadline; a test of the rules of a longer one sets it lower.
 func started() *outageWatch {
-	o := newOutageWatch(testOutageAt, testOutageHeal, outageSpaces)
+	o := newOutageWatch(testOutageAt, testOutageHeal, time.Duration(testOutageHeal-testOutageAt), outageSpaces)
 	o.step(testOutageHolder, kernel.Time(sec(10)), core.Tick{Now: sec(10)}, []core.Action{
 		core.StartRun{Space: "book", Shard: 0, Term: 5, Deadline: sec(20)},
 		core.StartRun{Space: "ledger", Shard: 0, Term: 5, Deadline: sec(20)},
@@ -67,6 +68,45 @@ func TestOutageMessages(t *testing.T) {
 			tick(o, 48, stop("book", core.StopExpired), core.Degrade{Space: "ledger", Shard: 0, Term: 5})
 			tick(o, 54.01, stop("ledger", core.StopMoved))
 		}, ""},
+		{"expected course of a long outage", func(o *outageWatch) {
+			o.renewDeadline = sec(10)
+			tick(o, 48, stop("book", core.StopExpired), core.Degrade{Space: "ledger", Shard: 0, Term: 5})
+			tick(o, 54.01, core.Restore{Space: "ledger", Shard: 0, Term: 5})
+		}, ""},
+		{"no fenced run degraded in a long outage", func(o *outageWatch) {
+			o.renewDeadline = sec(10)
+			tick(o, 30, stop("ledger", core.StopMoved))
+			tick(o, 48, stop("book", core.StopExpired))
+		}, "outage: no fenced run degraded during the 14s outage, longer than RenewDeadline 10s"},
+		{"no unfenced run expired in a long outage", func(o *outageWatch) {
+			o.renewDeadline = sec(10)
+			tick(o, 30, stop("book", core.StopMoved))
+			tick(o, 48, core.Degrade{Space: "ledger", Shard: 0, Term: 5})
+			tick(o, 54.01, core.Restore{Space: "ledger", Shard: 0, Term: 5})
+		}, "outage: no unfenced run stopped as expired during the 14s outage, longer than RenewDeadline 10s"},
+		{"runs at the isolation", func(o *outageWatch) {
+			o.atIsolation(func(string) bool { return true })
+		}, ""},
+		{"no run at the isolation", func(o *outageWatch) {
+			tick(o, 30, stop("ledger", core.StopMoved))
+			o.atIsolation(func(string) bool { return true })
+		}, "outage: no run of ledger goes at the isolation at 40.000000000s"},
+		{"runs only of a holder gone at the isolation", func(o *outageWatch) {
+			o.atIsolation(func(string) bool { return false })
+		}, "outage: no run of book goes at the isolation at 40.000000000s"},
+		{"fenced run not degraded", func(o *outageWatch) {
+			tick(o, 48.5, stop("book", core.StopExpired))
+		}, "outage: ledger/0: m2/0b runs in term 5 at 48.500000000s, past its session deadline 48.000000000s, and is not degraded"},
+		{"fenced run not degraded at the heal", func(o *outageWatch) {
+			tick(o, 30, stop("book", core.StopMoved))
+			o.atHeal(func(string) time.Duration { return sec(54) }, func(string) bool { return true })
+		}, "outage: ledger/0: m2/0b runs in term 5 at 54.000000000s, past its session deadline 48.000000000s, and is not degraded"},
+		{"sign of loss before the run", func(o *outageWatch) {
+			tick(o, 20, stop("ledger", core.StopMoved))
+			o.step(testOutageHolder, kernel.Time(sec(21)), core.HolderChanged{Space: "ledger", Shard: 0, Holder: "m3/0c", Term: 6, Now: sec(21)}, nil)
+			tick(o, 30, core.StartRun{Space: "ledger", Shard: 0, Term: 7, Deadline: sec(48)})
+			tick(o, 47, core.StopRun{Space: "ledger", Shard: 0, Term: 7, Reason: core.StopMoved})
+		}, "outage: ledger/0: m2/0b stopped its run in term 7 at 47.000000000s, during the outage, with reason moved and no sign of loss"},
 		{"stopped during the outage", func(o *outageWatch) {
 			tick(o, 47, stop("ledger", core.StopMoved))
 		}, "outage: ledger/0: m2/0b stopped its run in term 5 at 47.000000000s, during the outage, with reason moved and no sign of loss"},

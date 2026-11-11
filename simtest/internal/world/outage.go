@@ -25,11 +25,22 @@ import (
 // The final tenure/outage, after the world's own finals, holds the outage to that. The first
 // violation seen during the run is kept and reported; the end of the run adds one rule.
 //
+// At the isolation, each space has a run going, so that the rules below judge some run:
+// `outage: no run of ledger goes at the isolation at 40.000000000s`. An outage longer than
+// RenewDeadline outlasts every session deadline, so at least one fenced run degrades and one
+// unfenced run stops as expired during it: `outage: no fenced run degraded during the 14s
+// outage, longer than RenewDeadline 10s`, and `outage: no unfenced run stopped as expired
+// during the 14s outage, longer than RenewDeadline 10s`.
+//
 // Fenced shards:
 //
+//   - A fenced run whose holder's session deadline passes during the outage degrades by then,
+//     in the same step as an unfenced run stops (below), unless it stopped on a sign of loss:
+//     `outage: ledger/3: m2/<hex> runs in term 5 at 48.500000000s, past its session deadline
+//     48.000000000s, and is not degraded`.
 //   - No StopRun of a fenced shard comes between the isolation and the heal unless its holder
-//     was shown that it lost the shard first: a stepped record naming another holder or
-//     another term for the shard, or a lost session.
+//     was shown that it lost the shard first, while the run went: a stepped record naming
+//     another holder or another term for the shard, or a lost session.
 //     `outage: ledger/3: m2/<hex> stopped its run in term 5 at 47.000000000s, during the
 //     outage, with reason moved and no sign of loss`
 //   - A fenced run never stops at the session deadline: `outage: ledger/3: m2/<hex> stopped its
@@ -57,9 +68,10 @@ import (
 
 // The labels of the outage's global events.
 const (
-	labelOutageHeal  = "tenure/outage/heal"
-	labelOutageBound = "tenure/outage/bound"
-	finalOutage      = invariantPrefix + "outage"
+	labelOutageIsolate = "tenure/outage/isolate"
+	labelOutageHeal    = "tenure/outage/heal"
+	labelOutageBound   = "tenure/outage/bound"
+	finalOutage        = invariantPrefix + "outage"
 )
 
 // timerSlack is how late a mono timer may fire after its reading (SIM-130).
@@ -74,6 +86,9 @@ type outageRun struct {
 	fenced   bool
 	stopping bool // its StopRun was stepped
 	degraded bool // it is degraded now
+	// loss reports that, while the run went, its holder was shown a record of the shard naming
+	// another holder or another term than the run's: a sign that the run lost the shard.
+	loss bool
 }
 
 // outageHolder is what the outage final keeps of one holder.
@@ -81,25 +96,31 @@ type outageHolder struct {
 	holder   string
 	deadline time.Duration // the latest session deadline of StartRun and ExtendDeadline
 	runs     []*outageRun  // the runs that have not stopped, in the order they started
-	// loss holds the shards, as book/3, whose records the holder was shown naming another
-	// holder or another term than its run's; lost reports a lost session. Looked up only.
-	loss map[string]bool
-	lost bool
+	lost     bool          // its session was lost
 }
 
 // outageWatch decides tenure/outage over the steps of every driver.
 type outageWatch struct {
 	at, heal kernel.Time
-	fenced   map[string]bool // by space name; looked up only
-	byHolder map[string]*outageHolder
-	holders  []*outageHolder // in the order of their first step
-	all      []*outageRun    // every run, in the order they started
-	err      error           // the first violation
+	// renewDeadline is the RenewDeadline of the scenario's timing: an outage longer than it
+	// outlasts every session deadline.
+	renewDeadline time.Duration
+	spaces        []core.SpaceSpec
+	fenced        map[string]bool // by space name; looked up only
+	byHolder      map[string]*outageHolder
+	holders       []*outageHolder // in the order of their first step
+	all           []*outageRun    // every run, in the order they started
+	// degrades and expired count the Degrade actions of fenced runs and the StopRun actions
+	// with reason expired of unfenced runs during the outage.
+	degrades, expired int
+	err               error // the first violation
 }
 
-// newOutageWatch returns the watch of an outage from at to heal over spaces.
-func newOutageWatch(at, heal kernel.Time, spaces []core.SpaceSpec) *outageWatch {
-	o := &outageWatch{at: at, heal: heal, fenced: map[string]bool{}, byHolder: map[string]*outageHolder{}}
+// newOutageWatch returns the watch of an outage from at to heal over spaces, under a timing
+// whose RenewDeadline is renewDeadline.
+func newOutageWatch(at, heal kernel.Time, renewDeadline time.Duration, spaces []core.SpaceSpec) *outageWatch {
+	o := &outageWatch{at: at, heal: heal, renewDeadline: renewDeadline, spaces: spaces,
+		fenced: map[string]bool{}, byHolder: map[string]*outageHolder{}}
 	for _, sp := range spaces {
 		o.fenced[sp.Name] = sp.Fenced
 	}
@@ -117,7 +138,7 @@ func (o *outageWatch) fail(format string, args ...any) {
 func (o *outageWatch) holder(holder string) *outageHolder {
 	h := o.byHolder[holder]
 	if h == nil {
-		h = &outageHolder{holder: holder, loss: map[string]bool{}}
+		h = &outageHolder{holder: holder}
 		o.byHolder[holder] = h
 		o.holders = append(o.holders, h)
 	}
@@ -143,8 +164,8 @@ func (o *outageWatch) step(holder string, now kernel.Time, in core.Input, acts [
 	h := o.holder(holder)
 	switch in := in.(type) {
 	case core.HolderChanged:
-		if r := h.runOf(in.Space, in.Shard); in.Holder != holder || r != nil && in.Term != r.term {
-			h.loss[msgShard(in.Space, in.Shard)] = true
+		if r := h.runOf(in.Space, in.Shard); r != nil && (in.Holder != holder || in.Term != r.term) {
+			r.loss = true
 		}
 	case core.SessionFailed:
 		if in.Cause == core.CauseLost {
@@ -152,16 +173,12 @@ func (o *outageWatch) step(holder string, now kernel.Time, in core.Input, acts [
 		}
 	}
 	reading := inputNow(in)
-	// The unfenced runs whose session deadline this step is at or past, during the outage:
-	// the step must stop each with reason expired.
+	// The runs whose session deadline this step is at or past, during the outage: the step
+	// must stop each unfenced one with reason expired, and leave each fenced one degraded.
 	var due []*outageRun
 	deadline := h.deadline
 	if o.during(now) && deadline > 0 && reading >= deadline {
-		for _, r := range h.runs {
-			if !r.fenced {
-				due = append(due, r)
-			}
-		}
+		due = slices.Clone(h.runs)
 	}
 	for _, a := range acts {
 		switch a := a.(type) {
@@ -175,6 +192,9 @@ func (o *outageWatch) step(holder string, now kernel.Time, in core.Input, acts [
 		case core.Degrade:
 			if r := h.runOf(a.Space, a.Shard); r != nil && r.term == a.Term {
 				r.degraded = true
+				if r.fenced && o.during(now) {
+					o.degrades++
+				}
 			}
 		case core.Restore:
 			if r := h.runOf(a.Space, a.Shard); r != nil && r.term == a.Term {
@@ -185,10 +205,22 @@ func (o *outageWatch) step(holder string, now kernel.Time, in core.Input, acts [
 		}
 	}
 	for _, r := range due {
-		if !r.stopping {
-			o.fail("%s: %s still runs in term %d at %s, past its session deadline %s",
-				msgShard(r.space, r.shard), holder, r.term, kernel.Time(reading), kernel.Time(deadline))
-		}
+		o.pastDeadline(r, reading, deadline)
+	}
+}
+
+// pastDeadline checks the run r at its holder's reading now, past the session deadline
+// deadline during the outage: an unfenced run must have stopped, a fenced one must be degraded
+// or have stopped.
+func (o *outageWatch) pastDeadline(r *outageRun, now, deadline time.Duration) {
+	switch {
+	case r.stopping:
+	case !r.fenced:
+		o.fail("%s: %s still runs in term %d at %s, past its session deadline %s",
+			msgShard(r.space, r.shard), r.holder, r.term, kernel.Time(now), kernel.Time(deadline))
+	case !r.degraded:
+		o.fail("%s: %s runs in term %d at %s, past its session deadline %s, and is not degraded",
+			msgShard(r.space, r.shard), r.holder, r.term, kernel.Time(now), kernel.Time(deadline))
 	}
 }
 
@@ -202,8 +234,11 @@ func (o *outageWatch) stopRun(h *outageHolder, now kernel.Time, deadline time.Du
 	r.stopping = true
 	h.runs = slices.DeleteFunc(h.runs, func(x *outageRun) bool { return x == r })
 	key := msgShard(a.Space, a.Shard)
+	if !r.fenced && o.during(now) && a.Reason == core.StopExpired {
+		o.expired++
+	}
 	switch {
-	case r.fenced && o.during(now) && !h.loss[key] && !h.lost:
+	case r.fenced && o.during(now) && !r.loss && !h.lost:
 		o.fail("%s: %s stopped its run in term %d at %s, during the outage, with reason %s and no sign of loss",
 			key, h.holder, r.term, now, a.Reason)
 	case r.fenced && a.Reason == core.StopExpired:
@@ -215,10 +250,25 @@ func (o *outageWatch) stopRun(h *outageHolder, now kernel.Time, deadline time.Du
 	r.degraded = false
 }
 
+// atIsolation checks, at the isolation, that each space has a run going of a holder for which
+// current is true.
+func (o *outageWatch) atIsolation(current func(holder string) bool) {
+	for _, sp := range o.spaces {
+		going := slices.ContainsFunc(o.holders, func(h *outageHolder) bool {
+			return current(h.holder) && slices.ContainsFunc(h.runs, func(r *outageRun) bool { return r.space == sp.Name })
+		})
+		if !going {
+			o.fail("no run of %s goes at the isolation at %s", sp.Name, o.at)
+			return
+		}
+	}
+}
+
 // atHeal checks, at the heal, that no unfenced run of a holder whose clock reads more than
-// the timer's slack past its session deadline still goes. mono returns the reading of each
-// holder's clock, and current reports whether a holder is the present incarnation of a member
-// that is up: the others' runs stopped with them.
+// the timer's slack past its session deadline still goes, and that every fenced one is
+// degraded. mono returns the reading of each holder's clock, and current reports whether a
+// holder is the present incarnation of a member that is up: the others' runs stopped with
+// them.
 func (o *outageWatch) atHeal(mono func(holder string) time.Duration, current func(holder string) bool) {
 	for _, h := range o.holders {
 		if h.deadline == 0 || !current(h.holder) {
@@ -229,11 +279,7 @@ func (o *outageWatch) atHeal(mono func(holder string) time.Duration, current fun
 			continue
 		}
 		for _, r := range h.runs {
-			if !r.fenced {
-				o.fail("%s: %s still runs in term %d at %s, past its session deadline %s",
-					msgShard(r.space, r.shard), h.holder, r.term, kernel.Time(now), kernel.Time(h.deadline))
-				return
-			}
+			o.pastDeadline(r, now, h.deadline)
 		}
 	}
 }
@@ -256,11 +302,22 @@ func (o *outageWatch) atBound(now kernel.Time, b time.Duration, spaces []core.Sp
 	}
 }
 
-// final returns the first violation of the run, else the first run, in the order they started,
-// that is still degraded at the end.
+// final returns the first violation of the run; else, for an outage longer than
+// RenewDeadline, an error when no fenced run degraded or no unfenced run stopped as expired
+// during it; else the first run, in the order they started, that is still degraded at the end.
 func (o *outageWatch) final() error {
 	if o.err != nil {
 		return o.err
+	}
+	if d := time.Duration(o.heal - o.at); d > o.renewDeadline {
+		hasFenced := slices.ContainsFunc(o.spaces, func(sp core.SpaceSpec) bool { return sp.Fenced })
+		hasUnfenced := slices.ContainsFunc(o.spaces, func(sp core.SpaceSpec) bool { return !sp.Fenced })
+		switch {
+		case hasFenced && o.degrades == 0:
+			return fmt.Errorf("outage: no fenced run degraded during the %v outage, longer than RenewDeadline %v", d, o.renewDeadline)
+		case hasUnfenced && o.expired == 0:
+			return fmt.Errorf("outage: no unfenced run stopped as expired during the %v outage, longer than RenewDeadline %v", d, o.renewDeadline)
+		}
 	}
 	for _, r := range o.all {
 		if r.degraded && !r.stopping {
@@ -288,7 +345,7 @@ func (w *World) installOutage() {
 		return
 	}
 	at, heal := kernel.Time(oc.At), kernel.Time(oc.At+oc.For)
-	o := newOutageWatch(at, heal, w.sc.Spaces)
+	o := newOutageWatch(at, heal, w.sc.Timing.RenewDeadline, w.sc.Spaces)
 	w.outage = o
 	w.fw.Plan(fault.Script(outageEvents(at, heal)...))
 	prev := w.drivers.onStep
@@ -298,6 +355,9 @@ func (w *World) installOutage() {
 		}
 		o.step(d.holder, w.sim.Now(), in, acts)
 	}
+	w.sim.At(at, labelOutageIsolate, func() {
+		o.atIsolation(w.currentHolder)
+	})
 	w.sim.At(heal, labelOutageHeal, func() {
 		o.atHeal(w.holderMono, w.currentHolder)
 	})
