@@ -15,6 +15,7 @@ import (
 
 	"github.com/hmdsefi/faultline"
 	"github.com/hmdsefi/faultline/kernel"
+	"github.com/hmdsefi/faultline/kernel/fault"
 	"github.com/hmdsefi/faultline/kernel/simnet"
 
 	"github.com/hmdsefi/tenure/simtest/internal/world"
@@ -58,6 +59,14 @@ var rows = []row{
 	{
 		name: "TestSessionEnds", sc: world.Scenario{EndAfter: 40 * time.Second},
 		seeds: 20, duration: 75 * time.Second, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestSlotScaleDown", sc: world.Scenario{Slots: 5, SetSlotsAt: scaleDownAt, SetSlotsTo: scaleDownTo},
+		seeds: 20, duration: 125 * time.Second, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestSlotGrace", sc: world.Scenario{Slots: 5, Faults: &fault.Random{Quiet: graceRun - graceCrash}},
+		seeds: 20, duration: graceRun, net: defaultNet, g2: true,
 	},
 	// The row's Outage.For is the first of outageLengths; TestFencedStoreOutage runs each.
 	{
