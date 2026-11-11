@@ -105,6 +105,14 @@ var rows = []row{
 		name: "TestSessionEnds", sc: world.Scenario{EndAfter: 40 * time.Second},
 		seeds: 20, duration: 75 * time.Second, net: defaultNet, g2: true,
 	},
+	{
+		name: "TestSlotScaleDown", sc: world.Scenario{Slots: 5, SetSlotsAt: scaleDownAt, SetSlotsTo: scaleDownTo},
+		seeds: 20, duration: 125 * time.Second, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestSlotGrace", sc: world.Scenario{Slots: 5, Faults: &fault.Random{Quiet: graceRun - graceCrash}},
+		seeds: 20, duration: graceRun, net: defaultNet, g2: true,
+	},
 }
 
 // rowNamed returns the row of the table whose name is name, and fails t when there is none.
