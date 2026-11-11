@@ -7,13 +7,9 @@ package simtest
 
 import (
 	"testing"
-	"time"
 
 	"github.com/hmdsefi/faultline"
-	"github.com/hmdsefi/faultline/kernel"
-	"github.com/hmdsefi/faultline/kernel/fault"
 
-	"github.com/hmdsefi/tenure/core"
 	"github.com/hmdsefi/tenure/simtest/internal/world"
 )
 
@@ -35,7 +31,7 @@ func TestMutantGrantHeld(t *testing.T) {
 }
 
 // TestMutantSkipRaise plants SkipRaise into a world of three members with a fenced space,
-// where m1 is cut off from the store from 10 s to 40 s: its runs degrade and go on writing,
+// where m1 is cut off from the store from 10 s to 40 s (cutRow): its runs degrade and go on writing,
 // the others take its shards and write in newer terms without raising the fence, and the fence
 // accepts m1's older writes after theirs. It must fail tenure/g3.
 func TestMutantSkipRaise(t *testing.T) {
@@ -43,7 +39,7 @@ func TestMutantSkipRaise(t *testing.T) {
 }
 
 // TestMutantLateDeadline plants LateDeadline into a world of three members with an unfenced
-// space, where m1 is cut off from the store from 10 s to 40 s: m1's machine keeps its shards
+// space, where m1 is cut off from the store from 10 s to 40 s (cutRow): m1's machine keeps its shards
 // RenewDeadline past the deadline its renewals allow, while the others take them once the
 // store has ended its session. It must fail tenure/g2.
 func TestMutantLateDeadline(t *testing.T) {
@@ -60,26 +56,13 @@ func TestMutantReadConfirm(t *testing.T) {
 	runRace(t, r)
 }
 
-// runCutMutant runs one seed of 60 s of a world of three members under the Server rule, with
-// the space book of 8 shards, fenced or not, and the bug m planted through the scenario's
-// Mutation, in which m1 is cut off from the store both ways from 10 s to 40 s.
+// runCutMutant runs one seed of cutRow's world with the bug m planted through the scenario's
+// Mutation: three members under the Server rule, the space book of 8 shards, fenced or not, and
+// m1 cut off from the store both ways from 10 s to 40 s. TestUnplantedWorlds runs the same
+// worlds without a bug, where every check holds.
 func runCutMutant(t *testing.T, m world.Mutation, fenced bool) {
 	t.Helper()
-	r := row{
-		name: t.Name(),
-		sc: world.Scenario{
-			Members: 3, StopDelay: time.Second, Mutation: m,
-			Spaces: []core.SpaceSpec{{Name: "book", Shards: 8, Fenced: fenced}},
-		},
-		seeds: 1, duration: 60 * time.Second, net: defaultNet, g2: true,
-	}
-	faultline.Run(t, r.options(), r.body(world.Server, func(fw *faultline.World, _ *world.World) {
-		cut, heal := kernel.Time(10*time.Second), kernel.Time(40*time.Second)
-		fw.Plan(fault.Script(
-			fault.Event{At: cut, Kind: fault.KindCut, Node: "m1", Peer: "store"},
-			fault.Event{At: cut, Kind: fault.KindCut, Node: "store", Peer: "m1"},
-			fault.Event{At: heal, Kind: fault.KindHealLink, Node: "m1", Peer: "store"},
-			fault.Event{At: heal, Kind: fault.KindHealLink, Node: "store", Peer: "m1"},
-		))
-	}))
+	r := cutRow(t.Name(), m, fenced)
+	r.seeds = 1
+	faultline.Run(t, r.options(), r.body(world.Server, cutSetup))
 }
