@@ -144,6 +144,7 @@ func (s *storeServer) apply(text string) storePushes {
 		switch e := e.(type) {
 		case sessionEffect:
 			s.w.emitSession(text, string(e.Op), e.Holder, e.Version, string(e.Cause))
+			s.w.sessions.session(e)
 			sessions = true
 		case grantEffect:
 			g := e.grant()
