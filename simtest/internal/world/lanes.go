@@ -89,6 +89,10 @@ type lanes struct {
 	// requests in flight before it goes out.
 	closing   bool
 	closeCall *call
+
+	// abandoned reports that the session was lost (O7): every request was dropped, and no
+	// request is queued from then on.
+	abandoned bool
 }
 
 // newLanes returns empty lanes that put requests on the network with send.
@@ -129,6 +133,7 @@ func (ls *lanes) laneOf(key laneKey) *lane {
 //     flight on its lane, whose answer answers both, and when c is a KeepAlive while one is
 //     queued, as the runtime's executor drops it;
 //   - O7: when a CloseSession has been submitted and c is not one.
+//   - O7: when the session was lost and the lanes were abandoned.
 //
 // A CloseSession that is not dropped closes the lanes (O7): it drops every queued request, and
 // it goes out once every request in flight has been answered or has timed out. The machine
@@ -154,6 +159,9 @@ func (ls *lanes) submit(c *call) bool {
 
 // admits reports whether submit would queue c rather than drop it.
 func (ls *lanes) admits(c *call) bool {
+	if ls.abandoned {
+		return false
+	}
 	_, isClose := c.act.(core.CloseSession)
 	if ls.closing && !isClose {
 		return false
@@ -190,6 +198,22 @@ func (ls *lanes) dropQueued() {
 		l.waiting = false
 	}
 	ls.waiting = nil
+}
+
+// abandon drops every request of the lanes, the queued ones and those in flight, whose
+// timeouts it cancels, and admits none from then on: the session is lost, and no request of
+// its holder may go out any more (O7). A reply to a request in flight is dropped when it comes.
+func (ls *lanes) abandon() {
+	ls.dropQueued()
+	for _, l := range ls.all {
+		if l.cur != nil && l.cur.timer != nil {
+			l.cur.timer.cancel()
+		}
+		l.cur = nil
+	}
+	ls.inFlight, ls.shardOut = 0, 0
+	ls.closeCall = nil
+	ls.abandoned = true
 }
 
 // finish frees the lane of c, which has been answered or has timed out, and sends what may go

@@ -78,6 +78,11 @@ type Member struct {
 	phase  Phase
 	holder string        // the holder of the present incarnation; "" before the first
 	wall   time.Duration // the offset of the wall clock from the monotonic one
+	// draining reports that the member was told to drain (recover.go): it hands its shards
+	// over and exits instead of recovering, and a boot of its node exits it at once.
+	draining bool
+	// recoveries counts the incarnations that started after a lost session (recover.go).
+	recoveries int
 }
 
 // Phase returns the member's phase.
@@ -137,6 +142,9 @@ type World struct {
 	// drivers holds the drivers of the members' incarnations (driver.go).
 	drivers *drivers
 
+	// sessions keeps the session ends the members owe a recovery for (recover.go).
+	sessions *sessionWatch
+
 	// checker decides the invariants over what the store, the drivers and the fence observe
 	// (checks.go).
 	checker *check.Checker
@@ -181,7 +189,14 @@ type World struct {
 // scenario has NoLiveness, checks that every shard has an owner at the recovery time plus the
 // bound; tenure/converged checks that the members that are active and up agree on where each
 // shard goes, that this is where the balanced placement over those members puts it, and that
-// each shard with an assignee is owned by that member alone.
+// each shard with an assignee is owned by that member alone. A scenario with EndAfter also gets
+// the final tenure/recovered, after those two: every end of a session of a member that was not
+// told to drain is followed by exactly one recovery of the member, whose new session the store
+// opened.
+//
+// A member whose session is lost starts a new incarnation, cause "recover", once its machine is
+// done and every run has returned, in the event of the last of them. A member told to drain
+// (Drain) exits once its machine is done, and never boots again.
 func Build(w *faultline.World, sc Scenario) *World {
 	w.T().Helper()
 	st, err := newSetup(sc, w.End())
@@ -206,6 +221,7 @@ func Build(w *faultline.World, sc Scenario) *World {
 	world.installHooks()
 	world.installChecks()
 	world.installFinals()
+	world.installRecovered()
 	world.emitBound()
 	return world
 }
@@ -395,8 +411,13 @@ func (w *World) planWallSteps() {
 
 // boot runs at every boot of a member's node. Only an active member starts an incarnation
 // (SIM-150): a replacement on standby waits for its turn, and a member that exited stays out.
+// A member told to drain whose node crashed exits when the node boots again (recover.go).
 func (w *World) boot(m *Member) {
 	if m.phase != Active {
+		return
+	}
+	if m.draining {
+		w.exit(m)
 		return
 	}
 	w.incarnate(m, bootCauseBoot)

@@ -136,6 +136,7 @@ type driver struct {
 	late     map[uint64]bool  // the requests that timed out with no reply yet; looked up only
 	stepping bool             // a step is being carried out
 	stopped  bool             // a later incarnation took over, or the member left
+	lost     bool             // the machine has lost its session (recover.go)
 
 	// viewStepped reports that a view has been stepped, and viewVersion is the Version of the
 	// latest. slotFloor is the version of the store's view after the latest SlotClaimed or
@@ -197,8 +198,8 @@ func (d *driver) begin() {
 }
 
 // stop ends the driver: it cancels its timers and from then on ignores what reaches it. The
-// handler stays on the node until the next incarnation installs its own; a member that leaves
-// for good removes it (1.8-13).
+// handler stays on the node until the next incarnation installs its own; a member that exits
+// removes it (recover.go).
 func (d *driver) stop() {
 	d.stopped = true
 	if d.wake != nil {
@@ -273,6 +274,7 @@ func (d *driver) stepOne(in core.Input, text, src string) {
 	if d.ds.onStep != nil {
 		d.ds.onStep(d, in, acts)
 	}
+	d.afterStep()
 }
 
 // rearm keeps the wake timer at the machine's NextWake.

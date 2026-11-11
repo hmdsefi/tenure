@@ -82,6 +82,9 @@ func (w *World) liveMembers() ([]liveMember, error) {
 			return nil, fmt.Errorf("converged: %s is active and up but drives no machine for its holder %s", m.Name, m.holder)
 		}
 		st := d.status()
+		if st.Session == core.SessionStateLost { // gone for good; a new incarnation replaces it (SIM-145)
+			continue
+		}
 		live = append(live, liveMember{
 			name: m.Name, holder: d.holder, draining: st.Draining, slot: st.Slot,
 			assign: d.machine.Assignment,
