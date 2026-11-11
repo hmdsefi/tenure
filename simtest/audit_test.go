@@ -19,9 +19,9 @@ import (
 	"github.com/hmdsefi/tenure/simtest/internal/world"
 )
 
-// The record kinds the audits read (SIM §8), besides those of steady_test.go.
+// The record kinds the audits read (SIM §8), besides those of steady_test.go and
+// session_test.go.
 const (
-	kindGrant     = "tenure.grant"
 	kindWallStep  = "tenure.wall_step"
 	kindReplyLate = "tenure.reply_late"
 )
