@@ -150,6 +150,23 @@ func (c *Checker) Down(holder string) {
 	}
 }
 
+// Owners returns the holders whose runs own the shard now, each once, in the order of their
+// runs: by term, then by holder. It returns nil for a shard nobody owns, and for a shard no
+// observation named. The result is the caller's.
+func (c *Checker) Owners(space string, shard int) []string {
+	s := c.shards[shardKey{space, shard}]
+	if s == nil || len(s.owners) == 0 {
+		return nil
+	}
+	holders := make([]string, 0, len(s.owners))
+	for _, o := range s.owners {
+		if !slices.Contains(holders, o.holder) {
+			holders = append(holders, o.holder)
+		}
+	}
+	return holders
+}
+
 // Liveness decides the check g5: every shard of Config.Spaces has an owner at the time r + b,
 // where r is the time the faults stopped and b the bound on how long a shard may then stay
 // without an owner. It returns nil when that holds, and otherwise the violation of the first

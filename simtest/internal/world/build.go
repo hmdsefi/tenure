@@ -140,6 +140,10 @@ type World struct {
 	// checker decides the invariants over what the store, the drivers and the fence observe
 	// (checks.go).
 	checker *check.Checker
+
+	// finalsOff turns the final checks into checks that pass. The tests of the parts of the world
+	// that disturb it by hand, after the recovery time, set it; the scenarios never do.
+	finalsOff bool
 }
 
 // Build builds the world of sc in w, the world of one run, and returns it. It must be called
@@ -172,7 +176,12 @@ type World struct {
 // Every StartRun of a member's machine starts a run that raises the fence of its shard and
 // writes to it in its term. A checker observes the store, the drivers and the fence, and Build
 // registers its checks as the invariants tenure/g1, tenure/g2 (only when the run asserts it),
-// tenure/g3, tenure/g4 and tenure/monotonic, which run after every event.
+// tenure/g3, tenure/g4 and tenure/monotonic, which run after every event. It also registers two
+// final checks, which run once after the last event, in this order: tenure/g5, unless the
+// scenario has NoLiveness, checks that every shard has an owner at the recovery time plus the
+// bound; tenure/converged checks that the members that are active and up agree on where each
+// shard goes, that this is where the balanced placement over those members puts it, and that
+// each shard with an assignee is owned by that member alone.
 func Build(w *faultline.World, sc Scenario) *World {
 	w.T().Helper()
 	st, err := newSetup(sc, w.End())
@@ -196,6 +205,7 @@ func Build(w *faultline.World, sc Scenario) *World {
 	world.planWallSteps()
 	world.installHooks()
 	world.installChecks()
+	world.installFinals()
 	world.emitBound()
 	return world
 }
