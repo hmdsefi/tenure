@@ -174,14 +174,16 @@ func nodeNames(recs []kernel.Record) map[kernel.NodeID]string {
 }
 
 // TestATSIM48DriverAudit checks AT-SIM-48 under each rule, with every record kept, over the
-// faulty worlds of TestCrashRestart (crashes and restarts, so many incarnations) and
-// TestPauses (pauses, after which a member's events come due at once): every tenure.input,
+// faulty worlds of TestCrashRestart (crashes and restarts, so many incarnations),
+// TestPartitions (lost sessions and recoveries, late replies), TestPauses (pauses, after which
+// a member's events come due at once) and TestStoreFaults (a store that crashes and is cut
+// off, so timeouts and resyncs): every tenure.input,
 // tenure.action and tenure.reply_late record of every member is audited against the driver
 // contract (MCH O1 to O8, SIM-300 to SIM-340). The steps were written for this task from the
 // issue and the design note, since the original acceptance-test text is lost. auditDriver
 // lists the audit.
 func TestATSIM48DriverAudit(t *testing.T) {
-	for _, name := range []string{"TestCrashRestart", "TestPauses"} {
+	for _, name := range []string{"TestCrashRestart", "TestPartitions", "TestPauses", "TestStoreFaults"} {
 		r := rowNamed(t, name)
 		for _, rule := range r.takeovers() {
 			t.Run(name+"/"+rule.String(), func(t *testing.T) {
@@ -239,7 +241,7 @@ var coalescing = map[string]bool{"Release": true, "ReleaseSlot": true, "ClaimSlo
 func auditDriver(recs []kernel.Record, members []*world.Member, timing core.Timing) error {
 	var errs []error
 	for _, m := range members {
-		if err := auditMember(recs, m, timing.RetryPeriod); err != nil {
+		if err := auditMember(recs, m.Node.ID(), m.Name, timing.RetryPeriod); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -273,9 +275,9 @@ type auditRequest struct {
 	late     bool
 }
 
-// auditMember audits the records of the member m; see auditDriver. retry is the RetryPeriod.
-func auditMember(recs []kernel.Record, m *world.Member, retry time.Duration) error {
-	id := m.Node.ID()
+// auditMember audits the records of the member whose node is id and whose name is name; see
+// auditDriver. retry is the RetryPeriod.
+func auditMember(recs []kernel.Record, id kernel.NodeID, name string, retry time.Duration) error {
 	var inc auditIncarnation
 	var event uint64                   // the Seq of the present kernel.event
 	sent := map[uint64]bool{}          // the request IDs the member's actions sent
@@ -287,7 +289,7 @@ func auditMember(recs []kernel.Record, m *world.Member, retry time.Duration) err
 		return reqs[n]
 	}
 	fail := func(r kernel.Record, format string, args ...any) error {
-		return fmt.Errorf("%s at %v (seq %d): %s", m.Name, r.At, r.Seq, fmt.Sprintf(format, args...))
+		return fmt.Errorf("%s at %v (seq %d): %s", name, r.At, r.Seq, fmt.Sprintf(format, args...))
 	}
 	for _, r := range recs {
 		if r.Kind == kindEvent {
