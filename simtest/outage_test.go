@@ -229,7 +229,7 @@ func resyncAudit(recs []kernel.Record, members []*world.Member, store kernel.Nod
 				if answered[id] == nil {
 					answered[id] = map[string]bool{}
 				}
-				answered[id][textRequestID(p)] = true
+				answered[id][requestID(p)] = true
 			}
 			continue
 		}
@@ -312,7 +312,7 @@ func (inc *incarnation) send(r kernel.Record, heal kernel.Time) error {
 		}
 		return nil
 	}
-	inc.sent = append(inc.sent, textRequestID(p))
+	inc.sent = append(inc.sent, requestID(p))
 	if n := len(inc.spaces); n == 0 || inc.spaces[n-1] != f[2] {
 		inc.spaces = append(inc.spaces, f[2])
 	}
@@ -354,7 +354,7 @@ func (inc *incarnation) action(r, in kernel.Record) (bool, error) {
 	key := attr(r, "space") + "/" + attr(r, "shard")
 	switch attr(r, "type") {
 	case "Confirm":
-		inc.confirm[key] = textRequestID(r.Text)
+		inc.confirm[key] = requestID(r.Text)
 	case "Degrade":
 		if attr(r, "space") != "ledger" {
 			return false, fmt.Errorf("%s at %v: Degrade %s of an unfenced space", inc.name, r.At, shardTerm(r))
@@ -366,7 +366,7 @@ func (inc *incarnation) action(r, in kernel.Record) (bool, error) {
 			attr(in, "holder") != inc.holder || attr(in, "term") != attr(r, "term") {
 			return false, fmt.Errorf("%s at %v: Restore %s, not from a confirm answer naming %s at its term", inc.name, r.At, shardTerm(r), inc.holder)
 		}
-		if got, want := textRequestID(in.Text), inc.confirm[key]; got != want {
+		if got, want := requestID(in.Text), inc.confirm[key]; got != want {
 			return false, fmt.Errorf("%s at %v: Restore %s from the answer of confirm #%s, the latest is #%s", inc.name, r.At, shardTerm(r), got, want)
 		}
 		delete(inc.degraded, key)
@@ -379,9 +379,9 @@ func (inc *incarnation) action(r, in kernel.Record) (bool, error) {
 	return false, nil
 }
 
-// textRequestID returns the request ID of a message text such as "holdings#12 m1/0a book" or
+// requestID returns the request ID of a message text such as "holdings#12 m1/0a book" or
 // "confirmed#8 ledger/3 …": the digits after the first "#".
-func textRequestID(text string) string {
+func requestID(text string) string {
 	_, rest, ok := strings.Cut(text, "#")
 	if !ok {
 		return ""
