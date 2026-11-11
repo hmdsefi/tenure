@@ -145,6 +145,9 @@ type World struct {
 	// sessions keeps the session ends the members owe a recovery for (recover.go).
 	sessions *sessionWatch
 
+	// rollout keeps what the final tenure/rollout judges (rollout.go); nil without a Rollout.
+	rollout *rolloutWatch
+
 	// checker decides the invariants over what the store, the drivers and the fence observe
 	// (checks.go).
 	checker *check.Checker
@@ -192,7 +195,12 @@ type World struct {
 // each shard with an assignee is owned by that member alone. A scenario with EndAfter also gets
 // the final tenure/recovered, after those two: every end of a session of a member that was not
 // told to drain is followed by exactly one recovery of the member, whose new session the store
-// opened.
+// opened. A scenario with a Rollout gets the final tenure/rollout, last: each replacement
+// took the shards of the slot it claimed once, and no replaced member started a shard after
+// it was told to drain.
+//
+// With a Rollout, the replacement mi-r is activated at Start + (i−1)·Gap, which starts its
+// first incarnation, and mi is told to drain Surge later.
 //
 // A member whose session is lost starts a new incarnation, cause "recover", once its machine is
 // done and every run has returned, in the event of the last of them. A member told to drain
@@ -219,9 +227,11 @@ func Build(w *faultline.World, sc Scenario) *World {
 	world.planFaults()
 	world.planWallSteps()
 	world.installHooks()
+	world.planSetSlots()
 	world.installChecks()
 	world.installFinals()
 	world.installRecovered()
+	world.planRollout()
 	world.emitBound()
 	return world
 }
