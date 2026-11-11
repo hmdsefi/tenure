@@ -6,6 +6,7 @@ package world
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"slices"
@@ -92,7 +93,7 @@ func TestConvergedMessages(t *testing.T) {
 		want  string
 	}{
 		{"converged", func(*convergedRig) {}, ""},
-		{"no live member", func(r *convergedRig) { r.live = nil }, ""},
+		{"no live member", func(r *convergedRig) { r.live = nil }, "converged: no member is active and up"},
 		{"members disagree", func(r *convergedRig) {
 			r.set("m1", "m1", "m2", "m3", "m4")
 			r.set("m3", "m1", "m2", "m3", "m5")
@@ -123,13 +124,26 @@ func TestConvergedMessages(t *testing.T) {
 		{"owned by the assignee and another", func(r *convergedRig) {
 			r.owners["book/2"] = []string{"m1/01", "m3/03"}
 		}, `converged: book/2 assigned to m3, owned by m1/01, m3/03`},
+		{"owned by the assignee and a later one", func(r *convergedRig) {
+			r.owners["book/2"] = []string{"m3/03", "m1/01"}
+		}, `converged: book/2 assigned to m3, owned by m3/03, m1/01`},
 		{"no assignee", func(r *convergedRig) {
-			// Without a live member that is eligible, every key is "" and nothing is owed.
+			// Without a live member that is eligible, every key is "": the members agree on
+			// placing nothing, which is no convergence.
 			for i := range r.live {
 				r.live[i].draining = true
 			}
 			r.balance["book"] = []string{"", "", "", ""}
-		}, ""},
+		}, "converged: none of the 3 live members takes shards"},
+		{"every slot vacant", func(r *convergedRig) {
+			r.slots = 3
+			r.balance["book"] = []string{"", "", "", ""}
+		}, "converged: none of the 3 live members takes shards"},
+		{"two members hold one slot", func(r *convergedRig) {
+			r.slots = 3
+			r.live[0].slot, r.live[1].slot, r.live[2].slot = 1, 0, 1
+			r.balance["book"] = []string{"slot-0", "slot-1", "slot-0", "slot-1"}
+		}, "converged: m1 and m3 both hold slot-1"},
 		{"spaces by name", func(r *convergedRig) {
 			r.spaces = append(r.spaces, core.SpaceSpec{Name: "atlas", Shards: 4})
 			r.balance["atlas"] = []string{"m2", "m2", "m3", "m1"}
@@ -188,7 +202,8 @@ const finalEnv = "TENURE_SIM_FINAL"
 // TestFinalsRegistered checks that Build registers tenure/g5 and then tenure/converged as final
 // checks, and leaves tenure/g5 out with NoLiveness: a child process takes every run off the
 // checker's shards at 1 s of a steady world, which nothing starts again, and its run fails
-// both finals, in that order, or only tenure/converged with NoLiveness.
+// both finals, in that order, or only tenure/converged with NoLiveness. tenure/g5 judges the
+// world's recovery time, not the start of the run.
 func TestFinalsRegistered(t *testing.T) {
 	if os.Getenv(finalEnv) != "" {
 		t.Skip("in the child process")
@@ -202,6 +217,10 @@ func TestFinalsRegistered(t *testing.T) {
 			`final check "tenure/g5" failed after the run at t=30.000000000s`,
 			"g5: book/0 has no owner from 1.000000000s to 30.000000001s, which contains 21.045000000s (recovery 0.000000000s + bound 21.045000000s)",
 			`also failed: "tenure/converged"`,
+		}, ""},
+		{"g5-recovery", []string{
+			`final check "tenure/g5" failed after the run at t=60.000000000s`,
+			"g5: book/0 has no owner from 1.000000000s to 60.000000001s, which contains 59.045000000s (recovery 38.000000000s + bound 21.045000000s)",
 		}, ""},
 		{"converged", []string{
 			`final check "tenure/converged" failed after the run at t=30.000000000s`,
@@ -235,14 +254,20 @@ func TestFinalsRegistered(t *testing.T) {
 
 // TestFinalsChild is the child process of TestFinalsRegistered: in a steady world of 30 s, it
 // reports every member's holder Down to the checker at 1 s, so the checker sees no shard owned
-// from then on. With TENURE_SIM_FINAL=converged the scenario has NoLiveness.
+// from then on. With TENURE_SIM_FINAL=converged the scenario has NoLiveness; with
+// TENURE_SIM_FINAL=g5-recovery the run lasts 60 s and the wall clocks step, which puts the
+// recovery time at 38 s, so that tenure/g5 is seen to judge the world's R and not the start.
 func TestFinalsChild(t *testing.T) {
 	child := os.Getenv(finalEnv)
 	if child == "" {
 		t.Skip("runs only as the child process of TestFinalsRegistered")
 	}
 	sc := Scenario{NoLiveness: child == "converged"}
-	faultline.Run(t, faultline.Options{Seeds: 1, Duration: 30 * time.Second}, func(fw *faultline.World) {
+	duration := 30 * time.Second
+	if child == "g5-recovery" {
+		sc.WallSteps, duration = time.Second, 60*time.Second
+	}
+	faultline.Run(t, faultline.Options{Seeds: 1, Duration: duration}, func(fw *faultline.World) {
 		w := Build(fw, sc)
 		fw.Sim.At(kernel.Time(time.Second), "test/down", func() {
 			for _, m := range w.Members() {
@@ -262,7 +287,10 @@ func TestConvergedSlots(t *testing.T) {
 		faultline.Run(t, opts, func(fw *faultline.World) {
 			w := Build(fw, sc)
 			fw.RunFor(90*time.Second - time.Nanosecond)
-			live := w.liveMembers()
+			live, err := w.liveMembers()
+			if err != nil {
+				fw.T().Fatal(err)
+			}
 			if len(live) != 5 {
 				fw.T().Fatalf("%d live members, want 5", len(live))
 			}
@@ -271,6 +299,57 @@ func TestConvergedSlots(t *testing.T) {
 					fw.T().Errorf("%s holds no slot", m.name)
 				}
 			}
+		})
+	})
+}
+
+// TestConvergedMemberDown runs a steady world under each rule in which m5 crashes at 1 s and
+// never comes back, with the finals on: tenure/converged leaves m5 out, and the four others
+// agree on the balanced placement over themselves, each shard running on its assignee. A final
+// registered after Build's checks that m5 was indeed left out and that every live machine's
+// assignment names only the four.
+func TestConvergedMemberDown(t *testing.T) {
+	forRules(t, func(t *testing.T, rule Takeover) {
+		sc := Scenario{Takeover: rule, StopDelay: time.Second}
+		opts := faultline.Options{Seeds: 2, Duration: 60 * time.Second, CheckDeterminism: true}
+		faultline.Run(t, opts, func(fw *faultline.World) {
+			w := Build(fw, sc)
+			m5 := w.Members()[4]
+			fw.Sim.At(kernel.Time(time.Second), "test/crash", m5.Node.Crash)
+			fw.Final("test/left_out", func() error {
+				live, err := w.liveMembers()
+				if err != nil {
+					return err
+				}
+				if len(live) != 4 {
+					return fmt.Errorf("%d live members, want 4", len(live))
+				}
+				for _, m := range live {
+					if slices.Contains(m.assign("book"), m5.Name) {
+						return fmt.Errorf("%s assigns a shard to %s, which is down", m.name, m5.Name)
+					}
+				}
+				return nil
+			})
+		})
+	})
+}
+
+// TestConvergedNoDriver checks that an active member that is up but drives no machine for its
+// holder fails tenure/converged rather than being left out.
+func TestConvergedNoDriver(t *testing.T) {
+	faultline.Run(t, faultline.Options{Seeds: 1, Duration: 30 * time.Second, CheckDeterminism: true}, func(fw *faultline.World) {
+		w := Build(fw, Scenario{})
+		w.finalsOff = true
+		fw.Final("test/no_driver", func() error {
+			m := w.Members()[2]
+			w.drivers.current(m).stopped = true
+			_, err := w.liveMembers()
+			want := "converged: m3 is active and up but drives no machine for its holder " + m.Holder()
+			if err == nil || err.Error() != want {
+				return fmt.Errorf("liveMembers: %v, want %q", err, want)
+			}
+			return nil
 		})
 	})
 }
