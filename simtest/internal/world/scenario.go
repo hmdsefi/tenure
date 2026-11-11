@@ -148,7 +148,8 @@ type Scenario struct {
 	// EndAfter, when positive, makes the store end every session EndAfter after it opened.
 	// The recovery time is raised to the latest end of a session opened at the start, so a
 	// run with EndAfter should end before 2·EndAfter, when the recovered sessions would end in
-	// their turn.
+	// their turn. A scenario with EndAfter does not assert that no two members own a shard at
+	// once.
 	EndAfter time.Duration
 	// Faults plans random faults, or none when it is nil. The world plans a copy of it and
 	// leaves the caller's value as it is.
@@ -274,7 +275,7 @@ func ComputeBound(sc Scenario) time.Duration {
 }
 
 // AssertsG2 reports whether the scenario keeps the timing's promise that no two members own a
-// shard at once, so that a run of it may assert that. Two things break the promise:
+// shard at once, so that a run of it may assert that. Three things break the promise:
 //
 //   - clocks that drift too far: with LD and RD the timing's LeaseDuration and RenewDeadline
 //     and ρ the scenario's MaxDrift, the promise needs ρ·(LD + RD) < 10⁶·(LD − RD), which is
@@ -282,7 +283,10 @@ func ComputeBound(sc Scenario) time.Duration {
 //     overflow;
 //   - members that pause: Faults has a pause rule whose Target is "" (any member) or
 //     "members". A paused member cannot stop its runs at its deadline. A rule that pauses only
-//     another role, such as "store" or "fence", breaks nothing.
+//     another role, such as "store" or "fence", breaks nothing;
+//   - sessions that end out of band: EndAfter is positive. The store ends a session the
+//     moment EndAfter has passed and may grant its shards at once, while the holder, which has
+//     not yet seen the end, owns them until its deadline.
 //
 // The zero fields count at their defaults.
 func (sc Scenario) AssertsG2() bool {
@@ -292,7 +296,7 @@ func (sc Scenario) AssertsG2() bool {
 	drifted.Mul(drifted, big.NewInt(int64(sc.MaxDrift())))
 	margin := new(big.Int).Sub(ld, rd)
 	margin.Mul(margin, big.NewInt(million))
-	if drifted.Cmp(margin) >= 0 {
+	if drifted.Cmp(margin) >= 0 || sc.EndAfter > 0 {
 		return false
 	}
 	if sc.Faults == nil {

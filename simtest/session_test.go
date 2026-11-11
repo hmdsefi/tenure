@@ -278,7 +278,7 @@ const slowStops = 10 * time.Second
 func TestDrainSessionLost(t *testing.T) {
 	r := row{
 		name: "TestDrainSessionLost", sc: world.Scenario{EndAfter: 40 * time.Second, StopDelay: slowStops},
-		seeds: 5, duration: 75 * time.Second, net: defaultNet, g2: true,
+		seeds: 5, duration: 75 * time.Second, net: defaultNet, g2: false,
 	}
 	for _, rule := range r.takeovers() {
 		t.Run(rule.String(), func(t *testing.T) {
@@ -313,7 +313,7 @@ func TestDrainSessionLost(t *testing.T) {
 func TestSessionEndCrash(t *testing.T) {
 	r := row{
 		name: "TestSessionEndCrash", sc: world.Scenario{EndAfter: 40 * time.Second, StopDelay: slowStops, NoLiveness: true},
-		seeds: 5, duration: 75 * time.Second, net: defaultNet, g2: true,
+		seeds: 5, duration: 75 * time.Second, net: defaultNet, g2: false,
 	}
 	for _, rule := range r.takeovers() {
 		t.Run(rule.String(), func(t *testing.T) {
