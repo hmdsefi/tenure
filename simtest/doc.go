@@ -18,4 +18,8 @@
 // and, to check that every seed replays, run each passing seed twice with
 //
 //	FAULTLINE_CHECK_DETERMINISM=1 go test -count=1 ./...
+//
+// Built with the tag tenure_mutants, the simulations can also plant bugs into the protocol: each
+// TestMutant test plants one and must fail the check the bug breaks. TestMutantsCaught, in the
+// ordinary build, runs each of them in a child process and checks that it does.
 package simtest
