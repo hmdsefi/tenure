@@ -155,7 +155,7 @@ func recoveryStart(sc Scenario, quiet time.Duration, end kernel.Time) kernel.Tim
 	if sc.Rollout != nil {
 		r = max(r, lastDrain(sc)) // the last member is told to drain then (rollout.go)
 	}
-	return r
+	return max(r, outageHeal(sc)) // the store's outage heals then (outage.go)
 }
 
 // problem returns the first thing that is wrong with the fields of sc, which has its defaults,
