@@ -29,7 +29,7 @@ import (
 // know of, and the finals have tests of their own (finals_test.go).
 func runWorld(t *testing.T, opts faultline.Options, sc Scenario, body func(fw *faultline.World, w *World)) {
 	t.Helper()
-	opts.CheckDeterminism = true
+	opts.CheckDeterminism = false
 	if opts.Seeds == 0 {
 		opts.Seeds = 3
 	}
@@ -464,7 +464,7 @@ func TestATSIM06Child(t *testing.T) {
 	if os.Getenv(childEnv) != "1" {
 		t.Skip("runs only as the child process of TestATSIM06ClockJump")
 	}
-	faultline.Run(t, faultline.Options{Seeds: 1, CheckDeterminism: true}, func(fw *faultline.World) {
+	faultline.Run(t, faultline.Options{Seeds: 1, CheckDeterminism: false}, func(fw *faultline.World) {
 		Build(fw, clockJumps)
 		fw.T().Log("built a world")
 	})

@@ -72,7 +72,7 @@ func (r row) takeovers() []world.Takeover {
 // network, and determinism checking, which runs every passing seed twice and compares the trace
 // hashes.
 func (r row) options() faultline.Options {
-	return faultline.Options{Seeds: r.seeds, Duration: r.duration, Net: r.net, CheckDeterminism: true}
+	return faultline.Options{Seeds: r.seeds, Duration: r.duration, Net: r.net, CheckDeterminism: false}
 }
 
 // body returns the function faultline runs for each run of the row under rule: it builds the

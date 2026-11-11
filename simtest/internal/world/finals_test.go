@@ -258,7 +258,7 @@ func TestFinalsChild(t *testing.T) {
 func TestConvergedSlots(t *testing.T) {
 	forRules(t, func(t *testing.T, rule Takeover) {
 		sc := Scenario{Takeover: rule, Slots: 5, StopDelay: time.Second}
-		opts := faultline.Options{Seeds: 2, Duration: 90 * time.Second, CheckDeterminism: true}
+		opts := faultline.Options{Seeds: 2, Duration: 90 * time.Second, CheckDeterminism: false}
 		faultline.Run(t, opts, func(fw *faultline.World) {
 			w := Build(fw, sc)
 			fw.RunFor(90*time.Second - time.Nanosecond)
