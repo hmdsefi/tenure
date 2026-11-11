@@ -138,13 +138,21 @@ func wholeSeconds(d time.Duration) time.Duration {
 // recoveryStart returns R, the time from which the world of sc is left alone: the start of the
 // quiet window, of length quiet, of a disturbed run that ends at end, and the start of the run
 // otherwise. A part of the world that disturbs the run at a time of its own, as an outage, a
-// change of the slot count or a rollout does, raises R here, so that the setup check, the
+// change of the slot count or a rollout does, raises R here: EndAfter raises it to the latest
+// end of a first session (sessionEndTime), so that the setup check, the
 // tenure.bound record and the final checks agree on it.
 func recoveryStart(sc Scenario, quiet time.Duration, end kernel.Time) kernel.Time {
-	if !sc.disturbed() {
-		return 0
+	r := kernel.Time(0)
+	if sc.disturbed() {
+		r = end.Add(-quiet)
 	}
-	return end.Add(-quiet)
+	if sc.SetSlotsAt > 0 {
+		r = max(r, kernel.Time(sc.SetSlotsAt)) // the slot count changes at SetSlotsAt (1.8-14)
+	}
+	if sc.EndAfter > 0 {
+		r = max(r, sessionEndTime(sc))
+	}
+	return r
 }
 
 // problem returns the first thing that is wrong with the fields of sc, which has its defaults,

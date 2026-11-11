@@ -15,6 +15,7 @@ import (
 
 	"github.com/hmdsefi/faultline"
 	"github.com/hmdsefi/faultline/kernel"
+	"github.com/hmdsefi/faultline/kernel/fault"
 	"github.com/hmdsefi/faultline/kernel/simnet"
 
 	"github.com/hmdsefi/tenure/simtest/internal/world"
@@ -51,6 +52,21 @@ var rows = []row{
 	{
 		name: "TestSteady", sc: world.Scenario{StopDelay: time.Second},
 		seeds: 20, duration: 60 * time.Second, net: defaultNet, g2: true,
+	},
+	// The store ends each first session once, at about 40 s, and the members recover. The run
+	// lasts 75 s, not 90 s: the recovered sessions, opened at about 40 s, would end at about
+	// 80 s, and that second round of ends leaves no bound to recover in before 90 s.
+	{
+		name: "TestSessionEnds", sc: world.Scenario{EndAfter: 40 * time.Second},
+		seeds: 20, duration: 75 * time.Second, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestSlotScaleDown", sc: world.Scenario{Slots: 5, SetSlotsAt: scaleDownAt, SetSlotsTo: scaleDownTo},
+		seeds: 20, duration: 125 * time.Second, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestSlotGrace", sc: world.Scenario{Slots: 5, Faults: &fault.Random{Quiet: graceRun - graceCrash}},
+		seeds: 20, duration: graceRun, net: defaultNet, g2: true,
 	},
 }
 

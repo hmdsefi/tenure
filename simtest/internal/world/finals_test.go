@@ -353,3 +353,29 @@ func TestConvergedNoDriver(t *testing.T) {
 		})
 	})
 }
+
+// TestConvergedNoneActive checks tenure/converged when no member is active, as after every
+// member drained and exited: it passes when no shard is owned, and reports the first owned
+// shard, by space name and then shard, otherwise.
+func TestConvergedNoneActive(t *testing.T) {
+	spaces := []core.SpaceSpec{{Name: "ledger", Shards: 2}, {Name: "book", Shards: 4}}
+	owned := map[string][]string{}
+	owners := func(space string, shard int) []string { return owned[space+"/"+strconv.Itoa(shard)] }
+	if err := unownedErr(spaces, owners); err != nil {
+		t.Errorf("nothing owned: %v, want nil", err)
+	}
+	owned["ledger/0"] = []string{"m2/0b"}
+	owned["book/3"] = []string{"m1/0a", "m3/0c"}
+	want := "converged: book/3 owned by m1/0a, m3/0c, but no member is active"
+	if err := unownedErr(spaces, owners); err == nil || err.Error() != want {
+		t.Errorf("book/3 and ledger/0 owned: %v, want %q", err, want)
+	}
+	w := &World{members: []*Member{{Name: "m1", phase: Exited}, {Name: "m1-r", phase: Standby}}}
+	if !w.noneActive() {
+		t.Error("noneActive with an exited member and a standby: false, want true")
+	}
+	w.members[1].phase = Active
+	if w.noneActive() {
+		t.Error("noneActive with an active member: true, want false")
+	}
+}
