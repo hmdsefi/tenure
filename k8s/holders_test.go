@@ -539,9 +539,19 @@ func TestATK8S38Versions(t *testing.T) {
 // change above R that the informer delivers while the list is under way is sent.
 func TestK8S500WatchFrom(t *testing.T) {
 	client := newFake()
+	watching := watchOpened(client)
 	a := fakeAdapter(t, client)
 	closeAtEnd(t, a, "pod-0/1")
 	mustKeepAlive(t, a, "pod-0/1")
+	// KeepAlive returns once the informer's first list is observed, which can be before the
+	// informer opens its watch. The fake runs reactors under its lock and its watches do not
+	// replay earlier writes, so the LIST below would hold the watch back and the record it
+	// creates would never reach the cache: wait for the watch first.
+	select {
+	case <-watching:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the informer opened no watch in 10s")
+	}
 	tracker := client.Tracker()
 	name := shardName("g", "markets", 0)
 	listed := false
@@ -557,12 +567,12 @@ func TestK8S500WatchFrom(t *testing.T) {
 		if err := tracker.Create(leasesResource, l, "default"); err != nil {
 			return true, nil, err
 		}
-		for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(time.Millisecond) {
+		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
 			if o, ok := a.cached(name); ok && o.lease.ResourceVersion == "201" {
 				break
 			}
 			if time.Now().After(deadline) {
-				return true, nil, errors.New("record not observed in 2s")
+				return true, nil, errors.New("record not observed in 10s")
 			}
 		}
 		return true, &coordinationv1.LeaseList{ListMeta: metav1.ListMeta{ResourceVersion: "200"}}, nil
@@ -571,6 +581,19 @@ func TestK8S500WatchFrom(t *testing.T) {
 	if got := nextHolding(t, ch, tenure.Holding{Space: "markets", Shard: 0, Term: 3}); got.Version != 201 {
 		t.Errorf("Version %d, want 201", got.Version)
 	}
+}
+
+// watchOpened returns a channel that is closed when a WATCH of the Leases first reaches client.
+// The fake handles that WATCH under its lock, so a request that reaches the fake after the close
+// finds the watch open.
+func watchOpened(client *fake.Clientset) <-chan struct{} {
+	opened := make(chan struct{})
+	var once sync.Once
+	client.PrependWatchReactor(resourceLeases, func(k8stesting.Action) (bool, watch.Interface, error) {
+		once.Do(func() { close(opened) })
+		return false, nil, nil
+	})
+	return opened
 }
 
 // listHookClient is a fake clientset whose Lease LISTs call before first, outside the fake's
