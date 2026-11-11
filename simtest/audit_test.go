@@ -123,7 +123,7 @@ func termsGrow(recs []kernel.Record, rule world.Takeover) (termCover, error) {
 				return cover, fmt.Errorf("%s: term %d granted at %v at wall %v after term %d, want NextTerm %d",
 					shard, term, r.At, wall.Sub(kernel.Epoch), prev, want)
 			}
-			if prev > 0 && core.Term(term) == prev+1 && wall.UnixMilli() <= int64(prev) {
+			if prev > 0 && core.Term(term) == prev+1 && core.NextTerm(0, wall) <= prev { // the wall's milliseconds are at most prev
 				cover.fromPrev++
 			}
 			if member, _, _ := strings.Cut(attr(r, "holder"), "/"); backStep[member] {
