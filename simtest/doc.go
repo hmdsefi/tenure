@@ -19,6 +19,10 @@
 //
 //	FAULTLINE_CHECK_DETERMINISM=1 go test -count=1 ./...
 //
+// No test turns that check on by itself, so state that makes two runs of a seed differ fails
+// only a run with the variable set; TestTraceReplay, which compares two runs of a seed record
+// by record, runs only then and skips otherwise.
+//
 // The file testdata/hashes.txt pins the trace hashes of eight scenarios at three fixed seeds,
 // under Go 1.26, so a change that alters a run fails TestGoldenHashes; under another Go minor
 // version the test skips. When the change is intended, rewrite the file under Go 1.26 with

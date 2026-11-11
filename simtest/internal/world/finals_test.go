@@ -283,7 +283,7 @@ func TestFinalsChild(t *testing.T) {
 func TestConvergedSlots(t *testing.T) {
 	forRules(t, func(t *testing.T, rule Takeover) {
 		sc := Scenario{Takeover: rule, Slots: 5, StopDelay: time.Second}
-		opts := faultline.Options{Seeds: 2, Duration: 90 * time.Second, CheckDeterminism: true}
+		opts := faultline.Options{Seeds: 2, Duration: 90 * time.Second}
 		faultline.Run(t, opts, func(fw *faultline.World) {
 			w := Build(fw, sc)
 			fw.RunFor(90*time.Second - time.Nanosecond)
@@ -311,7 +311,7 @@ func TestConvergedSlots(t *testing.T) {
 func TestConvergedMemberDown(t *testing.T) {
 	forRules(t, func(t *testing.T, rule Takeover) {
 		sc := Scenario{Takeover: rule, StopDelay: time.Second}
-		opts := faultline.Options{Seeds: 2, Duration: 60 * time.Second, CheckDeterminism: true}
+		opts := faultline.Options{Seeds: 2, Duration: 60 * time.Second}
 		faultline.Run(t, opts, func(fw *faultline.World) {
 			w := Build(fw, sc)
 			m5 := w.Members()[4]
@@ -338,7 +338,7 @@ func TestConvergedMemberDown(t *testing.T) {
 // TestConvergedNoDriver checks that an active member that is up but drives no machine for its
 // holder fails tenure/converged rather than being left out.
 func TestConvergedNoDriver(t *testing.T) {
-	faultline.Run(t, faultline.Options{Seeds: 1, Duration: 30 * time.Second, CheckDeterminism: true}, func(fw *faultline.World) {
+	faultline.Run(t, faultline.Options{Seeds: 1, Duration: 30 * time.Second}, func(fw *faultline.World) {
 		w := Build(fw, Scenario{})
 		w.finalsOff = true
 		fw.Final("test/no_driver", func() error {

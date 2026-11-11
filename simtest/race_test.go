@@ -136,11 +136,11 @@ func raceSetup(fw *faultline.World, w *world.World) {
 }
 
 // TestConfirmRace runs the confirmation race (SIM-670, AT-SIM-43 in a whole world) for 3
-// seeds, every seed twice with equal trace hashes: every invariant holds after every event,
-// the finals tenure/g5 and tenure/converged pass, then tenure/race: b's cas is answered stale
-// and a stepped Restore from a HolderChanged read in a Confirm's answer. test/window checks in
-// the trace that the window opened: b's getSession, a's renewal, a's confirm and b's cas reach
-// the store in that order.
+// seeds (with FAULTLINE_CHECK_DETERMINISM=1, every seed twice with equal trace hashes): every
+// invariant holds after every event, the finals tenure/g5 and tenure/converged pass, then
+// tenure/race: b's cas is answered stale and a stepped Restore from a HolderChanged read in a
+// Confirm's answer. test/window checks in the trace that the window opened: b's getSession,
+// a's renewal, a's confirm and b's cas reach the store in that order.
 func TestConfirmRace(t *testing.T) {
 	runRace(t, raceRow)
 }

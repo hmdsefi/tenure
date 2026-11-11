@@ -150,11 +150,12 @@ func (r row) takeovers() []world.Takeover {
 	return r.rules
 }
 
-// options returns the faultline options of a run of the row: its seeds, its duration, its
-// network, and determinism checking, which runs every passing seed twice and compares the trace
-// hashes.
+// options returns the faultline options of a run of the row: its seeds, its duration and its
+// network. They leave CheckDeterminism off (AT-DET-16): FAULTLINE_CHECK_DETERMINISM=1, which
+// CI's determinism step sets, runs every passing seed twice and compares the trace hashes, and
+// without it a plain run does not, so a planted per-process difference fails that step alone.
 func (r row) options() faultline.Options {
-	return faultline.Options{Seeds: r.seeds, Duration: r.duration, Net: r.net, CheckDeterminism: true}
+	return faultline.Options{Seeds: r.seeds, Duration: r.duration, Net: r.net}
 }
 
 // body returns the function faultline runs for each run of the row under rule: it builds the
@@ -215,13 +216,13 @@ func TestRowsNamed(t *testing.T) {
 }
 
 // TestRowOptions checks that a row's options are its seeds, its duration and its network, with
-// determinism checking on, and that the row runs under both rules, Server then Observer, unless
-// it names its rules.
+// CheckDeterminism off so that FAULTLINE_CHECK_DETERMINISM decides (AT-DET-16), and that the
+// row runs under both rules, Server then Observer, unless it names its rules.
 func TestRowOptions(t *testing.T) {
 	r := rowNamed(t, "TestSteady")
 	got := r.options()
-	if got.Seeds != r.seeds || got.Duration != r.duration || got.Net != r.net || !got.CheckDeterminism {
-		t.Errorf("options() = Seeds %d, Duration %v, Net %+v, CheckDeterminism %v; want %d, %v, %+v, true",
+	if got.Seeds != r.seeds || got.Duration != r.duration || got.Net != r.net || got.CheckDeterminism {
+		t.Errorf("options() = Seeds %d, Duration %v, Net %+v, CheckDeterminism %v; want %d, %v, %+v, false",
 			got.Seeds, got.Duration, got.Net, got.CheckDeterminism, r.seeds, r.duration, r.net)
 	}
 	if got, want := r.takeovers(), []world.Takeover{world.Server, world.Observer}; !slices.Equal(got, want) {

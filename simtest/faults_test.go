@@ -6,11 +6,11 @@ package simtest
 import "testing"
 
 // The fault scenarios of SIM-600 (AT-SIM-31), each a row of the scenario table run under both
-// rules at its seed count, every seed twice with equal trace hashes. Every invariant holds
-// after every event (G2 only where the row's G2 column says the timing bound holds), and the
-// finals hold at the end: every shard has an owner once the bound has passed after the faults
-// (except beyond the drift bound), and the members agree on the placement and each shard runs
-// on its assignee.
+// rules at its seed count, and with FAULTLINE_CHECK_DETERMINISM=1 every seed twice with equal
+// trace hashes. Every invariant holds after every event (G2 only where the row's G2 column says
+// the timing bound holds), and the finals hold at the end: every shard has an owner once the
+// bound has passed after the faults (except beyond the drift bound), and the members agree on
+// the placement and each shard runs on its assignee.
 
 // TestCrashRestart crashes members every 10 s on average, for 1 s to 20 s each, at most two
 // at once.
