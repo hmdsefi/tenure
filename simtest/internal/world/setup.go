@@ -142,9 +142,12 @@ func wholeSeconds(d time.Duration) time.Duration {
 // end of a first session (sessionEndTime), so that the setup check, the
 // tenure.bound record and the final checks agree on it.
 func recoveryStart(sc Scenario, quiet time.Duration, end kernel.Time) kernel.Time {
-	var r kernel.Time
+	r := kernel.Time(0)
 	if sc.disturbed() {
 		r = end.Add(-quiet)
+	}
+	if sc.SetSlotsAt > 0 {
+		r = max(r, kernel.Time(sc.SetSlotsAt)) // the slot count changes at SetSlotsAt (1.8-14)
 	}
 	if sc.EndAfter > 0 {
 		r = max(r, sessionEndTime(sc))
