@@ -55,7 +55,7 @@ var rows = []row{
 }
 
 // rowNamed returns the row of the table whose name is name, and fails t when there is none.
-func rowNamed(t testing.TB, name string) row {
+func rowNamed(t testing.TB, name string) row { //nolint:unparam // the rows of 1.8-12 on look up their own names
 	t.Helper()
 	for _, r := range rows {
 		if r.name == name {
@@ -169,8 +169,8 @@ func TestRowAssertsG2(t *testing.T) {
 	// The child's output is matched by substring, and none of faultline's variables of this
 	// process reaches it.
 	cmd := exec.Command(os.Args[0], "-test.run=^TestRowChild$", "-test.v") //nolint:gosec // the test binary itself
-	env := slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "FAULTLINE_") })
-	cmd.Env = append(env, rowChildEnv+"=1", "FAULTLINE_ARTIFACTS=off")
+	cmd.Env = append(slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "FAULTLINE_") }),
+		rowChildEnv+"=1", "FAULTLINE_ARTIFACTS=off")
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err := cmd.Run()
