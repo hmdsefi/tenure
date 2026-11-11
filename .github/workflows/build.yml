@@ -36,6 +36,12 @@ jobs:
         with:
           version: v2.14.0
           working-directory: simtest
+      - name: golangci-lint (simtest, tenure_mutants)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+          working-directory: simtest
+          args: --build-tags tenure_mutants
 
   build:
     name: Go build
@@ -164,7 +170,13 @@ jobs:
       - name: 'simulation: every seed twice, equal trace hashes'
         env:
           FAULTLINE_CHECK_DETERMINISM: '1'
-        run: go -C simtest test -count=1 ./...
+        run: go -C simtest test -count=1 -skip '^TestGoldenHashes$' ./...
+      # Its own step with -v, so the log shows it passing under go 1.26 and skipping under
+      # other minor versions, where its hashes are not pinned.
+      - name: 'simulation: golden trace hashes'
+        env:
+          FAULTLINE_CHECK_DETERMINISM: '1'
+        run: go -C simtest test -count=1 -run '^TestGoldenHashes$' -v .
 
   api:
     name: API snapshot
@@ -237,6 +249,10 @@ jobs:
         with:
           go-version-file: simtest/go.mod
           cache-dependency-path: simtest/go.sum
+      # TestMutantsCaught, in the step below, runs each planted bug in a child built with the
+      # tag tenure_mutants.
+      - name: vet with the planted bugs (tenure_mutants)
+        run: go -C simtest vet -tags tenure_mutants ./...
       - name: simulations with the short seed counts
         env:
           FAULTLINE_ARTIFACTS: ${{ runner.temp }}/faultline
