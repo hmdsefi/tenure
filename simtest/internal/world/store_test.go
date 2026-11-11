@@ -379,7 +379,7 @@ func TestStoreNode(t *testing.T) {
 	t.Run("receivers", func(t *testing.T) {
 		// A rollout that never activates: m1-r to m3-r stay on standby.
 		sc := Scenario{Members: 3, Slots: 3, Rollout: rollout}
-		runWorld(t, fullTrace(90*time.Second), sc, func(fw *faultline.World, w *World) {
+		runWorld(t, fullTrace(120*time.Second), sc, func(fw *faultline.World, w *World) {
 			t := fw.T()
 			s := scripted(fw, w)
 			ms := time.Millisecond

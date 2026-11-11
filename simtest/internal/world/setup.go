@@ -152,6 +152,9 @@ func recoveryStart(sc Scenario, quiet time.Duration, end kernel.Time) kernel.Tim
 	if sc.SetSlotsAt > 0 {
 		r = max(r, kernel.Time(sc.SetSlotsAt)) // the slot count changes at SetSlotsAt (1.8-14)
 	}
+	if sc.Rollout != nil {
+		r = max(r, lastDrain(sc)) // the last member is told to drain then (rollout.go)
+	}
 	return r
 }
 
