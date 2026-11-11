@@ -170,18 +170,19 @@ func TestTermsGrowCatches(t *testing.T) {
 	recs := []kernel.Record{
 		names,
 		grant(0, "m2/0b", wallMs+10_000, "10.000000000s"),
+		grant(500*time.Millisecond, "m1/0a", wallMs+10_001, "8.000000000s"),
 		step,
-		grant(time.Second, "m1/0a", wallMs+10_001, "5.000000000s"),
+		grant(time.Second, "m1/0a", wallMs+10_002, "5.000000000s"),
 	}
 	cover, err := termsGrow(recs, world.Observer)
-	if err != nil || cover != (termCover{fromPrev: 1, afterBackStep: 1}) {
-		t.Errorf("termsGrow = %+v, %v; want one grant of each kind and no error", cover, err)
+	if err != nil || cover != (termCover{fromPrev: 2, afterBackStep: 1}) {
+		t.Errorf("termsGrow = %+v, %v; want two grants from the previous term, one at a wall reading that went back, and no error", cover, err)
 	}
-	recs[3] = grant(time.Second, "m1/0a", wallMs+10_000, "5.000000000s")
+	recs[4] = grant(time.Second, "m1/0a", wallMs+10_001, "5.000000000s")
 	if _, err := termsGrow(recs, world.Observer); err == nil || !strings.Contains(err.Error(), "after term") {
 		t.Errorf("termsGrow = %v, want a term that does not grow", err)
 	}
-	recs[3] = grant(time.Second, "m1/0a", wallMs+10_005, "5.000000000s")
+	recs[4] = grant(time.Second, "m1/0a", wallMs+10_005, "5.000000000s")
 	if _, err := termsGrow(recs, world.Observer); err == nil || !strings.Contains(err.Error(), "want NextTerm") {
 		t.Errorf("termsGrow = %v, want a term that is not NextTerm's", err)
 	}

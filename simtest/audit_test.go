@@ -46,7 +46,8 @@ const auditSeeds = 5
 //  3. Under the Observer rule the run reaches the case the rule is about: over the seeds, at
 //     least one grant is decided at a wall reading at or below the shard's previous term (in
 //     Unix milliseconds), so the term is the previous one plus one; and at least one grant
-//     goes to a member whose wall clock has stepped backwards before it.
+//     goes to a member at a wall reading below the one an earlier grant to it was decided at,
+//     its wall clock having stepped backwards in between.
 func TestATSIM13TermsGrow(t *testing.T) {
 	r := rowNamed(t, "TestWallClock")
 	r.sc.Faults = rowNamed(t, "TestCrashRestart").sc.Faults
@@ -68,13 +69,13 @@ func TestATSIM13TermsGrow(t *testing.T) {
 			for _, c := range bySeed {
 				cover.add(c)
 			}
-			t.Logf("%v: %d grants at a wall reading at or below the previous term, %d after a step backwards",
+			t.Logf("%v: %d grants at a wall reading at or below the previous term, %d at a wall reading that went back",
 				rule, cover.fromPrev, cover.afterBackStep)
 			if t.Failed() || rule != world.Observer {
 				return
 			}
 			if cover.fromPrev == 0 || cover.afterBackStep == 0 {
-				t.Errorf("observer: %d grants at a wall reading at or below the previous term, %d after a step backwards; want some of each",
+				t.Errorf("observer: %d grants at a wall reading at or below the previous term, %d at a wall reading that went back; want some of each",
 					cover.fromPrev, cover.afterBackStep)
 			}
 		})
@@ -84,7 +85,7 @@ func TestATSIM13TermsGrow(t *testing.T) {
 // termCover counts the grants of TestATSIM13TermsGrow's step 3.
 type termCover struct {
 	fromPrev      int // grants whose term is the previous term plus one, the wall reading being at or below it
-	afterBackStep int // grants to a member whose wall clock stepped backwards before
+	afterBackStep int // grants to a member at a wall reading below that of an earlier grant to it
 }
 
 func (c *termCover) add(o termCover) {
@@ -99,8 +100,9 @@ var casWall = regexp.MustCompile(` wall=(-?[0-9]+)\.([0-9]{9})s`)
 // step 3 needs.
 func termsGrow(recs []kernel.Record, rule world.Takeover) (termCover, error) {
 	var cover termCover
-	terms := map[string]core.Term{} // the latest term granted, by shard
-	backStep := map[string]bool{}   // the members whose wall clock has stepped backwards, by name
+	terms := map[string]core.Term{}    // the latest term granted, by shard
+	backStep := map[string]bool{}      // the members whose wall clock has stepped backwards, by name
+	lastWall := map[string]time.Time{} // the wall reading of the latest grant to each member, by name
 	names := nodeNames(recs)
 	for _, r := range recs {
 		switch r.Kind {
@@ -129,9 +131,11 @@ func termsGrow(recs []kernel.Record, rule world.Takeover) (termCover, error) {
 			if prev > 0 && core.Term(term) == prev+1 && core.NextTerm(0, wall) <= prev { // the wall's milliseconds are at most prev
 				cover.fromPrev++
 			}
-			if member, _, _ := strings.Cut(attr(r, "holder"), "/"); backStep[member] {
+			member, _, _ := strings.Cut(attr(r, "holder"), "/")
+			if last, ok := lastWall[member]; ok && backStep[member] && wall.Before(last) {
 				cover.afterBackStep++
 			}
+			lastWall[member] = wall
 			terms[shard] = core.Term(term)
 		}
 	}
