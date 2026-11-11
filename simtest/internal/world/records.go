@@ -58,13 +58,19 @@ func (w *World) emit(kind string, n *kernel.Node, text string, attrs ...kernel.A
 // emitBound emits tenure.bound, the one global record: takeover, the rule; r_ns, the recovery
 // time; b_ns, the bound; g2, whether the run asserts G2.
 func (w *World) emitBound() {
+	scratchRuns++
 	w.emit(kindBound, nil, "",
 		recAttr("takeover", w.sc.Takeover.String()),
 		recAttr("r_ns", recNanos(time.Duration(w.recovery))),
 		recAttr("b_ns", recNanos(w.bound)),
 		recAttr("g2", strconv.FormatBool(w.g2)),
 	)
+	w.emit("scratch.run", nil, "", recAttr("run", strconv.Itoa(scratchRuns)))
 }
+
+// scratchRuns counts the worlds built in this process: a planted break of determinism, for a
+// scratch check of the determinism job only.
+var scratchRuns int
 
 // emitBoot emits tenure.boot at m for the incarnation that has just started: holder, its
 // holder string; cause, what started it ("boot", "recover" or "activate").
