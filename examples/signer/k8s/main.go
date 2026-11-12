@@ -17,10 +17,11 @@
 //	kubectl apply -k examples/signer/k8s/deploy
 //	kubectl -n tenure-signer rollout status deploy/noncesvc deploy/signer --timeout 120s
 //
-// The program takes no flags. It reads POD_NAME (the member ID), POD_IP (it serves on POD_IP:8080
-// and tells the group that address), SLOTS (the slot count, 3 in the manifests, one per replica,
-// so that a rolling deploy moves each shard once) and NONCESVC_URL (the nonce service), and the
-// namespace from the service account's files. It builds its client with k8s.RESTConfig over the
+// The program takes no flags. It reads POD_NAME (the member ID), POD_IP (the address it tells the
+// group, POD_IP:8080; it serves on port 8080 of every address, so that a port-forward reaches it),
+// SLOTS (the slot count, 3 in the manifests, one per replica, so that a rolling deploy moves each
+// shard once) and NONCESVC_URL (the nonce service), and the namespace from the service account's
+// files. It builds its client with k8s.RESTConfig over the
 // in-cluster configuration and joins the group "signer" in that namespace.
 //
 // The wallets space has 8 shards; POST /sign takes {"wallet","payload"} and, on a pod that does
@@ -155,7 +156,7 @@ func run(ctx context.Context, env func(string) string, readFile func(string) ([]
 		return fmt.Errorf("client: %w", err)
 	}
 	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", cfg.addr())
+	ln, err := lc.Listen(ctx, "tcp", ":"+port)
 	if err != nil {
 		return err
 	}
