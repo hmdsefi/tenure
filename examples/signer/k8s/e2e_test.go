@@ -44,6 +44,7 @@ const (
 	workers = 4
 
 	steadyBefore  = 5 * time.Second  // requests before the restart
+	termSettle    = 5 * time.Second  // quiet time that makes the terms stable
 	steadyAfter   = 10 * time.Second // requests after the rollout finished
 	rolloutLimit  = 3 * time.Minute
 	requestLimit  = 90 * time.Second // how long one request is retried
@@ -262,6 +263,14 @@ type termWatch struct {
 	mu      sync.Mutex
 	last    map[string]string
 	changes map[string]int
+	at      time.Time // the last change
+}
+
+// quiet reports whether no term changed for d.
+func (w *termWatch) quiet(d time.Duration) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return time.Since(w.at) >= d
 }
 
 func leaseNames() []string {
@@ -344,6 +353,7 @@ func (w *termWatch) consume(ctx context.Context, wi watch.Interface, rv string) 
 			if term := l.Annotations[termKey]; term != "" && term != w.last[l.Name] {
 				w.last[l.Name] = term
 				w.changes[l.Name]++
+				w.at = time.Now()
 			}
 			w.mu.Unlock()
 		}
@@ -383,7 +393,7 @@ func TestSignerKubernetes(t *testing.T) {
 	}
 	t.Logf("terms before the restart: %v", baseline)
 
-	tw := &termWatch{last: maps.Clone(baseline), changes: map[string]int{}}
+	tw := &termWatch{last: maps.Clone(baseline), changes: map[string]int{}, at: time.Now()}
 	wctx, stopWatch := context.WithCancel(ctx)
 	var watching sync.WaitGroup
 	watching.Go(func() { tw.watchTerms(wctx, client, rv) })
@@ -424,6 +434,13 @@ func TestSignerKubernetes(t *testing.T) {
 	t.Logf("rollout finished; requests ok so far: %d", l.ok.Load())
 
 	time.Sleep(steadyAfter)
+	// Pods Ready is not slots moved: count the terms once none has changed for a while.
+	for stable := time.Now().Add(termSettle); !tw.quiet(termSettle); {
+		if time.Now().After(stable.Add(time.Minute)) {
+			t.Fatalf("the Lease terms did not settle")
+		}
+		time.Sleep(retryPause)
+	}
 	stopLoad()
 
 	l.mu.Lock()
