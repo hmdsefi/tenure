@@ -12,9 +12,10 @@
 **Shard stateful Go services: every shard has one owner at a time, and a stale owner's writes can be
 rejected.**
 
-> **Status: design complete, implementation starting.** There is no code to import yet. The work is
+> **Status: v0.1.0, the first release, which targets Kubernetes.** The root module and the `k8s`
+> module are tagged and can be imported; the API may still change before v1.0.0. Later work is
 > planned as public issues: see the pinned roadmap issue and the
-> [milestones](https://github.com/hmdsefi/tenure/milestones). v0.1.0 targets Kubernetes.
+> [milestones](https://github.com/hmdsefi/tenure/milestones).
 
 Some services can't be scaled by adding replicas, because each piece of their state needs exactly
 one writer: a relayer's signer per wallet (two signers reuse a nonce), a matching engine per market
