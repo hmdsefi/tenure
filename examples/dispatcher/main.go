@@ -113,7 +113,7 @@ func execute(ctx context.Context, args []string, out io.Writer) (err error) {
 		}
 	}()
 
-	w := &work{c: c, tree: tasksTree, tasks: *tasks, seed: *seed, done: make(chan struct{}), seen: make(map[string]struct{})}
+	w := newWork(c, tasksTree, *tasks, *seed)
 	if err := w.run(ctx); err != nil {
 		return err
 	}
@@ -132,14 +132,67 @@ func execute(ctx context.Context, args []string, out io.Writer) (err error) {
 // work is the load of the program: producers that add tasks and pollers that take them.
 type work struct {
 	c     *cluster
-	tree  core.Tree
 	tasks int
 	seed  uint64
 
+	// gate, when set, is called by a producer before it adds task n; the producer stops when it
+	// fails. A test uses it to hold the load while it changes the tree.
+	gate func(ctx context.Context, n int) error
+
 	done chan struct{} // closed when every task has been delivered
 
-	mu   sync.Mutex
-	seen map[string]struct{}
+	mu       sync.Mutex
+	tree     core.Tree   // the tree the load picks partitions from
+	inflight map[int]int // calls in progress, by partition
+	seen     map[string]struct{}
+}
+
+func newWork(c *cluster, tree core.Tree, tasks int, seed uint64) *work {
+	return &work{
+		c: c, tree: tree, tasks: tasks, seed: seed,
+		done:     make(chan struct{}),
+		inflight: make(map[int]int),
+		seen:     make(map[string]struct{}),
+	}
+}
+
+// setTree changes the tree the load picks partitions from. Calls that picked before it may
+// still be in progress.
+func (w *work) setTree(t core.Tree) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.tree = t
+}
+
+// enter picks a partition for r, a write partition or a read partition, and counts a call on it
+// as in progress until leave.
+func (w *work) enter(r uint64, write bool) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	p := w.tree.PickRead(r)
+	if write {
+		p = w.tree.Pick(r)
+	}
+	w.inflight[p]++
+	return p
+}
+
+func (w *work) leave(p int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.inflight[p]--
+}
+
+// busy reports whether a call is in progress on a partition from first up.
+func (w *work) busy(first int) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for p, n := range w.inflight {
+		if p >= first && n > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *work) delivered() int {
@@ -192,6 +245,12 @@ func (w *work) run(ctx context.Context) error {
 	}
 	stop()
 	wg.Wait()
+	if err == nil {
+		select {
+		case err = <-errc: // a failure that came in as the last task did
+		default:
+		}
+	}
 	return err
 }
 
@@ -200,10 +259,18 @@ func (w *work) run(ctx context.Context) error {
 func (w *work) produce(ctx context.Context, i int) error {
 	rng := rand.New(rand.NewPCG(w.seed, uint64(i))) //nolint:gosec // seeded on purpose: the same flags make the same load
 	for n := i; n < w.tasks; n += producers {
+		if w.gate != nil {
+			if err := w.gate(ctx, n); err != nil {
+				return nil // the load ended
+			}
+		}
 		t := Task{ID: fmt.Sprintf("t-%05d", n), Payload: fmt.Sprintf("job %d", n)}
-		req := AddTaskRequest{Partition: w.tree.Pick(rng.Uint64()), Task: t}
+		r := rng.Uint64()
 		addr := w.c.addrs[rng.IntN(len(w.c.addrs))]
-		if err := w.add(ctx, addr, req); err != nil {
+		req := AddTaskRequest{Partition: w.enter(r, true), Task: t}
+		err := w.add(ctx, addr, req)
+		w.leave(req.Partition)
+		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -235,9 +302,11 @@ func (w *work) poll(ctx context.Context, i int) error {
 	rng := rand.New(rand.NewPCG(w.seed, uint64(i))) //nolint:gosec // seeded on purpose: the same flags make the same load
 	for ctx.Err() == nil {
 		addr := w.c.addrs[rng.IntN(len(w.c.addrs))]
+		part := w.enter(rng.Uint64(), false)
 		pctx, cancel := context.WithTimeout(ctx, pollDeadline)
-		t, err := w.c.client.Poll(pctx, addr, PollRequest{Partition: w.tree.PickRead(rng.Uint64())})
+		t, err := w.c.client.Poll(pctx, addr, PollRequest{Partition: part})
 		cancel()
+		w.leave(part)
 		switch {
 		case ctx.Err() != nil:
 			return nil
@@ -252,6 +321,37 @@ func (w *work) poll(ctx context.Context, i int) error {
 		}
 	}
 	return nil
+}
+
+// clusterOption changes how startCluster builds the members.
+type clusterOption func(*clusterConfig)
+
+type clusterConfig struct {
+	views map[int][]int
+}
+
+// withView gives member i its own membership list: the members at the given indexes, which
+// include i. The other members keep the full list.
+func withView(i int, members ...int) clusterOption {
+	return func(cfg *clusterConfig) {
+		if cfg.views == nil {
+			cfg.views = make(map[int][]int)
+		}
+		cfg.views[i] = members
+	}
+}
+
+// view returns the members that member i's list names.
+func (cfg *clusterConfig) view(all []core.Member, i int) []core.Member {
+	idx, ok := cfg.views[i]
+	if !ok {
+		return all
+	}
+	out := make([]core.Member, len(idx))
+	for k, j := range idx {
+		out[k] = all[j]
+	}
+	return out
 }
 
 // cluster is a group of members in one process: each has a node, a gRPC server and a listener.
@@ -271,7 +371,14 @@ type cluster struct {
 // startCluster starts n members that place the partitions of tree with their resolvers. Every
 // listener is open before the group is formed, so each member's address is known. ctx bounds the
 // start only.
-func startCluster(ctx context.Context, tree core.Tree, n int) (*cluster, error) {
+//
+// By default every member sees all n members. A test gives a member a view of its own with
+// withView.
+func startCluster(ctx context.Context, tree core.Tree, n int, opts ...clusterOption) (*cluster, error) {
+	var cfg clusterConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	c := &cluster{client: NewClient()}
 	members := make([]core.Member, n)
 	var lc net.ListenConfig
@@ -285,12 +392,12 @@ func startCluster(ctx context.Context, tree core.Tree, n int) (*cluster, error) 
 		c.addrs = append(c.addrs, ln.Addr().String())
 		members[i] = core.Member{ID: fmt.Sprintf("n%d", i+1), Addr: ln.Addr().String(), Slot: -1}
 	}
-	group, err := static.New(members)
-	if err != nil {
-		c.abort()
-		return nil, fmt.Errorf("group: %w", err)
-	}
 	for i, self := range members {
+		group, err := static.New(cfg.view(members, i))
+		if err != nil {
+			c.abort()
+			return nil, fmt.Errorf("group: %w", err)
+		}
 		node, err := tenure.Start(ctx, tenure.Config{Self: self, Membership: group.Share()})
 		if err != nil {
 			c.abort()
