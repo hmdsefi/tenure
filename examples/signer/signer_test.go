@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -353,6 +354,44 @@ func TestCommand(t *testing.T) {
 
 	if err := execute(ctx, []string{"-requests", "0"}, io.Discard); err == nil {
 		t.Error("execute with -requests 0 succeeded")
+	}
+}
+
+// TestLoadRouteLoop checks that a client that ends up in a route loop sends its request again:
+// the server answers 421, naming itself, to the first 7 sends, and signs after that.
+func TestLoadRouteLoop(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	var (
+		mu    sync.Mutex
+		posts int
+		srv   *httptest.Server
+	)
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		posts++
+		n := posts
+		mu.Unlock()
+		if n <= 7 { // two route loops of 3 sends each, then one more 421
+			w.Header().Set("Tenure-Route", srv.Listener.Addr().String())
+			w.WriteHeader(http.StatusMisdirectedRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(signing.Tx{Wallet: "w-00", Nonce: 0, Payload: "p0-0"})
+	}))
+	defer srv.Close()
+
+	l := &load{hc: srv.Client(), urls: []string{srv.URL}, clients: 1, requests: 1, seed: 1}
+	if err := l.run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := l.signed.Load(); got != 1 {
+		t.Errorf("signed %d requests, want 1", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if posts != 8 {
+		t.Errorf("server saw %d posts, want 8", posts)
 	}
 }
 

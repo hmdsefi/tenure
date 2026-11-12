@@ -6,11 +6,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hmdsefi/tenure/examples/internal/demo"
 	"github.com/hmdsefi/tenure/examples/internal/signing"
@@ -85,7 +87,7 @@ func (l *load) client(ctx context.Context, i, n int) error {
 		if err != nil {
 			return err
 		}
-		res, err := demo.Post(ctx, l.hc, url, body)
+		res, err := post(ctx, l.hc, url, body)
 		if err != nil {
 			return fmt.Errorf("request %s: %w", req.Payload, err)
 		}
@@ -99,6 +101,26 @@ func (l *load) client(ctx context.Context, i, n int) error {
 		l.record(tx)
 	}
 	return nil
+}
+
+// routeLoopWait is how long post waits after demo.Post gave up on a route loop.
+const routeLoopWait = 50 * time.Millisecond
+
+// post is demo.Post that sends the request again after a route loop. Right after a start or a
+// drain two nodes can name each other as the owner of a shard until their views agree; a 421
+// means the request was not accepted, so sending it again signs nothing twice.
+func post(ctx context.Context, hc *http.Client, url string, body []byte) (demo.Response, error) {
+	for {
+		res, err := demo.Post(ctx, hc, url, body)
+		if !errors.Is(err, demo.ErrRouteLoop) {
+			return res, err
+		}
+		select {
+		case <-time.After(routeLoopWait):
+		case <-ctx.Done():
+			return res, ctx.Err()
+		}
+	}
 }
 
 // record keeps a signed transaction.
