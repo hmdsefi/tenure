@@ -59,6 +59,10 @@ differ:
 FAULTLINE_CHECK_DETERMINISM=1 GOWORK=off go -C simtest test -count=1 ./...
 ```
 
+No test turns this check on by itself, so state that makes two runs of a seed differ, such as a
+package-level counter, fails this command and not the others. `TestTraceReplay`, which compares
+two runs of one seed record by record, runs only with the variable set and skips otherwise.
+
 `simtest` also has four planted bugs, which build only with the tag `tenure_mutants`. A plain
 `vet` or lint never sees their files, so vet and lint `simtest` once more with the tag:
 
@@ -71,7 +75,7 @@ Do not run `go test` with the tag: each `TestMutant<Name>` fails by design. `Tes
 which runs without the tag, builds each planted bug with the tag and checks that it fails.
 
 On every pull request, CI runs `simtest` with `-short` and the race detector, and it runs the
-command above on Linux and macOS with Go 1.26 and the newest stable Go. It runs the full seed
+`FAULTLINE_CHECK_DETERMINISM=1` command on Linux and macOS with Go 1.26 and the newest stable Go. It runs the full seed
 counts on every push to `main`, and 2000 new seeds for each simulation every night.
 
 Each nested module requires the root module, and any other module of this repository it uses,
