@@ -31,6 +31,11 @@ jobs:
         with:
           version: v2.14.0
           working-directory: k8s
+      - name: golangci-lint (examples)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+          working-directory: examples
       - name: golangci-lint (simtest)
         uses: golangci/golangci-lint-action@v9
         with:
