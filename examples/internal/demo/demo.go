@@ -62,7 +62,8 @@ type Cluster struct {
 	// Nodes are the running nodes.
 	Nodes []*tenure.Node
 
-	// Cuts are the stores the nodes use; each wraps Store.
+	// Cuts are the stores the nodes use; each wraps Store. A node whose store is cut also gets
+	// no new view of the group (see CutStore.Membership).
 	Cuts []*CutStore
 
 	// Store is the one store shared by all nodes, reachable without a cut.
@@ -70,6 +71,13 @@ type Cluster struct {
 
 	// Addrs are the listener addresses, "127.0.0.1:port": the member addresses.
 	Addrs []string
+
+	// Groups are the handles the nodes joined the group with. SetDraining(ctx, true) on
+	// Groups[i] marks member n<i+1> as draining for every node but itself while its store is cut,
+	// as a failure detector that evicts a member would: the other members place its shards on
+	// themselves and take them once its session has expired in the store, while the node goes
+	// on believing it owns them. Do not call Leave on a handle; the node's Close does.
+	Groups []*static.Membership
 
 	listeners []net.Listener
 	servers   []*http.Server
@@ -121,9 +129,10 @@ func Start(ctx context.Context, opts Options) (*Cluster, error) {
 	}
 	for i, self := range members {
 		cut := NewCutStore(c.Store)
+		handle := group.Share()
 		cfg := tenure.Config{
 			Self:       self,
-			Membership: group.Share(),
+			Membership: cut.Membership(handle),
 			Store:      cut,
 			Timing:     opts.Timing,
 		}
@@ -135,6 +144,7 @@ func Start(ctx context.Context, opts Options) (*Cluster, error) {
 			c.abort(ctx)
 			return nil, fmt.Errorf("demo: start %s: %w", self.ID, err)
 		}
+		c.Groups = append(c.Groups, handle)
 		c.Cuts = append(c.Cuts, cut)
 		c.Nodes = append(c.Nodes, n)
 	}

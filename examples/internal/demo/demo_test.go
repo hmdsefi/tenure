@@ -466,3 +466,35 @@ func TestStartOptions(t *testing.T) {
 		}
 	})
 }
+
+// n2Draining reports whether node n's latest view lists member n2 as draining.
+func n2Draining(n *tenure.Node) bool {
+	for _, m := range n.Table().Members {
+		if m.ID == "n2" {
+			return m.Draining
+		}
+	}
+	return false
+}
+
+// TestCutMembership checks that a cut node does not see the group change while the other nodes
+// do, and sees it after Heal.
+func TestCutMembership(t *testing.T) {
+	noLeaks(t)
+	ctx := testCtx(t, 30*time.Second)
+	c := startCluster(t, demo.Options{Nodes: 3, Spaces: testSpaces})
+
+	c.Cuts[1].Cut()
+	if err := c.Groups[1].SetDraining(ctx, true); err != nil {
+		t.Fatalf("SetDraining: %v", err)
+	}
+	waitFor(t, ctx, "n1 to see n2 draining", func() bool { return n2Draining(c.Nodes[0]) })
+	waitFor(t, ctx, "n3 to see n2 draining", func() bool { return n2Draining(c.Nodes[2]) })
+	time.Sleep(200 * time.Millisecond)
+	if n2Draining(c.Nodes[1]) {
+		t.Error("the cut node n2 sees the group change")
+	}
+
+	c.Cuts[1].Heal()
+	waitFor(t, ctx, "n2 to see itself draining after Heal", func() bool { return n2Draining(c.Nodes[1]) })
+}
