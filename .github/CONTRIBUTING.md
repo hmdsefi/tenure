@@ -75,8 +75,10 @@ Do not run `go test` with the tag: each `TestMutant<Name>` fails by design. `Tes
 which runs without the tag, builds each planted bug with the tag and checks that it fails.
 
 On every pull request, CI runs `simtest` with `-short` and the race detector, and it runs the
-`FAULTLINE_CHECK_DETERMINISM=1` command on Linux and macOS with Go 1.26 and the newest stable Go. It runs the full seed
-counts on every push to `main`, and 2000 new seeds for each simulation every night.
+`FAULTLINE_CHECK_DETERMINISM=1` command on Linux and macOS with Go 1.26 and the newest stable
+Go. It runs the full seed counts on every push to `main`, and 2000 new seeds for each simulation
+every night, each passing seed twice. The goroutine-mode tests of `simtest/bubble` cannot replay
+a seed exactly, so they skip under `FAULTLINE_CHECK_DETERMINISM=1` and run without it.
 
 Each nested module requires the root module, and any other module of this repository it uses,
 through a `replace` directive that points at that module's directory in your checkout. That is
