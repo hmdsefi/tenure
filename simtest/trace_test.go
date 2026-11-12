@@ -5,6 +5,7 @@ package simtest
 
 import (
 	"fmt"
+	"os"
 	"slices"
 	"testing"
 
@@ -17,6 +18,9 @@ import (
 // replaySeed is the seed of TestSteady's server row that TestTraceReplay runs twice.
 const replaySeed = 0x1
 
+// traceReplaySkip is why TestTraceReplay skips in a run without FAULTLINE_CHECK_DETERMINISM=1.
+const traceReplaySkip = "simtest: TestTraceReplay runs a seed twice and so runs only with FAULTLINE_CHECK_DETERMINISM=1, like every same-seed check"
+
 // traceRun is what one run of TestTraceReplay keeps: every record and the trace hash.
 type traceRun struct {
 	records []kernel.Record
@@ -28,13 +32,20 @@ type traceRun struct {
 // Cause, Text and Attrs), and the same trace hash. The first difference is reported. The
 // steps were written for this task from the issue and the design note, since the original
 // acceptance-test text is lost.
+//
+// Like every check that runs a seed twice, it runs only with FAULTLINE_CHECK_DETERMINISM=1, as
+// CI's determinism step sets it, and skips otherwise (AT-DET-16): state kept outside the World,
+// such as a package-level counter, makes two runs of a seed differ, and only that step is to
+// fail on it.
 func TestTraceReplay(t *testing.T) {
+	if os.Getenv("FAULTLINE_CHECK_DETERMINISM") != "1" {
+		t.Skip(traceReplaySkip)
+	}
 	r := rowNamed(t, "TestSteady")
-	opts := r.options()
+	opts := r.options() // CheckDeterminism off: the test compares the two runs itself
 	opts.Trace = kernel.TraceConfig{Level: kernel.TraceFull}
-	opts.CheckDeterminism = false // the test compares the two runs itself
 	// Each subtest keeps the trace of its first run only: FAULTLINE_CHECK_DETERMINISM=1, which
-	// an option cannot turn off, runs the seed a second time with the hash alone.
+	// this test needs, runs the seed a second time with the hash alone.
 	var runs [2]*traceRun
 	for i := range runs {
 		t.Run(fmt.Sprintf("run%d", i+1), func(t *testing.T) {

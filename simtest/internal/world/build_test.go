@@ -23,13 +23,13 @@ import (
 	"github.com/hmdsefi/faultline/kernel/fault"
 )
 
-// runWorld runs Build for sc in every run of a faultline test with opts, which checks
-// determinism, then body with the world. A failure of body goes to fw.T(). The final checks are
-// off: these tests disturb the world by hand after its recovery time, which the finals cannot
-// know of, and the finals have tests of their own (finals_test.go).
+// runWorld runs Build for sc in every run of a faultline test with opts, then body with the
+// world. A failure of body goes to fw.T(). Like every test of the module, it leaves the
+// determinism check to FAULTLINE_CHECK_DETERMINISM (AT-DET-16). The final checks are off: these
+// tests disturb the world by hand after its recovery time, which the finals cannot know of, and
+// the finals have tests of their own (finals_test.go).
 func runWorld(t *testing.T, opts faultline.Options, sc Scenario, body func(fw *faultline.World, w *World)) {
 	t.Helper()
-	opts.CheckDeterminism = true
 	if opts.Seeds == 0 {
 		opts.Seeds = 3
 	}
@@ -468,7 +468,7 @@ func TestATSIM06Child(t *testing.T) {
 	if os.Getenv(childEnv) != "1" {
 		t.Skip("runs only as the child process of TestATSIM06ClockJump")
 	}
-	faultline.Run(t, faultline.Options{Seeds: 1, CheckDeterminism: true}, func(fw *faultline.World) {
+	faultline.Run(t, faultline.Options{Seeds: 1}, func(fw *faultline.World) {
 		Build(fw, clockJumps)
 		fw.T().Log("built a world")
 	})

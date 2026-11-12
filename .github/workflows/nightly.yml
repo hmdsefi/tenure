@@ -28,10 +28,19 @@ jobs:
         with:
           go-version-file: simtest/go.mod
           cache-dependency-path: simtest/go.sum
-      - name: simulations with new seeds
+      # No simtest test checks determinism by itself, so the variable is what runs every passing
+      # seed twice here. The goroutine-mode tests of bubble skip under it, so they get a step of
+      # their own, without it.
+      - name: simulations with new seeds, every seed twice
         env:
           FAULTLINE_ARTIFACTS: ${{ runner.temp }}/faultline
+          FAULTLINE_CHECK_DETERMINISM: '1'
         run: go -C simtest test -count=1 -timeout 350m ./...
+      - name: goroutine mode with new seeds
+        if: ${{ !cancelled() }}
+        env:
+          FAULTLINE_ARTIFACTS: ${{ runner.temp }}/faultline
+        run: go -C simtest test -count=1 -timeout 30m ./bubble/...
       - name: upload the artifacts of the failing seeds
         if: failure()
         uses: actions/upload-artifact@v7

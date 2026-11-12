@@ -30,8 +30,8 @@ const (
 // and each member recovers with a new holder (SIM-145). Every invariant but G2 holds after
 // every event; G2 is not asserted, because the store may grant an ended session's shard while
 // its holder, not yet aware, still owns it inside its deadline. The finals tenure/g5,
-// tenure/converged and tenure/recovered pass, and m1 recovers exactly once. Every seed runs
-// twice with equal trace hashes.
+// tenure/converged and tenure/recovered pass, and m1 recovers exactly once. With
+// FAULTLINE_CHECK_DETERMINISM=1, every seed runs twice with equal trace hashes.
 func TestSessionEnds(t *testing.T) {
 	runRow(t, rowNamed(t, "TestSessionEnds"), func(fw *faultline.World, w *world.World) {
 		m1 := w.Members()[0]

@@ -17,8 +17,8 @@ import (
 // TestSteady runs five members that share the 16 shards of one space for 60 s under each rule,
 // with a stop delay of up to 1 s and no fault (SIM-600's first row, AT-SIM-31): every invariant
 // holds after every event, every shard has an owner once the bound has passed, and at the end
-// the members agree on the placement and each shard runs on its assignee. Every seed runs twice
-// with equal trace hashes.
+// the members agree on the placement and each shard runs on its assignee. With
+// FAULTLINE_CHECK_DETERMINISM=1, every seed runs twice with equal trace hashes.
 //
 // It also checks AT-SIM-33: the trace hashes of the seeds of TestSteady/server are pairwise
 // distinct, so the seeds do explore different runs. The steps were written for this task from
@@ -26,7 +26,7 @@ import (
 func TestSteady(t *testing.T) {
 	r := rowNamed(t, "TestSteady")
 	// The trace hash of each run, by rule and seed. A seed that runs twice, for the
-	// determinism check, writes the same hash twice.
+	// determinism check of FAULTLINE_CHECK_DETERMINISM=1, writes the same hash twice.
 	hashes := map[world.Takeover]map[uint64]uint64{}
 	for _, rule := range r.takeovers() {
 		hashes[rule] = map[uint64]uint64{}
