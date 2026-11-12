@@ -111,7 +111,8 @@ func (c *slowChain) Broadcast(ctx context.Context, tx Tx) error {
 
 // published runs the shard at term in the background, waits until it is published and returns
 // the function that ends Run.
-func published(t *testing.T, s *Signer, shard int, term core.Term) (stop func()) {
+func published(t *testing.T, s *Signer, term core.Term) (stop func()) {
+	const shard = 2
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -180,12 +181,12 @@ func TestSignerRun(t *testing.T) {
 	t.Run("a new term on the same node", func(t *testing.T) {
 		chain := NewChain()
 		s, _ := newSigner(chain)
-		stopOld := published(t, s, shard, 5)
+		stopOld := published(t, s, 5)
 		if _, err := s.sign(ctx, shard, 5, wallet, "a"); err != nil {
 			t.Fatal(err)
 		}
 		// The new term raises the fence while the old Run still holds its shard.
-		stopNew := published(t, s, shard, 6)
+		stopNew := published(t, s, 6)
 		defer stopNew()
 		if _, err := s.sign(ctx, shard, 5, wallet, "b"); !errors.Is(err, ErrStale) {
 			t.Fatalf("sign at the old term = %v, want ErrStale", err)
@@ -208,7 +209,7 @@ func TestSignerRun(t *testing.T) {
 	t.Run("one shard serialises a wallet", func(t *testing.T) {
 		chain := &slowChain{FakeChain: NewChain()}
 		s, _ := newSigner(chain)
-		defer published(t, s, shard, 1)()
+		defer published(t, s, 1)()
 		var wg sync.WaitGroup
 		for range 16 {
 			wg.Go(func() { _, _ = s.sign(ctx, shard, 1, wallet, "p") })
@@ -222,7 +223,7 @@ func TestSignerRun(t *testing.T) {
 	t.Run("a broadcast outlives the request", func(t *testing.T) {
 		chain := &slowChain{FakeChain: NewChain()}
 		s, _ := newSigner(chain)
-		defer published(t, s, shard, 1)()
+		defer published(t, s, 1)()
 		gone, cancel := context.WithCancel(ctx)
 		cancel()
 		if _, err := s.sign(gone, shard, 1, wallet, "p"); err != nil {
