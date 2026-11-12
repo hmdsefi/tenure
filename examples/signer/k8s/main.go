@@ -71,6 +71,10 @@ const (
 	drainTimeout = 25 * time.Second
 	closeTimeout = 3 * time.Second
 
+	// shutdownTimeout bounds the wait for requests in flight after the node is closed. With the
+	// drain and the close it makes 29 s, inside the pod's 30 s of termination grace.
+	shutdownTimeout = time.Second
+
 	// httpTimeout bounds one call to the nonce service.
 	httpTimeout = 5 * time.Second
 )
@@ -211,10 +215,12 @@ func serve(ctx context.Context, cfg config, client kubernetes.Interface, ln net.
 	}
 
 	stopNode(n)
-	sd, cancel := context.WithTimeout(context.Background(), time.Second)
+	sd, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(sd); err != nil {
-		return err
+		// Requests still in flight (a forwarded one waiting on its owner) do not hold the pod
+		// back: the node is closed already, so cut them and exit 0 as the doc comment says.
+		_ = srv.Close()
 	}
 	if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err

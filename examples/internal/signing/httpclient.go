@@ -11,9 +11,14 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/hmdsefi/tenure/core"
 )
+
+// defaultTimeout bounds one call of a client made without an http.Client of its own, so that a
+// call to a service that does not answer cannot wait for ever.
+const defaultTimeout = 10 * time.Second
 
 // maxAnswer is the most of an answer of the nonce service that a client reads.
 const maxAnswer = 1 << 20
@@ -24,8 +29,8 @@ type HTTPNonces struct {
 }
 
 // NewHTTPNonces returns Nonces that call the nonce service at base, such as
-// "http://noncesvc:8080", with hc; a nil hc means http.DefaultClient. A stale answer of the
-// service comes back as an error that wraps ErrStale.
+// "http://noncesvc:8080", with hc; a nil hc means a client with a 10 s timeout. A stale answer
+// of the service comes back as an error that wraps ErrStale.
 func NewHTTPNonces(base string, hc *http.Client) *HTTPNonces {
 	return &HTTPNonces{c: newHTTPClient(base, hc)}
 }
@@ -53,8 +58,8 @@ type HTTPChain struct {
 }
 
 // NewHTTPChain returns a Chain that calls the nonce service at base with hc; a nil hc means
-// http.DefaultClient. A rejection of the service comes back as an error that wraps ErrConflict
-// or ErrGap.
+// a client with a 10 s timeout. A rejection of the service comes back as an error that wraps
+// ErrConflict or ErrGap.
 func NewHTTPChain(base string, hc *http.Client) *HTTPChain {
 	return &HTTPChain{c: newHTTPClient(base, hc)}
 }
@@ -84,7 +89,7 @@ type httpClient struct {
 
 func newHTTPClient(base string, hc *http.Client) *httpClient {
 	if hc == nil {
-		hc = http.DefaultClient
+		hc = &http.Client{Timeout: defaultTimeout}
 	}
 	return &httpClient{base: strings.TrimSuffix(base, "/"), hc: hc}
 }

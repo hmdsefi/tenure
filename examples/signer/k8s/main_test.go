@@ -9,6 +9,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -137,5 +140,26 @@ func TestServe(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("serve did not return after its context ended")
+	}
+}
+
+// TestStopFitsTerminationGrace checks that the drain, the close and the shutdown of the HTTP
+// server fit in the terminationGracePeriodSeconds of the signer's manifest, and that the stop
+// keeps the 25 s and 3 s that EXM-350 sets.
+func TestStopFitsTerminationGrace(t *testing.T) {
+	if drainTimeout != 25*time.Second || closeTimeout != 3*time.Second {
+		t.Errorf("drain %v and close %v, want 25 s and 3 s", drainTimeout, closeTimeout)
+	}
+	raw, err := os.ReadFile("deploy/signer.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?m)^\s*terminationGracePeriodSeconds:\s*(\d+)\s*$`).FindSubmatch(raw)
+	if m == nil {
+		t.Fatal("deploy/signer.yaml has no terminationGracePeriodSeconds")
+	}
+	grace, _ := strconv.Atoi(string(m[1]))
+	if stop := drainTimeout + closeTimeout + shutdownTimeout; stop >= time.Duration(grace)*time.Second {
+		t.Errorf("the stop takes up to %v, the pod's grace is %d s", stop, grace)
 	}
 }
