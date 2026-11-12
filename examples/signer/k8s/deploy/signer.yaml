@@ -1,0 +1,55 @@
+# Three signer pods with one slot each: a rolling deploy surges one pod and never removes a ready
+# one first, so each shard moves once.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signer
+  labels:
+    app: signer
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: signer
+  template:
+    metadata:
+      labels:
+        app: signer
+    spec:
+      serviceAccountName: signer
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: signer
+          image: tenure-signer:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SLOTS
+              value: "3"
+            - name: NONCESVC_URL
+              value: http://noncesvc:8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true

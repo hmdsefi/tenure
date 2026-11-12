@@ -1,0 +1,52 @@
+# The nonce fence and the fake chain, in memory: one replica, because the fence must be one.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: noncesvc
+  labels:
+    app: noncesvc
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: noncesvc
+  template:
+    metadata:
+      labels:
+        app: noncesvc
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: noncesvc
+          image: tenure-noncesvc:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: LISTEN_ADDR
+              value: ":8080"
+          readinessProbe:
+            httpGet:
+              path: /report
+              port: http
+            periodSeconds: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: noncesvc
+spec:
+  selector:
+    app: noncesvc
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
