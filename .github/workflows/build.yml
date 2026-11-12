@@ -364,6 +364,13 @@ jobs:
         run: |
           grep -q -e '^--- PASS: TestSignerKubernetes ' "$RUNNER_TEMP/examples-k8s-test.log"
           if grep -e '--- SKIP: TestSignerKubernetes' "$RUNNER_TEMP/examples-k8s-test.log"; then exit 1; fi
+      - name: cluster state after a failure
+        if: failure()
+        run: |
+          kubectl get pods,leases -A -o wide || true
+          kubectl -n tenure-signer describe pods || true
+          kubectl -n tenure-signer logs -l app=signer --all-containers --tail=200 --prefix || true
+          kubectl -n tenure-signer logs -l app=noncesvc --all-containers --tail=200 --prefix || true
 
   golden-trailer:
     if: github.event_name == 'pull_request'

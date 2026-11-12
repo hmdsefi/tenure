@@ -202,6 +202,7 @@ type load struct {
 	hc *http.Client
 
 	ok       atomic.Int64
+	attempts atomic.Int64 // requests sent, resends included
 	mu       sync.Mutex
 	failures []string
 }
@@ -217,6 +218,7 @@ func (l *load) request(ctx context.Context, wallet string) error {
 		base, gen, err := l.f.target(ctx)
 		if err == nil {
 			var res demo.Response
+			l.attempts.Add(1)
 			res, err = demo.Post(ctx, l.hc, base+"/sign", body)
 			switch {
 			case err != nil:
@@ -271,6 +273,14 @@ func (w *termWatch) quiet(d time.Duration) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return time.Since(w.at) >= d
+}
+
+// reset forgets the changes counted so far and takes the current terms as the new baseline.
+func (w *termWatch) reset() map[string]string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.changes = map[string]int{}
+	return maps.Clone(w.last)
 }
 
 func leaseNames() []string {
@@ -407,9 +417,24 @@ func TestSignerKubernetes(t *testing.T) {
 		senders.Go(func() { l.run(ctx, w, stop) })
 	}
 	stopLoad := sync.OnceFunc(func() { close(stop); senders.Wait() })
-	defer stopLoad()
+	defer func() {
+		if t.Failed() {
+			cancel() // do not wait out the retries of requests that cannot succeed
+		}
+		stopLoad()
+	}()
 
 	time.Sleep(steadyBefore)
+	// The Leases may still be moving while the deployment settles: the baseline is the terms
+	// once none has changed for a while, and only the changes after it count.
+	for deadline := time.Now().Add(time.Minute); !tw.quiet(termSettle); {
+		if time.Now().After(deadline) {
+			t.Fatalf("the Lease terms did not settle before the restart")
+		}
+		time.Sleep(retryPause)
+	}
+	baseline = tw.reset()
+	t.Logf("terms at the restart: %v", baseline)
 	if n := l.ok.Load(); n == 0 {
 		t.Fatalf("no request got a 200 in %v before the restart; failures: %v", steadyBefore, l.failures)
 	}
@@ -475,6 +500,9 @@ func TestSignerKubernetes(t *testing.T) {
 	if len(rep.Conflicts) > 0 || len(rep.Gaps) > 0 {
 		t.Errorf("the chain saw conflicts %v and gaps %v", rep.Conflicts, rep.Gaps)
 	}
+	if sent := int(l.attempts.Load()); rep.Accepted > sent {
+		t.Errorf("the chain accepted %d transactions, more than the %d requests sent", rep.Accepted, sent)
+	}
 	if rep.Accepted < ok {
 		t.Errorf("the chain accepted %d transactions, fewer than the %d requests that ended 200", rep.Accepted, ok)
 	}
@@ -483,7 +511,14 @@ func TestSignerKubernetes(t *testing.T) {
 	watching.Wait()
 	tw.mu.Lock()
 	defer tw.mu.Unlock()
+	final, _, err := waitLeases(ctx, client)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range leaseNames() {
+		if final[name] != tw.last[name] {
+			t.Errorf("Lease %s: tenure.term is %s but the watch saw %s: a change was missed", name, final[name], tw.last[name])
+		}
 		if n := tw.changes[name]; n != 1 {
 			t.Errorf("Lease %s: tenure.term changed %d times (%s to %s), want once", name, n, baseline[name], tw.last[name])
 		}
