@@ -3,7 +3,7 @@ module github.com/hmdsefi/tenure/examples
 go 1.26.0
 
 require (
-	github.com/hmdsefi/tenure v0.0.0-00010101000000-000000000000
+	github.com/hmdsefi/tenure v0.1.0
 	github.com/hmdsefi/tenure/k8s v0.0.0-00010101000000-000000000000
 	go.uber.org/goleak v1.3.0
 	google.golang.org/grpc v1.85.0
