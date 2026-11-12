@@ -328,6 +328,50 @@ jobs:
             END { exit bad }
           ' "$RUNNER_TEMP/k8s-test.log"
 
+  examples-k8s:
+    name: examples on kind
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: examples/go.mod
+          cache-dependency-path: examples/go.sum
+      - name: install kind
+        run: go install sigs.k8s.io/kind@v0.33.0
+      - name: build the images
+        run: |
+          docker build -f examples/signer/k8s/Dockerfile --build-arg PKG=./signer/k8s -t tenure-signer:dev .
+          docker build -f examples/signer/k8s/Dockerfile --build-arg PKG=./signer/noncesvc -t tenure-noncesvc:dev .
+      - name: create the kind cluster
+        run: |
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+          kind create cluster --name tenure-examples --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5 --kubeconfig "$RUNNER_TEMP/kubeconfig" --wait 120s
+      - name: deploy the signer and noncesvc
+        run: |
+          kind load docker-image tenure-signer:dev tenure-noncesvc:dev --name tenure-examples
+          kubectl apply -k examples/signer/k8s/deploy
+          kubectl -n tenure-signer rollout status deploy/noncesvc deploy/signer --timeout 120s
+      - name: test the signer through a rollout
+        env:
+          TENURE_TEST_EXTERNAL: '1'
+        run: |
+          set -o pipefail
+          TENURE_TEST_KUBECONFIG="$KUBECONFIG" go -C examples test -race -count=1 -v -run '^TestSignerKubernetes$' ./signer/k8s 2>&1 | tee "$RUNNER_TEMP/examples-k8s-test.log"
+      - name: TestSignerKubernetes not skipped
+        run: |
+          grep -q -e '^--- PASS: TestSignerKubernetes ' "$RUNNER_TEMP/examples-k8s-test.log"
+          if grep -e '--- SKIP: TestSignerKubernetes' "$RUNNER_TEMP/examples-k8s-test.log"; then exit 1; fi
+      - name: cluster state after a failure
+        if: failure()
+        run: |
+          kubectl get pods,leases -A -o wide || true
+          kubectl -n tenure-signer describe pods || true
+          kubectl -n tenure-signer logs -l app=signer --all-containers --tail=200 --prefix || true
+          kubectl -n tenure-signer logs -l app=noncesvc --all-containers --tail=200 --prefix || true
+
   golden-trailer:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
