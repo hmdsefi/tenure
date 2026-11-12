@@ -3,7 +3,7 @@ module github.com/hmdsefi/tenure/k8s
 go 1.26.0
 
 require (
-	github.com/hmdsefi/tenure v0.0.0-00010101000000-000000000000
+	github.com/hmdsefi/tenure v0.1.0
 	go.uber.org/goleak v1.3.0
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
