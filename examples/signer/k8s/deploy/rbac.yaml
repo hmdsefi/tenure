@@ -1,0 +1,26 @@
+# The signer pods keep the group "signer" in Leases of their own namespace and need nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: signer
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: signer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: signer
+subjects:
+  - kind: ServiceAccount
+    name: signer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: signer

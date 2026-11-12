@@ -1,0 +1,15 @@
+.git
+.github
+.helper
+.claude
+.idea
+.vscode
+**/*.test
+**/*.out
+**/*.prof
+coverage.*
+cover.out
+/bin
+/dist
+go.work
+go.work.sum
