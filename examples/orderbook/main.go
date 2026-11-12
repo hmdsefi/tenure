@@ -111,15 +111,25 @@ func execute(ctx context.Context, args []string, out io.Writer) (err error) {
 		orders:  *orders,
 		seed:    *seed,
 	}
+	// The clients stop when execute returns, whatever the reason.
+	lctx, stopLoad := context.WithCancel(ctx)
+	defer stopLoad()
 	loadDone := make(chan error, 1)
-	go func() { loadDone <- l.run(ctx) }()
+	go func() { loadDone <- l.run(lctx) }()
 
-	// The drain comes after half of the orders are accepted, unless the clients end first.
+	// The drain comes after half of the orders are accepted. When the clients end first, with
+	// every order accepted, the drain comes at once; a client that failed ends the program.
 	half := int64((*orders + 1) / 2)
+	finished := false
+wait:
 	for l.accepted.Load() < half {
 		select {
 		case err := <-loadDone:
-			return err
+			if err != nil {
+				return err
+			}
+			finished = true
+			break wait
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(5 * time.Millisecond):
@@ -142,8 +152,10 @@ func execute(ctx context.Context, args []string, out io.Writer) (err error) {
 	if err != nil {
 		return fmt.Errorf("wait for the shards of %s to move: %w", memberID(drained), err)
 	}
-	if err := <-loadDone; err != nil {
-		return err
+	if !finished {
+		if err := <-loadDone; err != nil {
+			return err
+		}
 	}
 
 	fmt.Fprintf(out, "\nafter the drain of %s:\n", memberID(drained))

@@ -438,6 +438,22 @@ func TestCommand(t *testing.T) {
 	}
 }
 
+// TestCommandShort runs the program with so few orders that the clients may end before the
+// program has seen half of them accepted: it must still drain, print both tables and the summary.
+func TestCommandShort(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Second)
+	defer cancel()
+	for i := range 10 {
+		var out bytes.Buffer
+		if err := execute(ctx, []string{"-orders", "1", "-clients", "1"}, &out); err != nil {
+			t.Fatalf("run %d: execute: %v\n%s", i, err, out.String())
+		}
+		if s := out.String(); strings.Count(s, "shard  owner  term") != 2 || !strings.Contains(s, "orders accepted: 1\n") {
+			t.Fatalf("run %d: output lacks two tables or the summary:\n%s", i, s)
+		}
+	}
+}
+
 // TestOrderEntry checks the answers of POST /orders: 200 with fills, 409 for a repeated ID,
 // 400 for a body that is not a valid order, 421 with the owner's address from a member that does
 // not own the shard, 503 with Retry-After from an engine that refuses orders, and 405 for other
