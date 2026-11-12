@@ -57,14 +57,20 @@ func (w *World) emit(kind string, n *kernel.Node, text string, attrs ...kernel.A
 	w.sim.Emit(r)
 }
 
+// plantedRuns counts the runs of this process. It is the planted bug of AT-DET-16's scratch
+// branch: package-level state that makes two runs of a seed emit different records.
+var plantedRuns uint64
+
 // emitBound emits tenure.bound, the one global record: takeover, the rule; r_ns, the recovery
-// time; b_ns, the bound; g2, whether the run asserts G2.
+// time; b_ns, the bound; g2, whether the run asserts G2; run, the planted run counter.
 func (w *World) emitBound() {
+	plantedRuns++
 	w.emit(kindBound, nil, "",
 		recAttr("takeover", w.sc.Takeover.String()),
 		recAttr("r_ns", recNanos(time.Duration(w.recovery))),
 		recAttr("b_ns", recNanos(w.bound)),
 		recAttr("g2", strconv.FormatBool(w.g2)),
+		recAttr("run", strconv.FormatUint(plantedRuns, 10)),
 	)
 }
 

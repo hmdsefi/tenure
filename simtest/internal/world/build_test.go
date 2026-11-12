@@ -356,7 +356,7 @@ func TestBuildRecovery(t *testing.T) {
 					"b_ns=" + strconv.FormatInt(int64(tt.bound), 10),
 					"g2=" + strconv.FormatBool(tt.g2),
 				}
-				if len(bound) != 1 || bound[0].Node != 0 || bound[0].At != 0 || !slices.Equal(attrs(bound[0]), want) {
+				if len(bound) != 1 || bound[0].Node != 0 || bound[0].At != 0 || !slices.Equal(attrs(bound[0])[:4], want) {
 					t.Errorf("tenure.bound records %+v, want one global record at 0 with %v", bound, want)
 				}
 			})
