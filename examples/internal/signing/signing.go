@@ -42,6 +42,9 @@ const (
 	// that the previous owner made just before the raise needs that long to reach the chain;
 	// without the wait the new owner's first broadcast could overtake it and be a gap.
 	settle = 100 * time.Millisecond
+
+	// broadcastTimeout bounds a broadcast that no longer follows the request's context.
+	broadcastTimeout = 10 * time.Second
 )
 
 // ErrStale means the term of a reservation is below the shard's fence. It is fencedb.ErrStale,
@@ -212,6 +215,13 @@ var (
 // sign reserves the wallet's next nonce at the term of the shard, signs the payload and
 // broadcasts the transaction, all under the shard's lock. An error that wraps ErrStale means the
 // fence rejected the reservation: the shard then refuses every further request of its term.
+//
+// A reserved nonce is spent whatever happens next, so a failed broadcast leaves a gap that the
+// chain rejects for every later transaction of the wallet. The broadcast therefore does not stop
+// when the client goes away: it runs on a context that is not cancelled with ctx, and ends after
+// broadcastTimeout. A chain that rejects or fails the transaction itself still burns the nonce;
+// the example does not repair that, since the fake chain only rejects what a correct signer
+// never sends.
 func (s *Signer) sign(ctx context.Context, shard int, term core.Term, wallet, payload string) (Tx, error) {
 	st := s.shard(shard, term)
 	if st == nil {
@@ -230,7 +240,9 @@ func (s *Signer) sign(ctx context.Context, shard int, term core.Term, wallet, pa
 		return Tx{}, err
 	}
 	tx := Tx{Wallet: wallet, Nonce: nonce, Payload: payload, Sig: Signature(wallet, nonce, payload)}
-	if err := s.chain.Broadcast(ctx, tx); err != nil {
+	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), broadcastTimeout)
+	defer cancel()
+	if err := s.chain.Broadcast(bctx, tx); err != nil {
 		return Tx{}, err
 	}
 	return tx, nil

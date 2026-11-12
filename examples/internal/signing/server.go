@@ -53,6 +53,7 @@ const proxyTarget = "X-Tenure-Proxy-Target"
 // Handler returns the HTTP handler of node n, whose member ID is self: POST /sign takes
 // {"wallet","payload"}, signs the payload with the wallet's next nonce and broadcasts it.
 //
+//   - 413: the body is over 64 KiB.
 //   - 400: the body is not one JSON request, or the wallet is empty, or Tenure-Hops is not a
 //     number.
 //   - Not the owner of the wallet's shard: without forward, 421 with Tenure-Route naming the
@@ -87,7 +88,12 @@ func (s *Signer) Handler(n *tenure.Node, self string, forward bool) http.Handler
 func (s *server) postSign(w http.ResponseWriter, r *http.Request) {
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
-		reply(w, http.StatusBadRequest, errorBody(err))
+		status := http.StatusBadRequest
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		reply(w, status, errorBody(err))
 		return
 	}
 	req, err := decodeRequest(raw)
