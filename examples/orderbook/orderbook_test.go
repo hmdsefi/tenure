@@ -302,6 +302,10 @@ func TestOrderbook(t *testing.T) {
 		}
 	}
 
+	// Close the client's connections first: a server's Shutdown waits up to 5 s for a connection
+	// that was opened and never used, which the client's transport leaves behind when it dials
+	// a second connection for a request that an idle one then served.
+	hc.CloseIdleConnections()
 	cctx, ccancel := context.WithTimeout(ctx, 20*time.Second)
 	defer ccancel()
 	if err := c.Close(cctx); err != nil {
