@@ -268,7 +268,7 @@ func (w *work) produce(ctx context.Context, i int) error {
 		r := rng.Uint64()
 		addr := w.c.addrs[rng.IntN(len(w.c.addrs))]
 		req := AddTaskRequest{Partition: w.enter(r, true), Task: t}
-		err := w.add(ctx, addr, req)
+		err := add(ctx, w.c.client, addr, req)
 		w.leave(req.Partition)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -280,11 +280,17 @@ func (w *work) produce(ctx context.Context, i int) error {
 	return nil
 }
 
-// add sends req, and sends it again only after an answer that says the task was not accepted.
-func (w *work) add(ctx context.Context, addr string, req AddTaskRequest) error {
+// taskAdder sends an AddTask call; *Client is one.
+type taskAdder interface {
+	AddTask(ctx context.Context, addr string, req AddTaskRequest) error
+}
+
+// add sends req, and sends it again only after an answer that says the task was not accepted:
+// after any other error the task may be somewhere already, and a second send could duplicate it.
+func add(ctx context.Context, c taskAdder, addr string, req AddTaskRequest) error {
 	var err error
 	for range addAttempts {
-		err = w.c.client.AddTask(ctx, addr, req)
+		err = c.AddTask(ctx, addr, req)
 		if !errors.Is(err, ErrNotAccepted) {
 			return err
 		}

@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"google.golang.org/grpc"
@@ -174,6 +175,31 @@ func TestATEXM16Routing(t *testing.T) {
 			}
 			if !reflect.DeepEqual(back, msg) {
 				t.Fatalf("round trip of %+v gave %+v", msg, back)
+			}
+		}
+	})
+}
+
+// TestPollEndsBeforeDeadline checks that a root poll stops waiting a margin before its caller's
+// deadline, so that a task is never handed to a caller that has already given up: the margin is
+// pollMargin, and at most a quarter of the time left.
+func TestPollEndsBeforeDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		self := tenure.Member{ID: "a"}
+		s := NewServer("a", lookupFunc(func(string) (tenure.Member, error) { return self, nil }), tasksTree, nil)
+		for _, tc := range []struct{ deadline, want time.Duration }{
+			{5 * time.Second, 5*time.Second - pollMargin},
+			{200 * time.Millisecond, 150 * time.Millisecond},
+		} {
+			ctx, cancel := context.WithTimeout(t.Context(), tc.deadline)
+			start := time.Now()
+			resp, err := s.poll(ctx, &PollRequest{Partition: 0})
+			cancel()
+			if err != nil || resp == nil || resp.Task != nil {
+				t.Fatalf("poll = %+v, %v; want an empty answer", resp, err)
+			}
+			if got := time.Since(start); got != tc.want {
+				t.Errorf("a poll with a %v deadline ended after %v, want %v", tc.deadline, got, tc.want)
 			}
 		}
 	})
