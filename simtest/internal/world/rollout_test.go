@@ -70,13 +70,18 @@ func TestRolloutMessages(t *testing.T) {
 		if err := rw.err(); err == nil || err.Error() != "rollout: replacement 1: book/3 started 2 times on m1-r" {
 			t.Errorf("two starts: %v", err)
 		}
-		r1.starts["m1-r/a"][spaceShard{"book", 3}] = 1
+		r1.starts["m1-r/a"][spaceShard{"book", 3}], r1.most["m1-r/a"][spaceShard{"book", 3}] = 1, 1
+		r1.stop("m1-r/a", spaceShard{"book", 3})
+		r1.count("m1-r/a", spaceShard{"book", 3}) // its run stopped, then it came back: a new run
+		if err := rw.err(); err != nil {
+			t.Errorf("a start after a stop: %v, want nil", err)
+		}
 		r1.count("m1-r/b", spaceShard{"book", 4})
 		r1.count("m1-r/b", spaceShard{"book", 4})
 		if err := rw.err(); err == nil || err.Error() != "rollout: replacement 1: book/4 started 2 times on m1-r" {
 			t.Errorf("two starts in a later incarnation: %v", err)
 		}
-		r1.starts["m1-r/b"][spaceShard{"book", 4}] = 1
+		r1.most["m1-r/b"][spaceShard{"book", 4}] = 1
 		rw.late = "rollout: m1: book/3 started at 25.010000000s, after its drain began at 25.000000000s"
 		if err := rw.err(); err == nil || err.Error() != rw.late {
 			t.Errorf("a late start: %v", err)
