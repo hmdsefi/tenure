@@ -71,15 +71,20 @@ type rolloutWatch struct {
 }
 
 // replacementWatch is what one replacement did: the first of its incarnations whose machine
-// held a slot, the slot, and how many times each incarnation started each shard. A machine may
-// start a shard before the reply to its claim is stepped, when a view showed it the slot first,
-// so the starts of every incarnation are counted from its first step.
+// held a slot, the slot, how many times each incarnation started each shard, and the most
+// starts of each shard on each incarnation without a stop between them. A machine may start a
+// shard before the reply to its claim is stepped, when a view showed it the slot first, so the
+// starts of every incarnation are counted from its first step.
 type replacementWatch struct {
 	m      *Member
 	holder string                        // the first incarnation that held a slot, "" before
 	slot   int                           // the slot it held
 	starts map[string]map[spaceShard]int // by holder; looked up only
-	spaces map[string]core.SpaceSpec     // looked up only
+	// streak counts the starts of each shard by holder since its run last stopped, and most
+	// is the largest streak each reached. A run that stops and starts again is a new streak.
+	streak map[string]map[spaceShard]int
+	most   map[string]map[spaceShard]int
+	spaces map[string]core.SpaceSpec // looked up only
 }
 
 // spaceShard names one shard of one space.
@@ -100,8 +105,10 @@ type spaceShard struct {
 // was started on it more than once. No later incarnation of the replacement started a shard
 // more than once either. In a run that nothing but the rollout disturbs, that incarnation also
 // took the slot its replaced member held when its drain began (D16), still runs at the end, and
-// has some shard assigned to its slot. Then no shard was started on a replaced member after its
-// drain began. The messages are "rollout: replacement 1: m1-r never held a slot",
+// has some shard assigned to its slot. Under faults a shard may leave an incarnation and come
+// back, so there "more than once" counts the starts between two stops of the shard's run, and
+// an assigned shard was started at least once (see replacementWatch.err). Then no shard was
+// started on a replaced member after its drain began. The messages are "rollout: replacement 1: m1-r never held a slot",
 // "rollout: replacement 1: book/3 started 2 times on m1-r" (or 0 times),
 // "rollout: replacement 1: m1-r took slot 3, not m1's slot 0",
 // "rollout: replacement 1: m1-r took slot 0, but m1 held no slot when its drain began",
@@ -121,7 +128,12 @@ func (w *World) planRollout() {
 	}
 	for i := range n {
 		old, rep := w.members[i], w.members[n+i]
-		rw.reps[i] = &replacementWatch{m: rep, slot: -1, starts: map[string]map[spaceShard]int{}, spaces: spaces}
+		rw.reps[i] = &replacementWatch{
+			m: rep, slot: -1, spaces: spaces,
+			starts: map[string]map[spaceShard]int{},
+			streak: map[string]map[spaceShard]int{},
+			most:   map[string]map[spaceShard]int{},
+		}
 		rw.drainAt[i], rw.drainSlot[i] = -1, -1
 		at := ro.Start + time.Duration(i)*ro.Gap
 		w.sim.At(kernel.Time(at), labelRolloutActivate, func() { w.activate(rep) })
@@ -184,8 +196,11 @@ func (rw *rolloutWatch) step(d *driver, acts []core.Action) {
 			}
 		}
 		for _, a := range acts {
-			if s, ok := a.(core.StartRun); ok {
-				r.count(d.holder, spaceShard{s.Space, s.Shard})
+			switch a := a.(type) {
+			case core.StartRun:
+				r.count(d.holder, spaceShard{a.Space, a.Shard})
+			case core.StopRun:
+				r.stop(d.holder, spaceShard{a.Space, a.Shard})
 			}
 		}
 		return
@@ -225,6 +240,13 @@ func (rw *rolloutWatch) err() error {
 // another member's expired slot, or end its first incarnation, so those three are not judged
 // under faults. Every incarnation of the replacement, the first or a later one, starts each
 // shard at most once.
+//
+// Under faults a shard may also leave a replacement and come back to the same incarnation:
+// a member that crashes while it drains never releases its slot, the slot expires, and
+// Balanced's caps move shards between the slots that are left, then back when a replacement
+// claims the slot (ASG-140). So under faults each incarnation starts each shard at most once
+// between two stops of its run, and a shard assigned to the slot at the end was started on it
+// at least once.
 func (r *replacementWatch) err(w *World, index, drainSlot int) error {
 	m := r.m
 	if r.holder == "" {
@@ -257,7 +279,7 @@ func (r *replacementWatch) err(w *World, index, drainSlot int) error {
 			if mine {
 				assigned++
 			}
-			if mine && got != 1 { // more than once on any incarnation is judged below
+			if mine && (got == 0 || quiet && got != 1) { // more than once is judged below
 				return fmt.Errorf("rollout: replacement %d: %s/%d started %d times on %s", index, name, shard, got, m.Name)
 			}
 		}
@@ -265,10 +287,14 @@ func (r *replacementWatch) err(w *World, index, drainSlot int) error {
 	if quiet && assigned == 0 {
 		return fmt.Errorf("rollout: replacement %d: no shard is assigned to %s on %s", index, key, m.Name)
 	}
-	for _, holder := range slices.Sorted(maps.Keys(r.starts)) {
+	repeats := r.starts
+	if !quiet {
+		repeats = r.most
+	}
+	for _, holder := range slices.Sorted(maps.Keys(repeats)) {
 		for _, name := range sortedSpaceNames(w.sc.Spaces) {
 			for shard := range r.spaces[name].Shards {
-				if got := r.starts[holder][spaceShard{name, shard}]; got > 1 {
+				if got := repeats[holder][spaceShard{name, shard}]; got > 1 {
 					return fmt.Errorf("rollout: replacement %d: %s/%d started %d times on %s", index, name, shard, got, m.Name)
 				}
 			}
@@ -277,12 +303,24 @@ func (r *replacementWatch) err(w *World, index, drainSlot int) error {
 	return nil
 }
 
-// count counts a start of s by holder.
+// count counts a start of s by holder, in its starts and in the streak since its run of s last
+// stopped.
 func (r *replacementWatch) count(holder string, s spaceShard) {
-	if r.starts[holder] == nil {
-		r.starts[holder] = map[spaceShard]int{}
+	for _, m := range []map[string]map[spaceShard]int{r.starts, r.streak, r.most} {
+		if m[holder] == nil {
+			m[holder] = map[spaceShard]int{}
+		}
 	}
 	r.starts[holder][s]++
+	r.streak[holder][s]++
+	r.most[holder][s] = max(r.most[holder][s], r.streak[holder][s])
+}
+
+// stop ends the streak of starts of s by holder: its run of s stopped.
+func (r *replacementWatch) stop(holder string, s spaceShard) {
+	if r.streak[holder] != nil {
+		r.streak[holder][s] = 0
+	}
 }
 
 // PlantStart counts one more start of a shard on the present incarnation of the replacement m,

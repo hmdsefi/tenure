@@ -168,10 +168,14 @@ const (
 // m1's node at 40 s (SIM-350, SIM-380). m1 hands its shards over, closes its session and
 // exits: its phase is exited, the trace has its tenure.exit after the store closed its
 // session, and m1 emits no tenure record after it, not even when its node boots again. The other four
-// members converge on every shard, and every invariant and final holds.
+// members converge on every shard, and every invariant and final holds. The drain and the crash
+// are not part of the world's plan, so the recovery time stays at 0; the liveness final would
+// judge the ownership of the shards at the bound, about 22 s, while m1 may still be handing them
+// over, so it is left out, as in TestDrainWhileDown. tenure/converged still checks that the four
+// own every shard at the end.
 func TestDrainExit(t *testing.T) {
 	r := row{
-		name: "TestDrainExit", sc: world.Scenario{StopDelay: time.Second},
+		name: "TestDrainExit", sc: world.Scenario{StopDelay: time.Second, NoLiveness: true},
 		seeds: 5, duration: 60 * time.Second, net: defaultNet, g2: true,
 	}
 	for _, rule := range r.takeovers() {

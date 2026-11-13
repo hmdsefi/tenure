@@ -559,6 +559,11 @@ func (d *driver) reply(rep reply) {
 		return
 	}
 	c.timer.cancel()
+	// A Tick due now is stepped before the answer (O2). Step it while c still holds its lane:
+	// the machine has not seen the answer yet and may repeat c's action in that Tick, as a
+	// member that resumes after a pause past c's RetryPeriod does, and the repeat must be
+	// dropped as equal to c, which is still in flight (O6).
+	d.tickUntil(d.m.Mono())
 	d.lanes.finish(c)
 	if c.onReply != nil {
 		c.onReply(c, rep)
