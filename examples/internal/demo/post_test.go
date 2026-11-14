@@ -223,3 +223,44 @@ func TestATEXM06Client(t *testing.T) {
 		http.DefaultClient.CloseIdleConnections()
 	})
 }
+
+// TestPostSettled checks that PostSettled sends the request again after a route loop, until an
+// answer comes or the context ends, and passes other errors on.
+func TestPostSettled(t *testing.T) {
+	hc := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+
+	t.Run("a route loop that settles", func(t *testing.T) {
+		s := newScript(t)
+		self := reply{status: 421, route: host(s)}
+		s.setReplies(self, self, self, self, reply{status: 200, body: "done"})
+		res, err := demo.PostSettled(testCtx(t, 10*time.Second), hc, s.URL+"/orders", []byte(`{}`))
+		if err != nil || res.Status != 200 || string(res.Body) != "done" {
+			t.Errorf("PostSettled = %+v, %v; want 200 done", res, err)
+		}
+		if n := len(s.requests()); n != 5 {
+			t.Errorf("the member got %d requests, want 5", n)
+		}
+	})
+
+	t.Run("a route loop that does not settle", func(t *testing.T) {
+		s := newScript(t)
+		s.setReplies(reply{status: 421, route: host(s)})
+		ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+		defer cancel()
+		res, err := demo.PostSettled(ctx, hc, s.URL+"/orders", []byte(`{}`))
+		if !errors.Is(err, context.DeadlineExceeded) || res.Status != http.StatusMisdirectedRequest {
+			t.Errorf("PostSettled = %+v, %v; want the last 421 and DeadlineExceeded", res, err)
+		}
+		if n := len(s.requests()); n < 6 {
+			t.Errorf("the member got %d requests, want at least two route loops of 3", n)
+		}
+	})
+
+	t.Run("other errors are returned", func(t *testing.T) {
+		s := newScript(t, reply{status: 421})
+		res, err := demo.PostSettled(testCtx(t, 10*time.Second), hc, s.URL+"/orders", []byte(`{}`))
+		if err == nil || errors.Is(err, demo.ErrRouteLoop) || res.Sends != 1 {
+			t.Errorf("PostSettled = %+v, %v; want the route error after 1 send", res, err)
+		}
+	})
+}

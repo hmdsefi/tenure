@@ -29,6 +29,9 @@ const (
 	// so it ignores a Retry-After header that asks for more.
 	retryWait = 50 * time.Millisecond
 
+	// routeLoopWait is how long PostSettled waits after Post gave up on a route loop.
+	routeLoopWait = 50 * time.Millisecond
+
 	// maxBody is the most of a response body that Post reads.
 	maxBody = 1 << 20
 )
@@ -100,6 +103,24 @@ func Post(ctx context.Context, hc *http.Client, url string, body []byte) (Respon
 			}
 		default:
 			return res, nil
+		}
+	}
+}
+
+// PostSettled is Post that sends the request again, after 50 ms, each time Post gives up with
+// ErrRouteLoop, until ctx ends. Right after a start or a drain two members can name each other
+// as the owner of a shard until their views agree, so a route loop is not an answer. A 421 means
+// no member took the request, so sending it again does nothing twice.
+func PostSettled(ctx context.Context, hc *http.Client, url string, body []byte) (Response, error) {
+	for {
+		res, err := Post(ctx, hc, url, body)
+		if !errors.Is(err, ErrRouteLoop) {
+			return res, err
+		}
+		select {
+		case <-time.After(routeLoopWait):
+		case <-ctx.Done():
+			return res, ctx.Err()
 		}
 	}
 }
