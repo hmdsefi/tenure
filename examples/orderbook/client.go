@@ -45,7 +45,8 @@ func marketName(i int) string {
 // run posts l.orders orders, split among l.clients clients, and returns when each is accepted,
 // a client failed, or ctx ended. Client i makes its orders from rand.New(rand.NewPCG(seed, i)),
 // names them <prefix><i>-<k> for k from 0 (prefix "c" unless set), and sends each to its first
-// member. demo.Post retries a 503 and follows a 421, so an answer other than 200 means a bug.
+// member. demo.PostSettled retries a 503, follows a 421 and sends again after a route loop, so an
+// answer other than 200 means a bug.
 func (l *load) run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -93,7 +94,7 @@ func (l *load) client(ctx context.Context, i, n int) error {
 		if err != nil {
 			return err
 		}
-		res, err := demo.Post(ctx, l.hc, url, body)
+		res, err := demo.PostSettled(ctx, l.hc, url, body)
 		if err != nil {
 			return fmt.Errorf("order %s: %w", o.ID, err)
 		}
