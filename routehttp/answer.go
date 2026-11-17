@@ -32,9 +32,10 @@ const (
 // only before the request has had any effect, and before anything else is written to w.
 //
 // A member without an address cannot be named, so for an m whose Addr is empty Misdirected
-// answers as Unavailable with a wait of one second.
+// answers as Unavailable with a wait of one second, and removes any Tenure-Route set before.
 func Misdirected(w http.ResponseWriter, m tenure.Member) {
 	if m.Addr == "" {
+		w.Header().Del(RouteHeader)
 		Unavailable(w, time.Second)
 		return
 	}

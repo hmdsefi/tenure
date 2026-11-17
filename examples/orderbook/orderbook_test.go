@@ -214,7 +214,7 @@ func TestOrderbook(t *testing.T) {
 	accepted := make(map[string]bool) // IDs of the orders that got a 200
 
 	// Phase 1: orders through n1 and n2 while the three nodes serve.
-	one := &load{hc: hc, urls: stay, clients: 4, orders: 120, seed: 1}
+	one := &load{dc: &demo.Client{HTTP: hc}, urls: stay, clients: 4, orders: 120, seed: 1}
 	if err := one.run(ctx); err != nil {
 		t.Fatalf("first orders: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestOrderbook(t *testing.T) {
 	if err := c.Groups[cut].SetDraining(ctx, true); err != nil {
 		t.Fatalf("mark the cut node as draining in the group: %v", err)
 	}
-	two := &load{hc: hc, urls: stay[:1], clients: 2, orders: 60, seed: 2, prefix: "d"}
+	two := &load{dc: &demo.Client{HTTP: hc}, urls: stay[:1], clients: 2, orders: 60, seed: 2, prefix: "d"}
 	twoDone := make(chan error, 1)
 	go func() { twoDone <- two.run(ctx) }()
 
@@ -433,23 +433,26 @@ func TestOrderbook(t *testing.T) {
 		len(accepted), len(rejected), stale, len(ob.staleFrom(cut)), memberID(cut))
 }
 
-// TestCommand runs the program in process: two tables and the summary, every order accepted.
-// It matches the output by substring, as the program may be built with coverage.
+// TestCommand runs the program in process, with the clients' Router and without it: two tables
+// and the summary, every order accepted. It matches the output by substring, as the program may
+// be built with coverage.
 func TestCommand(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Second)
 	defer cancel()
-	var out bytes.Buffer
-	if err := execute(ctx, []string{"-orders", "60", "-clients", "3", "-seed", "7"}, &out); err != nil {
-		t.Fatalf("execute: %v\n%s", err, out.String())
-	}
-	s := out.String()
-	for _, want := range []string{"before the drain of n3:", "after the drain of n3:", "shard  owner  term", "orders accepted: 60\n", "fills: ", "shards moved: "} {
-		if !strings.Contains(s, want) {
-			t.Errorf("output lacks %q:\n%s", want, s)
+	for _, router := range []string{"-router=true", "-router=false"} {
+		var out bytes.Buffer
+		if err := execute(ctx, []string{"-orders", "60", "-clients", "3", "-seed", "7", router}, &out); err != nil {
+			t.Fatalf("%s: execute: %v\n%s", router, err, out.String())
 		}
-	}
-	if n := strings.Count(s, "shard  owner  term"); n != 2 {
-		t.Errorf("output has %d tables, want 2", n)
+		s := out.String()
+		for _, want := range []string{"before the drain of n3:", "after the drain of n3:", "shard  owner  term", "orders accepted: 60\n", "fills: ", "shards moved: ", "sends: "} {
+			if !strings.Contains(s, want) {
+				t.Errorf("%s: output lacks %q:\n%s", router, want, s)
+			}
+		}
+		if n := strings.Count(s, "shard  owner  term"); n != 2 {
+			t.Errorf("%s: output has %d tables, want 2", router, n)
+		}
 	}
 
 	if err := execute(ctx, []string{"-orders", "0"}, io.Discard); err == nil {
@@ -544,9 +547,9 @@ func TestOrderEntry(t *testing.T) {
 		}
 	}
 	if a := post(other, orderJSON(t, orderbook.Order{ID: "o1", Market: market, Side: orderbook.SideBuy, Price: 1, Qty: 1})); a.status != http.StatusMisdirectedRequest ||
-		a.header.Get(routehttp.RouteHeader) != c.Addrs[ownerIdx] {
-		t.Errorf("order sent to a member that does not own the shard: status %d, %s %q; want 421 and %q",
-			a.status, routehttp.RouteHeader, a.header.Get(routehttp.RouteHeader), c.Addrs[ownerIdx])
+		a.header.Get(routehttp.RouteHeader) != c.Addrs[ownerIdx] || a.header.Get(routehttp.UnprocessedHeader) != "1" {
+		t.Errorf("order sent to a member that does not own the shard: status %d, header %v; want 421, %s %q and %s 1",
+			a.status, a.header, routehttp.RouteHeader, c.Addrs[ownerIdx], routehttp.UnprocessedHeader)
 	}
 
 	// The same order through demo.Post lands on the owner.
@@ -576,8 +579,8 @@ func TestOrderEntry(t *testing.T) {
 	e.Close()
 	before := len(journalOf(t, journalLines(t, db, sh.ID)))
 	a = post(owner, orderJSON(t, orderbook.Order{ID: "r1", Market: market, Side: orderbook.SideBuy, Price: 1, Qty: 1}))
-	if a.status != http.StatusServiceUnavailable || a.header.Get("Retry-After") != "1" {
-		t.Errorf("order to a refusing engine: status %d, Retry-After %q; want 503 and 1", a.status, a.header.Get("Retry-After"))
+	if a.status != http.StatusServiceUnavailable || a.header.Get("Retry-After") != "1" || a.header.Get(routehttp.UnprocessedHeader) != "1" {
+		t.Errorf("order to a refusing engine: status %d, header %v; want 503, Retry-After 1 and %s 1", a.status, a.header, routehttp.UnprocessedHeader)
 	}
 	if after := len(journalOf(t, journalLines(t, db, sh.ID))); after != before {
 		t.Errorf("the journal grew from %d to %d entries on a refused order", before, after)

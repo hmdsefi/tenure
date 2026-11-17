@@ -19,8 +19,8 @@ import (
 
 // load is a set of clients that post orders to the members of a cluster and follow their routes.
 type load struct {
-	hc      *http.Client
-	urls    []string // base URLs of the members the clients start with; client i uses urls[i%len]
+	dc      *demo.Client // posts the orders; with a Router, it routes each by its market
+	urls    []string     // base URLs of the members the clients start with; client i uses urls[i%len]
 	clients int
 	orders  int
 	seed    uint64
@@ -28,13 +28,15 @@ type load struct {
 
 	accepted atomic.Int64
 	fills    atomic.Int64
+	sends    atomic.Int64 // the sends of the accepted orders
 }
 
 // run posts l.orders orders, split among l.clients clients, and returns when each is accepted,
 // a client failed, or ctx ended. Client i makes its orders from rand.New(rand.NewPCG(seed, i)),
 // names them <prefix><i>-<k> for k from 0 (prefix "c" unless set), and sends each to its first
-// member. demo.PostSettled retries a 503, follows a 421 and sends again after a route loop, so an
-// answer other than 200 means a bug.
+// member, or, when l.dc has a Router, to the owner of the order's market. Client.PostSettled
+// retries a 503, follows a 421 and sends again after a route loop, so an answer other than 200
+// means a bug.
 func (l *load) run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -73,7 +75,7 @@ func (l *load) client(ctx context.Context, i, n int) error {
 		if err != nil {
 			return err
 		}
-		res, err := demo.PostSettled(ctx, l.hc, url, body)
+		res, err := l.dc.PostSettled(ctx, url, o.Market, body)
 		if err != nil {
 			return fmt.Errorf("order %s: %w", o.ID, err)
 		}
@@ -85,6 +87,7 @@ func (l *load) client(ctx context.Context, i, n int) error {
 			return fmt.Errorf("order %s: answer: %w", o.ID, err)
 		}
 		l.fills.Add(int64(len(r.Fills)))
+		l.sends.Add(int64(res.Sends))
 		l.accepted.Add(1)
 	}
 	return nil

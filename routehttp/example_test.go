@@ -25,16 +25,18 @@ func Example() {
 	const self = "n1"
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
-		if err := local("orders", r.URL.Query().Get("key")); err != nil {
-			var notOwner *tenure.NotOwnerError
-			if errors.As(err, &notOwner) && notOwner.Route.ID != self {
-				routehttp.Misdirected(w, notOwner.Route)
-				return
-			}
+		err := local("orders", r.URL.Query().Get("key"))
+		var notOwner *tenure.NotOwnerError
+		switch {
+		case err == nil:
+			// Serve the request.
+		case errors.As(err, &notOwner) && notOwner.Route.ID != "" && notOwner.Route.ID != self:
+			routehttp.Misdirected(w, notOwner.Route)
+		case errors.As(err, &notOwner), errors.Is(err, tenure.ErrClosed):
 			routehttp.Unavailable(w, time.Second)
-			return
+		default:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
-		// Serve the request.
 	}
 
 	w := httptest.NewRecorder()

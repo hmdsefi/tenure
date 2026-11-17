@@ -4,9 +4,11 @@
 package signing
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -19,6 +21,7 @@ import (
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/core"
 	"github.com/hmdsefi/tenure/examples/internal/fencedb"
+	"github.com/hmdsefi/tenure/routehttp"
 )
 
 func TestSignHandlerBodyLimit(t *testing.T) {
@@ -233,4 +236,33 @@ func TestSignerRun(t *testing.T) {
 			t.Fatal("the broadcast ran on the cancelled context of the request")
 		}
 	})
+}
+
+// TestSignHandlerProxyError checks the answer of a forwarding server whose proxy cannot complete
+// the request: 503 with Retry-After: 1, but without Tenure-Unprocessed, since a forwarded request
+// may have reached the owner and spent a nonce before the proxy failed.
+func TestSignHandlerProxyError(t *testing.T) {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &server{self: "n1", forward: true, proxy: newProxy()}
+	raw := []byte(signBody("p"))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/sign", bytes.NewReader(raw))
+	rec := httptest.NewRecorder()
+	srv.notLocal(rec, req, raw, 0, &tenure.NotOwnerError{Space: SpaceName, Route: tenure.Member{ID: "n2", Addr: dead}})
+
+	res := rec.Result()
+	if res.StatusCode != http.StatusServiceUnavailable || res.Header.Get("Retry-After") != "1" {
+		t.Fatalf("proxy error: %d, Retry-After %q; want 503 and 1", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+	if got := res.Header.Get(routehttp.UnprocessedHeader); got != "" {
+		t.Fatalf("proxy error: %s = %q, want none", routehttp.UnprocessedHeader, got)
+	}
 }

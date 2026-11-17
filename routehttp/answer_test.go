@@ -46,6 +46,7 @@ func TestRTR800Misdirected(t *testing.T) {
 	checkHeader(t, res.Header, routehttp.RouteHeader, "10.0.0.2:8080")
 	checkHeader(t, res.Header, routehttp.UnprocessedHeader, "1")
 	checkHeader(t, res.Header, "Content-Type", "text/plain; charset=utf-8")
+	checkHeader(t, res.Header, "X-Content-Type-Options", "nosniff")
 	checkHeader(t, res.Header, "Retry-After")
 	checkHeader(t, res.Header, "Content-Length")
 	if body := w.Body.String(); body != "tenure: misdirected request: send it to 10.0.0.2:8080\n" {
@@ -57,6 +58,7 @@ func TestRTR800Misdirected(t *testing.T) {
 // name, gets the 503 answer instead.
 func TestRTR800MisdirectedNoAddr(t *testing.T) {
 	w := httptest.NewRecorder()
+	w.Header().Set(routehttp.RouteHeader, "stale:1")
 	routehttp.Misdirected(w, tenure.Member{ID: "n2"})
 
 	res := w.Result()
@@ -69,7 +71,8 @@ func TestRTR800MisdirectedNoAddr(t *testing.T) {
 }
 
 // TestRTR800Unavailable checks the 503 answer: status, Tenure-Unprocessed, a text body, and
-// Retry-After in whole seconds, rounded up and at least 1.
+// Retry-After in whole seconds, rounded up and at least 1, with values the caller set before
+// replaced.
 func TestRTR800Unavailable(t *testing.T) {
 	for _, c := range []struct {
 		d    time.Duration
@@ -87,6 +90,8 @@ func TestRTR800Unavailable(t *testing.T) {
 	} {
 		w := httptest.NewRecorder()
 		w.Header().Set("Retry-After", "77")
+		w.Header().Set(routehttp.UnprocessedHeader, "0")
+		w.Header().Set("Content-Length", "99")
 		routehttp.Unavailable(w, c.d)
 
 		res := w.Result()
@@ -97,6 +102,8 @@ func TestRTR800Unavailable(t *testing.T) {
 		checkHeader(t, res.Header, routehttp.UnprocessedHeader, "1")
 		checkHeader(t, res.Header, routehttp.RouteHeader)
 		checkHeader(t, res.Header, "Content-Type", "text/plain; charset=utf-8")
+		checkHeader(t, res.Header, "X-Content-Type-Options", "nosniff")
+		checkHeader(t, res.Header, "Content-Length")
 		if body := w.Body.String(); body != "tenure: no member can serve the request yet\n" {
 			t.Errorf("Unavailable(%v): body = %q", c.d, body)
 		}
