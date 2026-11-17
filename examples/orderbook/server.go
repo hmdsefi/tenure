@@ -11,10 +11,12 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/examples/internal/demo"
 	"github.com/hmdsefi/tenure/examples/internal/fencedb"
+	"github.com/hmdsefi/tenure/routehttp"
 )
 
 const (
@@ -23,9 +25,6 @@ const (
 
 	// maxOrderBody is the most of a request body that the server reads.
 	maxOrderBody = 64 << 10
-
-	// routeHeader is the response header that names the member to send the request to instead.
-	routeHeader = "Tenure-Route"
 )
 
 // space returns the markets space served by o: 16 shards, fenced, so that a node that cannot
@@ -92,6 +91,11 @@ type result struct {
 //     further order of its term.
 //   - 409: the order's ID is journaled already.
 //   - 200: the order was matched and journaled, and the body lists its fills.
+//
+// The 421 and every 503 carry Tenure-Unprocessed: 1, as routehttp.Misdirected and
+// routehttp.Unavailable write them, because none follows an effect: a 503 after a rejected
+// commit neither, since the fence rejects the whole commit and the engine keeps the order's match
+// only when the commit succeeded.
 func (s *server) postOrder(w http.ResponseWriter, r *http.Request) {
 	o, err := decodeOrder(http.MaxBytesReader(w, r.Body, maxOrderBody))
 	if err != nil {
@@ -105,16 +109,15 @@ func (s *server) postOrder(w http.ResponseWriter, r *http.Request) {
 		// A route to this member itself means the shard is about to be ours: no one else
 		// can serve it, so the client waits.
 		if errors.As(err, &notOwner) && notOwner.Route.Addr != "" && notOwner.Route.ID != s.self {
-			w.Header().Set(routeHeader, notOwner.Route.Addr)
-			reply(w, http.StatusMisdirectedRequest, errorBody(err))
+			routehttp.Misdirected(w, notOwner.Route)
 			return
 		}
-		unavailable(w, err)
+		routehttp.Unavailable(w, time.Second)
 		return
 	}
 	e := s.ob.engine(sh.ID, sh.Term)
 	if e == nil {
-		unavailable(w, errors.New("orderbook: the shard's engine is not ready"))
+		routehttp.Unavailable(w, time.Second)
 		return
 	}
 
@@ -127,7 +130,7 @@ func (s *server) postOrder(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, errDuplicate):
 		reply(w, http.StatusConflict, errorBody(err))
 	case errors.Is(err, errRefusing), errors.Is(err, fencedb.ErrStale):
-		unavailable(w, err)
+		routehttp.Unavailable(w, time.Second)
 	default:
 		reply(w, http.StatusInternalServerError, errorBody(err))
 	}
@@ -145,12 +148,6 @@ func decodeOrder(r io.Reader) (order, error) {
 		return order{}, errors.New("orderbook: data after the order")
 	}
 	return o, o.validate()
-}
-
-// unavailable answers 503 and asks the client to retry in a second.
-func unavailable(w http.ResponseWriter, err error) {
-	w.Header().Set("Retry-After", "1")
-	reply(w, http.StatusServiceUnavailable, errorBody(err))
 }
 
 func errorBody(err error) map[string]string {

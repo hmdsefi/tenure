@@ -33,6 +33,8 @@ type reply struct {
 	status int
 	route  string // the Tenure-Route header, when not empty
 	body   string
+
+	unprocessed bool // set Tenure-Unprocessed: 1, and Retry-After: 1 on a 503
 }
 
 // sent is one request a script received.
@@ -52,6 +54,12 @@ func newScript(t *testing.T, replies ...reply) *script {
 		s.mu.Unlock()
 		if rep.route != "" {
 			w.Header().Set("Tenure-Route", rep.route)
+		}
+		if rep.unprocessed {
+			w.Header().Set("Tenure-Unprocessed", "1")
+			if rep.status == http.StatusServiceUnavailable {
+				w.Header().Set("Retry-After", "1")
+			}
 		}
 		w.WriteHeader(rep.status)
 		_, _ = io.WriteString(w, rep.body)

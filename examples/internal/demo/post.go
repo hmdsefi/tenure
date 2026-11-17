@@ -46,6 +46,11 @@ type Response struct {
 
 	// Sends is the number of requests Post sent, the one that got this answer included.
 	Sends int
+
+	// Hops is the highest Tenure-Hops header among the sends of a Client with a Router: the
+	// number of sends that moved the request to another member before its last one. It is 0
+	// for the package's Post, which sends no such header.
+	Hops int
 }
 
 // Post sends body to url as a POST with Content-Type application/json and follows the routes of

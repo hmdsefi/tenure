@@ -20,6 +20,7 @@ import (
 	"github.com/hmdsefi/tenure/core"
 	"github.com/hmdsefi/tenure/examples/internal/demo"
 	"github.com/hmdsefi/tenure/examples/internal/fencedb"
+	"github.com/hmdsefi/tenure/routehttp"
 )
 
 const wallet = "w-00"
@@ -47,7 +48,7 @@ func (l *hopLog) wrap(i int, h http.Handler) http.Handler {
 		for len(l.hops) <= i {
 			l.hops = append(l.hops, nil)
 		}
-		l.hops[i] = append(l.hops[i], r.Header.Get(HopsHeader))
+		l.hops[i] = append(l.hops[i], r.Header.Get(routehttp.HopsHeader))
 		l.mu.Unlock()
 		h.ServeHTTP(w, r)
 	})
@@ -264,8 +265,11 @@ func TestATEXM11Signer(t *testing.T) {
 		if a.status != http.StatusMisdirectedRequest {
 			t.Fatalf("non-owner answered %d, want 421: %s", a.status, a.body)
 		}
-		if got := a.header.Get(RouteHeader); got != r.c.Addrs[o] {
-			t.Fatalf("%s = %q, want the owner's address %q", RouteHeader, got, r.c.Addrs[o])
+		if got := a.header.Get(routehttp.RouteHeader); got != r.c.Addrs[o] {
+			t.Fatalf("%s = %q, want the owner's address %q", routehttp.RouteHeader, got, r.c.Addrs[o])
+		}
+		if got := a.header.Get(routehttp.UnprocessedHeader); got != "1" {
+			t.Fatalf("421: %s = %q, want 1", routehttp.UnprocessedHeader, got)
 		}
 
 		// demo.Post follows the route and gets the first nonce, then the second.
@@ -324,8 +328,8 @@ func TestSignHandlerBadRequests(t *testing.T) {
 		"empty wallet":    {body: `{"wallet":"","payload":"p"}`},
 		"no wallet":       {body: `{"payload":"p"}`},
 		"wallet a number": {body: `{"wallet":7,"payload":"p"}`},
-		"bad hops":        {body: signBody("p"), hdr: map[string]string{HopsHeader: "x"}},
-		"negative hops":   {body: signBody("p"), hdr: map[string]string{HopsHeader: "-1"}},
+		"bad hops":        {body: signBody("p"), hdr: map[string]string{routehttp.HopsHeader: "x"}},
+		"negative hops":   {body: signBody("p"), hdr: map[string]string{routehttp.HopsHeader: "-1"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			for i := range r.c.Nodes {
@@ -347,12 +351,12 @@ func TestSignHandlerHopLimit(t *testing.T) {
 	r.postUntil(t, o, signBody("warm"), nil) // the owner serves; the chain has nonce 0
 
 	// A request that arrives after 2 hops and is not local ends here.
-	a := r.post(t, np, signBody("p"), map[string]string{HopsHeader: "2"})
+	a := r.post(t, np, signBody("p"), map[string]string{routehttp.HopsHeader: "2"})
 	if a.status != http.StatusLoopDetected {
 		t.Fatalf("after 2 hops: %d, want 508: %s", a.status, a.body)
 	}
 	// After 1 hop it is sent on once more, with 2, and the owner serves it.
-	a = r.post(t, np, signBody("p"), map[string]string{HopsHeader: "1"})
+	a = r.post(t, np, signBody("p"), map[string]string{routehttp.HopsHeader: "1"})
 	if a.status != http.StatusOK {
 		t.Fatalf("after 1 hop: %d, want 200: %s", a.status, a.body)
 	}
@@ -360,11 +364,49 @@ func TestSignHandlerHopLimit(t *testing.T) {
 		t.Fatalf("hops seen by the owner = %q, want the last to be 2", got)
 	}
 	// The owner serves a request that came with 2 hops, since it is local.
-	if a := r.post(t, o, signBody("p"), map[string]string{HopsHeader: "2"}); a.status != http.StatusOK {
+	if a := r.post(t, o, signBody("p"), map[string]string{routehttp.HopsHeader: "2"}); a.status != http.StatusOK {
 		t.Fatalf("owner after 2 hops: %d: %s", a.status, a.body)
 	}
 	if rep := r.chain.Report(); rep.Accepted != 3 || len(rep.Conflicts)+len(rep.Gaps) != 0 {
 		t.Fatalf("Report = %+v", rep)
+	}
+}
+
+// TestSignHandlerNotPublished checks the answer of an owner whose shard no Run has published:
+// 503 with Retry-After: 1 and Tenure-Unprocessed: 1, without a reservation.
+func TestSignHandlerNotPublished(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	nonces := &countNonces{Nonces: NewNonces(fencedb.New())}
+	runs := New(nonces, NewChain())   // the space's Run publishes its shards
+	serves := New(nonces, NewChain()) // the handler's, never published
+	c, err := demo.Start(ctx, demo.Options{
+		Nodes:  1,
+		Spaces: func(int) []tenure.Space { return []tenure.Space{runs.Space()} },
+		Serve:  func(_ int, n *tenure.Node) http.Handler { return serves.Handler(n, "n1", false) },
+	})
+	if err != nil {
+		t.Fatalf("start the cluster: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := c.Close(cctx); err != nil {
+			t.Errorf("close the cluster: %v", err)
+		}
+	})
+	r := &rig{c: c, nonces: nonces, ctx: ctx}
+	r.owner(t) // the one node serves the wallet's shard
+
+	before := nonces.reserves.Load()
+	a := r.post(t, 0, signBody("p"), nil)
+	if a.status != http.StatusServiceUnavailable || a.header.Get("Retry-After") != "1" ||
+		a.header.Get(routehttp.UnprocessedHeader) != "1" {
+		t.Fatalf("not published: %d, header %v; want 503, Retry-After 1 and %s 1: %s",
+			a.status, a.header, routehttp.UnprocessedHeader, a.body)
+	}
+	if got := nonces.reserves.Load() - before; got != 0 {
+		t.Fatalf("the request made %d reservations, want 0", got)
 	}
 }
 
@@ -388,14 +430,19 @@ func TestSignHandlerStaleTerm(t *testing.T) {
 	if a.status != http.StatusServiceUnavailable || a.header.Get("Retry-After") != "1" {
 		t.Fatalf("stale reservation: %d, Retry-After %q; want 503 and 1: %s", a.status, a.header.Get("Retry-After"), a.body)
 	}
+	// The rejected reservation left the nonce as it was, so the 503 promises no effect.
+	if got := a.header.Get(routehttp.UnprocessedHeader); got != "1" {
+		t.Fatalf("stale reservation: %s = %q, want 1", routehttp.UnprocessedHeader, got)
+	}
 	if got := r.nonces.reserves.Load() - before; got != 1 {
 		t.Fatalf("the stale request made %d reservations, want 1", got)
 	}
 
 	// The shard now refuses the rest of its term without asking the nonce service.
 	for range 3 {
-		if a := r.post(t, o, signBody("p"), nil); a.status != http.StatusServiceUnavailable {
-			t.Fatalf("after the stale reservation: %d, want 503: %s", a.status, a.body)
+		if a := r.post(t, o, signBody("p"), nil); a.status != http.StatusServiceUnavailable || a.header.Get(routehttp.UnprocessedHeader) != "1" {
+			t.Fatalf("after the stale reservation: %d, %s %q; want 503 and 1: %s",
+				a.status, routehttp.UnprocessedHeader, a.header.Get(routehttp.UnprocessedHeader), a.body)
 		}
 	}
 	if got := r.nonces.reserves.Load() - before; got != 1 {

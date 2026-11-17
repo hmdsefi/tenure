@@ -3,7 +3,7 @@
 
 // Command orderbook runs a sharded order book that a node can lose without losing an order.
 //
-//	go run ./orderbook [-orders 2000] [-clients 4] [-seed 1]
+//	go run ./orderbook [-orders 2000] [-clients 4] [-seed 1] [-router=true]
 //
 // It starts three tenure nodes in one process, n1 to n3, each with an HTTP listener, and an
 // in-memory fake downstream that stands in for a database. The markets space has 16 shards and
@@ -12,18 +12,25 @@
 // shard's fence in the downstream first and rebuilds the books from the journal, so a stale
 // owner that has not noticed it lost the shard can no longer commit.
 //
-// Clients send orders to n1 and n2 with POST /orders, following the Tenure-Route header of a
-// 421 answer to the member that owns the shard and retrying a 503. After half of the orders are
-// accepted the program drains n3, so that its shards move to n1 and n2. It prints the ownership
-// table before and after the drain, and then
+// Clients send orders with POST /orders. By default they hold a tenure.Router that watches the
+// group as a client would, never joining it, and send each order straight to the member that
+// owns its market's shard, through a routehttp.Transport. With -router=false they send each order
+// to n1 or n2 instead and follow the Tenure-Route header of a 421 answer to the owner. Either way
+// they retry a 503. After half of the orders are accepted the program drains n3, so that its
+// shards move to n1 and n2. It prints the ownership table before and after the drain, and then
 //
 //	orders accepted: <n>
 //	fills: <n>
 //	shards moved: <n>
+//	sends: <n>
+//
+// where sends counts the HTTP requests of the accepted orders: one for an order sent straight
+// to its owner, more for an order that met a 421 or a 503.
 //
 // The flags are the number of orders (-orders, default 2000), the number of clients that send
-// them (-clients, default 4) and the seed of their random orders (-seed, default 1). The program
-// exits 0 when every order has been accepted.
+// them (-clients, default 4), the seed of their random orders (-seed, default 1) and whether the
+// clients route with a Router (-router, default true). The program exits 0 when every order has
+// been accepted.
 package main
 
 import (
@@ -37,6 +44,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/examples/internal/demo"
 	"github.com/hmdsefi/tenure/examples/internal/fencedb"
 )
@@ -75,6 +83,7 @@ func execute(ctx context.Context, args []string, out io.Writer) (err error) {
 	orders := fs.Int("orders", 2000, "number of orders to send")
 	clients := fs.Int("clients", 4, "number of clients that send them")
 	seed := fs.Uint64("seed", 1, "seed of the clients' random orders")
+	routed := fs.Bool("router", true, "send each order to its owner through a tenure.Router")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -104,8 +113,17 @@ func execute(ctx context.Context, args []string, out io.Writer) (err error) {
 
 	hc := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 8}}
 	defer hc.CloseIdleConnections()
+	dc := &demo.Client{HTTP: hc}
+	if *routed {
+		r, err := c.Router([]tenure.Space{books[0].space()})
+		if err != nil {
+			return err
+		}
+		defer func() { _ = r.Close() }()
+		dc.Router, dc.Space = r, marketsSpace
+	}
 	l := &load{
-		hc:      hc,
+		dc:      dc,
 		urls:    []string{c.URL(0), c.URL(1)}, // the nodes that stay
 		clients: *clients,
 		orders:  *orders,
@@ -166,7 +184,8 @@ wait:
 			moved++
 		}
 	}
-	fmt.Fprintf(out, "\norders accepted: %d\nfills: %d\nshards moved: %d\n", l.accepted.Load(), l.fills.Load(), moved)
+	fmt.Fprintf(out, "\norders accepted: %d\nfills: %d\nshards moved: %d\nsends: %d\n",
+		l.accepted.Load(), l.fills.Load(), moved, l.sends.Load())
 	return nil
 }
 
