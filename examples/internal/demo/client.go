@@ -18,14 +18,17 @@ import (
 
 // Client posts requests to a sharded service. Without a Router it is Post and PostSettled: it
 // sends each request to the url's member and follows the 421 answers. With a Router it sends
-// each request straight to the member that owns its key, through a routehttp.Transport.
+// each request straight to the member that owns its key, through a routehttp.Transport: one for
+// each host of the urls it is given, made at the first Post to that host, since the host is the
+// Transport's Fallback. They share HTTP's transport, and so its connections.
 //
 // Set the fields before the first Post and do not change them later. A Client is safe for
 // concurrent use, and must not be copied after first use.
 type Client struct {
 	// HTTP is the client to use, http.DefaultClient when nil. With a Router, its Transport
-	// sends each copy of a request (the Transport's Base); when HTTP or its Transport is nil,
-	// the routehttp.Transport's own default does.
+	// sends each copy of a request (the routehttp.Transport's Base) and its Timeout bounds each
+	// Post; when HTTP or its Transport is nil, a transport like routehttp.Transport's default
+	// does, with up to 256 idle connections per member.
 	HTTP *http.Client
 
 	// Router, when not nil, names the member that owns each request's key.
@@ -104,8 +107,9 @@ func (c *Client) PostSettled(ctx context.Context, url, key string, body []byte) 
 // routed returns the client that sends through a routehttp.Transport whose Fallback is
 // fallback, making it the first time.
 func (c *Client) routed(fallback string) *http.Client {
-	if hc, ok := c.clients.Load(fallback); ok {
-		return hc.(*http.Client)
+	if v, ok := c.clients.Load(fallback); ok {
+		hc, _ := v.(*http.Client) // the map holds nothing else
+		return hc
 	}
 	c.once.Do(func() {
 		var base http.RoundTripper
@@ -129,8 +133,9 @@ func (c *Client) routed(fallback string) *http.Client {
 	if c.HTTP != nil {
 		hc.Timeout = c.HTTP.Timeout
 	}
-	got, _ := c.clients.LoadOrStore(fallback, hc)
-	return got.(*http.Client)
+	v, _ := c.clients.LoadOrStore(fallback, hc)
+	hc, _ = v.(*http.Client)
+	return hc
 }
 
 // defaultBase returns what routehttp.Transport uses when its Base is nil: a clone of
