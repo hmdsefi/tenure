@@ -266,3 +266,27 @@ func TestSignHandlerProxyError(t *testing.T) {
 		t.Fatalf("proxy error: %s = %q, want none", routehttp.UnprocessedHeader, got)
 	}
 }
+
+// TestSignHandlerNoOwner checks the answer for a shard no other member can serve: 503 with
+// Retry-After: 1 and Tenure-Unprocessed: 1, without forwarding, since nothing happened.
+func TestSignHandlerNoOwner(t *testing.T) {
+	for name, err := range map[string]error{
+		"no route":      &tenure.NotOwnerError{Space: SpaceName},
+		"route to self": &tenure.NotOwnerError{Space: SpaceName, Route: tenure.Member{ID: "n1", Addr: "127.0.0.1:1"}},
+		"other error":   errors.New("no view yet"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := &server{self: "n1", forward: true} // no proxy: forwarding would panic
+			raw := []byte(signBody("p"))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/sign", bytes.NewReader(raw))
+			rec := httptest.NewRecorder()
+			srv.notLocal(rec, req, raw, 0, err)
+			res := rec.Result()
+			if res.StatusCode != http.StatusServiceUnavailable || res.Header.Get("Retry-After") != "1" ||
+				res.Header.Get(routehttp.UnprocessedHeader) != "1" {
+				t.Fatalf("no owner: %d, header %v; want 503, Retry-After 1 and %s 1",
+					res.StatusCode, res.Header, routehttp.UnprocessedHeader)
+			}
+		})
+	}
+}

@@ -263,6 +263,12 @@ func (e *Engine) Close() {
 	e.mu.Unlock()
 }
 
+// Snapshot returns every market's book, as "bids id@price*qty ... | asks id@price*qty ...",
+// best first.
+func (e *Engine) Snapshot() map[string]string {
+	return e.snapshot()
+}
+
 // snapshot returns every market's book as String lists it.
 func (e *Engine) snapshot() map[string]string {
 	e.mu.Lock()

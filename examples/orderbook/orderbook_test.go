@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -571,13 +572,31 @@ func TestOrderEntry(t *testing.T) {
 		t.Errorf("GET /orders: status %d, want 405", resp.StatusCode)
 	}
 
-	// An engine that refuses orders answers 503 with Retry-After, and journals nothing more.
 	e := books[ownerIdx].Engine(sh.ID, sh.Term)
 	if e == nil {
 		t.Fatal("the owner has no engine")
 	}
-	e.Close()
 	before := len(journalOf(t, journalLines(t, db, sh.ID)))
+
+	// A commit the fence rejects answers 503 with Tenure-Unprocessed: the order crossed s1, but
+	// neither the journal nor the book keeps its match.
+	if err := db.Update(orderbook.SpaceName, sh.ID, sh.Term+1, func(*fencedb.Tx) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	book := e.Snapshot()
+	a = post(owner, orderJSON(t, orderbook.Order{ID: "f1", Market: market, Side: orderbook.SideBuy, Price: 101, Qty: 1}))
+	if a.status != http.StatusServiceUnavailable || a.header.Get("Retry-After") != "1" || a.header.Get(routehttp.UnprocessedHeader) != "1" {
+		t.Errorf("order whose commit the fence rejects: status %d, header %v; want 503, Retry-After 1 and %s 1", a.status, a.header, routehttp.UnprocessedHeader)
+	}
+	if after := len(journalOf(t, journalLines(t, db, sh.ID))); after != before {
+		t.Errorf("the journal grew from %d to %d entries on an order the fence rejected", before, after)
+	}
+	if got := e.Snapshot(); !maps.Equal(got, book) {
+		t.Errorf("the book after an order the fence rejected = %v, want %v", got, book)
+	}
+
+	// An engine that refuses orders answers 503 with Retry-After, and journals nothing more.
+	e.Close()
 	a = post(owner, orderJSON(t, orderbook.Order{ID: "r1", Market: market, Side: orderbook.SideBuy, Price: 1, Qty: 1}))
 	if a.status != http.StatusServiceUnavailable || a.header.Get("Retry-After") != "1" || a.header.Get(routehttp.UnprocessedHeader) != "1" {
 		t.Errorf("order to a refusing engine: status %d, header %v; want 503, Retry-After 1 and %s 1", a.status, a.header, routehttp.UnprocessedHeader)

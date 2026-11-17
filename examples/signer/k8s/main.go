@@ -52,6 +52,7 @@ import (
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/examples/internal/signing"
 	"github.com/hmdsefi/tenure/k8s"
+	"github.com/hmdsefi/tenure/routehttp"
 )
 
 const (
@@ -177,8 +178,8 @@ func serve(ctx context.Context, cfg config, client kubernetes.Interface, ln net.
 			h := node.Load()
 			switch {
 			case h == nil:
-				w.Header().Set("Retry-After", "1")
-				http.Error(w, "starting", http.StatusServiceUnavailable)
+				// Nothing has served the request: it may be sent again, to any member.
+				routehttp.Unavailable(w, time.Second)
 			case r.URL.Path == "/healthz":
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte("ok\n"))
