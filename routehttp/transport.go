@@ -211,14 +211,18 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	addr, err := s.lookup()
 	if err != nil {
-		closeBody(req)
+		if s.buffered == nil || s.once {
+			closeBody(req) // prepareBody closed a body it buffered in full
+		}
 		return nil, err
 	}
 	redirects := 0
 	for {
 		res, err := s.do(addr)
 		if err != nil {
-			if !isDial(err) || t.Fallback == "" || s.usedFallback || !s.replayable() {
+			// A dial error at the Fallback itself, which a request the Router names no member
+			// for goes to first, is not sent there again.
+			if !isDial(err) || t.Fallback == "" || addr == t.Fallback || s.usedFallback || !s.replayable() {
 				return nil, err
 			}
 			s.usedFallback = true
@@ -319,13 +323,14 @@ func (s *send) lookup() (string, error) {
 // do sends a copy of the request to addr and reports the send.
 func (s *send) do(addr string) (*http.Response, error) {
 	r := s.req
-	out := r.Clone(r.Context())
+	// Clone copies everything but the header, which withHops copies with room for Tenure-Hops,
+	// so that setting it allocates nothing more and never grows the map.
+	shallow := *r
+	shallow.Header = nil
+	out := shallow.Clone(r.Context())
 	out.URL.Host = addr
 	out.Host = ""
-	if out.Header == nil {
-		out.Header = make(http.Header, 1)
-	}
-	out.Header[HopsHeader] = hopValue(s.hops)
+	out.Header = withHops(r.Header, s.hops)
 	switch {
 	case s.buffered != nil && s.once:
 		out.Body = struct {
@@ -359,22 +364,27 @@ func (s *send) do(addr string) (*http.Response, error) {
 	return res, err
 }
 
-// hopValues are the Tenure-Hops values of the first sends, made once so that a send sets the
-// header without allocating. Base round trippers only read request headers.
-var hopValues = func() [][]string {
-	v := make([][]string, 8)
-	for i := range v {
-		v[i] = []string{strconv.Itoa(i)}
+// withHops returns a copy of h, as http.Header.Clone makes it, with Tenure-Hops set to hops. Like
+// Clone it allocates the map and one array for all values, both with room for Tenure-Hops.
+func withHops(h http.Header, hops int) http.Header {
+	nv := 1
+	for _, vv := range h {
+		nv += len(vv)
 	}
-	return v
-}()
-
-// hopValue returns the header value of hop n.
-func hopValue(n int) []string {
-	if n < len(hopValues) {
-		return hopValues[n]
+	sv := make([]string, nv)
+	out := make(http.Header, len(h)+1)
+	for k, vv := range h {
+		if vv == nil {
+			out[k] = nil
+			continue
+		}
+		n := copy(sv, vv)
+		out[k] = sv[:n:n]
+		sv = sv[n:]
 	}
-	return []string{strconv.Itoa(n)}
+	sv[0] = strconv.Itoa(hops)
+	out[HopsHeader] = sv[:1:1]
+	return out
 }
 
 // isDial reports whether err is a failure to connect, after which the request was not sent.

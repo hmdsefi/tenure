@@ -6,6 +6,7 @@ package routehttp_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -228,6 +229,12 @@ func deadAddr(t *testing.T) string {
 	addr := l.Addr().String()
 	_ = l.Close()
 	return addr
+}
+
+// isDial reports whether err is a failure to connect.
+func isDial(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
 }
 
 // misdirect answers 421 naming addr.
@@ -863,6 +870,15 @@ func TestATRTR18NoRoute(t *testing.T) {
 			if h := fallback.hops(); len(h) != 1 || h[0] != "0" {
 				t.Errorf("Tenure-Hops at the Fallback = %q, want 0", h)
 			}
+
+			// A Fallback that refuses connections is not tried a second time.
+			var down sends
+			tr = transport(r, &down)
+			tr.Fallback = deadAddr(t)
+			if err := roundTripErr(t, tr, request(t, context.Background(), http.MethodGet, nil)); !isDial(err) {
+				t.Fatalf("Fallback down: RoundTrip = %v, want the dial error", err)
+			}
+			down.check(t, routehttp.SendInfo{Space: "orders", Shard: -1, Addr: tr.Fallback, Err: errors.New("dial")})
 		})
 	}
 }
@@ -876,10 +892,14 @@ func TestTransportErrors(t *testing.T) {
 	closedLater := newRouter(t, tenure.Member{ID: "n1", Addr: owner.addr})
 	// With a Fallback, so that a closed Router's error is seen not to go there.
 	later := &routehttp.Transport{Router: closedLater, Space: "orders", Key: headerKey, Fallback: owner.addr}
-	if res, err := later.RoundTrip(request(t, context.Background(), http.MethodGet, nil)); err != nil {
-		t.Fatalf("before Close: %v", err)
-	} else {
-		_ = readBody(t, res)
+	// Without buffering, so that the body is still open when the lookup fails.
+	laterUnbuffered := &routehttp.Transport{Router: closedLater, Space: "orders", Key: headerKey, MaxBufferedBody: -1}
+	for _, tr := range []*routehttp.Transport{later, laterUnbuffered} {
+		if res, err := tr.RoundTrip(request(t, context.Background(), http.MethodGet, nil)); err != nil {
+			t.Fatalf("before Close: %v", err)
+		} else {
+			_ = readBody(t, res)
+		}
 	}
 	_ = closedLater.Close()
 
@@ -895,35 +915,36 @@ func TestTransportErrors(t *testing.T) {
 		{"KeyError", &routehttp.Transport{Router: r, Space: "orders", Key: headerKey}, "", errNoKey.Error()},
 		{"Closed", &routehttp.Transport{Router: closed, Space: "orders", Key: headerKey}, "k1", tenure.ErrClosed.Error()},
 		{"ClosedLater", later, "k1", tenure.ErrClosed.Error()},
+		{"ClosedLaterUnbuffered", laterUnbuffered, "k1", tenure.ErrClosed.Error()},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			body := &closeCheck{Reader: strings.NewReader("x")}
 			req := request(t, context.Background(), http.MethodPost, body)
 			req.Header.Set(keyHeader, c.key)
 			for range 2 {
-				body.closed = false
+				body.closed = 0
 				if err := roundTripErr(t, c.tr, req); err == nil || err.Error() != c.want {
 					t.Fatalf("RoundTrip = %v, want error %q", err, c.want)
 				}
-				if !body.closed {
-					t.Error("RoundTrip left the body open")
+				if body.closed != 1 {
+					t.Errorf("RoundTrip closed the body %d times, want once", body.closed)
 				}
 			}
 		})
 	}
-	if n := len(owner.requests()); n != 1 {
-		t.Errorf("member received %d requests, want only the one before Close", n)
+	if n := len(owner.requests()); n != 2 {
+		t.Errorf("member received %d requests, want only the two before Close", n)
 	}
 }
 
-// closeCheck is a body that records Close.
+// closeCheck is a body that counts its Close calls.
 type closeCheck struct {
 	io.Reader
-	closed bool
+	closed int
 }
 
 func (c *closeCheck) Close() error {
-	c.closed = true
+	c.closed++
 	return nil
 }
 
@@ -972,22 +993,38 @@ func BenchmarkTransport(b *testing.B) {
 }
 
 // TestTransportAllocs checks that a send to the owner allocates at most 2 times more than
-// http.Request.Clone.
+// http.Request.Clone, for a POST with a replayable body, an OnSend, and from 1 to 20 headers:
+// setting Tenure-Hops must not grow the copied header's map, which at 8 headers took 3
+// allocations more.
 func TestTransportAllocs(t *testing.T) {
 	if raceEnabled {
 		t.Skip("the race detector changes allocation counts")
 	}
-	tr, req := benchTransport(t)
-	clone := testing.AllocsPerRun(1000, func() { _ = req.Clone(req.Context()) })
-	send := testing.AllocsPerRun(1000, func() {
-		res, err := tr.RoundTrip(req)
-		if err != nil {
-			t.Fatal(err)
+	tr, _ := benchTransport(t)
+	var hops atomic.Int64
+	tr.OnSend = func(i routehttp.SendInfo) { hops.Add(int64(i.Hop)) }
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://orders.invalid/orders",
+		strings.NewReader(`{"id":"o-1","qty":3}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(keyHeader, "k1")
+	for n := 1; n <= 20; n++ {
+		if n > 1 {
+			req.Header.Set(fmt.Sprintf("X-Header-%d", n), "v")
 		}
-		_ = res.Body.Close()
-	})
-	t.Logf("Clone: %v allocations, RoundTrip: %v", clone, send)
-	if send > clone+2 {
-		t.Errorf("RoundTrip allocates %v times, Clone %v: more than 2 beyond Clone", send, clone)
+		clone := testing.AllocsPerRun(1000, func() { _ = req.Clone(req.Context()) })
+		body := testing.AllocsPerRun(1000, func() { req.Body, _ = req.GetBody() })
+		send := testing.AllocsPerRun(1000, func() {
+			req.Body, _ = req.GetBody()
+			res, err := tr.RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = res.Body.Close()
+		}) - body
+		if send > clone+2 {
+			t.Errorf("%d headers: RoundTrip allocates %v times, Clone %v: more than 2 beyond Clone", n, send, clone)
+		}
 	}
 }

@@ -3,6 +3,8 @@
 
 package routehttp
 
+import "net/http"
+
 // DefaultJitter is the random source of the retry waits.
 var DefaultJitter = jitter
 
@@ -12,4 +14,13 @@ func SetJitter(f func(n int64) int64) (restore func()) {
 	old := jitter
 	jitter = f
 	return func() { jitter = old }
+}
+
+// RetryAfter is the wait a Retry-After value asks for.
+var RetryAfter = retryAfter
+
+// BaseOf returns the RoundTripper t sends through, after applying t's defaults.
+func BaseOf(t *Transport) http.RoundTripper {
+	t.once.Do(t.init)
+	return t.base
 }
