@@ -16,4 +16,14 @@
 //
 // A router polls GET /tenure/view?wait=30s with the ETag of the last answer in If-None-Match,
 // and gets the next view as soon as there is one, or 304 Not Modified when the wait ends.
+//
+// NewMembership is that client: a watch-only tenure.Membership that long-polls one of several
+// endpoints, moves to another when one fails, and reports through Stale when it has heard
+// nothing for too long. A Router follows the group through it:
+//
+//	m, err := viewhttp.NewMembership([]string{"http://tenure-relay.orders:8080/tenure"})
+//	if err != nil {
+//		return err
+//	}
+//	router, err := tenure.NewRouter(m, spaces)
 package viewhttp

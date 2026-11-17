@@ -7,10 +7,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -18,6 +22,7 @@ import (
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/core"
 	"github.com/hmdsefi/tenure/memstore"
+	"github.com/hmdsefi/tenure/viewhttp"
 )
 
 // The end-to-end check of the Router against real nodes (AT-RTR-03): groups of nodes on one
@@ -140,6 +145,48 @@ type nodeGroup struct {
 	drained map[string]bool
 	router  *tenure.Router
 	keys    map[string][]string // a key of each shard, by space
+	relay   *relayNet           // the nodes' view handlers, when the Router follows them; else nil
+}
+
+// relayNet is an http.RoundTripper that serves the views of the running nodes in-process, as a
+// Kubernetes Service in front of them would: each request goes to the viewhttp.Handler of the
+// running node with the lowest ID, in the caller's goroutine, so that a long poll blocks only on
+// channels and timers, which testing/synctest can wait for.
+type relayNet struct {
+	mu       sync.Mutex
+	handlers map[string]http.Handler
+}
+
+// add serves the views of node id from now on.
+func (r *relayNet) add(id string, n *tenure.Node) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.handlers[id] = viewhttp.Handler(n)
+}
+
+// remove stops sending requests to node id.
+func (r *relayNet) remove(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.handlers, id)
+}
+
+func (r *relayNet) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.mu.Lock()
+	var h http.Handler
+	if ids := slices.Sorted(maps.Keys(r.handlers)); len(ids) > 0 {
+		h = r.handlers[ids[0]]
+	}
+	r.mu.Unlock()
+	if h == nil {
+		return nil, errors.New("relay: no node running")
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if err := req.Context().Err(); err != nil {
+		return nil, err
+	}
+	return w.Result(), nil
 }
 
 // newNodeGroup starts the nodes ids, one after the other, with Config.Slots slots, and a Router
@@ -147,8 +194,25 @@ type nodeGroup struct {
 // over it that reads the memstore, since static's views carry no slot data.
 func newNodeGroup(t *testing.T, slots int, ids ...string) *nodeGroup {
 	t.Helper()
+	return newNodeGroupOn(t, slots, false, ids...)
+}
+
+// newRelayNodeGroup starts the nodes ids as newNodeGroup does, and a Router that follows their
+// merged views over HTTP: on a viewhttp membership whose one endpoint, a relayNet, serves the
+// views of a running node through viewhttp.Handler, as a Service in front of the nodes would.
+func newRelayNodeGroup(t *testing.T, slots int, ids ...string) *nodeGroup {
+	t.Helper()
+	return newNodeGroupOn(t, slots, true, ids...)
+}
+
+// newNodeGroupOn is newRelayNodeGroup with relay, else newNodeGroup.
+func newNodeGroupOn(t *testing.T, slots int, relay bool, ids ...string) *nodeGroup {
+	t.Helper()
 	ng := &nodeGroup{t: t, ms: memstore.New(nil), g: newGroup(t), slots: slots,
 		nodes: make(map[string]*tenure.Node), drained: make(map[string]bool), keys: make(map[string][]string)}
+	if relay {
+		ng.relay = &relayNet{handlers: make(map[string]http.Handler)}
+	}
 	for _, sp := range nodeRouterSpaces() {
 		ng.keys[sp.Name] = shardKeys(sp.Shards)
 	}
@@ -156,7 +220,15 @@ func newNodeGroup(t *testing.T, slots int, ids ...string) *nodeGroup {
 		ng.join(id)
 	}
 	var m tenure.Membership = ng.g.Absent("router")
-	if slots > 0 {
+	switch {
+	case relay:
+		vm, err := viewhttp.NewMembership([]string{"http://relay"},
+			viewhttp.WithHTTPClient(&http.Client{Transport: ng.relay}))
+		if err != nil {
+			t.Fatalf("viewhttp.NewMembership: %v", err)
+		}
+		m = vm
+	case slots > 0:
 		m = &slotMembership{Membership: m, slots: ng.ms, period: core.DefaultTiming.RetryPeriod}
 	}
 	r, err := tenure.NewRouter(m, nodeRouterSpaces())
@@ -192,6 +264,9 @@ func (ng *nodeGroup) join(id string) {
 		Slots:      ng.slots,
 	}
 	ng.nodes[id] = start(ng.t, context.Background(), cfg)
+	if ng.relay != nil {
+		ng.relay.add(id, ng.nodes[id])
+	}
 }
 
 // drain drains member id, which stays in the group, draining, until it leaves.
@@ -206,6 +281,9 @@ func (ng *nodeGroup) drain(id string) {
 // leave closes member id, which leaves the group.
 func (ng *nodeGroup) leave(id string) {
 	ng.t.Helper()
+	if ng.relay != nil {
+		ng.relay.remove(id)
+	}
 	closeNode(ng.t, ng.nodes[id])
 	delete(ng.nodes, id)
 	delete(ng.drained, id)
@@ -390,38 +468,57 @@ func TestATRTR03RouterLikeNodes(t *testing.T) {
 func TestATRTR03RouterLikeNodesWithSlots(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
-		ng := newNodeGroup(t, 3, "n1", "n2", "n3")
-		ng.settle("start n1 to n3 on 3 slots")
-		ng.join("n4")
-		ng.settle("join n4 with no free slot")
-		setSlots := func(count int) {
-			t.Helper()
-			if err := ng.nodes[ng.ids()[0]].SetSlots(context.Background(), count); err != nil {
-				t.Fatalf("SetSlots(%d) = %v, want nil", count, err)
-			}
-			ng.settle("SetSlots(" + strconv.Itoa(count) + ")")
-		}
-		setSlots(5)
-		ng.join("n5")
-		ng.settle("join n5")
-		ng.drain("n2")
-		ng.settle("drain n2")
-		ng.leave("n2")
-		ng.settle("leave n2")
-		setSlots(3)
-		ng.join("n6")
-		ng.join("n7")
-		ng.settle("join n6 and n7")
-		// Roll every member over to a new one, as a rollout replaces pods: start the new member,
-		// then close the old one, which hands its slot over.
-		for _, id := range ng.ids() {
-			ng.join("r" + id[1:])
-			ng.settle("join r" + id[1:])
-			ng.leave(id)
-			ng.settle("leave " + id)
-		}
-		setSlots(4)
-		ng.close()
+		slotsScenario(t, newNodeGroup(t, 3, "n1", "n2", "n3"))
 		check()
 	})
+}
+
+// TestATRTR03RouterOnRelay runs the scenario of TestATRTR03RouterLikeNodesWithSlots with the
+// Router on a viewhttp membership that follows the nodes' merged views over HTTP, through one
+// Service-like endpoint that sends each poll to a running node, and checks that it routes every
+// shard of both spaces as every node does, also after the node it polls leaves (AT-RTR-03).
+func TestATRTR03RouterOnRelay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		check := baseline(t)
+		slotsScenario(t, newRelayNodeGroup(t, 3, "n1", "n2", "n3"))
+		check()
+	})
+}
+
+// slotsScenario runs the slotted AT-RTR-03 scenario on ng, which runs n1 to n3 on 3 slots: a
+// join without a free slot, slot count changes, a join, a drain, leaves and a rolling
+// replacement of every member, settling and checking the routes after each, then closes ng.
+func slotsScenario(t *testing.T, ng *nodeGroup) {
+	t.Helper()
+	ng.settle("start n1 to n3 on 3 slots")
+	ng.join("n4")
+	ng.settle("join n4 with no free slot")
+	setSlots := func(count int) {
+		t.Helper()
+		if err := ng.nodes[ng.ids()[0]].SetSlots(context.Background(), count); err != nil {
+			t.Fatalf("SetSlots(%d) = %v, want nil", count, err)
+		}
+		ng.settle("SetSlots(" + strconv.Itoa(count) + ")")
+	}
+	setSlots(5)
+	ng.join("n5")
+	ng.settle("join n5")
+	ng.drain("n2")
+	ng.settle("drain n2")
+	ng.leave("n2")
+	ng.settle("leave n2")
+	setSlots(3)
+	ng.join("n6")
+	ng.join("n7")
+	ng.settle("join n6 and n7")
+	// Roll every member over to a new one, as a rollout replaces pods: start the new member,
+	// then close the old one, which hands its slot over.
+	for _, id := range ng.ids() {
+		ng.join("r" + id[1:])
+		ng.settle("join r" + id[1:])
+		ng.leave(id)
+		ng.settle("leave " + id)
+	}
+	setSlots(4)
+	ng.close()
 }
