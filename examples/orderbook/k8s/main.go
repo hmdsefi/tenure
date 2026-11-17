@@ -55,6 +55,7 @@ import (
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/examples/internal/orderbook"
 	"github.com/hmdsefi/tenure/k8s"
+	"github.com/hmdsefi/tenure/routehttp"
 )
 
 const (
@@ -173,22 +174,7 @@ func serve(ctx context.Context, cfg config, client kubernetes.Interface, ln net.
 	ob := orderbook.New(orderbook.NewHTTPJournal(cfg.journal, &http.Client{Timeout: httpTimeout}))
 
 	var node atomic.Pointer[http.Handler]
-	srv := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			h := node.Load()
-			switch {
-			case h == nil:
-				w.Header().Set("Retry-After", "1")
-				http.Error(w, "starting", http.StatusServiceUnavailable)
-			case r.URL.Path == "/healthz":
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte("ok\n"))
-			default:
-				(*h).ServeHTTP(w, r)
-			}
-		}),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	srv := &http.Server{Handler: front(&node), ReadHeaderTimeout: 10 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
@@ -232,6 +218,24 @@ func serve(ctx context.Context, cfg config, client kubernetes.Interface, ln net.
 		return err
 	}
 	return nil
+}
+
+// front is the pod's handler: until node holds the node's handler every path answers 503 with
+// Tenure-Unprocessed, /healthz too, since nothing has served the request and a client may send
+// it again, to any member; then /healthz answers 200 and every other path goes to the node.
+func front(node *atomic.Pointer[http.Handler]) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := node.Load()
+		switch {
+		case h == nil:
+			routehttp.Unavailable(w, time.Second)
+		case r.URL.Path == "/healthz":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+		default:
+			(*h).ServeHTTP(w, r)
+		}
+	})
 }
 
 // stopNode hands the node's shards over and closes it: Drain for 25 s, then Close for 3 s. The

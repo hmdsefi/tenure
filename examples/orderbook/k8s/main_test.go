@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 
 	"github.com/hmdsefi/tenure/examples/internal/fencedb"
 	"github.com/hmdsefi/tenure/examples/internal/orderbook"
+	"github.com/hmdsefi/tenure/routehttp"
 )
 
 func envOf(m map[string]string) func(string) string {
@@ -155,6 +157,31 @@ func TestServe(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("serve did not return after its context ended")
+	}
+}
+
+// TestFrontStarting: until the node has started, every path answers 503 with Tenure-Unprocessed,
+// since nothing served the request, so a Router's Transport may send it again; then /healthz
+// answers 200 and the rest goes to the node's handler.
+func TestFrontStarting(t *testing.T) {
+	var node atomic.Pointer[http.Handler]
+	h := front(&node)
+	for _, path := range []string{"/healthz", orderbook.OrdersPath} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader("{}")))
+		if rec.Code != http.StatusServiceUnavailable || rec.Header().Get(routehttp.UnprocessedHeader) != "1" || rec.Header().Get("Retry-After") != "1" {
+			t.Errorf("%s while starting: %d, header %v; want 503 with Retry-After 1 and %s 1",
+				path, rec.Code, rec.Header(), routehttp.UnprocessedHeader)
+		}
+	}
+	var started http.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
+	node.Store(&started)
+	for path, want := range map[string]int{"/healthz": http.StatusOK, orderbook.OrdersPath: http.StatusTeapot} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil))
+		if rec.Code != want {
+			t.Errorf("%s once started: %d, want %d", path, rec.Code, want)
+		}
 	}
 }
 
