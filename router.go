@@ -52,6 +52,11 @@ type Router struct {
 	done   chan struct{}      // closed when the builder returns
 	stale  atomic.Bool        // the watch has ended or failed and no view has come since
 
+	// The builder alone uses these two: whether the source last reported itself stale through
+	// Stale() bool, and whether the last router.stale or router.fresh said stale.
+	srcStale bool
+	reported bool
+
 	// mu guards the build state: only one snapshot is built at a time.
 	mu       sync.Mutex
 	assigner *core.Assigner

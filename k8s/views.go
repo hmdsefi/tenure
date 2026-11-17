@@ -79,8 +79,8 @@ type viewWatch struct {
 // record and changed within the Lease's duration, as this Adapter observes it, sorted by ID; a
 // member's Slot is the lowest slot one of its sessions holds, and Slots and SlotHolders are what
 // Slots reports. While the Adapter has joined or holds a session but has not seen its own member
-// Lease writes come back from its watch within RenewDeadline, the passing of time alone removes
-// no member. A new view, with the next Version, comes when anything but Version changes. The
+// Lease writes come back from its watch within RenewDeadline, and while a watch-only Adapter is
+// stale (see Stale), the passing of time alone removes no member. A new view, with the next Version, comes when anything but Version changes. The
 // channel holds one view; a newer view replaces one not yet received. Watch may be called before
 // Join, also on an Adapter that never joins, and any number of times. The channel is closed when
 // ctx is done and when Leave ends the membership; Watch returns tenure.ErrClosed after Leave.

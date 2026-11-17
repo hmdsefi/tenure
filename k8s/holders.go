@@ -150,13 +150,18 @@ func (s *holderWatches) closeLocked(w *holderWatch) {
 // channel buffers 1024 values; it is closed when its buffer is full, when the Adapter's watch
 // of the Leases may have missed a change, when a change's resourceVersion is not an integer, and
 // once ctx is done. WatchHolders lists the group's shard Leases once, for a version to start
-// from, and keeps the Adapter's watch of the Leases running while the channel is open.
+// from, and keeps the Adapter's watch of the Leases running while the channel is open. A
+// watch-only Adapter, which does not watch shard Leases, refuses WatchHolders with an error
+// wrapping ErrWatchOnly.
 func (a *Adapter) WatchHolders(ctx context.Context) (<-chan tenure.Holding, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if a.err != nil {
 		return nil, a.err
+	}
+	if err := a.refuse("WatchHolders"); err != nil {
+		return nil, err
 	}
 	c, err := a.holdCache(ctx)
 	if err != nil {
@@ -261,11 +266,12 @@ func (a *Adapter) holdingIn(l *coordinationv1.Lease) (h tenure.Holding, malforme
 
 // leaseInformer returns the informer of run c: the group's Leases in the namespace, with no
 // resync, whose every list of the Leases closes the run's channels at its start and at its end
-// (K8S-520), as does its watch error handler. A watch that streams the Leases' current state
-// first, in place of a list, ends its list at the bookmark that closes that state.
-func (a *Adapter) leaseInformer(c *leaseCache) cache.SharedIndexInformer {
+// (K8S-520), as does its watch error handler, which also calls failed. A watch that streams the
+// Leases' current state first, in place of a list, ends its list at the bookmark that closes that
+// state.
+func (a *Adapter) leaseInformer(c *leaseCache, failed func()) cache.SharedIndexInformer {
 	leases := a.leases()
-	selector := labelGroup + "=" + a.group
+	selector := a.leaseSelector()
 	lw := &cache.ListWatch{
 		ListWithContextFunc: func(ctx context.Context, o metav1.ListOptions) (runtime.Object, error) {
 			o.LabelSelector = selector
@@ -291,6 +297,7 @@ func (a *Adapter) leaseInformer(c *leaseCache) cache.SharedIndexInformer {
 	err := informer.SetWatchErrorHandlerWithContext(func(ctx context.Context, r *cache.Reflector, err error) {
 		cache.DefaultWatchErrorHandler(ctx, r, err)
 		c.holders.closeAll()
+		failed()
 	})
 	if err != nil {
 		// SetWatchErrorHandler fails only on an informer that has started; this one has not.

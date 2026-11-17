@@ -38,8 +38,9 @@ func (r *Router) start(m Membership) error {
 
 // build is the builder, the Router's one goroutine (RTR-300 to RTR-340). It applies the latest
 // view of ch, ticks the Assigner at its next wake, and after ch closes or a Watch fails marks the
-// Router stale and calls Watch again RetryPeriod later. It never calls Join, SetDraining or
-// Leave. It returns when ctx is done; after Watch returns ErrClosed it watches no more, but
+// Router stale and calls Watch again RetryPeriod later. When the source reports its own
+// staleness, it reads it every RetryPeriod and after each view. It never calls Join, SetDraining
+// or Leave. It returns when ctx is done; after Watch returns ErrClosed it watches no more, but
 // keeps ticking.
 func (r *Router) build(ctx context.Context, ch <-chan core.View) {
 	defer close(r.done)
@@ -49,6 +50,13 @@ func (r *Router) build(ctx context.Context, ch <-chan core.View) {
 	retry := time.NewTimer(time.Hour)
 	retry.Stop()
 	defer retry.Stop()
+	var poll <-chan time.Time
+	if _, ok := r.source.(staleSource); ok {
+		t := time.NewTicker(r.opts.timing.RetryPeriod)
+		defer t.Stop()
+		poll = t.C
+		r.pollSource()
+	}
 
 	for {
 		r.armWake(wake)
@@ -65,6 +73,9 @@ func (r *Router) build(ctx context.Context, ch <-chan core.View) {
 				continue
 			}
 			r.setStale(false)
+			r.pollSource()
+		case <-poll:
+			r.pollSource()
 		case <-wake.C:
 			r.tickNow()
 		case <-retry.C:
@@ -85,14 +96,35 @@ func (r *Router) build(ctx context.Context, ch <-chan core.View) {
 	}
 }
 
-// setStale records whether the Router is stale and reports a change with router.stale or
-// router.fresh.
+// setStale records whether the Router's watch is stale, and reports a change of the Router's
+// staleness with router.stale or router.fresh. Only the builder calls it.
 func (r *Router) setStale(stale bool) {
-	if r.stale.Swap(stale) == stale {
+	r.stale.Store(stale)
+	r.reportStale(errWatchClosed)
+}
+
+// pollSource reads the staleness the source reports through Stale() bool, if it does, and
+// reports a change of the Router's staleness. Only the builder calls it.
+func (r *Router) pollSource() {
+	s, ok := r.source.(staleSource)
+	if !ok {
 		return
 	}
-	if stale {
-		r.events.emit(RouterEvent{Kind: RouterEventStale, Shard: -1, Err: errWatchClosed})
+	r.srcStale = s.Stale()
+	r.reportStale(errSourceStale)
+}
+
+// reportStale emits router.stale, with cause as its Err, when the Router has become stale, from
+// its watch or its source, since the last report, and router.fresh when it has stopped being
+// stale. Only the builder calls it.
+func (r *Router) reportStale(cause error) {
+	now := r.stale.Load() || r.srcStale
+	if now == r.reported {
+		return
+	}
+	r.reported = now
+	if now {
+		r.events.emit(RouterEvent{Kind: RouterEventStale, Shard: -1, Err: cause})
 		return
 	}
 	r.events.emit(RouterEvent{Kind: RouterEventFresh, Version: r.Version(), Shard: -1})

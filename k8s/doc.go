@@ -6,7 +6,9 @@
 // It needs no other infrastructure and one RBAC rule: get, list, watch, create, update and
 // delete on Leases in that namespace. The module's rbac.yaml holds that rule as a Role tenure,
 // with a ServiceAccount tenure and a RoleBinding tenure between them, in the namespace default:
-// change the namespace to the Adapter's.
+// change the namespace to the Adapter's. A watch-only Adapter needs only get, list and watch on
+// Leases, which the module's rbac-readonly.yaml grants in the same way, all three objects named
+// tenure-readonly.
 //
 // # Objects
 //
@@ -89,6 +91,22 @@
 // their slots. While the Adapter's view of the group is stale, the passing of time alone removes
 // no member. The Adapter deletes member Leases that have not changed for a long time; see
 // WithMemberGC.
+//
+// # Watch only
+//
+// WithWatchOnly makes an Adapter for processes that only follow the group, such as routers. Its
+// watch selects only the member, slots and slot Leases of the group, so it receives none of the
+// writes of shard handoffs; it deletes no member Lease; and every method that writes, and
+// WatchHolders, return an error wrapping ErrWatchOnly without a request. Watch works as for an
+// Adapter that never joins.
+//
+// A watch-only Adapter writes nothing whose return would show that its watch still delivers.
+// Instead, when its watch has delivered no Lease event for RenewDeadline while its view lists a
+// member, it starts its watch again, which lists the Leases. Until that list arrives, Stale
+// reports true and the passing of time alone removes no member. After it, a member Lease whose
+// resourceVersion differs from the one last seen counts as changed then, and one that has not
+// changed keeps aging. Lists that fail are retried with a backoff from RetryPeriod, doubling up to
+// LeaseDuration.
 //
 // # Configuration
 //

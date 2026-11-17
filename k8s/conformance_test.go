@@ -146,8 +146,18 @@ func stopAdapter(t *testing.T, a *Adapter) {
 // order. It waits until the service account may list Leases.
 func applyRBAC(t *testing.T, c *cluster) {
 	t.Helper()
+	applyManifest(t, c, "rbac.yaml", "tenure", []string{"get", "list", "watch", "create", "update", "delete"})
+}
+
+// applyManifest creates the objects of the RBAC manifest file in c.ns, with c.ns for the
+// namespace default, after checking that it holds a Role, a ServiceAccount and a RoleBinding, in
+// that order, all named name, the Role with one rule granting verbs on Leases and the binding
+// giving it to the service account. It waits until the service account may list Leases, and
+// checks that it may not list pods.
+func applyManifest(t *testing.T, c *cluster, file, name string, verbs []string) {
+	t.Helper()
 	ctx := t.Context()
-	manifest, err := os.ReadFile("rbac.yaml")
+	manifest, err := os.ReadFile(file)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,29 +166,29 @@ func applyRBAC(t *testing.T, c *cluster) {
 	for doc := range strings.SplitSeq(string(manifest), "---\n") {
 		obj, _, err := scheme.Codecs.UniversalDeserializer().Decode([]byte(doc), nil, nil)
 		if err != nil {
-			t.Fatalf("decode rbac.yaml: %v", err)
+			t.Fatalf("decode %s: %v", file, err)
 		}
 		objs = append(objs, obj)
 	}
-	meta := metav1.ObjectMeta{Name: "tenure", Namespace: c.ns}
+	meta := metav1.ObjectMeta{Name: name, Namespace: c.ns}
 	role := &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
 		ObjectMeta: meta,
 		Rules: []rbacv1.PolicyRule{{
 			APIGroups: []string{"coordination.k8s.io"},
 			Resources: []string{"leases"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "delete"},
+			Verbs:     verbs,
 		}},
 	}
 	account := &corev1.ServiceAccount{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"}, ObjectMeta: meta}
 	binding := &rbacv1.RoleBinding{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
 		ObjectMeta: meta,
-		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: "tenure", Namespace: c.ns}},
-		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "tenure"},
+		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: c.ns}},
+		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: name},
 	}
 	if want := []runtime.Object{role, account, binding}; !reflect.DeepEqual(objs, want) {
-		t.Fatalf("rbac.yaml holds %+v, want %+v", objs, want)
+		t.Fatalf("%s holds %+v, want %+v", file, objs, want)
 	}
 	// The manifest holds exactly these objects: create them.
 	if _, err := c.raw.RbacV1().Roles(c.ns).Create(ctx, role, metav1.CreateOptions{}); err != nil {
@@ -192,7 +202,7 @@ func applyRBAC(t *testing.T, c *cluster) {
 	}
 
 	// The API server's authorizer learns of the binding through its own informers.
-	sa, _ := c.clientAs(t, "system:serviceaccount:"+c.ns+":tenure")
+	sa, _ := c.clientAs(t, "system:serviceaccount:"+c.ns+":"+name)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		_, err := sa.CoordinationV1().Leases(c.ns).List(ctx, metav1.ListOptions{})

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -32,8 +33,9 @@ import (
 // been gone for that Lease's duration.
 //
 // Freshness (K8S-150). The cache is fresh while the Adapter has neither joined nor an active
-// session, or when the informer delivered one of the Adapter's own member Lease writes that
-// changed its resourceVersion and was sent within the last RenewDeadline (of the active
+// session, unless it is a watch-only Adapter that is stale (watchonly_fresh.go), or when the
+// informer delivered one of the Adapter's own member Lease writes that changed its
+// resourceVersion and was sent within the last RenewDeadline (of the active
 // sessions' Timing, the largest when there are several, else of the Adapter's). The age counts
 // from the write's sending, not from its delivery: the watch delivers in resourceVersion order,
 // so the delivery shows the cache holds every change committed before the write, and no later
@@ -118,6 +120,15 @@ type leaseCache struct {
 	gone map[string]types.UID
 	// holders are the run's WatchHolders channels (holders.go).
 	holders holderWatches
+
+	// equalOnly is set for a watch-only Adapter: observe compares resourceVersions for equality
+	// only (watchonly_fresh.go).
+	equalOnly bool
+	// gen is the generation of the run's current informer; the others' events are dropped.
+	gen atomic.Uint64
+	// lastEvent is when the current informer last delivered an event, or when the run or that
+	// informer started; c.mu guards it.
+	lastEvent time.Time
 }
 
 // holdCache holds the informer running, starting it unless it runs already, and waits for its
@@ -172,10 +183,37 @@ func (a *Adapter) startCache() *leaseCache {
 		pending:     map[string][]pendingWrite{},
 		delivered:   map[string]uint64{},
 		gone:        map[string]types.UID{},
+		equalOnly:   a.watchOnly,
 	}
-	informer := a.leaseInformer(c)
+	c.lastEvent = c.now()
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cancel = cancel
+	run := a.startInformer(ctx, c)
+	c.synced = run.synced
+	if a.watchOnly {
+		a.runs.Go(func() { a.followFreshness(ctx, c, run) })
+	}
+	a.runs.Go(func() { a.collectMembers(ctx) })
+	return c
+}
+
+// startInformer starts an informer for run c, which runs until ctx ends or it is stopped, as
+// the run's current one: the events of the informers started before it are dropped from now on.
+func (a *Adapter) startInformer(ctx context.Context, c *leaseCache) *informerRun {
+	gen := c.gen.Add(1)
+	current := func() bool { return c.gen.Load() == gen }
+	failed := make(chan struct{})
+	var failOnce sync.Once
+	informer := a.leaseInformer(c, func() { failOnce.Do(func() { close(failed) }) })
 	deliver := func(old, obj any) {
+		if !current() {
+			return
+		}
+		c.noteEvent()
 		l := asLease(obj)
+		if a.onEvent != nil {
+			a.onEvent(l)
+		}
 		c.observe(l)
 		a.delivered(c, l)
 		a.holderEvent(c, asLease(old), l, false, false)
@@ -185,6 +223,13 @@ func (a *Adapter) startCache() *leaseCache {
 		AddFunc:    func(obj any) { deliver(nil, obj) },
 		UpdateFunc: deliver,
 		DeleteFunc: func(obj any) {
+			if !current() {
+				return
+			}
+			c.noteEvent()
+			if a.onEvent != nil {
+				a.onEvent(asLease(obj))
+			}
 			_, gap := obj.(cache.DeletedFinalStateUnknown)
 			c.forget(asLease(obj), gap)
 			a.holderEvent(c, nil, asLease(obj), true, gap)
@@ -195,12 +240,19 @@ func (a *Adapter) startCache() *leaseCache {
 		// AddEventHandler fails only on an informer that has stopped; this one has not started.
 		panic("k8s: add event handler: " + err.Error())
 	}
-	c.synced = reg.HasSyncedChecker().Done()
-	ctx, cancel := context.WithCancel(context.Background())
-	c.cancel = cancel
-	a.runs.Go(func() { informer.RunWithContext(ctx) })
-	a.runs.Go(func() { a.collectMembers(ctx) })
-	return c
+	ictx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	a.runs.Go(func() {
+		defer close(done)
+		informer.RunWithContext(ictx)
+	})
+	return &informerRun{
+		informer: informer,
+		cancel:   cancel,
+		done:     done,
+		synced:   reg.HasSyncedChecker().Done(),
+		failed:   failed,
+	}
 }
 
 // asLease returns the Lease of an informer event, also of a deletion whose final state is
@@ -243,7 +295,9 @@ func isOlder(rv, seen string) bool {
 }
 
 // observe records state l of a Lease (K8S-110). A state older than the one recorded is ignored,
-// also when the recorded one is of a Lease created anew at the name.
+// also when the recorded one is of a Lease created anew at the name. A watch-only Adapter's
+// cache, which only its informer feeds, compares resourceVersions for equality only (RTR-720):
+// any other resourceVersion is a change.
 func (c *leaseCache) observe(l *coordinationv1.Lease) {
 	if l == nil {
 		return
@@ -254,7 +308,7 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 	c.prune(now)
 	o, ok := c.obs[l.Name]
 	switch {
-	case ok && isOlder(l.ResourceVersion, o.lease.ResourceVersion):
+	case ok && !c.equalOnly && isOlder(l.ResourceVersion, o.lease.ResourceVersion):
 		// Older than the state recorded, also of a Lease since deleted: a late delivery after a
 		// read from the API server was noted (noteRead).
 	case c.isGone(l.Name, l.UID):
@@ -269,7 +323,7 @@ func (c *leaseCache) observe(l *coordinationv1.Lease) {
 			c.noteGone(l.Name, o.lease.UID)
 		}
 		c.obs[l.Name] = &observation{lease: l, rvSeenAt: now, tokenSeenAt: now, named: holderOf(l)}
-	case l.ResourceVersion == o.lease.ResourceVersion || isOlder(l.ResourceVersion, o.lease.ResourceVersion):
+	case l.ResourceVersion == o.lease.ResourceVersion || !c.equalOnly && isOlder(l.ResourceVersion, o.lease.ResourceVersion):
 	default:
 		next := &observation{lease: l, rvSeenAt: now, tokenSeenAt: o.tokenSeenAt, named: o.named}
 		if h := holderOf(l); h != "" {
@@ -542,9 +596,10 @@ func (a *Adapter) freshness() (fresh bool, next time.Time) {
 	a.mu.Lock()
 	active, deadline, next := a.freshRuleLocked(now)
 	c := a.cache
+	stale := a.stale
 	a.mu.Unlock()
 	if !active {
-		return true, time.Time{}
+		return !stale, time.Time{}
 	}
 	if c == nil {
 		return false, next
