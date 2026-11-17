@@ -16,6 +16,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -49,6 +50,14 @@ const (
 	pollPause     = 250 * time.Millisecond
 	minOneSend    = 0.99 // the share of steady-state orders that must take one send
 	maxRolloutHop = 2    // 1 + the highest hop: at most 3 sends during the rollout
+
+	// minSteadyOrders and minRolloutOrders keep the measurements from passing on too few
+	// orders: two clients at 40 orders/s finish about 1200 in the steady window and about 1000
+	// over a rollout and its settle.
+	minSteadyOrders  = 600
+	minRolloutOrders = 400
+
+	readOnlySA = "tenure-readonly" // the client pods' ServiceAccount
 )
 
 // stats is a client pod's GET /stats, as orderbook/k8s/client serves it.
@@ -279,6 +288,51 @@ func (e *e2e) converged(ctx context.Context) []string {
 	return pods
 }
 
+// checkReadOnlyClients checks what the cluster runs for the clients: no Service selects them,
+// their pods run as the read-only ServiceAccount, and the API server lets that account get,
+// list and watch Leases but not create, update or delete them.
+func (e *e2e) checkReadOnlyClients(ctx context.Context) {
+	e.t.Helper()
+	svcs, err := e.client.CoreV1().Services(e2eNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		e.t.Fatalf("services: %v", err)
+	}
+	for _, s := range svcs.Items {
+		if s.Spec.Selector["app"] == clientApp {
+			e.t.Errorf("service %s selects the client pods", s.Name)
+		}
+	}
+	pods, err := e.client.CoreV1().Pods(e2eNamespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + clientApp})
+	if err != nil {
+		e.t.Fatalf("client pods: %v", err)
+	}
+	for _, p := range pods.Items {
+		if p.Spec.ServiceAccountName != readOnlySA {
+			e.t.Errorf("client pod %s runs as %q, want %q", p.Name, p.Spec.ServiceAccountName, readOnlySA)
+		}
+	}
+	user := "system:serviceaccount:" + e2eNamespace + ":" + readOnlySA
+	for verb, want := range map[string]bool{
+		"get": true, "list": true, "watch": true, "create": false, "update": false, "delete": false,
+	} {
+		sar, err := e.client.AuthorizationV1().SubjectAccessReviews().Create(ctx, &authorizationv1.SubjectAccessReview{
+			Spec: authorizationv1.SubjectAccessReviewSpec{
+				User:   user,
+				Groups: []string{"system:serviceaccounts", "system:serviceaccounts:" + e2eNamespace, "system:authenticated"},
+				ResourceAttributes: &authorizationv1.ResourceAttributes{
+					Namespace: e2eNamespace, Verb: verb, Group: "coordination.k8s.io", Resource: "leases",
+				},
+			},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			e.t.Fatalf("access review of %s on leases: %v", verb, err)
+		}
+		if sar.Status.Allowed != want {
+			e.t.Errorf("%s may %s leases: %v, want %v", readOnlySA, verb, sar.Status.Allowed, want)
+		}
+	}
+}
+
 // rolloutDone reports whether d's latest generation is fully rolled out.
 func rolloutDone(d *appsv1.Deployment) bool {
 	want := int32(1)
@@ -418,7 +472,9 @@ func checkJournal(t *testing.T, all [][][]byte, finals map[string]stats) {
 // order to more than 3 sends; deleting each client pod in turn, which the Deployment replaces,
 // fails no order. No order ends with a 409 (a client counts a 409 ok only for a resend after a lost
 // answer, and the test logs those). The journal check reads the journal service: unique IDs, and
-// each client pod's ok count equals its journaled orders. The steps were written for this test from the text of
+// each client pod's ok count equals its journaled orders. Before the load is measured it checks
+// that no Service selects the client pods and that their ServiceAccount may read Leases but not
+// write them. The steps were written for this test from the text of
 // issue #385.
 func TestOrderbookKubernetes(t *testing.T) {
 	path := kubeconfig(t)
@@ -442,6 +498,7 @@ func TestOrderbookKubernetes(t *testing.T) {
 		}
 	})
 	e.waitRollout(ctx, clientDeploy)
+	e.checkReadOnlyClients(ctx)
 	finals := map[string]stats{} // the final stats of every client pod of this run
 
 	// Steady state: both clients are ready and route as the Leases say.
@@ -450,8 +507,8 @@ func TestOrderbookKubernetes(t *testing.T) {
 	time.Sleep(steadyWindow)
 	steady := diff(before, e.allStats(ctx, pods))
 	t.Logf("steady state: %v", steady)
-	if steady.orders == 0 {
-		t.Fatal("no order finished in the steady state")
+	if steady.orders < minSteadyOrders {
+		t.Fatalf("%d orders finished in the steady state, want at least %d", steady.orders, minSteadyOrders)
 	}
 	if share := float64(steady.oneSend) / float64(steady.orders); share < minOneSend {
 		t.Errorf("%.2f%% of the steady-state orders took one send, want at least %.0f%%", 100*share, 100*minOneSend)
@@ -466,6 +523,9 @@ func TestOrderbookKubernetes(t *testing.T) {
 	time.Sleep(settle)
 	rollout := diff(before, e.allStats(ctx, pods))
 	t.Logf("orderbook rollout: %v", rollout)
+	if rollout.orders < minRolloutOrders {
+		t.Errorf("%d orders finished during the rollout, want at least %d", rollout.orders, minRolloutOrders)
+	}
 	if rollout.maxHop > maxRolloutHop {
 		t.Errorf("an order took %d sends during the rollout (highest hop %d), want at most %d",
 			rollout.maxHop+1, rollout.maxHop, maxRolloutHop+1)
