@@ -47,6 +47,7 @@ import (
 	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/examples/internal/demo"
 	"github.com/hmdsefi/tenure/examples/internal/fencedb"
+	"github.com/hmdsefi/tenure/examples/internal/orderbook"
 )
 
 const (
@@ -115,12 +116,12 @@ func execute(ctx context.Context, args []string, out io.Writer) (err error) {
 	defer hc.CloseIdleConnections()
 	dc := &demo.Client{HTTP: hc}
 	if *routed {
-		r, err := c.Router([]tenure.Space{books[0].space()})
+		r, err := c.Router(orderbook.Spaces())
 		if err != nil {
 			return err
 		}
 		defer func() { _ = r.Close() }()
-		dc.Router, dc.Space = r, marketsSpace
+		dc.Router, dc.Space = r, orderbook.SpaceName
 	}
 	l := &load{
 		dc:      dc,
@@ -189,6 +190,27 @@ wait:
 	return nil
 }
 
+// newBooks returns n orderbooks, one for each node, that journal to db.
+func newBooks(db *fencedb.DB, n int) []*orderbook.Orderbook {
+	books := make([]*orderbook.Orderbook, n)
+	for i := range books {
+		books[i] = orderbook.New(orderbook.NewDBJournal(db))
+	}
+	return books
+}
+
+// startCluster starts one demo node for each of books: node i runs books[i] and serves its
+// orders over HTTP.
+func startCluster(ctx context.Context, books []*orderbook.Orderbook) (*demo.Cluster, error) {
+	return demo.Start(ctx, demo.Options{
+		Nodes:  len(books),
+		Spaces: func(i int) []tenure.Space { return []tenure.Space{books[i].Space()} },
+		Serve: func(i int, n *tenure.Node) http.Handler {
+			return orderbook.NewServer(n, books[i], memberID(i))
+		},
+	})
+}
+
 // memberID returns the ID of node i.
 func memberID(i int) string {
 	return fmt.Sprintf("n%d", i+1)
@@ -203,11 +225,11 @@ type owner struct {
 // owners reads who runs each shard from the nodes' own tables. It returns nil when some shard
 // has no owner now.
 func owners(c *demo.Cluster) map[int]owner {
-	m := make(map[int]owner, marketShards)
+	m := make(map[int]owner, orderbook.Shards)
 	for _, n := range c.Nodes {
 		t := n.Table()
 		for _, sp := range t.Spaces {
-			if sp.Name != marketsSpace {
+			if sp.Name != orderbook.SpaceName {
 				continue
 			}
 			for _, row := range sp.Rows {
@@ -217,7 +239,7 @@ func owners(c *demo.Cluster) map[int]owner {
 			}
 		}
 	}
-	if len(m) != marketShards {
+	if len(m) != orderbook.Shards {
 		return nil
 	}
 	return m
@@ -263,7 +285,7 @@ func ownedBy(m map[int]owner, id string) bool {
 func printOwners(out io.Writer, m map[int]owner) {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "shard\towner\tterm")
-	for shard := range marketShards {
+	for shard := range orderbook.Shards {
 		o := m[shard]
 		fmt.Fprintf(tw, "%d\t%s\t%d\n", shard, o.id, o.term)
 	}

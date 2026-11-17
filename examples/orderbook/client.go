@@ -14,14 +14,7 @@ import (
 	"sync/atomic"
 
 	"github.com/hmdsefi/tenure/examples/internal/demo"
-)
-
-const (
-	// marketCount is the number of markets the clients trade: mkt-00 to mkt-31.
-	marketCount = 32
-
-	minPrice, maxPrice = 90, 110
-	maxQty             = 10
+	"github.com/hmdsefi/tenure/examples/internal/orderbook"
 )
 
 // load is a set of clients that post orders to the members of a cluster and follow their routes.
@@ -36,11 +29,6 @@ type load struct {
 	accepted atomic.Int64
 	fills    atomic.Int64
 	sends    atomic.Int64 // the sends of the accepted orders
-}
-
-// marketName returns the name of market i.
-func marketName(i int) string {
-	return fmt.Sprintf("mkt-%02d", i)
 }
 
 // run posts l.orders orders, split among l.clients clients, and returns when each is accepted,
@@ -79,19 +67,10 @@ func (l *load) run(ctx context.Context) error {
 // client posts n orders as client i.
 func (l *load) client(ctx context.Context, i, n int) error {
 	rng := rand.New(rand.NewPCG(l.seed, uint64(i))) //nolint:gosec // seeded on purpose: the same flags make the same orders
-	url := l.urls[i%len(l.urls)] + "/orders"
+	url := l.urls[i%len(l.urls)] + orderbook.OrdersPath
 	prefix := cmp.Or(l.prefix, "c")
 	for k := range n {
-		o := order{
-			ID:     fmt.Sprintf("%s%d-%d", prefix, i, k),
-			Market: marketName(rng.IntN(marketCount)),
-			Side:   sideBuy,
-			Price:  minPrice + rng.Int64N(maxPrice-minPrice+1),
-			Qty:    1 + rng.Int64N(maxQty),
-		}
-		if rng.IntN(2) == 0 {
-			o.Side = sideSell
-		}
+		o := orderbook.RandomOrder(rng, fmt.Sprintf("%s%d-%d", prefix, i, k))
 		body, err := json.Marshal(o)
 		if err != nil {
 			return err
@@ -103,7 +82,7 @@ func (l *load) client(ctx context.Context, i, n int) error {
 		if res.Status != http.StatusOK {
 			return fmt.Errorf("order %s: status %d: %s", o.ID, res.Status, res.Body)
 		}
-		var r result
+		var r orderbook.Result
 		if err := json.Unmarshal(res.Body, &r); err != nil {
 			return fmt.Errorf("order %s: answer: %w", o.ID, err)
 		}

@@ -1,0 +1,69 @@
+# Three orderbook pods with one slot each: a rolling deploy surges one pod and never removes a
+# ready one first, so each shard moves once.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orderbook
+  labels:
+    app: orderbook
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: orderbook
+  template:
+    metadata:
+      labels:
+        app: orderbook
+    spec:
+      serviceAccountName: orderbook
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: orderbook
+          image: tenure-orderbook:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SLOTS
+              value: "3"
+            - name: JOURNAL_URL
+              value: http://journalsvc:8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+---
+# The clients' fallback: a request with no route yet goes to any ready pod, which answers with
+# the owner's address.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orderbook
+spec:
+  selector:
+    app: orderbook
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

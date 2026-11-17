@@ -337,6 +337,7 @@ jobs:
   examples-k8s:
     name: examples on kind
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       GOWORK: 'off'
     steps:
@@ -351,6 +352,9 @@ jobs:
         run: |
           docker build -f examples/signer/k8s/Dockerfile --build-arg PKG=./signer/k8s -t tenure-signer:dev .
           docker build -f examples/signer/k8s/Dockerfile --build-arg PKG=./signer/noncesvc -t tenure-noncesvc:dev .
+          docker build -f examples/signer/k8s/Dockerfile --build-arg PKG=./orderbook/k8s -t tenure-orderbook:dev .
+          docker build -f examples/signer/k8s/Dockerfile --build-arg PKG=./orderbook/journalsvc -t tenure-journalsvc:dev .
+          docker build -f examples/signer/k8s/Dockerfile --build-arg PKG=./orderbook/k8s/client -t tenure-orderbook-client:dev .
       - name: create the kind cluster
         run: |
           echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
@@ -370,6 +374,21 @@ jobs:
         run: |
           grep -q -e '^--- PASS: TestSignerKubernetes ' "$RUNNER_TEMP/examples-k8s-test.log"
           if grep -e '--- SKIP: TestSignerKubernetes' "$RUNNER_TEMP/examples-k8s-test.log"; then exit 1; fi
+      - name: deploy the orderbook, journalsvc and the clients
+        run: |
+          kind load docker-image tenure-orderbook:dev tenure-journalsvc:dev tenure-orderbook-client:dev --name tenure-examples
+          kubectl apply -k examples/orderbook/k8s/deploy
+          kubectl -n tenure-orderbook rollout status deploy/journalsvc deploy/orderbook deploy/client --timeout 120s
+      - name: test the orderbook's routing clients
+        env:
+          TENURE_TEST_EXTERNAL: '1'
+        run: |
+          set -o pipefail
+          TENURE_TEST_KUBECONFIG="$KUBECONFIG" go -C examples test -race -count=1 -v -run '^TestOrderbookKubernetes$' ./orderbook/k8s 2>&1 | tee "$RUNNER_TEMP/examples-k8s-orderbook.log"
+      - name: TestOrderbookKubernetes not skipped
+        run: |
+          grep -q -e '^--- PASS: TestOrderbookKubernetes ' "$RUNNER_TEMP/examples-k8s-orderbook.log"
+          if grep -e '--- SKIP: TestOrderbookKubernetes' "$RUNNER_TEMP/examples-k8s-orderbook.log"; then exit 1; fi
       - name: cluster state after a failure
         if: failure()
         run: |
@@ -377,6 +396,11 @@ jobs:
           kubectl -n tenure-signer describe pods || true
           kubectl -n tenure-signer logs -l app=signer --all-containers --tail=200 --prefix || true
           kubectl -n tenure-signer logs -l app=noncesvc --all-containers --tail=200 --prefix || true
+          kubectl -n tenure-orderbook get deploy,pods,leases -o wide || true
+          kubectl -n tenure-orderbook describe pods || true
+          kubectl -n tenure-orderbook logs -l app=orderbook --all-containers --tail=200 --prefix || true
+          kubectl -n tenure-orderbook logs -l app=journalsvc --all-containers --tail=200 --prefix || true
+          kubectl -n tenure-orderbook logs -l app=client --all-containers --tail=200 --prefix || true
 
   golden-trailer:
     if: github.event_name == 'pull_request'

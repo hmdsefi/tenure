@@ -1,7 +1,7 @@
 // Copyright 2026 Hamed Yousefi
 // SPDX-License-Identifier: MPL-2.0
 
-package main
+package orderbook
 
 import (
 	"errors"
@@ -13,12 +13,12 @@ import (
 
 // Order sides.
 const (
-	sideBuy  = "buy"
-	sideSell = "sell"
+	SideBuy  = "buy"
+	SideSell = "sell"
 )
 
-// order is a limit order: Qty units of Market at Price or better. Price and Qty are integers.
-type order struct {
+// Order is a limit order: Qty units of Market at Price or better. Price and Qty are integers.
+type Order struct {
 	ID     string `json:"id"`
 	Market string `json:"market"`
 	Side   string `json:"side"`
@@ -31,13 +31,13 @@ var errInvalidOrder = errors.New("orderbook: invalid order")
 
 // validate reports whether o can be matched: it has an ID and a market, a side of buy or sell,
 // and a positive price and quantity.
-func (o order) validate() error {
+func (o Order) validate() error {
 	switch {
 	case o.ID == "":
 		return fmt.Errorf("%w: empty id", errInvalidOrder)
 	case o.Market == "":
 		return fmt.Errorf("%w: %s: empty market", errInvalidOrder, o.ID)
-	case o.Side != sideBuy && o.Side != sideSell:
+	case o.Side != SideBuy && o.Side != SideSell:
 		return fmt.Errorf("%w: %s: side %q is neither buy nor sell", errInvalidOrder, o.ID, o.Side)
 	case o.Price <= 0:
 		return fmt.Errorf("%w: %s: price %d is not positive", errInvalidOrder, o.ID, o.Price)
@@ -47,9 +47,9 @@ func (o order) validate() error {
 	return nil
 }
 
-// fill is one trade of an incoming order (the taker) against a resting one (the maker), at the
+// Fill is one trade of an incoming order (the taker) against a resting one (the maker), at the
 // maker's price.
-type fill struct {
+type Fill struct {
 	Maker string `json:"maker"`
 	Taker string `json:"taker"`
 	Price int64  `json:"price"`
@@ -75,23 +75,23 @@ type book struct {
 // within a price, filling at the maker's price and never more than either side has left. What is
 // left of o then rests in the book. It returns the fills in the order they happened, never nil.
 // o must be valid.
-func (b *book) match(o order) []fill {
+func (b *book) match(o Order) []Fill {
 	opposite, same := &b.asks, &b.bids
 	crosses := func(maker int64) bool { return maker <= o.Price }
 	worse := func(r resting) bool { return r.price < o.Price } // r ranks behind o on the same side
-	if o.Side == sideSell {
+	if o.Side == SideSell {
 		opposite, same = &b.bids, &b.asks
 		crosses = func(maker int64) bool { return maker >= o.Price }
 		worse = func(r resting) bool { return r.price > o.Price }
 	}
 
-	fills := []fill{}
+	fills := []Fill{}
 	left := o.Qty
 	used := 0 // makers at the head of opposite that are used up
 	for used < len(*opposite) && left > 0 && crosses((*opposite)[used].price) {
 		m := &(*opposite)[used]
 		q := min(left, m.qty)
-		fills = append(fills, fill{Maker: m.id, Taker: o.ID, Price: m.price, Qty: q})
+		fills = append(fills, Fill{Maker: m.id, Taker: o.ID, Price: m.price, Qty: q})
 		left -= q
 		m.qty -= q
 		if m.qty == 0 {

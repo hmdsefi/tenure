@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/core"
 	"github.com/hmdsefi/tenure/examples/internal/demo"
 	"github.com/hmdsefi/tenure/examples/internal/fencedb"
+	"github.com/hmdsefi/tenure/examples/internal/orderbook"
 	"github.com/hmdsefi/tenure/routehttp"
 )
 
@@ -24,11 +24,11 @@ import (
 func TestOrderbookRouter(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	c, books := obCluster(t, ctx, fencedb.New(), nil)
+	c, _ := obCluster(t, ctx, fencedb.New(), nil)
 	hc := &http.Client{Transport: &http.Transport{}}
 	t.Cleanup(hc.CloseIdleConnections)
 
-	r, err := c.Router([]tenure.Space{books[0].space()})
+	r, err := c.Router(orderbook.Spaces())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,9 +40,9 @@ func TestOrderbookRouter(t *testing.T) {
 		if own = owners(c); own == nil {
 			return false
 		}
-		for i := range marketCount {
-			m, err := r.Route(marketsSpace, marketName(i))
-			if err != nil || m.ID != own[core.KeyShard(marketName(i), marketShards)].id {
+		for i := range orderbook.MarketCount {
+			m, err := r.Route(orderbook.SpaceName, orderbook.MarketName(i))
+			if err != nil || m.ID != own[core.KeyShard(orderbook.MarketName(i), orderbook.Shards)].id {
 				return false
 			}
 		}
@@ -53,7 +53,7 @@ func TestOrderbookRouter(t *testing.T) {
 		mu    sync.Mutex
 		sends []routehttp.SendInfo
 	)
-	dc := &demo.Client{HTTP: hc, Router: r, Space: marketsSpace, OnSend: func(s routehttp.SendInfo) {
+	dc := &demo.Client{HTTP: hc, Router: r, Space: orderbook.SpaceName, OnSend: func(s routehttp.SendInfo) {
 		mu.Lock()
 		sends = append(sends, s)
 		mu.Unlock()
