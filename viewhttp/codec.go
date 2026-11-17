@@ -5,6 +5,7 @@ package viewhttp
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/hmdsefi/tenure/core"
@@ -66,4 +67,48 @@ func formatTime(t time.Time) string {
 		return ""
 	}
 	return t.UTC().Format(time.RFC3339Nano)
+}
+
+// decodeView returns the view of a body that encodeView wrote. Empty lists and an empty meta
+// decode as nil; times decode in UTC. It fails when the body is not such an object or a time
+// does not parse.
+func decodeView(b []byte) (core.View, error) {
+	var in viewJSON
+	if err := json.Unmarshal(b, &in); err != nil {
+		return core.View{}, err
+	}
+	v := core.View{Version: in.Version, Slots: in.Slots}
+	if len(in.SlotHolders) > 0 {
+		v.SlotHolders = in.SlotHolders
+	}
+	if len(in.Members) > 0 {
+		v.Members = make([]core.Member, len(in.Members))
+	}
+	for i, m := range in.Members {
+		out := core.Member{ID: m.ID, Addr: m.Addr, Draining: m.Draining, Slot: m.Slot}
+		if len(m.Meta) > 0 {
+			out.Meta = m.Meta
+		}
+		var err error
+		if out.JoinAt, err = parseTime(m.JoinAt); err != nil {
+			return core.View{}, fmt.Errorf("members[%d].join_at: %w", i, err)
+		}
+		if out.LeaveAt, err = parseTime(m.LeaveAt); err != nil {
+			return core.View{}, fmt.Errorf("members[%d].leave_at: %w", i, err)
+		}
+		v.Members[i] = out
+	}
+	return v, nil
+}
+
+// parseTime parses s, a time that formatTime wrote, in UTC; "" is the zero time.
+func parseTime(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t.UTC(), nil
 }
