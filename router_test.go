@@ -54,6 +54,37 @@ func (s *routerSource) Watch(ctx context.Context) (<-chan core.View, error) {
 	return ch, nil
 }
 
+// put delivers v to every open watch, replacing a view not yet received.
+func (s *routerSource) put(v core.View) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.last = &v
+	for _, ch := range s.watches {
+		select {
+		case <-ch:
+		default:
+		}
+		ch <- v
+	}
+}
+
+// closeAll closes every open watch, as a source whose watch ends does.
+func (s *routerSource) closeAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ch := range s.watches {
+		close(ch)
+	}
+	s.watches = nil
+}
+
+// calls returns how many times Watch has been called.
+func (s *routerSource) calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.watchN
+}
+
 // closeWatch closes ch and forgets it, once.
 func (s *routerSource) closeWatch(ch chan core.View) {
 	s.mu.Lock()
@@ -74,6 +105,7 @@ func newTestRouter(t testing.TB, spaces []Space, opts ...RouterOption) *Router {
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
 	}
+	t.Cleanup(func() { _ = r.Close() })
 	return r
 }
 

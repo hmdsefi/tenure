@@ -721,13 +721,29 @@ func NewRouter(m Membership, spaces []Space, opts ...RouterOption) (*Router, err
     returned as "tenure: NewRouter: " followed by the reason, such as `tenure:
     NewRouter: Spaces[1].Name: duplicate name "orders"`.
 
+    NewRouter calls m.Watch once and returns its error as "tenure: NewRouter:
+    watch: " and the error; it never calls Join, SetDraining or Leave.
+    The Router's one goroutine then applies the latest view of the channel,
+    so a burst of views costs at most two builds, and lookups read the previous
+    snapshot while it builds. When the placement keys stay the same, as with
+    slots while the slot count does, it maps them to the new members without
+    recomputing the assignment. When the channel closes or a later Watch fails,
+    the Router keeps its last table, reports Stale, and calls Watch again the
+    timing's RetryPeriod later, until Close or until Watch returns ErrClosed.
+
     Until the Router has applied its first view, lookups fail with an error that
     matches ErrNoMembers and says "no view yet".
 
+func (r *Router) Close() error
+    Close stops the Router (RTR-350): lookups return ErrClosed from then on,
+    Ready returns ErrClosed, the builder and its timers stop, and every channel
+    of Subscribe is closed. It returns once every goroutine of the Router has
+    returned, and returns nil; later calls do the same.
+
 func (r *Router) Ready(ctx context.Context) error
     Ready waits until the Router has applied its first view. It returns nil
-    then, ErrClosed if the Router is closed first, or ctx.Err() if ctx is done
-    first.
+    then, ErrClosed once the Router is closed, also after a view, or ctx.Err()
+    if ctx is done first.
 
 func (r *Router) Route(space, key string) (Member, error)
     Route returns the member that serves key in space: the member to which
@@ -754,6 +770,19 @@ func (r *Router) Space(name string) (*RouteSpace, error)
     Space returns a handle on the named space, or an error such as `tenure:
     unknown space "carts"` for a space the Router does not have, or ErrClosed
     after Close.
+
+func (r *Router) Stale() bool
+    Stale reports whether the Router's table may be out of date: its watch
+    of the Membership has ended or failed and no view has come since,
+    or the Membership reports itself stale through a method Stale() bool.
+    A stale Router keeps routing with its last table.
+
+func (r *Router) Subscribe() <-chan uint64
+    Subscribe returns a channel that receives the version of each new snapshot:
+    right away the current one, once there has been a view, and then each later
+    one. The channel holds one version, and a newer one replaces one not yet
+    received, so a slow reader sees the latest. Close closes it; after Close,
+    Subscribe returns a closed channel.
 
 func (r *Router) Version() uint64
     Version returns the version of the Router's latest snapshot: 0 before the
