@@ -40,6 +40,10 @@ type routeTable struct {
 	// errs holds, by shard, the error of a shard with no member, or is nil when every shard has
 	// one. A lookup returns a pointer into it, which allocates nothing.
 	errs []shardError
+
+	// mismatch is the *SpaceMismatchError of a space whose shard count a member disagrees with,
+	// which every lookup of the space returns, or nil (RTR-510).
+	mismatch error
 }
 
 // shardError is the error of a lookup of a shard that no member can serve. It matches
@@ -64,6 +68,9 @@ func (e *shardError) Unwrap() error {
 // route returns the member that serves shard of the space at index space, or the shard's error.
 func (s *routerSnapshot) route(space, shard int) (Member, error) {
 	t := &s.tables[space]
+	if t.mismatch != nil {
+		return Member{}, t.mismatch
+	}
 	if i := t.owners[shard]; i >= 0 {
 		return s.members[i], nil
 	}
@@ -76,6 +83,7 @@ func (r *Router) firstSnapshot() *routerSnapshot {
 	s := &routerSnapshot{tables: make([]routeTable, len(r.spaces))}
 	for i, h := range r.spaces {
 		t := &s.tables[i]
+		t.mismatch = mismatch(h.name, h.shards, s.members)
 		t.owners = make([]int32, h.shards)
 		t.errs = make([]shardError, h.shards)
 		for shard := range t.owners {
@@ -133,6 +141,7 @@ func (r *Router) buildSnapshot(version uint64) *routerSnapshot {
 
 	for i, h := range r.spaces {
 		t := &s.tables[i]
+		t.mismatch = mismatch(h.name, h.shards, s.members)
 		t.owners = make([]int32, h.shards)
 		for shard, key := range r.assigner.Assignment(h.name) {
 			kr := keyRoute{member: -1, detail: "no placement keys"}

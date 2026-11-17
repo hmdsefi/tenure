@@ -73,7 +73,7 @@ func TestATOBS19Table(t *testing.T) {
 		if want := time.Now().UTC(); !tab.Taken.Equal(want) || tab.Taken.Location() != time.UTC {
 			t.Errorf("Taken = %v, want %v in UTC", tab.Taken, want)
 		}
-		wantSelf := tenure.Member{ID: "a", Addr: "a:1", Meta: map[string]string{"zone": "z1"}, Slot: -1}
+		wantSelf := tenure.Member{ID: "a", Addr: "a:1", Meta: map[string]string{"zone": "z1", "tenure.spaces": "s:4"}, Slot: -1}
 		if !reflect.DeepEqual(tab.Member, wantSelf) {
 			t.Errorf("Member = %+v, want %+v", tab.Member, wantSelf)
 		}
@@ -91,7 +91,7 @@ func TestATOBS19Table(t *testing.T) {
 		if tab.ViewVersion != view.Version || tab.ViewVersion == 0 {
 			t.Errorf("ViewVersion = %d, want the published view's %d", tab.ViewVersion, view.Version)
 		}
-		wantMembers := []tenure.Member{wantSelf, {ID: "b", Addr: "b:1", Slot: -1}}
+		wantMembers := []tenure.Member{wantSelf, {ID: "b", Addr: "b:1", Meta: map[string]string{"tenure.spaces": "s:4"}, Slot: -1}}
 		if !reflect.DeepEqual(tab.Members, wantMembers) {
 			t.Errorf("Members = %+v, want %+v", tab.Members, wantMembers)
 		}

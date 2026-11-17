@@ -137,7 +137,7 @@ func Start(ctx context.Context, cfg Config) (*Node, error) {
 	n.snap.Store(newRoutes(nil, nil, nil))
 	n.obs.start(n.holder)
 
-	if err := cfg.Membership.Join(ctx, cfg.Self); err != nil {
+	if err := cfg.Membership.Join(ctx, advertised(cfg.Self, cfg.Spaces)); err != nil {
 		err = fmt.Errorf("tenure: join: %w", err)
 		n.obs.startFailed(ctx, err)
 		return nil, err

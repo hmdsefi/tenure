@@ -36,13 +36,21 @@ var (
 	// ErrDraining means the node is draining, or has drained, and refuses the call.
 	ErrDraining = errors.New("tenure: draining")
 )
+var ErrSpaceMismatch = errors.New("tenure: space mismatch")
+    ErrSpaceMismatch is wrapped by the error a Router's lookups return for
+    a space whose shard count differs from the one a member of the group
+    advertises: see SpaceMismatchError.
+
 
 TYPES
 
 type Config struct {
 	// Self is this member. Its ID must be valid as core.Member.Validate says, and no key of its
 	// Meta may start with "tenure.", a prefix tenure reserves. Start ignores Slot and Draining:
-	// the member always joins with Slot -1 and Draining false.
+	// the member always joins with Slot -1 and Draining false. When the node has spaces, the
+	// member joins with Meta["tenure.spaces"] added: each space's name and shard count, sorted
+	// by name, as "markets:64,orders:8", which lets a Router check that it uses the same shard
+	// counts (a ',', ':' or '%' in a name is written as %2C, %3A or %25).
 	Self Member
 
 	// Membership tells the node which members its group has. It is required.
@@ -747,9 +755,10 @@ func (r *Router) Correct(space string, shard int, addr string) bool
     lookups of that shard return the member of the current snapshot's view whose
     Addr is addr. Correct returns false, and records nothing, when no member
     of the snapshot's view has addr, for a space the Router does not have,
-    for a shard outside the space, before the first view and after Close;
-    the caller then follows the redirect for that request only. A correction
-    leaves lookups without allocation.
+    for a shard outside the space, for a space whose shard count a member
+    disagrees with, before the first view and after Close; the caller then
+    follows the redirect for that request only. A correction leaves lookups
+    without allocation.
 
 func (r *Router) Ready(ctx context.Context) error
     Ready waits until the Router has applied its first view. It returns nil
@@ -927,6 +936,35 @@ type Space struct {
     themselves.
 
     Write Space values with keyed fields: later versions add fields.
+
+type SpaceMismatchError struct {
+	// Space is the space's name.
+	Space string
+
+	// Shards is the Router's shard count for the space.
+	Shards int
+
+	// Member is the ID of a member that advertises another count, and MemberShards that count.
+	Member       string
+	MemberShards int
+}
+    SpaceMismatchError is the error of a Router's lookups in a space whose
+    shard count differs from the count that a member the Router routes to
+    advertises for it. Its table would send requests to the wrong members,
+    so the Router fails the space's lookups until no such member disagrees.
+    It wraps ErrSpaceMismatch.
+
+    A member advertises the shard counts of its spaces in its member record
+    when its node starts; members that advertise nothing, such as those of older
+    versions, are not checked. Nor can ShardOf be: a Router's ShardOf must be
+    the members' own.
+
+func (e *SpaceMismatchError) Error() string
+    Error returns text such as "tenure: space mismatch: orders has 8 shards here
+    and 16 on member n2".
+
+func (e *SpaceMismatchError) Unwrap() error
+    Unwrap returns ErrSpaceMismatch.
 
 type Store interface {
 	// KeepAlive opens a session for a holder that has never had one, or renews the live session

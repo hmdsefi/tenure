@@ -627,7 +627,8 @@ func TestStoppingClosed(t *testing.T) {
 func TestViewChangedWithoutStore(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		check := baseline(t)
-		h := newObsHarness(t, "a")
+		h := newObsHarness(t)
+		h.g, h.listed["a"] = newGroup(t, obsSelf("a")), true // no spaces: a joins with no "tenure.spaces"
 		noStore := func(c *tenure.Config) { c.Store, c.Spaces = nil, nil }
 		a := h.Start("a", noStore)
 		synctest.Wait()
