@@ -247,7 +247,7 @@ func renewing(t *testing.T, a *Adapter, holder string) {
 // watchOnlyAdapter returns a watch-only Adapter of group g in c.ns with timing T on a new client
 // that impersonates user. When the test ends, it checks that the Adapter's goroutines stop and
 // that no request of its client got 403 Forbidden or wrote.
-func watchOnlyAdapter(t *testing.T, c *cluster, g, user string) *Adapter {
+func watchOnlyAdapter(t *testing.T, c *cluster, g, user string) (*Adapter, *recorder) {
 	t.Helper()
 	cl, rec := c.clientAs(t, user)
 	a := New(cl, c.ns, g, WithTiming(T), WithWatchOnly())
@@ -263,7 +263,7 @@ func watchOnlyAdapter(t *testing.T, c *cluster, g, user string) *Adapter {
 		}
 		waitStopped(t, a)
 	})
-	return a
+	return a, rec
 }
 
 // TestATRTR14WatchOnly checks a watch-only Adapter on a cluster, on a client that impersonates
@@ -279,7 +279,7 @@ func TestATRTR14WatchOnly(t *testing.T) {
 	g := group()
 	ctx := t.Context()
 
-	wo := watchOnlyAdapter(t, c, g, user)
+	wo, _ := watchOnlyAdapter(t, c, g, user)
 	var mu sync.Mutex
 	seen := map[string]int{}
 	wo.onEvent = func(l *coordinationv1.Lease) {
@@ -397,7 +397,7 @@ func TestRTR780WatchOnlyConformance(t *testing.T) {
 			writers[i] = conformanceAdapter(t, c, admin, g)
 			f.Writers = append(f.Writers, writers[i])
 		}
-		f.WatchOnly = watchOnlyAdapter(t, c, g, user)
+		f.WatchOnly, _ = watchOnlyAdapter(t, c, g, user)
 		writer := func(id string) *Adapter { return writers[slices.Index(ids, id)] }
 		var mu sync.Mutex
 		started := map[string]bool{}

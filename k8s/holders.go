@@ -266,9 +266,10 @@ func (a *Adapter) holdingIn(l *coordinationv1.Lease) (h tenure.Holding, malforme
 
 // leaseInformer returns the informer of run c: the group's Leases in the namespace, with no
 // resync, whose every list of the Leases closes the run's channels at its start and at its end
-// (K8S-520), as does its watch error handler. A watch that streams the Leases' current state
-// first, in place of a list, ends its list at the bookmark that closes that state.
-func (a *Adapter) leaseInformer(c *leaseCache) cache.SharedIndexInformer {
+// (K8S-520), as does its watch error handler, which also calls failed. A watch that streams the
+// Leases' current state first, in place of a list, ends its list at the bookmark that closes that
+// state.
+func (a *Adapter) leaseInformer(c *leaseCache, failed func()) cache.SharedIndexInformer {
 	leases := a.leases()
 	selector := a.leaseSelector()
 	lw := &cache.ListWatch{
@@ -296,6 +297,7 @@ func (a *Adapter) leaseInformer(c *leaseCache) cache.SharedIndexInformer {
 	err := informer.SetWatchErrorHandlerWithContext(func(ctx context.Context, r *cache.Reflector, err error) {
 		cache.DefaultWatchErrorHandler(ctx, r, err)
 		c.holders.closeAll()
+		failed()
 	})
 	if err != nil {
 		// SetWatchErrorHandler fails only on an informer that has started; this one has not.

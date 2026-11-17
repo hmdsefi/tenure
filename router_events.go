@@ -29,14 +29,17 @@ const RouterEventView RouterEventKind = 1
 // building the snapshot took.
 const RouterEventRebuilt RouterEventKind = 2
 
-// RouterEventStale ("router.stale") is emitted when the channel of the Router's watch of its
-// Membership closes while the Router was fresh: Err is "tenure: watch channel closed". The Router
-// stays stale while the Watch calls that follow fail. Router.Stale reports it, as it reports a
-// Membership that reports itself stale, which emits no event.
+// RouterEventStale ("router.stale") is emitted when the Router becomes stale: the channel of
+// its watch of its Membership closes, with Err "tenure: watch channel closed", or the
+// Membership reports itself stale through a method Stale() bool, which the Router reads every
+// RetryPeriod and after each view, with Err "tenure: membership reports stale". The Router stays
+// stale while the Watch calls that follow fail or the Membership reports itself stale, and
+// emits no second router.stale meanwhile. Router.Stale reports both at once.
 const RouterEventStale RouterEventKind = 3
 
-// RouterEventFresh ("router.fresh") is emitted when a stale Router applies a view of a new
-// watch: Version is the new snapshot's version.
+// RouterEventFresh ("router.fresh") is emitted when a stale Router is no longer stale: it has
+// applied a view of a new watch, and its Membership, if it reports staleness, last reported
+// itself fresh. Version is the current snapshot's version.
 const RouterEventFresh RouterEventKind = 4
 
 // RouterEventCorrected ("router.corrected") is emitted when Router.Correct records a correction:

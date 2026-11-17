@@ -94,8 +94,23 @@ func TestATK8S01ConfigErrors(t *testing.T) {
 	t.Run("every method", func(t *testing.T) {
 		typ := reflect.TypeFor[*Adapter]()
 		want := make([]string, 0, typ.NumMethod())
+		errType := reflect.TypeFor[error]()
+		// The methods that return no error, named so that a new one needs a row or a place here.
+		noError := []string{"Stale"}
 		for m := range typ.Methods() {
+			n := m.Type.NumOut()
+			returnsErr := n > 0 && m.Type.Out(n-1) == errType
+			if slices.Contains(noError, m.Name) {
+				if returnsErr {
+					t.Errorf("%s returns an error, want a row in adapterCalls", m.Name)
+				}
+				continue
+			}
 			want = append(want, m.Name)
+		}
+		// Stale reports a state and returns no error; a misconfigured Adapter is never stale.
+		if bad := New(nil, "default", "g"); bad.err == nil || bad.Stale() {
+			t.Errorf("New(nil client): err %v, Stale() %t; want an error and false", bad.err, bad.Stale())
 		}
 		got := make([]string, 0, len(adapterCalls))
 		for _, c := range adapterCalls {
@@ -103,7 +118,7 @@ func TestATK8S01ConfigErrors(t *testing.T) {
 		}
 		slices.Sort(got)
 		if !slices.Equal(got, want) {
-			t.Errorf("adapterCalls has rows for %q, want one row for each exported method of *Adapter: %q", got, want)
+			t.Errorf("adapterCalls has rows for %q, want one row for each exported method of *Adapter but %q: %q", got, noError, want)
 		}
 	})
 

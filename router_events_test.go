@@ -306,3 +306,75 @@ func TestRouterTable(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestRouterEventsSourceStale checks that a Membership that reports itself stale makes the
+// Router emit router.stale within RetryPeriod, once while it stays stale, also when its watch
+// closes meanwhile, and router.fresh once both its watch and its own report are fresh again
+// (RTR-340, RTR-600, RTR-720).
+func TestRouterEventsSourceStale(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		retry := core.DefaultTiming.RetryPeriod
+		sink := &eventSink{}
+		src := &staleRouterSource{}
+		setStale := func(b bool) {
+			src.mu.Lock()
+			src.stale = b
+			src.mu.Unlock()
+		}
+		r, err := NewRouter(src, routerSpaces(), WithRouterEvents(sink.add))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		src.put(plainView(1, "n1", "n2"))
+		synctest.Wait()
+		sink.take()
+
+		setStale(true)
+		time.Sleep(retry - time.Nanosecond)
+		synctest.Wait()
+		checkEvents(t, "before the poll", sink.take(), nil)
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		checkEvents(t, "source stale", sink.take(), []RouterEvent{
+			{Kind: RouterEventStale, Shard: -1, Err: errors.New("tenure: membership reports stale")},
+		})
+
+		// Still stale, and the watch ends too: no second router.stale.
+		time.Sleep(3 * retry)
+		src.closeAll()
+		synctest.Wait()
+		checkEvents(t, "watch closed while stale", sink.take(), nil)
+
+		// The next Watch delivers a view, but the source still reports stale: no router.fresh.
+		time.Sleep(retry)
+		synctest.Wait()
+		for _, e := range sink.take() {
+			if e.Kind == RouterEventFresh || e.Kind == RouterEventStale {
+				t.Fatalf("new watch while the source is stale: event %+v", e)
+			}
+		}
+		if !r.Stale() {
+			t.Fatal("Stale() = false while the source reports stale")
+		}
+
+		setStale(false)
+		time.Sleep(retry)
+		synctest.Wait()
+		checkEvents(t, "source fresh", sink.take(), []RouterEvent{
+			{Kind: RouterEventFresh, Version: r.Version(), Shard: -1},
+		})
+		if r.Stale() {
+			t.Fatal("Stale() = true after router.fresh")
+		}
+
+		// A view that arrives while the source has turned stale reports it at once.
+		setStale(true)
+		src.put(plainView(3, "n1"))
+		synctest.Wait()
+		got := sink.take()
+		if len(got) == 0 || got[len(got)-1].Kind != RouterEventStale {
+			t.Fatalf("view while the source is stale: events %+v, want router.stale last", got)
+		}
+	})
+}
