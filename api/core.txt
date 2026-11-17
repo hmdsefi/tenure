@@ -38,6 +38,25 @@ var ErrInvalidTree = errors.New("core: invalid tree")
 
 FUNCTIONS
 
+func AppendRank(dst []int, namespace, key string, members []Member, n int) []int
+    AppendRank appends to dst the positions in members of Rank(namespace,
+    key, members, n), best first, and returns the extended slice:
+    members[r[len(dst)+i]] is Rank's i-th member, position included, so members
+    with equal IDs keep Rank's order by position. It suits a lookup on every
+    message, such as finding the member that hosts a lockstep grain and the
+    runner-up during a handoff, where Rank's copies would allocate on each call.
+
+    It returns dst unchanged when n <= 0 or members is empty. It never modifies
+    members or the elements of dst before len(dst), and it allocates nothing
+    when cap(dst) - len(dst) is at least min(n, len(members)), so a caller's
+    array serves:
+
+        var buf [2]int
+        r := core.AppendRank(buf[:0], kind, key, members, 2)
+
+    AppendRank takes time O(len(members) · min(n, len(members))) and needs no
+    sort; for n up to 16 it computes Score once per member.
+
 func Balanced(space string, n int, keys []string) []int
     Balanced assigns the n shards of space to placement keys and returns, for
     each shard 0…n-1, the index in keys of its key; every entry is -1 when keys
