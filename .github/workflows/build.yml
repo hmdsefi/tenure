@@ -72,6 +72,10 @@ jobs:
         run: go vet ./...
       - name: build
         run: go build -v ./...
+      # The test jobs run with -race, under which the parallel-scaling check of Router lookups
+      # skips itself: this step runs it without, and -v shows whether it passed or skipped.
+      - name: Router lookups scale in parallel
+        run: go test -run '^TestRouterParallelScaling$' -count=1 -v .
       - name: private files are not committed
         run: |
           files=$( { git ls-files | grep -E '^(\.helper/|AGENTS\.md$)|(^|/)go\.work(\.sum)?$|^\.[^/]+' | grep -vE '^(\.github/|\.gitignore$|\.golangci\.yml$|\.testcoverage\.yml$)'; git ls-files | grep -E '^[^/]+\.md$' | grep -vx 'README.md'; } || true)
