@@ -206,7 +206,7 @@ func (m *Membership) Watch(ctx context.Context) (<-chan core.View, error) {
 	m.watches[w] = struct{}{}
 	ready := m.ready
 	m.mu.Unlock()
-	context.AfterFunc(ctx, func() { m.endWatch(w) })
+	stop := context.AfterFunc(ctx, func() { m.endWatch(w) })
 
 	limit := m.cfg.wait + m.cfg.timing.RenewDeadline
 	t := time.NewTimer(limit)
@@ -218,6 +218,7 @@ func (m *Membership) Watch(ctx context.Context) (<-chan core.View, error) {
 		return nil, ctx.Err()
 	case <-t.C:
 	}
+	stop()
 	m.endWatch(w)
 	m.mu.Lock()
 	last := m.lastErr
