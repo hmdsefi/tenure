@@ -740,6 +740,17 @@ func (r *Router) Close() error
     of Subscribe is closed. It returns once every goroutine of the Router has
     returned, and returns nil; later calls do the same.
 
+func (r *Router) Correct(space string, shard int, addr string) bool
+    Correct records that addr serves shard of space, as a member's redirect
+    says when the Router's view lags the members'. Until the Router takes a
+    new snapshot, and for at most the correction TTL (see WithCorrectionTTL),
+    lookups of that shard return the member of the current snapshot's view whose
+    Addr is addr. Correct returns false, and records nothing, when no member
+    of the snapshot's view has addr, for a space the Router does not have,
+    for a shard outside the space, before the first view and after Close;
+    the caller then follows the redirect for that request only. A correction
+    leaves lookups without allocation.
+
 func (r *Router) Ready(ctx context.Context) error
     Ready waits until the Router has applied its first view. It returns nil
     then, ErrClosed once the Router is closed, also after a view, or ctx.Err()
