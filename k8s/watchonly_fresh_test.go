@@ -346,9 +346,8 @@ func TestRTR720RelistEqualOnly(t *testing.T) {
 	if d := time.Since(listed); d > T.LeaseDuration-T.RetryPeriod {
 		t.Fatalf("m1 left %v after the first list, want at the relist, well before LeaseDuration %v", d, T.LeaseDuration)
 	}
-	if a.Stale() {
-		t.Error("Stale() = true after the relist, want false")
-	}
+	// The view may come just before the relist ends.
+	waitStale(t, a, false, T.RetryPeriod)
 	// m2, unchanged, expires LeaseDuration after the first list; m0, changed at the relist, stays.
 	w.waitFor(T.LeaseDuration, "m0 alone", listing("m0"))
 }
