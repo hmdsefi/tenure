@@ -111,6 +111,9 @@ func TestRTR700Refuse(t *testing.T) {
 		if err := rc.call(t.Context(), bad); err == nil || err.Error() != "k8s: nil client" {
 			t.Errorf("%s without a client = %v, want k8s: nil client", rc.method, err)
 		}
+		if err := rc.call(done, bad); !errors.Is(err, context.Canceled) {
+			t.Errorf("%s without a client, with a done ctx = %v, want context.Canceled", rc.method, err)
+		}
 	}
 	if got := client.Actions(); len(got) != 0 {
 		t.Errorf("requests %v, want none", got)
@@ -168,6 +171,46 @@ func TestRTR700Selector(t *testing.T) {
 
 	if got, want := New(client, "default", "g").leaseSelector(), "tenure.group=g"; got != want {
 		t.Errorf("writer selector %q, want %q", got, want)
+	}
+}
+
+// TestRTR700SlotsList checks on a fake client that Slots on a watch-only Adapter without a
+// running watch lists only the group's member, slots and slot Leases, in one request, and reads
+// the slot data from them.
+func TestRTR700SlotsList(t *testing.T) {
+	ctx := t.Context()
+	client := newFake()
+	leases := client.CoordinationV1().Leases("default")
+	for _, l := range []*coordinationv1.Lease{
+		memberLease("g", "m0", encodeMember(member("m0")), "m0/1", 3),
+		slotsLease("g", "2"),
+		slotLease("g", 1, "m0/1", ""),
+		shardLease("g", "orders", 0, "m0/1", nil),
+	} {
+		if _, err := leases.Create(ctx, l, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create %s: %v", l.Name, err)
+		}
+	}
+	client.ClearActions()
+	a := fakeAdapter(t, client, WithWatchOnly())
+	count, holders, err := a.Slots(ctx)
+	if err != nil || count != 2 || !slices.Equal(holders, []string{"", "m0/1"}) {
+		t.Errorf("Slots = %d, %q, %v; want 2, [\"\" \"m0/1\"], nil", count, holders, err)
+	}
+	got := client.Actions()
+	if len(got) != 1 {
+		t.Fatalf("requests %v, want one LIST", got)
+	}
+	list, ok := got[0].(k8stesting.ListAction)
+	if !ok {
+		t.Fatalf("request %v, want a LIST", got[0])
+	}
+	want, err := labels.Parse("tenure.group=g,tenure.kind in (member,slots,slot)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sel := list.GetListRestrictions().Labels.String(); sel != want.String() {
+		t.Errorf("LIST with selector %q, want %q", sel, want)
 	}
 }
 
