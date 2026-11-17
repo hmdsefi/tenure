@@ -26,22 +26,34 @@ func watchNode(t *testing.T, ms *memstore.Store, g *group, id string, slots int)
 	return start(t, context.Background(), cfg)
 }
 
-// nextView receives from ch until it gets a view for which ok holds, failing t when ch closes
-// or none comes within a minute. It returns that view.
-func nextView(t *testing.T, ch <-chan core.View, want string, ok func(core.View) bool) core.View {
-	t.Helper()
+// viewReader reads a Watch channel and keeps the latest view it received.
+type viewReader struct {
+	t    *testing.T
+	ch   <-chan core.View
+	last core.View
+}
+
+// until returns the latest view received when ok holds for it, and otherwise receives until it
+// gets a view for which ok holds, failing the test when the channel closes or none comes within
+// a minute.
+func (r *viewReader) until(want string, ok func(core.View) bool) core.View {
+	r.t.Helper()
+	if ok(r.last) {
+		return r.last
+	}
 	timeout := time.After(time.Minute)
 	for {
 		select {
-		case v, open := <-ch:
+		case v, open := <-r.ch:
 			if !open {
-				t.Fatalf("Watch channel closed, want a view with %s", want)
+				r.t.Fatalf("Watch channel closed, want a view with %s", want)
 			}
+			r.last = v
 			if ok(v) {
 				return v
 			}
 		case <-timeout:
-			t.Fatalf("no view with %s within a minute", want)
+			r.t.Fatalf("no view with %s within a minute; the latest has %s", want, describeView(r.last, true))
 		}
 	}
 }
@@ -68,42 +80,44 @@ func TestNodeWatchFollows(t *testing.T) {
 		ms := memstore.New(nil)
 		g := newGroup(t)
 		n1 := watchNode(t, ms, g, "n1", 2)
+		synctest.Wait() // the node publishes nothing more until time moves
 		ch, err := n1.Watch(context.Background())
 		if err != nil {
 			t.Fatalf("Watch() = %v, want nil", err)
 		}
+		r := &viewReader{t: t, ch: ch}
 		select {
-		case v := <-ch:
-			if pub := published(t, n1); v.Version != pub.Version || !sameView(v, pub) {
-				t.Fatalf("first view %d: %s, want the published view %d: %s", v.Version,
-					describeView(v, true), pub.Version, describeView(pub, true))
+		case r.last = <-ch:
+			if pub := published(t, n1); r.last.Version != pub.Version || !sameView(r.last, pub) {
+				t.Fatalf("first view %d: %s, want the published view %d: %s", r.last.Version,
+					describeView(r.last, true), pub.Version, describeView(pub, true))
 			}
 		default:
 			t.Fatal("Watch channel empty after Start, want the published view at once")
 		}
-		nextView(t, ch, "n1 in slot 0", func(v core.View) bool {
+		r.until("n1 in slot 0", func(v core.View) bool {
 			return len(v.Members) == 1 && v.Slots == 2 && v.Members[0].Slot == 0
 		})
 
 		n2 := watchNode(t, ms, g, "n2", 2)
-		nextView(t, ch, "n1 and n2, each in a slot", func(v core.View) bool {
+		r.until("n1 and n2, each in a slot", func(v core.View) bool {
 			return len(v.Members) == 2 && v.Members[0].Slot >= 0 && v.Members[1].Slot >= 0
 		})
 		if err := n2.Drain(context.Background()); err != nil {
 			t.Fatalf("n2: Drain() = %v, want nil", err)
 		}
-		nextView(t, ch, "n2 draining", func(v core.View) bool {
+		r.until("n2 draining", func(v core.View) bool {
 			return len(v.Members) == 2 && v.Members[1].Draining
 		})
 		if err := n1.SetSlots(context.Background(), 3); err != nil {
 			t.Fatalf("SetSlots(3) = %v, want nil", err)
 		}
-		v := nextView(t, ch, "3 slots", func(v core.View) bool { return v.Slots == 3 })
+		v := r.until("3 slots", func(v core.View) bool { return v.Slots == 3 })
 		if pub := published(t, n1); v.Version > pub.Version {
 			t.Errorf("view %d is newer than the published view %d", v.Version, pub.Version)
 		}
 		closeNode(t, n2)
-		v = nextView(t, ch, "n1 alone", func(v core.View) bool { return len(v.Members) == 1 })
+		v = r.until("n1 alone", func(v core.View) bool { return len(v.Members) == 1 })
 		synctest.Wait()
 		if len(ch) > 0 {
 			v = <-ch
