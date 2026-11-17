@@ -372,6 +372,44 @@ func TestSignHandlerHopLimit(t *testing.T) {
 	}
 }
 
+// TestSignHandlerNotPublished checks the answer of an owner whose shard no Run has published:
+// 503 with Retry-After: 1 and Tenure-Unprocessed: 1, without a reservation.
+func TestSignHandlerNotPublished(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	nonces := &countNonces{Nonces: NewNonces(fencedb.New())}
+	runs := New(nonces, NewChain())   // the space's Run publishes its shards
+	serves := New(nonces, NewChain()) // the handler's, never published
+	c, err := demo.Start(ctx, demo.Options{
+		Nodes:  1,
+		Spaces: func(int) []tenure.Space { return []tenure.Space{runs.Space()} },
+		Serve:  func(_ int, n *tenure.Node) http.Handler { return serves.Handler(n, "n1", false) },
+	})
+	if err != nil {
+		t.Fatalf("start the cluster: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := c.Close(cctx); err != nil {
+			t.Errorf("close the cluster: %v", err)
+		}
+	})
+	r := &rig{c: c, nonces: nonces, ctx: ctx}
+	r.owner(t) // the one node serves the wallet's shard
+
+	before := nonces.reserves.Load()
+	a := r.post(t, 0, signBody("p"), nil)
+	if a.status != http.StatusServiceUnavailable || a.header.Get("Retry-After") != "1" ||
+		a.header.Get(routehttp.UnprocessedHeader) != "1" {
+		t.Fatalf("not published: %d, header %v; want 503, Retry-After 1 and %s 1: %s",
+			a.status, a.header, routehttp.UnprocessedHeader, a.body)
+	}
+	if got := nonces.reserves.Load() - before; got != 0 {
+		t.Fatalf("the request made %d reservations, want 0", got)
+	}
+}
+
 func TestSignHandlerStaleTerm(t *testing.T) {
 	r := startRig(t, false)
 	o := r.owner(t)
@@ -402,8 +440,9 @@ func TestSignHandlerStaleTerm(t *testing.T) {
 
 	// The shard now refuses the rest of its term without asking the nonce service.
 	for range 3 {
-		if a := r.post(t, o, signBody("p"), nil); a.status != http.StatusServiceUnavailable {
-			t.Fatalf("after the stale reservation: %d, want 503: %s", a.status, a.body)
+		if a := r.post(t, o, signBody("p"), nil); a.status != http.StatusServiceUnavailable || a.header.Get(routehttp.UnprocessedHeader) != "1" {
+			t.Fatalf("after the stale reservation: %d, %s %q; want 503 and 1: %s",
+				a.status, routehttp.UnprocessedHeader, a.header.Get(routehttp.UnprocessedHeader), a.body)
 		}
 	}
 	if got := r.nonces.reserves.Load() - before; got != 1 {
