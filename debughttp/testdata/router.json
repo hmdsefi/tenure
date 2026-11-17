@@ -1,0 +1,153 @@
+{
+  "taken": "2026-11-17T12:00:00Z",
+  "version": 1,
+  "stale": false,
+  "closed": false,
+  "view_version": 1,
+  "members": [
+    {
+      "id": "n1",
+      "addr": "n1:80",
+      "meta": {
+        "tenure.spaces": "markets:4,orders:16",
+        "zone": "a"
+      },
+      "draining": false,
+      "slot": -1,
+      "join_at": null,
+      "leave_at": null
+    },
+    {
+      "id": "n2",
+      "addr": "n2:80",
+      "meta": {},
+      "draining": true,
+      "slot": -1,
+      "join_at": "2026-11-17T11:00:00Z",
+      "leave_at": null
+    },
+    {
+      "id": "n3",
+      "addr": "n3:80",
+      "meta": {},
+      "draining": false,
+      "slot": -1,
+      "join_at": null,
+      "leave_at": null
+    }
+  ],
+  "slots": 0,
+  "slot_holders": [],
+  "spaces": [
+    {
+      "name": "orders",
+      "shards": 8,
+      "mismatch": "tenure: space mismatch: orders has 8 shards here and 16 on member n1",
+      "routes": [
+        {
+          "shard": 0,
+          "member": "n3",
+          "addr": "n3:80",
+          "slot": -1,
+          "error": "",
+          "corrected": ""
+        },
+        {
+          "shard": 1,
+          "member": "n3",
+          "addr": "n3:80",
+          "slot": -1,
+          "error": "",
+          "corrected": ""
+        },
+        {
+          "shard": 2,
+          "member": "n1",
+          "addr": "n1:80",
+          "slot": -1,
+          "error": "",
+          "corrected": ""
+        },
+        {
+          "shard": 3,
+          "member": "n1",
+          "addr": "n1:80",
+          "slot": -1,
+          "error": "",
+          "corrected": ""
+        },
+        {
+          "shard": 4,
+          "member": "n3",
+          "addr": "n3:80",
+          "slot": -1,
+          "error": "",
+          "corrected": ""
+        },
+        {
+          "shard": 5,
+          "member": "n1",
+          "addr": "n1:80",
+          "slot": -1,
+          "error": "",
+          "corrected": ""
+        },
+        {
+          "shard": 6,
+          "member": "n1",
+          "addr": "n1:80",
+          "slot": -1,
+          "error": "",
+          "corrected": ""
+        },
+        {
+          "shard": 7,
+          "member": "n3",
+          "addr": "n3:80",
+          "slot": -1,
+          "error": "",
+          "corrected": ""
+        }
+      ]
+    },
+    {
+      "name": "markets",
+      "shards": 4,
+      "mismatch": "",
+      "routes": [
+        {
+          "shard": 0,
+          "member": "n1",
+          "addr": "n1:80",
+          "slot": -1,
+          "error": "",
+          "corrected": "n3:80"
+        },
+        {
+          "shard": 1,
+          "member": "n3",
+          "addr": "n3:80",
+          "slot": -1,
+          "error": "",
+          "corrected": ""
+        },
+        {
+          "shard": 2,
+          "member": "n1",
+          "addr": "n1:80",
+          "slot": -1,
+          "error": "",
+          "corrected": ""
+        },
+        {
+          "shard": 3,
+          "member": "n3",
+          "addr": "n3:80",
+          "slot": -1,
+          "error": "",
+          "corrected": ""
+        }
+      ]
+    }
+  ]
+}

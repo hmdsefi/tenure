@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 // Package debughttp serves a tenure node's ownership table and recent events as JSON, for
-// operators who look at a node over HTTP during deploys and incidents. It only reads the node.
+// operators who look at a node over HTTP during deploys and incidents, and a tenure.Router's
+// table (see RouterHandler). It only reads the node or the router.
 //
 // Every body is one JSON object indented by two spaces and followed by one newline. Keys come in
 // a fixed order, the same on every node and in every release that does not change them. Times
