@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -395,6 +396,52 @@ func TestATCOR19PurityRank(t *testing.T) {
 		_ = p.Rank("account", "alice", 3)
 		if !reflect.DeepEqual(before, ms) {
 			t.Errorf("input %d changed:\nbefore %+v\nafter  %+v", i, before, ms)
+		}
+	}
+}
+
+// TestATCOR20AppendRankEqualsRank checks that AppendRank keeps dst's prefix and appends the
+// positions of exactly Rank's result, position included, for random member lists with duplicate
+// IDs, keys and n from -1 to len+2 (AT-COR-20).
+func TestATCOR20AppendRankEqualsRank(t *testing.T) {
+	// A small linear congruential generator keeps the test free of math/rand.
+	state := uint64(1)
+	next := func(bound int) int {
+		state = state*6364136223846793005 + 1442695040888963407
+		return int(state>>33) % bound
+	}
+	ids := []string{"", "a", "b", "c", "n1", "n2", "n3", "zz"}
+	for round := range 3000 {
+		m := next(40)
+		ms := make([]Member, m)
+		for i := range ms {
+			// Addr records the position, so equal Members mean equal positions.
+			ms[i] = Member{ID: ids[next(len(ids))], Addr: strconv.Itoa(i)}
+		}
+		key := "k" + strconv.Itoa(next(50))
+		ns := []string{"", "account", "orders"}[next(3)]
+		for n := -1; n <= m+2; n++ {
+			prefix := []int{-7, 99, 5}[:next(3)]
+			dst := append(make([]int, 0, len(prefix)+next(4)), prefix...)
+			before := slices.Clone(ms)
+			got := AppendRank(dst, ns, key, ms, n)
+			if !slices.Equal(got[:len(prefix)], prefix) {
+				t.Fatalf("round %d n %d: prefix %v became %v", round, n, prefix, got[:len(prefix)])
+			}
+			want := Rank(ns, key, ms, n)
+			picked := make([]Member, 0, len(got)-len(prefix))
+			for _, i := range got[len(prefix):] {
+				picked = append(picked, ms[i])
+			}
+			if len(want) == 0 && len(picked) == 0 {
+				continue
+			}
+			if !reflect.DeepEqual(picked, want) {
+				t.Fatalf("round %d ns %q key %q n %d over %d members: AppendRank picks %v, Rank %v", round, ns, key, n, m, picked, want)
+			}
+			if !reflect.DeepEqual(ms, before) {
+				t.Fatalf("round %d: AppendRank modified members", round)
+			}
 		}
 	}
 }
