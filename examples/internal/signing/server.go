@@ -12,20 +12,15 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/hmdsefi/tenure"
+	"github.com/hmdsefi/tenure/routehttp"
 )
 
 const (
 	// maxBody is the most of a request body that the server reads.
 	maxBody = 64 << 10
-
-	// RouteHeader is the response header that names the member to send the request to instead.
-	RouteHeader = "Tenure-Route"
-
-	// HopsHeader is the request header that counts the members a forwarded request has been
-	// through.
-	HopsHeader = "Tenure-Hops"
 
 	// maxHops is the number of hops after which a request that is still not local is refused.
 	maxHops = 2
@@ -67,22 +62,34 @@ const proxyTarget = "X-Tenure-Proxy-Target"
 //     request of its term.
 //   - 500: the chain rejected the transaction, or any other failure.
 //   - 200: the body is the signed Tx.
+//
+// The 421 and the 503 answers above carry Tenure-Unprocessed: 1, as routehttp.Misdirected and
+// routehttp.Unavailable write them: none follows an effect, since a rejected reservation leaves
+// the nonce as it was. With forward, a request the proxy could not complete gets a 503 with
+// Retry-After: 1 but without Tenure-Unprocessed: the owner may have signed it already.
 func (s *Signer) Handler(n *tenure.Node, self string, forward bool) http.Handler {
-	srv := &server{signer: s, node: n, self: self, forward: forward}
-	srv.proxy = &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(&url.URL{Scheme: "http", Host: pr.In.Header.Get(proxyTarget)})
-			hops, _ := strconv.Atoi(pr.In.Header.Get(HopsHeader))
-			pr.Out.Header.Del(proxyTarget)
-			pr.Out.Header.Set(HopsHeader, strconv.Itoa(hops+1))
-		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-			unavailable(w, err)
-		},
-	}
+	srv := &server{signer: s, node: n, self: self, forward: forward, proxy: newProxy()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /sign", srv.postSign)
 	return mux
+}
+
+// newProxy returns the reverse proxy that forwards a request to the member named in its
+// proxyTarget header, with Tenure-Hops one higher.
+func newProxy() *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(&url.URL{Scheme: "http", Host: pr.In.Header.Get(proxyTarget)})
+			hops, _ := strconv.Atoi(pr.In.Header.Get(routehttp.HopsHeader))
+			pr.Out.Header.Del(proxyTarget)
+			pr.Out.Header.Set(routehttp.HopsHeader, strconv.Itoa(hops+1))
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			// The forwarded request may have reached the owner, which may have reserved a
+			// nonce and broadcast, so this 503 promises nothing: no Tenure-Unprocessed.
+			unavailableMaybeDone(w, err)
+		},
+	}
 }
 
 func (s *server) postSign(w http.ResponseWriter, r *http.Request) {
@@ -102,9 +109,9 @@ func (s *server) postSign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hops := 0
-	if h := r.Header.Get(HopsHeader); h != "" {
+	if h := r.Header.Get(routehttp.HopsHeader); h != "" {
 		if hops, err = strconv.Atoi(h); err != nil || hops < 0 {
-			reply(w, http.StatusBadRequest, errorBody(errors.New("signing: bad "+HopsHeader+" header")))
+			reply(w, http.StatusBadRequest, errorBody(errors.New("signing: bad "+routehttp.HopsHeader+" header")))
 			return
 		}
 	}
@@ -119,7 +126,7 @@ func (s *server) postSign(w http.ResponseWriter, r *http.Request) {
 	case err == nil:
 		reply(w, http.StatusOK, tx)
 	case errors.Is(err, errNotPublished), errors.Is(err, errRefusing), errors.Is(err, ErrStale):
-		unavailable(w, err)
+		routehttp.Unavailable(w, time.Second)
 	default:
 		reply(w, http.StatusInternalServerError, errorBody(err))
 	}
@@ -131,12 +138,11 @@ func (s *server) notLocal(w http.ResponseWriter, r *http.Request, raw []byte, ho
 	// A route to this member itself means the shard is about to be ours: no one else can serve
 	// it, so the client waits.
 	if !errors.As(err, &notOwner) || notOwner.Route.Addr == "" || notOwner.Route.ID == s.self {
-		unavailable(w, err)
+		routehttp.Unavailable(w, time.Second)
 		return
 	}
 	if !s.forward {
-		w.Header().Set(RouteHeader, notOwner.Route.Addr)
-		reply(w, http.StatusMisdirectedRequest, errorBody(err))
+		routehttp.Misdirected(w, notOwner.Route)
 		return
 	}
 	if hops >= maxHops {
@@ -147,7 +153,7 @@ func (s *server) notLocal(w http.ResponseWriter, r *http.Request, raw []byte, ho
 	out.Body = io.NopCloser(bytes.NewReader(raw))
 	out.ContentLength = int64(len(raw))
 	out.Header.Set(proxyTarget, notOwner.Route.Addr)
-	out.Header.Set(HopsHeader, strconv.Itoa(hops))
+	out.Header.Set(routehttp.HopsHeader, strconv.Itoa(hops))
 	s.proxy.ServeHTTP(w, out)
 }
 
@@ -169,8 +175,10 @@ func decodeRequest(raw []byte) (SignRequest, error) {
 	return req, nil
 }
 
-// unavailable answers 503 and asks the client to retry in a second.
-func unavailable(w http.ResponseWriter, err error) {
+// unavailableMaybeDone answers 503 and asks the client to retry in a second, without
+// Tenure-Unprocessed: for a request that may have had an effect, which only a caller that knows
+// the request is safe to repeat sends again.
+func unavailableMaybeDone(w http.ResponseWriter, err error) {
 	w.Header().Set("Retry-After", "1")
 	reply(w, http.StatusServiceUnavailable, errorBody(err))
 }

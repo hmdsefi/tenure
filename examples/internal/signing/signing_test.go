@@ -20,6 +20,7 @@ import (
 	"github.com/hmdsefi/tenure/core"
 	"github.com/hmdsefi/tenure/examples/internal/demo"
 	"github.com/hmdsefi/tenure/examples/internal/fencedb"
+	"github.com/hmdsefi/tenure/routehttp"
 )
 
 const wallet = "w-00"
@@ -47,7 +48,7 @@ func (l *hopLog) wrap(i int, h http.Handler) http.Handler {
 		for len(l.hops) <= i {
 			l.hops = append(l.hops, nil)
 		}
-		l.hops[i] = append(l.hops[i], r.Header.Get(HopsHeader))
+		l.hops[i] = append(l.hops[i], r.Header.Get(routehttp.HopsHeader))
 		l.mu.Unlock()
 		h.ServeHTTP(w, r)
 	})
@@ -264,8 +265,11 @@ func TestATEXM11Signer(t *testing.T) {
 		if a.status != http.StatusMisdirectedRequest {
 			t.Fatalf("non-owner answered %d, want 421: %s", a.status, a.body)
 		}
-		if got := a.header.Get(RouteHeader); got != r.c.Addrs[o] {
-			t.Fatalf("%s = %q, want the owner's address %q", RouteHeader, got, r.c.Addrs[o])
+		if got := a.header.Get(routehttp.RouteHeader); got != r.c.Addrs[o] {
+			t.Fatalf("%s = %q, want the owner's address %q", routehttp.RouteHeader, got, r.c.Addrs[o])
+		}
+		if got := a.header.Get(routehttp.UnprocessedHeader); got != "1" {
+			t.Fatalf("421: %s = %q, want 1", routehttp.UnprocessedHeader, got)
 		}
 
 		// demo.Post follows the route and gets the first nonce, then the second.
@@ -324,8 +328,8 @@ func TestSignHandlerBadRequests(t *testing.T) {
 		"empty wallet":    {body: `{"wallet":"","payload":"p"}`},
 		"no wallet":       {body: `{"payload":"p"}`},
 		"wallet a number": {body: `{"wallet":7,"payload":"p"}`},
-		"bad hops":        {body: signBody("p"), hdr: map[string]string{HopsHeader: "x"}},
-		"negative hops":   {body: signBody("p"), hdr: map[string]string{HopsHeader: "-1"}},
+		"bad hops":        {body: signBody("p"), hdr: map[string]string{routehttp.HopsHeader: "x"}},
+		"negative hops":   {body: signBody("p"), hdr: map[string]string{routehttp.HopsHeader: "-1"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			for i := range r.c.Nodes {
@@ -347,12 +351,12 @@ func TestSignHandlerHopLimit(t *testing.T) {
 	r.postUntil(t, o, signBody("warm"), nil) // the owner serves; the chain has nonce 0
 
 	// A request that arrives after 2 hops and is not local ends here.
-	a := r.post(t, np, signBody("p"), map[string]string{HopsHeader: "2"})
+	a := r.post(t, np, signBody("p"), map[string]string{routehttp.HopsHeader: "2"})
 	if a.status != http.StatusLoopDetected {
 		t.Fatalf("after 2 hops: %d, want 508: %s", a.status, a.body)
 	}
 	// After 1 hop it is sent on once more, with 2, and the owner serves it.
-	a = r.post(t, np, signBody("p"), map[string]string{HopsHeader: "1"})
+	a = r.post(t, np, signBody("p"), map[string]string{routehttp.HopsHeader: "1"})
 	if a.status != http.StatusOK {
 		t.Fatalf("after 1 hop: %d, want 200: %s", a.status, a.body)
 	}
@@ -360,7 +364,7 @@ func TestSignHandlerHopLimit(t *testing.T) {
 		t.Fatalf("hops seen by the owner = %q, want the last to be 2", got)
 	}
 	// The owner serves a request that came with 2 hops, since it is local.
-	if a := r.post(t, o, signBody("p"), map[string]string{HopsHeader: "2"}); a.status != http.StatusOK {
+	if a := r.post(t, o, signBody("p"), map[string]string{routehttp.HopsHeader: "2"}); a.status != http.StatusOK {
 		t.Fatalf("owner after 2 hops: %d: %s", a.status, a.body)
 	}
 	if rep := r.chain.Report(); rep.Accepted != 3 || len(rep.Conflicts)+len(rep.Gaps) != 0 {
@@ -387,6 +391,10 @@ func TestSignHandlerStaleTerm(t *testing.T) {
 	a := r.post(t, o, signBody("p"), nil)
 	if a.status != http.StatusServiceUnavailable || a.header.Get("Retry-After") != "1" {
 		t.Fatalf("stale reservation: %d, Retry-After %q; want 503 and 1: %s", a.status, a.header.Get("Retry-After"), a.body)
+	}
+	// The rejected reservation left the nonce as it was, so the 503 promises no effect.
+	if got := a.header.Get(routehttp.UnprocessedHeader); got != "1" {
+		t.Fatalf("stale reservation: %s = %q, want 1", routehttp.UnprocessedHeader, got)
 	}
 	if got := r.nonces.reserves.Load() - before; got != 1 {
 		t.Fatalf("the stale request made %d reservations, want 1", got)

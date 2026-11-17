@@ -6,7 +6,8 @@
 // The nodes share one in-memory store and one static group, and each reaches the store through
 // its own CutStore, so a test can cut one node off while the others carry on. Every node has
 // its own HTTP listener, whose address is the node's member address: a route that names a member
-// names a socket a client can reach. Post is the client that follows those routes.
+// names a socket a client can reach. Post is the client that follows those routes, and Client,
+// given a tenure.Router such as Cluster.Router returns, sends each request straight to its owner.
 package demo
 
 import (
@@ -79,6 +80,7 @@ type Cluster struct {
 	// on believing it owns them. Do not call Leave on a handle; the node's Close does.
 	Groups []*static.Membership
 
+	timing    core.Timing
 	listeners []net.Listener
 	servers   []*http.Server
 
@@ -89,6 +91,16 @@ type Cluster struct {
 // URL returns the base URL of node i, "http://" and its address.
 func (c *Cluster) URL(i int) string {
 	return "http://" + c.Addrs[i]
+}
+
+// Router returns a tenure.Router for spaces that follows the cluster's group as a client
+// would: on a handle of its own that watches the group's views and never joins, with the
+// nodes' timing, so that it places the shards as the nodes do. Close it when done.
+func (c *Cluster) Router(spaces []tenure.Space) (*tenure.Router, error) {
+	if len(c.Groups) == 0 {
+		return nil, errors.New("demo: the cluster has no group")
+	}
+	return tenure.NewRouter(c.Groups[0].Share(), spaces, tenure.WithRouterTiming(c.timing))
 }
 
 // Start starts the nodes of a demo group and their servers. It opens every listener first, on
@@ -107,7 +119,7 @@ func Start(ctx context.Context, opts Options) (*Cluster, error) {
 	if opts.Timing == (core.Timing{}) {
 		opts.Timing = TestTiming()
 	}
-	c := &Cluster{Store: memstore.New(nil)}
+	c := &Cluster{Store: memstore.New(nil), timing: opts.Timing}
 
 	members := make([]core.Member, opts.Nodes)
 	var lc net.ListenConfig
