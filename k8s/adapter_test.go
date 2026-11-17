@@ -94,8 +94,12 @@ func TestATK8S01ConfigErrors(t *testing.T) {
 	t.Run("every method", func(t *testing.T) {
 		typ := reflect.TypeFor[*Adapter]()
 		want := make([]string, 0, typ.NumMethod())
+		errType := reflect.TypeFor[error]()
 		for m := range typ.Methods() {
-			want = append(want, m.Name)
+			// Stale reports a state and returns no error.
+			if n := m.Type.NumOut(); n > 0 && m.Type.Out(n-1) == errType {
+				want = append(want, m.Name)
+			}
 		}
 		got := make([]string, 0, len(adapterCalls))
 		for _, c := range adapterCalls {
@@ -103,7 +107,7 @@ func TestATK8S01ConfigErrors(t *testing.T) {
 		}
 		slices.Sort(got)
 		if !slices.Equal(got, want) {
-			t.Errorf("adapterCalls has rows for %q, want one row for each exported method of *Adapter: %q", got, want)
+			t.Errorf("adapterCalls has rows for %q, want one row for each exported method of *Adapter that returns an error: %q", got, want)
 		}
 	})
 

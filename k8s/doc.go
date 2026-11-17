@@ -100,6 +100,14 @@
 // WatchHolders, return an error wrapping ErrWatchOnly without a request. Watch works as for an
 // Adapter that never joins.
 //
+// A watch-only Adapter writes nothing whose return would show that its watch still delivers.
+// Instead, when its watch has delivered no Lease event for RenewDeadline while its view lists a
+// member, it starts its watch again, which lists the Leases. Until that list arrives, Stale
+// reports true and the passing of time alone removes no member. After it, a member Lease whose
+// resourceVersion differs from the one last seen counts as changed then, and one that has not
+// changed keeps aging. Lists that fail are retried with a backoff from RetryPeriod, doubling up to
+// LeaseDuration.
+//
 // # Configuration
 //
 // New never fails and makes no request. It records the first problem it finds with its
