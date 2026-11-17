@@ -4,9 +4,11 @@
 package orderbook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"maps"
 	"math/rand/v2"
 	"net/http"
@@ -15,9 +17,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/hmdsefi/tenure"
 	"github.com/hmdsefi/tenure/core"
+	"github.com/hmdsefi/tenure/examples/internal/demo"
 	"github.com/hmdsefi/tenure/examples/internal/fencedb"
+	"github.com/hmdsefi/tenure/routehttp"
 )
 
 // serveJournal starts a journal service over db and returns a client of it.
@@ -38,14 +44,21 @@ func TestHTTPJournal(t *testing.T) {
 	if err := j.Raise(ctx, 3, 2); err != nil {
 		t.Fatalf("Raise(3, 2): %v", err)
 	}
-	if err := j.Append(ctx, 3, 2, []byte(`{"a":1}`)); err != nil {
+	if err := j.Append(ctx, 3, 2, 0, []byte(`{"a":1}`)); err != nil {
 		t.Fatalf("Append at the fence: %v", err)
 	}
-	if err := j.Append(ctx, 3, 3, []byte(`{"a":2}`)); err != nil {
+	if err := j.Append(ctx, 3, 3, 1, []byte(`{"a":2}`)); err != nil {
 		t.Fatalf("Append above the fence: %v", err)
 	}
-	if err := j.Append(ctx, 3, 2, []byte(`{"a":3}`)); !errors.Is(err, fencedb.ErrStale) {
+	if err := j.Append(ctx, 3, 2, 2, []byte(`{"a":3}`)); !errors.Is(err, fencedb.ErrStale) {
 		t.Errorf("Append below the fence: %v, want ErrStale", err)
+	}
+	// An Append that expects another length appends nothing: neither one that is late, nor one
+	// that skips a line.
+	for _, at := range []int{1, 3} {
+		if err := j.Append(ctx, 3, 3, at, []byte(`{"a":4}`)); !errors.Is(err, ErrLength) || errors.Is(err, fencedb.ErrStale) {
+			t.Errorf("Append at line %d of a journal of 2: %v, want ErrLength", at, err)
+		}
 	}
 	if err := j.Raise(ctx, 3, 1); !errors.Is(err, fencedb.ErrStale) {
 		t.Errorf("Raise below the fence: %v, want ErrStale", err)
@@ -160,8 +173,8 @@ type flaky struct {
 
 var errLost = errors.New("the answer was lost")
 
-func (f *flaky) Append(ctx context.Context, shard int, term core.Term, line []byte) error {
-	if err := f.DBJournal.Append(ctx, shard, term, line); err != nil {
+func (f *flaky) Append(ctx context.Context, shard int, term core.Term, at int, line []byte) error {
+	if err := f.DBJournal.Append(ctx, shard, term, at, line); err != nil {
 		return err
 	}
 	f.mu.Lock()
@@ -232,6 +245,123 @@ func TestEngineUnsureAppend(t *testing.T) {
 	}
 }
 
+// late is a Journal over a DBJournal whose Append, once hold is set, fails without appending,
+// as a remote journal's does when its client gives up first, and keeps the append to be applied
+// later, as the service does when the request reaches it after all. With inEntries the kept
+// append is applied right after the next Entries, before the engine's next Append.
+type late struct {
+	*DBJournal
+	mu        sync.Mutex
+	hold      bool
+	inEntries bool
+	held      func() error
+	heldErr   error
+}
+
+func (l *late) Append(ctx context.Context, shard int, term core.Term, at int, line []byte) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.hold {
+		l.hold = false
+		l.held = func() error { return l.DBJournal.Append(ctx, shard, term, at, line) }
+		return errLost
+	}
+	return l.DBJournal.Append(ctx, shard, term, at, line)
+}
+
+func (l *late) Entries(ctx context.Context, shard int) ([][]byte, error) {
+	lines, err := l.DBJournal.Entries(ctx, shard)
+	if l.inEntries {
+		l.apply()
+	}
+	return lines, err
+}
+
+// apply applies the kept append, once, and keeps its error.
+func (l *late) apply() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.held != nil {
+		l.heldErr, l.held = l.held(), nil
+	}
+}
+
+// TestEngineLateAppend: an Append of unknown outcome that reaches the journal only after the
+// engine read the journal again adds no line the engine's books do not hold, and does not
+// journal its order twice when the client sent it again: whichever of it and the engine's next
+// Append comes second fails with ErrLength and appends nothing, and the engine then reads the
+// journal again.
+func TestEngineLateAppend(t *testing.T) {
+	const shard = 4
+	s1 := Order{ID: "s1", Market: "m", Side: SideSell, Price: 10, Qty: 5}
+	b1 := Order{ID: "b1", Market: "m", Side: SideBuy, Price: 10, Qty: 2}
+	b2 := Order{ID: "b2", Market: "m", Side: SideBuy, Price: 10, Qty: 4}
+	for _, tc := range []struct {
+		name      string
+		next      Order // the order after b1's lost Append
+		inEntries bool  // b1's Append lands between the read and next's Append
+		nextErr   error // what next gets
+		lateErr   error // what b1's late Append gets
+		ids       []string
+	}{
+		{"after another order", b2, false, nil, ErrLength, []string{"s1", "b2"}},
+		{"after b1 again", b1, false, nil, ErrLength, []string{"s1", "b1"}},
+		{"before another order", b2, true, ErrLength, nil, []string{"s1", "b1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := &late{DBJournal: NewDBJournal(fencedb.New()), inEntries: tc.inEntries}
+			e, _ := start(t, New(l), shard, 1)
+			if e == nil {
+				t.Fatal("no engine")
+			}
+			if _, err := e.submit(s1); err != nil {
+				t.Fatal(err)
+			}
+			l.mu.Lock()
+			l.hold = true
+			l.mu.Unlock()
+			if _, err := e.submit(b1); !errors.Is(err, errLost) {
+				t.Fatalf("submit of b1 with a lost Append: %v", err)
+			}
+			_, err := e.submit(tc.next)
+			l.apply()
+			if !errors.Is(err, tc.nextErr) || (tc.nextErr == nil && err != nil) {
+				t.Errorf("submit of %s: %v, want %v", tc.next.ID, err, tc.nextErr)
+			}
+			if !errors.Is(l.heldErr, tc.lateErr) || (tc.lateErr == nil && l.heldErr != nil) {
+				t.Errorf("b1's late Append: %v, want %v", l.heldErr, tc.lateErr)
+			}
+
+			// One more order, so that the engine has read the journal again if it had to.
+			if _, err := e.submit(Order{ID: "z", Market: "z", Side: SideBuy, Price: 1, Qty: 1}); err != nil {
+				t.Fatalf("submit of z: %v", err)
+			}
+			lines, err := l.DBJournal.Entries(t.Context(), shard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ids []string
+			for _, line := range lines {
+				var en Entry
+				if err := json.Unmarshal(line, &en); err != nil {
+					t.Fatal(err)
+				}
+				ids = append(ids, en.Order.ID)
+			}
+			if want := append(slices.Clone(tc.ids), "z"); !slices.Equal(ids, want) {
+				t.Errorf("journal holds %v, want %v", ids, want)
+			}
+			fresh := newEngine(nil, shard, 1)
+			if err := fresh.replay(lines); err != nil {
+				t.Fatalf("the journal does not replay: %v", err)
+			}
+			if got, want := e.snapshot(), fresh.snapshot(); !maps.Equal(got, want) {
+				t.Errorf("books %v, the journal's %v", got, want)
+			}
+		})
+	}
+}
+
 func TestReplay(t *testing.T) {
 	var lines [][]byte
 	b := new(book)
@@ -270,5 +400,92 @@ func TestRandomOrder(t *testing.T) {
 	}
 	if sp := New(nil).Space(); sp.Name != SpaceName || sp.Shards != Shards || !sp.Fenced || sp.Run == nil {
 		t.Errorf("Space() = %+v", sp)
+	}
+}
+
+// TestServerUnknownAppend checks the answers of POST /orders around an Append of unknown
+// outcome: a 500 without Tenure-Unprocessed for the order itself, since it may be journaled; a
+// 503 with Tenure-Unprocessed for the next order when the lost Append landed before its own,
+// which then journaled nothing; and a 409 when the lost order comes again.
+func TestServerUnknownAppend(t *testing.T) {
+	l := &late{DBJournal: NewDBJournal(fencedb.New()), inEntries: true}
+	ob := New(l)
+	c, err := demo.Start(t.Context(), demo.Options{
+		Nodes:  1,
+		Spaces: func(int) []tenure.Space { return []tenure.Space{ob.Space()} },
+		Serve:  func(_ int, n *tenure.Node) http.Handler { return NewServer(n, ob, n.Table().Member.ID) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		_ = c.Close(ctx)
+	})
+	// answer is the status and the header of an answer to POST /orders.
+	type answer struct {
+		StatusCode int
+		Header     http.Header
+	}
+	post := func(o Order) answer {
+		t.Helper()
+		body, err := json.Marshal(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, c.URL(0)+OrdersPath, bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return answer{resp.StatusCode, resp.Header}
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for post(Order{ID: "s1", Market: "m", Side: SideSell, Price: 10, Qty: 5}).StatusCode != http.StatusOK {
+		if time.Now().After(deadline) {
+			t.Fatal("the node never took an order")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	shard := core.KeyShard("m", Shards)
+	journaled := func() [][]byte {
+		t.Helper()
+		lines, err := l.DBJournal.Entries(t.Context(), shard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return lines
+	}
+
+	l.mu.Lock()
+	l.hold = true
+	l.mu.Unlock()
+	b1 := Order{ID: "b1", Market: "m", Side: SideBuy, Price: 10, Qty: 2}
+	if resp := post(b1); resp.StatusCode != http.StatusInternalServerError || resp.Header.Get(routehttp.UnprocessedHeader) != "" {
+		t.Errorf("order whose Append's outcome is unknown: %d, header %v; want 500 without %s",
+			resp.StatusCode, resp.Header, routehttp.UnprocessedHeader)
+	}
+	b2 := Order{ID: "b2", Market: "m", Side: SideBuy, Price: 10, Qty: 1}
+	if resp := post(b2); resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get(routehttp.UnprocessedHeader) != "1" {
+		t.Errorf("order after a lost Append that landed late: %d, header %v; want 503 with %s 1",
+			resp.StatusCode, resp.Header, routehttp.UnprocessedHeader)
+	}
+	if n := len(journaled()); n != 2 {
+		t.Errorf("the journal holds %d lines, want s1 and b1", n)
+	}
+	if resp := post(b2); resp.StatusCode != http.StatusOK {
+		t.Errorf("b2 again: %d, want 200", resp.StatusCode)
+	}
+	if resp := post(b1); resp.StatusCode != http.StatusConflict {
+		t.Errorf("b1 again: %d, want 409", resp.StatusCode)
+	}
+	if lines := journaled(); len(lines) != 3 || Replay(lines) != nil {
+		t.Errorf("journal of %d lines replays with %v, want s1, b1 and b2", len(lines), Replay(lines))
 	}
 }

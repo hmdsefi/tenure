@@ -25,7 +25,7 @@ func TestServe(t *testing.T) {
 	j := orderbook.NewHTTPJournal("http://"+ln.Addr().String(), nil)
 	rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
 	defer rcancel()
-	if err := j.Append(rctx, 1, 1, []byte(`{}`)); err != nil {
+	if err := j.Append(rctx, 1, 1, 0, []byte(`{}`)); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	all, err := j.All(rctx)

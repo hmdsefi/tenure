@@ -35,8 +35,10 @@ const (
 )
 
 const (
-	// errNameStale is the error name of a 409 answer of the journal service.
-	errNameStale = "stale"
+	// errNameStale and errNameLength are the error names of the 409 answers of the journal
+	// service: a stale term, and an append that expects another length of the journal.
+	errNameStale  = "stale"
+	errNameLength = "length"
 
 	// maxRequest is the most of a request body that the journal service reads.
 	maxRequest = 64 << 10
@@ -58,6 +60,7 @@ type raiseRequest struct {
 type appendRequest struct {
 	Shard int             `json:"shard"`
 	Term  core.Term       `json:"term"`
+	At    int             `json:"at"`
 	Line  json.RawMessage `json:"line"`
 }
 
@@ -75,14 +78,15 @@ type journalResponse struct {
 // db behind one address so that several orderbook pods share it:
 //
 //   - POST /raise {"shard","term"} raises the shard's fence; 200 with {}.
-//   - POST /append {"shard","term","line"} appends line, a JSON value, to the shard's journal
-//     under term; 200 with {}.
+//   - POST /append {"shard","term","at","line"} appends line, a JSON value, to the shard's
+//     journal under term as its line number at; 200 with {}.
 //   - GET /entries?shard=N answers 200 with {"entries":[line, ...]}.
 //   - GET /journal answers 200 with {"shards":[[line, ...], ...]}, every shard's journal.
 //
-// A stale term answers 409 with {"error":"stale"}; a request that is not one JSON request of
+// A stale term answers 409 with {"error":"stale"}, and an append whose at is not the journal's
+// length 409 with {"error":"length"}; a request that is not one JSON request of
 // the endpoint, or a shard outside the space, answers 400 (413 over 64 KiB), and any other
-// failure 500. NewHTTPJournal turns the 409 back into fencedb.ErrStale.
+// failure 500. NewHTTPJournal turns the 409s back into fencedb.ErrStale and ErrLength.
 func NewJournalHandler(db *fencedb.DB) http.Handler {
 	s := &journalsvc{j: NewDBJournal(db)}
 	mux := http.NewServeMux()
@@ -114,7 +118,7 @@ func (s *journalsvc) append(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusBadRequest, errorBody(errors.New("orderbook: no line")))
 		return
 	}
-	replyJournal(w, s.j.Append(r.Context(), req.Shard, req.Term, req.Line), struct{}{})
+	replyJournal(w, s.j.Append(r.Context(), req.Shard, req.Term, req.At, req.Line), struct{}{})
 }
 
 func (s *journalsvc) entries(w http.ResponseWriter, r *http.Request) {
@@ -186,13 +190,15 @@ func decodeRequest(w http.ResponseWriter, r *http.Request, v any) bool {
 }
 
 // replyJournal answers a Journal call: 200 with v when err is nil, 409 with the name "stale"
-// for a stale term, otherwise 500.
+// for a stale term or "length" for an append at another length, otherwise 500.
 func replyJournal(w http.ResponseWriter, err error, v any) {
 	switch {
 	case err == nil:
 		reply(w, http.StatusOK, v)
 	case errors.Is(err, fencedb.ErrStale):
 		reply(w, http.StatusConflict, map[string]string{"error": errNameStale, "detail": err.Error()})
+	case errors.Is(err, ErrLength):
+		reply(w, http.StatusConflict, map[string]string{"error": errNameLength, "detail": err.Error()})
 	default:
 		reply(w, http.StatusInternalServerError, errorBody(err))
 	}
@@ -206,7 +212,8 @@ type HTTPJournal struct {
 
 // NewHTTPJournal returns a Journal that calls the journal service at base, such as
 // "http://journalsvc:8080", with hc; a nil hc means a client with a 10 s timeout. A stale
-// answer of the service comes back as an error that wraps fencedb.ErrStale.
+// answer of the service comes back as an error that wraps fencedb.ErrStale, and an append at
+// another length as one that wraps ErrLength.
 func NewHTTPJournal(base string, hc *http.Client) *HTTPJournal {
 	if hc == nil {
 		hc = &http.Client{Timeout: defaultTimeout}
@@ -229,8 +236,8 @@ func (j *HTTPJournal) Entries(ctx context.Context, shard int) ([][]byte, error) 
 }
 
 // Append calls POST /append. line must be one JSON value, as an Entry's encoding is.
-func (j *HTTPJournal) Append(ctx context.Context, shard int, term core.Term, line []byte) error {
-	return j.do(ctx, http.MethodPost, AppendPath, appendRequest{Shard: shard, Term: term, Line: line}, nil)
+func (j *HTTPJournal) Append(ctx context.Context, shard int, term core.Term, at int, line []byte) error {
+	return j.do(ctx, http.MethodPost, AppendPath, appendRequest{Shard: shard, Term: term, At: at, Line: line}, nil)
 }
 
 // All calls GET /journal and returns every shard's journal lines, indexed by shard.
@@ -256,8 +263,9 @@ func byteLines(raw []json.RawMessage) [][]byte {
 }
 
 // do sends body as JSON (none when nil) and decodes a 200 answer into out (nothing when nil).
-// A 409 answer named "stale" becomes an error that wraps fencedb.ErrStale; any other status is
-// an error that says the status and the service's message.
+// A 409 answer named "stale" becomes an error that wraps fencedb.ErrStale, one named "length" an
+// error that wraps ErrLength; any other status is an error that says the status and the
+// service's message.
 func (j *HTTPJournal) do(ctx context.Context, method, path string, body, out any) error {
 	var rd io.Reader
 	if body != nil {
@@ -298,8 +306,13 @@ func (j *HTTPJournal) do(ctx context.Context, method, path string, body, out any
 		Detail string `json:"detail"`
 	}
 	_ = json.Unmarshal(raw, &msg)
-	if resp.StatusCode == http.StatusConflict && msg.Error == errNameStale {
-		return fmt.Errorf("%w (%s)", fencedb.ErrStale, msg.Detail)
+	if resp.StatusCode == http.StatusConflict {
+		switch msg.Error {
+		case errNameStale:
+			return fmt.Errorf("%w (%s)", fencedb.ErrStale, msg.Detail)
+		case errNameLength:
+			return fmt.Errorf("%w (%s)", ErrLength, msg.Detail)
+		}
 	}
 	return fmt.Errorf("orderbook: %s: %d %s: %s", path, resp.StatusCode, http.StatusText(resp.StatusCode), msg.Error)
 }

@@ -75,8 +75,9 @@ type Result struct {
 //   - 421 with Tenure-Route: this node does not own the market's shard, and the header names the
 //     member that does. With no known owner, 503.
 //   - 503 with Retry-After: 1: the shard's engine is not ready, is for another term, refuses
-//     orders, or the fence rejected the order's commit. In the last case the engine refuses every
-//     further order of its term.
+//     orders, the fence rejected the order's commit (the engine then refuses every further order
+//     of its term), or the journal had grown by a line the engine did not know of (the engine
+//     then reads its journal again).
 //   - 409: the order's ID is journaled already.
 //   - 200: the order was matched and journaled, and the body lists its fills.
 //   - 500: the journal failed without saying whether it holds the order (a remote journal's
@@ -85,7 +86,8 @@ type Result struct {
 // The 421 and every 503 carry Tenure-Unprocessed: 1, as routehttp.Misdirected and
 // routehttp.Unavailable write them, because none follows an effect: a 503 after a rejected
 // commit neither, since the fence rejects the whole commit and the engine keeps the order's match
-// only when the commit succeeded, and a 503 while the engine cannot read its journal again after
+// only when the commit succeeded, after an append at another length neither, since it appended
+// nothing, and a 503 while the engine cannot read its journal again after
 // a 500 comes before the order reached the journal.
 func (s *server) postOrder(w http.ResponseWriter, r *http.Request) {
 	o, err := decodeOrder(http.MaxBytesReader(w, r.Body, maxOrderBody))
@@ -120,7 +122,7 @@ func (s *server) postOrder(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusBadRequest, errorBody(err))
 	case errors.Is(err, errDuplicate):
 		reply(w, http.StatusConflict, errorBody(err))
-	case errors.Is(err, errRefusing), errors.Is(err, fencedb.ErrStale):
+	case errors.Is(err, errRefusing), errors.Is(err, fencedb.ErrStale), errors.Is(err, ErrLength):
 		routehttp.Unavailable(w, time.Second)
 	default:
 		reply(w, http.StatusInternalServerError, errorBody(err))

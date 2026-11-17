@@ -195,6 +195,12 @@ func (e *Engine) bookOf(market string) *book {
 // every further order. Any other error of Append leaves it unknown whether the order is
 // journaled (a remote journal's answer can be lost), so the engine reads its journal again
 // before it takes the next order, and refuses orders with errRefusing until that read works.
+//
+// Each Append names the line number it adds, the count of the engine's journaled orders, so an
+// Append of unknown outcome that reaches the journal only after that read (one whose answer
+// timed out) fails with ErrLength instead of adding a line the books do not hold; so does the
+// next order's, which then reads the journal again too. An error that wraps ErrLength appended
+// nothing.
 func (e *Engine) submit(o Order) ([]Fill, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -220,7 +226,7 @@ func (e *Engine) submit(o Order) ([]Fill, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), appendTimeout)
-	err = e.o.j.Append(ctx, e.shard, e.term, line)
+	err = e.o.j.Append(ctx, e.shard, e.term, len(e.ids), line)
 	cancel()
 	if e.o.Commit != nil {
 		e.o.Commit(e.shard, e.term, o.ID, err)
