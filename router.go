@@ -79,6 +79,11 @@ type RouteSpace struct {
 	// built once so that returning them allocates nothing.
 	errOut   error
 	errShard error
+
+	// corrections holds the space's corrections, one per shard, and live counts those set
+	// (RTR-410). Lookups only read them; Correct and the builder write them.
+	corrections []atomic.Pointer[correction]
+	live        atomic.Int64
 }
 
 // A RouterOption changes how NewRouter builds a Router.
@@ -190,6 +195,7 @@ func NewRouter(m Membership, spaces []Space, opts ...RouterOption) (*Router, err
 		h := &RouteSpace{r: r, index: i, name: sp.Name, shards: sp.Shards, shardOf: sp.ShardOf}
 		h.errOut = fmt.Errorf("tenure: %s: ShardOf result is outside [0, %d)", sp.Name, sp.Shards)
 		h.errShard = fmt.Errorf("tenure: %s: shard is outside [0, %d)", sp.Name, sp.Shards)
+		h.corrections = make([]atomic.Pointer[correction], sp.Shards)
 		r.spaces = append(r.spaces, h)
 		r.byName[sp.Name] = h
 		specs[i] = core.AssignerSpace{Name: sp.Name, Shards: sp.Shards}
@@ -335,6 +341,9 @@ func (h *RouteSpace) Route(key string) (Member, error) {
 	if err != nil {
 		return Member{}, err
 	}
+	if h.live.Load() > 0 {
+		return h.corrected(s, shard)
+	}
 	return s.route(h.index, shard)
 }
 
@@ -346,6 +355,9 @@ func (h *RouteSpace) RouteShard(shard int) (Member, error) {
 	}
 	if shard < 0 || shard >= h.shards {
 		return Member{}, h.errShard
+	}
+	if h.live.Load() > 0 {
+		return h.corrected(s, shard)
 	}
 	return s.route(h.index, shard)
 }
@@ -393,6 +405,7 @@ func (r *Router) publish(balanced bool) {
 		return
 	}
 	s := r.buildSnapshot(prev.version + 1)
+	r.dropCorrections()
 	r.snap.Store(s)
 	r.builds.snapshots++
 	if balanced {
