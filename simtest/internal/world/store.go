@@ -9,6 +9,7 @@ import (
 
 	"github.com/hmdsefi/faultline/kernel"
 
+	"github.com/hmdsefi/tenure/core"
 	"github.com/hmdsefi/tenure/simtest/internal/check"
 )
 
@@ -69,6 +70,10 @@ type storeServer struct {
 	// tenure.grant record and before any message about it goes out. The checks of the run
 	// set it to feed Checker.Grant (1.8-10).
 	onGrant func(check.Grant)
+
+	// onView, when set, is called with every new view of the store, in the event that made it,
+	// after its tenure.view record. The routers set it to watch the store (router.go).
+	onView func(v core.View)
 
 	// end and snapshot are the mono timers of the present boot; nil or not pending when none
 	// is set.
@@ -170,6 +175,9 @@ func (s *storeServer) apply(text string) storePushes {
 			out.records = append(out.records, holderPush(e))
 		case viewEffect:
 			s.w.emitView(text, e.View)
+			if s.onView != nil {
+				s.onView(cloneView(e.View))
+			}
 			out.view = &viewPush{View: e.View, Sessions: e.Sessions}
 		default:
 			panic(fmt.Sprintf("world: store: unknown effect %T", e))
