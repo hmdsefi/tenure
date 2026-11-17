@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,8 +37,15 @@ var watchOnlyMutants = []struct {
 	cases []string
 }{
 	{"leak-write", []string{"WatchOnly/Refuse"}},
+	{"join-unwrapped", []string{"WatchOnly/Refuse"}},
+	{"drain-nil", []string{"WatchOnly/Refuse"}},
+	{"leave-nil", []string{"WatchOnly/Refuse"}},
 	{"skip-drain", []string{"WatchOnly/Follow"}},
+	{"repeat-view", []string{"WatchOnly/Follow"}},
+	{"empty-first", []string{"WatchOnly/Initial", "WatchOnly/Slots"}},
 	{"no-slots", []string{"WatchOnly/Slots"}},
+	{"holder-name", []string{"WatchOnly/Slots"}},
+	{"stuck-holder", []string{"WatchOnly/Slots"}},
 	{"no-close", []string{"WatchOnly/Cancel"}},
 	{"stale", []string{"WatchOnly/Fresh"}},
 }
@@ -84,8 +92,9 @@ func TestWatchOnlyMutant(t *testing.T) {
 }
 
 // TestWatchOnlyMutants checks that the suite catches a watch-only wrapper that leaks a write,
-// skips a view, drops the slot data, leaves a channel open past its context or reports itself
-// stale while views arrive (RTR-780): each mutant child starts every case, fails at least its
+// refuses one without tenure.ErrWatchOnly, skips a view, repeats one, starts with an empty view,
+// drops or garbles the slot data, leaves a channel open past its context or reports itself stale
+// while views arrive (RTR-780): each mutant child starts every case, fails at least its
 // named cases and exits non-zero, and every line it logs is a suite failure. Each baseline child
 // fails no case; without a Stale method, WatchOnly/Fresh skips.
 func TestWatchOnlyMutants(t *testing.T) {
@@ -206,7 +215,8 @@ func newWatchOnlyFixture(name string) func(t *testing.T, ids []string) membershi
 		for i := range ids {
 			writers[i] = g.Share()
 		}
-		wo := &watchOnly{m: g.Share(), slots: store, defect: name, period: 5 * time.Millisecond}
+		wo := &watchOnly{m: g.Share(), slots: store, defect: name, period: 5 * time.Millisecond,
+			held: make(map[int]string)}
 		var m tenure.Membership = wo
 		if name == "no-stale-method" {
 			m = plainWatchOnly{wo}
@@ -248,20 +258,34 @@ type watchOnly struct {
 	defect  string
 	period  time.Duration
 	version atomic.Uint64
+
+	mu   sync.Mutex
+	held map[int]string // with the defect "stuck-holder", the last holder seen on each slot
 }
 
 func (w *watchOnly) Join(ctx context.Context, self core.Member) error {
-	if w.defect == "leak-write" {
+	switch w.defect {
+	case "leak-write":
 		_ = w.m.Join(ctx, self)
+	case "join-unwrapped":
+		return fmt.Errorf("watchonly: Join: %v", tenure.ErrWatchOnly)
 	}
 	return fmt.Errorf("watchonly: Join: %w", tenure.ErrWatchOnly)
 }
 
 func (w *watchOnly) SetDraining(context.Context, bool) error {
+	if w.defect == "drain-nil" {
+		return nil
+	}
 	return fmt.Errorf("watchonly: SetDraining: %w", tenure.ErrWatchOnly)
 }
 
+// Leave refuses, or returns nil with the defect "leave-nil", as Leave before Join may on a
+// membership that can join.
 func (w *watchOnly) Leave(context.Context) error {
+	if w.defect == "leave-nil" {
+		return nil
+	}
 	return fmt.Errorf("watchonly: Leave: %w", tenure.ErrWatchOnly)
 }
 
@@ -269,7 +293,8 @@ func (w *watchOnly) Leave(context.Context) error {
 func (w *watchOnly) Stale() bool { return w.defect == "stale" }
 
 // Watch returns a channel holding the merged current view, which receives each later merged
-// view until ctx ends or the static channel closes.
+// view until ctx ends or the static channel closes. With the defect "empty-first", the first
+// view lists no members and no slots, and the merged view follows it.
 func (w *watchOnly) Watch(ctx context.Context) (<-chan core.View, error) {
 	in, err := w.m.Watch(ctx)
 	if err != nil {
@@ -278,13 +303,17 @@ func (w *watchOnly) Watch(ctx context.Context) (<-chan core.View, error) {
 	mem := <-in // static holds the current view at once
 	out := make(chan core.View, 1)
 	last := w.merge(ctx, mem)
+	if w.defect == "empty-first" {
+		last = core.View{Version: last.Version}
+	}
 	out <- last
 	go w.follow(ctx, in, out, mem, last)
 	return out, nil
 }
 
 // follow merges each view of in, and each change of the slot data read every period, into out
-// until in closes, then closes out (not with the defect "no-close").
+// until in closes, then closes out (not with the defect "no-close"). With the defect
+// "repeat-view", each merged view is sent twice.
 func (w *watchOnly) follow(ctx context.Context, in <-chan core.View, out chan core.View, mem, last core.View) {
 	tick := time.NewTicker(w.period)
 	defer tick.Stop()
@@ -310,6 +339,10 @@ func (w *watchOnly) follow(ctx context.Context, in <-chan core.View, out chan co
 		}
 		next.Version = w.version.Add(1)
 		last = next
+		if w.defect == "repeat-view" {
+			w.sendTwice(ctx, out, next)
+			continue
+		}
 		select {
 		case <-out:
 		default:
@@ -318,8 +351,24 @@ func (w *watchOnly) follow(ctx context.Context, in <-chan core.View, out chan co
 	}
 }
 
+// sendTwice sends v and then a copy of it with the next Version, without replacing an unreceived
+// view, so that the copy is received after v: the defect "repeat-view".
+func (w *watchOnly) sendTwice(ctx context.Context, out chan core.View, v core.View) {
+	dup := v
+	dup.Version = w.version.Add(1)
+	for _, x := range []core.View{v, dup} {
+		select {
+		case out <- x:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // merge returns v with the store's slot data merged in, as a node merges it, and the wrapper's
 // next Version; with the defect "no-slots", without slot data. A failed read merges no slots.
+// With the defect "holder-name", each held slot's holder is the slot's name instead; with
+// "stuck-holder", a slot keeps the last holder seen on it after a release.
 func (w *watchOnly) merge(ctx context.Context, v core.View) core.View {
 	out := core.View{Version: w.version.Add(1), Members: slices.Clone(v.Members)}
 	if w.defect != "no-slots" {
@@ -327,6 +376,20 @@ func (w *watchOnly) merge(ctx context.Context, v core.View) core.View {
 			out.Slots = count
 			out.SlotHolders = make([]string, count)
 			copy(out.SlotHolders, holders)
+		}
+	}
+	for s, h := range out.SlotHolders {
+		switch {
+		case w.defect == "holder-name" && h != "":
+			out.SlotHolders[s] = fmt.Sprintf("slot-%d", s)
+		case w.defect == "stuck-holder":
+			w.mu.Lock()
+			if h != "" {
+				w.held[s] = h
+			} else {
+				out.SlotHolders[s] = w.held[s]
+			}
+			w.mu.Unlock()
 		}
 	}
 	for i := range out.Members {
