@@ -19,8 +19,9 @@ import (
 // the trace is what shows that a seed replays: so every kind has one function here that emits
 // it, with its attributes in one order, and nothing else in the package calls Sim.Emit.
 //
-// A record belongs to the node it is about: the store, the fence or a member. Only
-// tenure.bound is global. The text of a record is the Describe of the message that caused it,
+// A record belongs to the node it is about: the store, the fence or a member. tenure.bound is
+// global, and so are the records of the routers, which have no node: tenure.router_view,
+// tenure.router_cut and tenure.route. The text of a record is the Describe of the message that caused it,
 // or empty. An attribute that holds a time or a duration is in nanoseconds, in decimal, and its
 // key ends in _ns.
 const (
@@ -42,6 +43,9 @@ const (
 	kindTimeout   = "tenure.timeout"
 	kindRun       = "tenure.run"
 	kindExit      = "tenure.exit"
+	kindRouteView = "tenure.router_view"
+	kindRouteCut  = "tenure.router_cut"
+	kindRoute     = "tenure.route"
 )
 
 // bootCauseBoot is the cause of tenure.boot for an incarnation that starts because its node
@@ -245,6 +249,39 @@ func (w *World) emitRun(m *Member, text, op, space string, shard int, t core.Ter
 		recAttr("space", space),
 		recAttr("shard", strconv.Itoa(shard)),
 		recAttr("term", recTerm(t)),
+	)
+}
+
+// emitRouterView emits the global tenure.router_view for a new snapshot of router r: router,
+// its name; snapshot, the snapshot version; then version, members and slots of the view it
+// applied, as tenure.view has them; cause, "view" for an applied view or "tick" for a slot
+// vacancy that expired.
+func (w *World) emitRouterView(r *router, cause string) {
+	attrs := []kernel.Attr{recAttr("router", r.name), recAttr("snapshot", recUint(r.table.version))}
+	attrs = append(attrs, viewFields(r.table.view)...)
+	w.emit(kindRouteView, nil, "", append(attrs, recAttr("cause", cause))...)
+}
+
+// emitRouterCut emits the global tenure.router_cut when router r is cut off from the store's
+// views (op "cut") and when the cut ends (op "heal").
+func (w *World) emitRouterCut(r *router, cut bool) {
+	op := "heal"
+	if cut {
+		op = "cut"
+	}
+	w.emit(kindRouteCut, nil, "", recAttr("router", r.name), recAttr("op", op))
+}
+
+// emitRoute emits the global tenure.route for one request of router r, whose text is the path
+// of its sends, as "m3 421 m2, m2 served": router; space and shard; sends, how many; result,
+// "served" or "failed".
+func (w *World) emitRoute(r *router, space string, shard, sends int, result, path string) {
+	w.emit(kindRoute, nil, path,
+		recAttr("router", r.name),
+		recAttr("space", space),
+		recAttr("shard", strconv.Itoa(shard)),
+		recAttr("sends", strconv.Itoa(sends)),
+		recAttr("result", result),
 	)
 }
 
