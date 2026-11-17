@@ -47,13 +47,14 @@ func TestErrorValues(t *testing.T) {
 		{tenure.ErrNotOwner, "tenure: not owner"},
 		{tenure.ErrNoMembers, "tenure: no members"},
 		{tenure.ErrDraining, "tenure: draining"},
+		{tenure.ErrWatchOnly, "tenure: watch only"},
 	}
 	for _, c := range cases {
 		if got := c.err.Error(); got != c.want {
 			t.Errorf("Error() = %q, want %q", got, c.want)
 		}
 	}
-	all := []error{tenure.ErrNoSlot, tenure.ErrSessionLost, tenure.ErrClosed, tenure.ErrNotOwner, tenure.ErrNoMembers, tenure.ErrDraining}
+	all := []error{tenure.ErrNoSlot, tenure.ErrSessionLost, tenure.ErrClosed, tenure.ErrNotOwner, tenure.ErrNoMembers, tenure.ErrDraining, tenure.ErrWatchOnly}
 	for i, a := range all {
 		for j, b := range all {
 			if (i == j) != errors.Is(a, b) {

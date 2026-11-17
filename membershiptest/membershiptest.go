@@ -49,6 +49,10 @@
 // tenure.PropagationEstimator skips the case that checks the estimate. Each skip says what is
 // missing.
 //
+// RunWatchOnly is the suite for a membership that only watches, such as one that follows a group
+// for a tenure.Router: it checks that membership against writer memberships of the same group,
+// with a WatchOnlyFixture instead of a Fixture. Its cases are named WatchOnly/<Case>.
+//
 // A failure reads "<Method>(<args>) = <got>, want <want>" or "view <Version> on <instance>: <got>,
 // want <condition>", with strings quoted, errors as their text and nil as nil.
 package membershiptest
@@ -172,6 +176,10 @@ type env struct {
 	ctx   context.Context
 	f     Fixture
 	insts map[string]tenure.Membership
+
+	// wo is the fixture of a RunWatchOnly case, nil in a Run case. In a RunWatchOnly case, a
+	// change of slot data alone counts as a change of the view.
+	wo *WatchOnlyFixture
 }
 
 func newEnv(t *testing.T, f Fixture) *env {
@@ -330,9 +338,12 @@ func (w *watcher) take(v core.View) {
 	case w.n > 0 && v.Version <= w.last.Version:
 		t.Fatalf("view %d on %s: Version %d after view %d, want Version above %d", v.Version, w.name,
 			v.Version, w.last.Version, w.last.Version)
-	case w.n > 0 && slices.EqualFunc(v.Members, w.last.Members, sameData):
+	case w.n > 0 && w.e.wo == nil && slices.EqualFunc(v.Members, w.last.Members, sameData):
 		t.Fatalf("view %d on %s: the member data of view %d, want a change of member data", v.Version,
 			w.name, w.last.Version)
+	case w.n > 0 && w.e.wo != nil && sameView(v, w.last):
+		t.Fatalf("view %d on %s: the member and slot data of view %d, want a change of member or slot data",
+			v.Version, w.name, w.last.Version)
 	}
 	for i := 1; i < len(v.Members); i++ {
 		if v.Members[i-1].ID >= v.Members[i].ID {
@@ -395,17 +406,26 @@ func (w *watcher) eventually(c cond) core.View {
 		case v, ok := <-w.ch:
 			if !ok {
 				w.e.t.Fatalf("view %d on %s: %s and then a closed channel, want %s", w.last.Version, w.name,
-					fmtMembers(w.last), c.want)
+					w.describe(w.last), c.want)
 			}
 			w.take(v)
 			if c.ok(v) {
 				return v
 			}
 		case <-timer.C:
-			w.e.t.Fatalf("view %d on %s: %s for %v, want %s", w.last.Version, w.name, fmtMembers(w.last),
+			w.e.t.Fatalf("view %d on %s: %s for %v, want %s", w.last.Version, w.name, w.describe(w.last),
 				budget, c.want)
 		}
 	}
+}
+
+// describe formats v for a failure message: its members, and in a RunWatchOnly case its slot
+// data too.
+func (w *watcher) describe(v core.View) string {
+	if w.e.wo == nil {
+		return fmtMembers(v)
+	}
+	return fmt.Sprintf("%s, Slots %d, SlotHolders %q", fmtMembers(v), v.Slots, v.SlotHolders)
 }
 
 // quiet waits Settle and then checks that no new view is waiting on the channel.

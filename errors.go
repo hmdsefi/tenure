@@ -29,6 +29,10 @@ var (
 
 	// ErrDraining means the node is draining, or has drained, and refuses the call.
 	ErrDraining = errors.New("tenure: draining")
+
+	// ErrWatchOnly means the value only watches, for example a Membership that follows a group
+	// for a Router without being a member, and refuses every call that would write.
+	ErrWatchOnly = errors.New("tenure: watch only")
 )
 
 // NotOwnerError reports that this member does not own a shard, and names the member a request
