@@ -116,6 +116,16 @@ func (r *leaseRenewer) close() {
 	r.wg.Wait()
 }
 
+// drain receives the views waiting on w's channel, so that w.last is the latest view. It waits a
+// little for each: with no wait at all, next's timer could win the race with a waiting view.
+func drain(w *viewer) {
+	for {
+		if _, ok := w.next(20 * time.Millisecond); !ok {
+			return
+		}
+	}
+}
+
 // waitStale waits up to d for a.Stale() to be want.
 func waitStale(t *testing.T, a *Adapter, want bool, d time.Duration) {
 	t.Helper()
@@ -181,11 +191,7 @@ func TestATRTR15Relist(t *testing.T) {
 	}
 	// Past LeaseDuration since m2 last changed, every member stays.
 	time.Sleep(T.LeaseDuration + T.RetryPeriod - time.Since(quietFrom))
-	for {
-		if _, ok := w.next(0); !ok {
-			break
-		}
-	}
+	drain(w)
 	if !listing("m0", "m1", "m2", "m3")(w.last) || !a.Stale() {
 		t.Fatalf("view %d: %s, stale %t; want m0 to m3 kept while stale", w.last.Version, fmtView(w.last), a.Stale())
 	}
@@ -378,11 +384,7 @@ func TestRTR720RelistBackoff(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	for {
-		if _, ok := w.next(0); !ok {
-			break
-		}
-	}
+	drain(w)
 	if !a.Stale() || !listing("m0")(w.last) {
 		t.Fatalf("stale %t, view %s while lists fail; want stale with m0", a.Stale(), fmtView(w.last))
 	}
