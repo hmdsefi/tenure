@@ -34,6 +34,7 @@ func (r *Router) Correct(space string, shard int, addr string) bool {
 			if h.corrections[shard].Swap(c) == nil {
 				h.live.Add(1)
 			}
+			r.events.emit(RouterEvent{Kind: RouterEventCorrected, Version: s.version, Space: space, Shard: shard, Addr: addr})
 			return true
 		}
 	}

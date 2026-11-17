@@ -59,6 +59,7 @@ type Router struct {
 	reading  time.Duration    // the latest reading fed to assigner
 	subs     []chan uint64    // every channel Subscribe returned, until Close
 	builds   routerBuildStats // what the builds have done, for tests and events
+	events   *routerEvents
 
 	// testApplyHook, when set by a test, is called with each view the builder is about to apply,
 	// with mu held.
@@ -96,12 +97,6 @@ type routerOptions struct {
 	events        func(RouterEvent)
 	correctionTTL time.Duration
 	now           func() time.Time
-}
-
-// RouterEvent is one thing that happened on a Router, as WithRouterEvents receives it.
-type RouterEvent struct {
-	// Time is the wall-clock time at which the Router emitted the event.
-	Time time.Time
 }
 
 // WithRouterTiming sets the timing of the group the Router follows: SlotGrace decides when a
@@ -206,7 +201,9 @@ func NewRouter(m Membership, spaces []Space, opts ...RouterOption) (*Router, err
 	}
 	r.assigner = a
 	r.snap.Store(r.firstSnapshot())
+	r.events = newRouterEvents(o.logger, o.events, o.now)
 	if err := r.start(m); err != nil {
+		r.events.close(RouterEvent{Kind: RouterEventClosed, Shard: -1})
 		return nil, err
 	}
 	return r, nil
@@ -371,11 +368,12 @@ func (r *Router) apply(v core.View, reading time.Duration, wall time.Time) bool 
 		r.tick(reading)
 		return false
 	}
+	start := r.opts.now()
 	keys := r.assigner.Keys()
 	r.reading = max(reading, r.reading)
 	r.assigner.ApplyView(v, r.reading, wall)
 	r.view = &v
-	r.publish(!sameSlice(keys, r.assigner.Keys()))
+	r.publish(!sameSlice(keys, r.assigner.Keys()), start, true)
 	r.readyOnce.Do(func() { close(r.ready) })
 	return true
 }
@@ -383,10 +381,11 @@ func (r *Router) apply(v core.View, reading time.Duration, wall time.Time) bool 
 // tick moves the Assigner's clock to reading and publishes a new snapshot when that changed an
 // assignment. A reading before the last one counts as the last. The caller holds r.mu.
 func (r *Router) tick(reading time.Duration) {
+	start := r.opts.now()
 	r.reading = max(reading, r.reading)
 	keys := r.assigner.Keys()
 	if r.assigner.Tick(r.reading) && r.view != nil {
-		r.publish(!sameSlice(keys, r.assigner.Keys()))
+		r.publish(!sameSlice(keys, r.assigner.Keys()), start, false)
 	}
 }
 
@@ -397,9 +396,10 @@ type routerBuildStats struct {
 }
 
 // publish builds a snapshot of the applied view and the Assigner's assignments, makes it the one
-// lookups read and sends its version to every subscriber. balanced reports that the placement
-// keys changed, so the Assigner ran Balanced. After Close it does nothing. The caller holds r.mu.
-func (r *Router) publish(balanced bool) {
+// lookups read, sends its version to every subscriber and reports it (RTR-600). balanced reports
+// that the placement keys changed, so the Assigner ran Balanced; start is when the build began;
+// viewed that a view was applied. After Close it does nothing. The caller holds r.mu.
+func (r *Router) publish(balanced bool, start time.Time, viewed bool) {
 	prev := r.snap.Load()
 	if prev.closed {
 		return
@@ -407,6 +407,7 @@ func (r *Router) publish(balanced bool) {
 	s := r.buildSnapshot(prev.version + 1)
 	r.dropCorrections()
 	r.snap.Store(s)
+	took := r.opts.now().Sub(start)
 	r.builds.snapshots++
 	if balanced {
 		r.builds.balanced++
@@ -414,4 +415,38 @@ func (r *Router) publish(balanced bool) {
 	for _, ch := range r.subs {
 		sendVersion(ch, s.version)
 	}
+
+	if viewed {
+		r.events.emit(RouterEvent{Kind: RouterEventView, Version: s.version, ViewVersion: s.view.Version,
+			Count: len(s.view.Members), Shard: -1})
+	}
+	for i, h := range r.spaces {
+		r.events.emit(RouterEvent{Kind: RouterEventRebuilt, Version: s.version, Space: h.name, Shard: -1,
+			Count: movedShards(prev, s, i), Balanced: balanced, Duration: took})
+		was, is := prev.tables[i].mismatch, s.tables[i].mismatch
+		switch {
+		case was == nil && is != nil:
+			r.events.emit(RouterEvent{Kind: RouterEventMismatch, Version: s.version, Space: h.name, Shard: -1, Err: is})
+		case was != nil && is == nil:
+			r.events.emit(RouterEvent{Kind: RouterEventMatched, Version: s.version, Space: h.name, Shard: -1})
+		}
+	}
+}
+
+// movedShards returns how many shards of the space at index i route to another member in next
+// than in prev, a shard with no member counting as routed to "".
+func movedShards(prev, next *routerSnapshot, i int) int {
+	owner := func(s *routerSnapshot, shard int) string {
+		if m := s.tables[i].owners[shard]; m >= 0 {
+			return s.members[m].ID
+		}
+		return ""
+	}
+	n := 0
+	for shard := range next.tables[i].owners {
+		if owner(prev, shard) != owner(next, shard) {
+			n++
+		}
+	}
+	return n
 }

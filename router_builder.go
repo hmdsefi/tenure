@@ -60,11 +60,11 @@ func (r *Router) build(ctx context.Context, ch <-chan core.View) {
 			}
 			if !ok { // the watch has ended: stale until a view of the next one (RTR-340)
 				ch = nil
-				r.stale.Store(true)
+				r.setStale(true)
 				retry.Reset(r.opts.timing.RetryPeriod)
 				continue
 			}
-			r.stale.Store(false)
+			r.setStale(false)
 		case <-wake.C:
 			r.tickNow()
 		case <-retry.C:
@@ -83,6 +83,19 @@ func (r *Router) build(ctx context.Context, ch <-chan core.View) {
 			return
 		}
 	}
+}
+
+// setStale records whether the Router is stale and reports a change with router.stale or
+// router.fresh.
+func (r *Router) setStale(stale bool) {
+	if r.stale.Swap(stale) == stale {
+		return
+	}
+	if stale {
+		r.events.emit(RouterEvent{Kind: RouterEventStale, Shard: -1, Err: errWatchClosed})
+		return
+	}
+	r.events.emit(RouterEvent{Kind: RouterEventFresh, Version: r.Version(), Shard: -1})
 }
 
 // latestView returns the latest view ch holds right now, v when it holds none, and whether ch
@@ -182,7 +195,8 @@ func sendVersion(ch chan uint64, version uint64) {
 }
 
 // Close stops the Router (RTR-350): lookups return ErrClosed from then on, Ready returns
-// ErrClosed, the builder and its timers stop, and every channel of Subscribe is closed. It
+// ErrClosed, the builder and its timers stop, and every channel of Subscribe is closed. Then it
+// emits router.closed, the last event, and waits until every event has been delivered. It
 // returns once every goroutine of the Router has returned, and returns nil; later calls do the
 // same.
 func (r *Router) Close() error {
@@ -198,7 +212,10 @@ func (r *Router) Close() error {
 		r.mu.Unlock()
 		close(r.closed)
 		r.cancel()
+		<-r.done
+		r.events.close(RouterEvent{Kind: RouterEventClosed, Version: closed.version, Shard: -1})
 	})
 	<-r.done
+	r.events.wait()
 	return nil
 }

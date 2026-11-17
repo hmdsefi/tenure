@@ -745,8 +745,9 @@ func NewRouter(m Membership, spaces []Space, opts ...RouterOption) (*Router, err
 func (r *Router) Close() error
     Close stops the Router (RTR-350): lookups return ErrClosed from then on,
     Ready returns ErrClosed, the builder and its timers stop, and every channel
-    of Subscribe is closed. It returns once every goroutine of the Router has
-    returned, and returns nil; later calls do the same.
+    of Subscribe is closed. Then it emits router.closed, the last event, and
+    waits until every event has been delivered. It returns once every goroutine
+    of the Router has returned, and returns nil; later calls do the same.
 
 func (r *Router) Correct(space string, shard int, addr string) bool
     Correct records that addr serves shard of space, as a member's redirect
@@ -804,16 +805,112 @@ func (r *Router) Subscribe() <-chan uint64
     received, so a slow reader sees the latest. Close closes it; after Close,
     Subscribe returns a closed channel.
 
+func (r *Router) Table() RouterTable
+    Table returns a consistent copy of the Router's snapshot: its version,
+    whether the Router is stale or closed, the members of its view, and for
+    each space the route of each shard and its live correction. The copy shares
+    nothing with the Router. Table does not wait for the builder.
+
 func (r *Router) Version() uint64
     Version returns the version of the Router's latest snapshot: 0 before the
     first view, then one more for each new snapshot.
 
 type RouterEvent struct {
-	// Time is the wall-clock time at which the Router emitted the event.
+	// Seq is the event's number on its Router: 1 for the first event, then one more for each
+	// event, without gaps.
+	Seq uint64
+
+	// Time is the wall-clock time, in UTC, at which the Router emitted the event.
 	Time time.Time
+
+	// Kind says what the event reports.
+	Kind RouterEventKind
+
+	// Version is the version of the Router's snapshot, or 0 when unused.
+	Version uint64
+
+	// ViewVersion is the version of the view, or 0 when unused.
+	ViewVersion uint64
+
+	// Space is the space the event is about, or "".
+	Space string
+
+	// Shard is the shard the event is about, or -1.
+	Shard int
+
+	// Addr is a member's address, or "".
+	Addr string
+
+	// Count is a number, such as members or shards moved, or 0.
+	Count int
+
+	// Balanced reports that the assignment was recomputed.
+	Balanced bool
+
+	// Duration is a length of time, or 0.
+	Duration time.Duration
+
+	// Err is the error the event reports, or nil.
+	Err error
 }
     RouterEvent is one thing that happened on a Router, as WithRouterEvents
-    receives it.
+    receives it. Each kind fills the fields its doc comment lists; a field the
+    kind does not use holds its unused value: -1 for Shard, and the zero value
+    for the others.
+
+type RouterEventKind uint8
+    RouterEventKind says what a RouterEvent reports. Its String method returns
+    the kind's name, such as "router.view", which is also the kind's name
+    in log records. Each kind's doc comment lists the RouterEvent fields it
+    fills besides Seq, Time and Kind; the others hold their unused values (see
+    RouterEvent).
+
+const RouterEventClosed RouterEventKind = 8
+    RouterEventClosed ("router.closed") is the last event of a Router, emitted
+    by Close.
+
+const RouterEventCorrected RouterEventKind = 5
+    RouterEventCorrected ("router.corrected") is emitted when Router.Correct
+    records a correction: Version is the snapshot's version, Space and Shard the
+    shard, and Addr the address.
+
+const RouterEventFresh RouterEventKind = 4
+    RouterEventFresh ("router.fresh") is emitted when a stale Router applies a
+    view of a new watch: Version is the new snapshot's version.
+
+const RouterEventMatched RouterEventKind = 7
+    RouterEventMatched ("router.matched") is emitted when a snapshot clears the
+    mark of a space: Version is the snapshot's and Space the space.
+
+const RouterEventMismatch RouterEventKind = 6
+    RouterEventMismatch ("router.mismatch") is emitted when a snapshot
+    marks a space whose shard count a member disagrees with, and it was not
+    marked before: Version is the snapshot's, Space the space, and Err the
+    *SpaceMismatchError its lookups return.
+
+const RouterEventRebuilt RouterEventKind = 2
+    RouterEventRebuilt ("router.rebuilt") is emitted for each space of each
+    new snapshot: Version is the snapshot's, Space the space, Count the number
+    of its shards that route to another member than in the previous snapshot,
+    Balanced whether the assignment was recomputed, because the placement keys
+    changed, rather than only mapped to new members, and Duration how long
+    building the snapshot took.
+
+const RouterEventStale RouterEventKind = 3
+    RouterEventStale ("router.stale") is emitted when the channel of the
+    Router's watch of its Membership closes while the Router was fresh: Err is
+    "tenure: watch channel closed". The Router stays stale while the Watch calls
+    that follow fail. Router.Stale reports it, as it reports a Membership that
+    reports itself stale, which emits no event.
+
+const RouterEventView RouterEventKind = 1
+    RouterEventView ("router.view") is emitted when the Router applies a view:
+    Version is the new snapshot's version, ViewVersion the view's and Count its
+    number of members.
+
+func (k RouterEventKind) String() string
+    String returns the kind's name, such as "router.view", or text such as
+    "RouterEventKind(0)" for a value that is not a kind.
 
 type RouterOption func(*routerOptions)
     A RouterOption changes how NewRouter builds a Router.
@@ -844,6 +941,58 @@ func WithRouterTiming(t core.Timing) RouterOption
     its watch ended. It must be the members' timing. The zero value means
     core.DefaultTiming, and a zero SlotGrace means DefaultSlotGrace, as in
     Config.
+
+type RouterRoute struct {
+	// Member is the ID of the member the snapshot routes the shard to, or "" for none, Addr its
+	// address and Slot its slot, -1 without one.
+	Member string
+	Addr   string
+	Slot   int
+
+	// Err is the text of the error a lookup of the shard returns without a correction, or "".
+	Err string
+
+	// Corrected is the address of the shard's live correction, or "" for none.
+	Corrected string
+}
+    RouterRoute is one shard's route in a RouterTable.
+
+type RouterSpaceTable struct {
+	// Name and Shards are the space's.
+	Name   string
+	Shards int
+
+	// Mismatch is the text of the space's *SpaceMismatchError, or "" when no member disagrees.
+	Mismatch string
+
+	// Routes holds each shard's route, by shard.
+	Routes []RouterRoute
+}
+    RouterSpaceTable is one space of a RouterTable.
+
+type RouterTable struct {
+	// Taken is the wall-clock time, in UTC, at which the copy was taken.
+	Taken time.Time
+
+	// Version is the snapshot's version, 0 before the first view.
+	Version uint64
+
+	// Stale and Closed report what Router.Stale reported and whether Close had been called.
+	Stale  bool
+	Closed bool
+
+	// ViewVersion is the version of the view the snapshot comes from, Members its members, Slots
+	// its slot count and SlotHolders its slot holders; all zero before the first view.
+	ViewVersion uint64
+	Members     []Member
+	Slots       int
+	SlotHolders []string
+
+	// Spaces holds each space's table, in the order NewRouter was given the spaces.
+	Spaces []RouterSpaceTable
+}
+    RouterTable is a consistent copy of a Router's snapshot, as Router.Table
+    returns it.
 
 type Shard struct {
 	// Space is the name of the shard's space.
