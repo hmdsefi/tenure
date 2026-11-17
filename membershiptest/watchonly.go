@@ -56,7 +56,7 @@ type SlotControl struct {
 // case's *testing.T and the IDs "m0" to "m7", and must return a fresh group each time.
 //
 // The cases check that the watch-only membership's first view lists the group as its writers
-// see it; that its views follow joins, drains and leaves made through the writers, and slot
+// see it, and the slot data as it is when the fixture has Slots; that its views follow joins, drains and leaves made through the writers, and slot
 // changes made through Slots; that Join, SetDraining and Leave on it return an error matching
 // tenure.ErrWatchOnly and change nothing; that ending the context of one of its Watch calls
 // closes that channel only; and, when it has a Stale() bool method, that Stale reports false
@@ -172,7 +172,7 @@ func watchOnlyFollow(e *env) {
 }
 
 // watchOnlySlots: the watch-only membership's views follow the slot count, a claim and a
-// release.
+// release, and a Watch started after the claim has it in its first view.
 func watchOnlySlots(e *env) {
 	sc := e.wo.Slots
 	w := e.watch("w")
@@ -187,7 +187,12 @@ func watchOnlySlots(e *env) {
 	if err != nil || slot < 0 || slot >= 2 {
 		e.t.Fatalf("Claim(ctx, %q) = %d, %s, want a slot in [0, 2), nil", "m0", slot, errText(err))
 	}
-	w.eventually(both(slotCount(2), heldBy(slot, "m0")))
+	claimed := both(slotCount(2), heldBy(slot, "m0"))
+	w.eventually(claimed)
+	if fresh := e.watch("w"); !claimed.ok(fresh.last) {
+		e.t.Fatalf("view %d on w: %s, want a first view with %s", fresh.last.Version,
+			fresh.describe(fresh.last), claimed.want)
+	}
 	if err := sc.Release(e.ctx, "m0", slot); err != nil {
 		e.t.Fatalf("Release(ctx, %q, %d) = %s, want nil", "m0", slot, errText(err))
 	}
@@ -209,14 +214,14 @@ func watchOnlyRefuse(e *env) {
 	w.eventually(lists(self(0)))
 	m := e.inst("w")
 	if err := m.Join(e.ctx, self(4)); !errors.Is(err, tenure.ErrWatchOnly) {
-		e.t.Fatalf("Join(ctx, %s) = %s, want an error matching %s", fmtMember(self(4)), errText(err),
-			tenure.ErrWatchOnly)
+		e.t.Fatalf("Join(ctx, %s) = %s, want an error matching tenure.ErrWatchOnly", fmtMember(self(4)),
+			errText(err))
 	}
 	if err := m.SetDraining(e.ctx, true); !errors.Is(err, tenure.ErrWatchOnly) {
-		e.t.Fatalf("SetDraining(ctx, true) = %s, want an error matching %s", errText(err), tenure.ErrWatchOnly)
+		e.t.Fatalf("SetDraining(ctx, true) = %s, want an error matching tenure.ErrWatchOnly", errText(err))
 	}
 	if err := m.Leave(e.ctx); !errors.Is(err, tenure.ErrWatchOnly) {
-		e.t.Fatalf("Leave(ctx) = %s, want an error matching %s", errText(err), tenure.ErrWatchOnly)
+		e.t.Fatalf("Leave(ctx) = %s, want an error matching tenure.ErrWatchOnly", errText(err))
 	}
 	ref.quiet()
 	w.quiet()
