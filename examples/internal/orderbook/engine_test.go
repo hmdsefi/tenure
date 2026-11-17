@@ -1,7 +1,7 @@
 // Copyright 2026 Hamed Yousefi
 // SPDX-License-Identifier: MPL-2.0
 
-package main
+package orderbook
 
 import (
 	"context"
@@ -29,16 +29,16 @@ type attempt struct {
 }
 
 // hooked returns an orderbook over db whose hooks record what they see.
-func hooked(db *fencedb.DB) (o *orderbook, raised *[]core.Term, attempts *[]attempt) {
-	o = newOrderbook(db)
+func hooked(db *fencedb.DB) (o *Orderbook, raised *[]core.Term, attempts *[]attempt) {
+	o = New(NewDBJournal(db))
 	var mu sync.Mutex
 	raised, attempts = new([]core.Term), new([]attempt)
-	o.raised = func(_ int, term core.Term) {
+	o.Raised = func(_ int, term core.Term) {
 		mu.Lock()
 		defer mu.Unlock()
 		*raised = append(*raised, term)
 	}
-	o.commit = func(shard int, term core.Term, id string, err error) {
+	o.Commit = func(shard int, term core.Term, id string, err error) {
 		mu.Lock()
 		defer mu.Unlock()
 		*attempts = append(*attempts, attempt{shard, term, id, err})
@@ -55,12 +55,12 @@ type running struct {
 
 // start runs o.Run for the shard at term and waits until it has published its engine, or has
 // returned. It returns the engine, nil when Run returned first, and the Run.
-func start(t *testing.T, o *orderbook, shard int, term core.Term) (*engine, *running) {
+func start(t *testing.T, o *Orderbook, shard int, term core.Term) (*Engine, *running) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	r := &running{cancel: cancel, done: make(chan struct{})}
 	go func() {
-		r.err = o.Run(ctx, &tenure.Shard{Space: marketsSpace, ID: shard, Term: term})
+		r.err = o.Run(ctx, &tenure.Shard{Space: SpaceName, ID: shard, Term: term})
 		close(r.done)
 	}()
 	t.Cleanup(func() {
@@ -68,7 +68,7 @@ func start(t *testing.T, o *orderbook, shard int, term core.Term) (*engine, *run
 		<-r.done
 	})
 	for {
-		if e := o.engine(shard, term); e != nil {
+		if e := o.Engine(shard, term); e != nil {
 			return e, r
 		}
 		select {
@@ -102,23 +102,23 @@ func (r *running) result(t *testing.T) error {
 
 // five is o1 to o5 of the recovery test: all in one market, the fourth sweeps two sellers and
 // the fifth hits a resting buyer.
-func five() []order {
-	return []order{
-		{ID: "o1", Market: "m1", Side: sideSell, Price: 100, Qty: 5},
-		{ID: "o2", Market: "m1", Side: sideSell, Price: 101, Qty: 5},
-		{ID: "o3", Market: "m1", Side: sideBuy, Price: 99, Qty: 4},
-		{ID: "o4", Market: "m1", Side: sideBuy, Price: 101, Qty: 7},
-		{ID: "o5", Market: "m1", Side: sideSell, Price: 99, Qty: 6},
+func five() []Order {
+	return []Order{
+		{ID: "o1", Market: "m1", Side: SideSell, Price: 100, Qty: 5},
+		{ID: "o2", Market: "m1", Side: SideSell, Price: 101, Qty: 5},
+		{ID: "o3", Market: "m1", Side: SideBuy, Price: 99, Qty: 4},
+		{ID: "o4", Market: "m1", Side: SideBuy, Price: 101, Qty: 7},
+		{ID: "o5", Market: "m1", Side: SideSell, Price: 99, Qty: 6},
 	}
 }
 
 // journal reads the committed journal of a shard.
-func journal(t *testing.T, db *fencedb.DB, shard int) []entry {
+func journal(t *testing.T, db *fencedb.DB, shard int) []Entry {
 	t.Helper()
-	var out []entry
-	err := db.View(marketsSpace, shard, func(tx *fencedb.Tx) error {
+	var out []Entry
+	err := db.View(SpaceName, shard, func(tx *fencedb.Tx) error {
 		for _, l := range tx.Entries(journalLog) {
-			var en entry
+			var en Entry
 			if err := json.Unmarshal(l, &en); err != nil {
 				return err
 			}
@@ -134,9 +134,9 @@ func journal(t *testing.T, db *fencedb.DB, shard int) []entry {
 
 // write journals the entries of a shard under term, as an engine would, but with the fills the
 // caller chose.
-func write(t *testing.T, db *fencedb.DB, shard int, term core.Term, entries ...entry) {
+func write(t *testing.T, db *fencedb.DB, shard int, term core.Term, entries ...Entry) {
 	t.Helper()
-	err := db.Update(marketsSpace, shard, term, func(tx *fencedb.Tx) error {
+	err := db.Update(SpaceName, shard, term, func(tx *fencedb.Tx) error {
 		for _, en := range entries {
 			line, err := json.Marshal(en)
 			if err != nil {
@@ -162,7 +162,7 @@ func TestATEXM08Recovery(t *testing.T) {
 		if e == nil {
 			t.Fatalf("Run returned %v", first.result(t))
 		}
-		var want [][]fill
+		var want [][]Fill
 		for _, ord := range five() {
 			fills, err := e.submit(ord)
 			if err != nil {
@@ -170,7 +170,7 @@ func TestATEXM08Recovery(t *testing.T) {
 			}
 			want = append(want, fills)
 		}
-		wantFills := []fill{
+		wantFills := []Fill{
 			{Maker: "o1", Taker: "o4", Price: 100, Qty: 5},
 			{Maker: "o2", Taker: "o4", Price: 101, Qty: 2},
 		}
@@ -185,10 +185,10 @@ func TestATEXM08Recovery(t *testing.T) {
 		if err := first.stop(t); err != nil {
 			t.Fatalf("first Run: %v", err)
 		}
-		if o.engine(shard, 1) != nil {
+		if o.Engine(shard, 1) != nil {
 			t.Error("the engine is still published after Run returned")
 		}
-		if _, err := e.submit(order{ID: "late", Market: "m1", Side: sideBuy, Price: 1, Qty: 1}); !errors.Is(err, errRefusing) {
+		if _, err := e.submit(Order{ID: "late", Market: "m1", Side: SideBuy, Price: 1, Qty: 1}); !errors.Is(err, errRefusing) {
 			t.Errorf("submit after Run returned: %v, want errRefusing", err)
 		}
 
@@ -200,7 +200,7 @@ func TestATEXM08Recovery(t *testing.T) {
 		if got := e2.snapshot(); !maps.Equal(got, wantBooks) {
 			t.Errorf("rebuilt books %v, want %v", got, wantBooks)
 		}
-		var got [][]fill
+		var got [][]Fill
 		for _, en := range journal(t, db, shard) {
 			got = append(got, en.Fills)
 		}
@@ -220,12 +220,12 @@ func TestATEXM08Recovery(t *testing.T) {
 		if _, err := e2.submit(five()[0]); !errors.Is(err, errDuplicate) {
 			t.Errorf("resubmitting o1: %v, want errDuplicate", err)
 		}
-		fills, err := e2.submit(order{ID: "o6", Market: "m1", Side: sideBuy, Price: 101, Qty: 1})
-		if err != nil || !slices.Equal(fills, []fill{{Maker: "o5", Taker: "o6", Price: 99, Qty: 1}}) {
+		fills, err := e2.submit(Order{ID: "o6", Market: "m1", Side: SideBuy, Price: 101, Qty: 1})
+		if err != nil || !slices.Equal(fills, []Fill{{Maker: "o5", Taker: "o6", Price: 99, Qty: 1}}) {
 			t.Errorf("o6: fills %v, err %v", fills, err)
 		}
 		var terms []core.Term
-		for _, c := range db.History(marketsSpace, shard) {
+		for _, c := range db.History(SpaceName, shard) {
 			terms = append(terms, c.Term)
 		}
 		if !slices.Equal(terms, []core.Term{1, 1, 1, 1, 1, 2}) {
@@ -234,20 +234,20 @@ func TestATEXM08Recovery(t *testing.T) {
 	})
 
 	t.Run("edited fills make Run return an error", func(t *testing.T) {
-		good := func() []entry {
-			var out []entry
+		good := func() []Entry {
+			var out []Entry
 			b := new(book)
 			for _, o := range five() {
-				out = append(out, entry{Order: o, Fills: b.match(o)})
+				out = append(out, Entry{Order: o, Fills: b.match(o)})
 			}
 			return out
 		}
-		edits := map[string]func(es []entry){
-			"changed quantity": func(es []entry) { es[3].Fills[0].Qty++ },
-			"changed price":    func(es []entry) { es[3].Fills[1].Price = 100 },
-			"changed maker":    func(es []entry) { es[3].Fills[0].Maker = "o9" },
-			"dropped fill":     func(es []entry) { es[3].Fills = es[3].Fills[:1] },
-			"added fill":       func(es []entry) { es[0].Fills = []fill{{Maker: "o9", Taker: "o1", Price: 100, Qty: 1}} },
+		edits := map[string]func(es []Entry){
+			"changed quantity": func(es []Entry) { es[3].Fills[0].Qty++ },
+			"changed price":    func(es []Entry) { es[3].Fills[1].Price = 100 },
+			"changed maker":    func(es []Entry) { es[3].Fills[0].Maker = "o9" },
+			"dropped fill":     func(es []Entry) { es[3].Fills = es[3].Fills[:1] },
+			"added fill":       func(es []Entry) { es[0].Fills = []Fill{{Maker: "o9", Taker: "o1", Price: 100, Qty: 1}} },
 		}
 		for name, edit := range edits {
 			t.Run(name, func(t *testing.T) {
@@ -272,7 +272,7 @@ func TestATEXM08Recovery(t *testing.T) {
 
 		t.Run("not JSON", func(t *testing.T) {
 			db := fencedb.New()
-			err := db.Update(marketsSpace, shard, 1, func(tx *fencedb.Tx) error {
+			err := db.Update(SpaceName, shard, 1, func(tx *fencedb.Tx) error {
 				tx.Append(journalLog, []byte("{"))
 				return nil
 			})
@@ -288,7 +288,7 @@ func TestATEXM08Recovery(t *testing.T) {
 		t.Run("an order journaled twice", func(t *testing.T) {
 			db := fencedb.New()
 			o1 := five()[0]
-			write(t, db, shard, 1, entry{Order: o1, Fills: []fill{}}, entry{Order: o1, Fills: []fill{}})
+			write(t, db, shard, 1, Entry{Order: o1, Fills: []Fill{}}, Entry{Order: o1, Fills: []Fill{}})
 			o, _, _ := hooked(db)
 			if _, r := start(t, o, shard, 2); r.result(t) == nil {
 				t.Error("Run returned nil for a journal with an order twice")
@@ -299,7 +299,7 @@ func TestATEXM08Recovery(t *testing.T) {
 	t.Run("a higher fence makes Run return ErrStale without reading the journal", func(t *testing.T) {
 		db := fencedb.New()
 		// The journal is not JSON: a Run that read it would fail with a different error.
-		err := db.Update(marketsSpace, shard, 5, func(tx *fencedb.Tx) error {
+		err := db.Update(SpaceName, shard, 5, func(tx *fencedb.Tx) error {
 			tx.Append(journalLog, []byte("not a journal entry"))
 			return nil
 		})
@@ -319,7 +319,7 @@ func TestATEXM08Recovery(t *testing.T) {
 		}
 		// The fence stays where it was, and a Run at the fence's own term goes on to read the
 		// journal, which is where it fails.
-		if err := db.Raise(marketsSpace, shard, 4); !errors.Is(err, fencedb.ErrStale) {
+		if err := db.Raise(SpaceName, shard, 4); !errors.Is(err, fencedb.ErrStale) {
 			t.Errorf("Raise(4) = %v, want ErrStale", err)
 		}
 		if _, r := start(t, o, shard, 5); r.result(t) == nil {
@@ -338,30 +338,30 @@ func TestEngineStale(t *testing.T) {
 	if e == nil {
 		t.Fatal("no engine")
 	}
-	if _, err := e.submit(order{ID: "a", Market: "m", Side: sideSell, Price: 10, Qty: 1}); err != nil {
+	if _, err := e.submit(Order{ID: "a", Market: "m", Side: SideSell, Price: 10, Qty: 1}); err != nil {
 		t.Fatal(err)
 	}
 	before := e.snapshot()
 
 	// A new owner takes the shard: its Run raised the fence to 2.
-	if err := db.Raise(marketsSpace, shard, 2); err != nil {
+	if err := db.Raise(SpaceName, shard, 2); err != nil {
 		t.Fatal(err)
 	}
-	fills, err := e.submit(order{ID: "b", Market: "m", Side: sideBuy, Price: 10, Qty: 1})
+	fills, err := e.submit(Order{ID: "b", Market: "m", Side: SideBuy, Price: 10, Qty: 1})
 	if !errors.Is(err, fencedb.ErrStale) || fills != nil {
 		t.Fatalf("submit below the fence: %v, %v; want nil and ErrStale", fills, err)
 	}
 	if got := e.snapshot(); !maps.Equal(got, before) {
 		t.Errorf("books changed by a rejected order: %v, was %v", got, before)
 	}
-	if n := len(db.History(marketsSpace, shard)); n != 1 {
+	if n := len(db.History(SpaceName, shard)); n != 1 {
 		t.Errorf("history has %d commits, want the 1 before the fence moved", n)
 	}
 	if got := journal(t, db, shard); len(got) != 1 || got[0].Order.ID != "a" {
 		t.Errorf("journal %v, want only a", got)
 	}
 	// The engine refuses from now on, without trying the fence again.
-	if _, err := e.submit(order{ID: "c", Market: "m", Side: sideBuy, Price: 1, Qty: 1}); !errors.Is(err, errRefusing) {
+	if _, err := e.submit(Order{ID: "c", Market: "m", Side: SideBuy, Price: 1, Qty: 1}); !errors.Is(err, errRefusing) {
 		t.Errorf("submit after ErrStale: %v, want errRefusing", err)
 	}
 	if len(*attempts) != 2 || (*attempts)[0].err != nil || !errors.Is((*attempts)[1].err, fencedb.ErrStale) ||
@@ -374,20 +374,20 @@ func TestEngineSubmitErrors(t *testing.T) {
 	db := fencedb.New()
 	o, _, attempts := hooked(db)
 	e, _ := start(t, o, 0, 1)
-	if _, err := e.submit(order{ID: "x", Market: "m", Side: "hold", Price: 1, Qty: 1}); !errors.Is(err, errInvalidOrder) {
+	if _, err := e.submit(Order{ID: "x", Market: "m", Side: "hold", Price: 1, Qty: 1}); !errors.Is(err, errInvalidOrder) {
 		t.Errorf("invalid order: %v", err)
 	}
-	if _, err := e.submit(order{ID: "x", Market: "m", Side: sideBuy, Price: 1, Qty: 1}); err != nil {
+	if _, err := e.submit(Order{ID: "x", Market: "m", Side: SideBuy, Price: 1, Qty: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.submit(order{ID: "x", Market: "m", Side: sideBuy, Price: 1, Qty: 1}); !errors.Is(err, errDuplicate) {
+	if _, err := e.submit(Order{ID: "x", Market: "m", Side: SideBuy, Price: 1, Qty: 1}); !errors.Is(err, errDuplicate) {
 		t.Errorf("duplicate: %v", err)
 	}
 	// Neither failure reached the fence, and neither refuses the engine.
 	if len(*attempts) != 1 {
 		t.Errorf("%d commit attempts, want 1", len(*attempts))
 	}
-	if _, err := e.submit(order{ID: "y", Market: "m", Side: sideBuy, Price: 1, Qty: 1}); err != nil {
+	if _, err := e.submit(Order{ID: "y", Market: "m", Side: SideBuy, Price: 1, Qty: 1}); err != nil {
 		t.Errorf("submit after rejected orders: %v", err)
 	}
 }
@@ -406,17 +406,17 @@ func TestEngineConcurrent(t *testing.T) {
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	got := map[string][]fill{}
+	got := map[string][]Fill{}
 	for w := range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for k := range each {
-				side := sideBuy
+				side := SideBuy
 				if (w+k)%2 == 0 {
-					side = sideSell
+					side = SideSell
 				}
-				ord := order{ID: fmt.Sprintf("c%d-%d", w, k), Market: fmt.Sprintf("m%d", k%3), Side: side, Price: int64(95 + (w*7+k*3)%10), Qty: int64(1 + (w+k)%5)}
+				ord := Order{ID: fmt.Sprintf("c%d-%d", w, k), Market: fmt.Sprintf("m%d", k%3), Side: side, Price: int64(95 + (w*7+k*3)%10), Qty: int64(1 + (w+k)%5)}
 				fills, err := e.submit(ord)
 				if err != nil {
 					t.Errorf("submit %s: %v", ord.ID, err)

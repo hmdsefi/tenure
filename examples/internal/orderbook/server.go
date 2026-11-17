@@ -1,11 +1,10 @@
 // Copyright 2026 Hamed Yousefi
 // SPDX-License-Identifier: MPL-2.0
 
-package main
+package orderbook
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,13 +12,15 @@ import (
 	"strconv"
 
 	"github.com/hmdsefi/tenure"
-	"github.com/hmdsefi/tenure/examples/internal/demo"
 	"github.com/hmdsefi/tenure/examples/internal/fencedb"
 )
 
 const (
-	// marketShards is the number of shards of the markets space.
-	marketShards = 16
+	// Shards is the number of shards of the markets space.
+	Shards = 16
+
+	// OrdersPath is the path of POST /orders.
+	OrdersPath = "/orders"
 
 	// maxOrderBody is the most of a request body that the server reads.
 	maxOrderBody = 64 << 10
@@ -28,58 +29,45 @@ const (
 	routeHeader = "Tenure-Route"
 )
 
-// space returns the markets space served by o: 16 shards, fenced, so that a node that cannot
+// Space returns the markets space served by o: 16 shards, fenced, so that a node that cannot
 // reach the store keeps its shards running and relies on the journal's fence to stop it.
-func (o *orderbook) space() tenure.Space {
-	return tenure.Space{
-		Name:   marketsSpace,
-		Shards: marketShards,
-		Fenced: true,
-		Run:    o.Run,
-	}
+func (o *Orderbook) Space() tenure.Space {
+	sp := marketsSpace()
+	sp.Run = o.Run
+	return sp
 }
 
-// newBooks returns n orderbooks, one for each node, that journal to db.
-func newBooks(db *fencedb.DB, n int) []*orderbook {
-	books := make([]*orderbook, n)
-	for i := range books {
-		books[i] = newOrderbook(db)
-	}
-	return books
+// Spaces returns the spaces of the orderbook as a Router takes them: the markets space, as
+// Space describes it, without a Run.
+func Spaces() []tenure.Space {
+	return []tenure.Space{marketsSpace()}
 }
 
-// startCluster starts one demo node for each of books: node i runs books[i] and serves its
-// orders over HTTP.
-func startCluster(ctx context.Context, books []*orderbook) (*demo.Cluster, error) {
-	return demo.Start(ctx, demo.Options{
-		Nodes:  len(books),
-		Spaces: func(i int) []tenure.Space { return []tenure.Space{books[i].space()} },
-		Serve: func(i int, n *tenure.Node) http.Handler {
-			return newServer(n, books[i], memberID(i))
-		},
-	})
+func marketsSpace() tenure.Space {
+	return tenure.Space{Name: SpaceName, Shards: Shards, Fenced: true}
 }
 
 // server is the HTTP front of one node: it takes an order for the shard this node owns and sends
 // every other request to the owner.
 type server struct {
 	node *tenure.Node
-	ob   *orderbook
+	ob   *Orderbook
 	self string // the node's member ID
 }
 
-// newServer returns the handler of node n, whose member ID is self and which runs ob.
-func newServer(n *tenure.Node, ob *orderbook, self string) http.Handler {
+// NewServer returns the handler of node n, whose member ID is self and which runs ob: POST
+// /orders, as postOrder describes it.
+func NewServer(n *tenure.Node, ob *Orderbook, self string) http.Handler {
 	s := &server{node: n, ob: ob, self: self}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /orders", s.postOrder)
+	mux.HandleFunc("POST "+OrdersPath, s.postOrder)
 	return mux
 }
 
-// result is the body of a 200 answer.
-type result struct {
+// Result is the body of a 200 answer to POST /orders.
+type Result struct {
 	ID    string `json:"id"`
-	Fills []fill `json:"fills"`
+	Fills []Fill `json:"fills"`
 }
 
 // postOrder takes one order:
@@ -99,7 +87,7 @@ func (s *server) postOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sh, err := s.node.Local(marketsSpace, o.Market)
+	sh, err := s.node.Local(SpaceName, o.Market)
 	if err != nil {
 		var notOwner *tenure.NotOwnerError
 		// A route to this member itself means the shard is about to be ours: no one else
@@ -112,7 +100,7 @@ func (s *server) postOrder(w http.ResponseWriter, r *http.Request) {
 		unavailable(w, err)
 		return
 	}
-	e := s.ob.engine(sh.ID, sh.Term)
+	e := s.ob.Engine(sh.ID, sh.Term)
 	if e == nil {
 		unavailable(w, errors.New("orderbook: the shard's engine is not ready"))
 		return
@@ -121,7 +109,7 @@ func (s *server) postOrder(w http.ResponseWriter, r *http.Request) {
 	fills, err := e.submit(o)
 	switch {
 	case err == nil:
-		reply(w, http.StatusOK, result{ID: o.ID, Fills: fills})
+		reply(w, http.StatusOK, Result{ID: o.ID, Fills: fills})
 	case errors.Is(err, errInvalidOrder):
 		reply(w, http.StatusBadRequest, errorBody(err))
 	case errors.Is(err, errDuplicate):
@@ -134,15 +122,15 @@ func (s *server) postOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 // decodeOrder reads one order from r: a single JSON object with the order's fields and no others.
-func decodeOrder(r io.Reader) (order, error) {
-	var o order
+func decodeOrder(r io.Reader) (Order, error) {
+	var o Order
 	dec := json.NewDecoder(r)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&o); err != nil {
-		return order{}, err
+		return Order{}, err
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return order{}, errors.New("orderbook: data after the order")
+		return Order{}, errors.New("orderbook: data after the order")
 	}
 	return o, o.validate()
 }

@@ -21,7 +21,23 @@ import (
 	"github.com/hmdsefi/tenure/core"
 	"github.com/hmdsefi/tenure/examples/internal/demo"
 	"github.com/hmdsefi/tenure/examples/internal/fencedb"
+	"github.com/hmdsefi/tenure/examples/internal/orderbook"
+	"github.com/hmdsefi/tenure/routehttp"
 )
+
+// attempt is one call of the commit hook.
+type attempt struct {
+	shard int
+	term  core.Term
+	id    string
+	err   error
+}
+
+// shardTerm names a shard at a term.
+type shardTerm struct {
+	shard int
+	term  core.Term
+}
 
 // raiseEvent is one call of the raised hook: node n raised the fence of a shard to a term.
 type raiseEvent struct {
@@ -44,13 +60,13 @@ type observer struct {
 }
 
 // hook installs the observer's hooks into the orderbook of node n.
-func (ob *observer) hook(n int, o *orderbook) {
-	o.raised = func(shard int, term core.Term) {
+func (ob *observer) hook(n int, o *orderbook.Orderbook) {
+	o.Raised = func(shard int, term core.Term) {
 		ob.mu.Lock()
 		defer ob.mu.Unlock()
 		ob.raises = append(ob.raises, raiseEvent{n, shard, term})
 	}
-	o.commit = func(shard int, term core.Term, id string, err error) {
+	o.Commit = func(shard int, term core.Term, id string, err error) {
 		ob.mu.Lock()
 		defer ob.mu.Unlock()
 		ob.attempts = append(ob.attempts, commitEvent{n, attempt{shard, term, id, err}})
@@ -86,7 +102,7 @@ func (ob *observer) snapshot() ([]raiseEvent, []commitEvent) {
 
 // obCluster starts a cluster of three nodes over db, with the hooks of ob when it is not nil,
 // and closes it when the test is over.
-func obCluster(t *testing.T, ctx context.Context, db *fencedb.DB, ob *observer) (*demo.Cluster, []*orderbook) {
+func obCluster(t *testing.T, ctx context.Context, db *fencedb.DB, ob *observer) (*demo.Cluster, []*orderbook.Orderbook) {
 	t.Helper()
 	books := newBooks(db, nodeCount)
 	if ob != nil {
@@ -135,7 +151,7 @@ func postOrder(ctx context.Context, hc *http.Client, url string, body []byte) (a
 }
 
 // orderJSON returns the JSON of a valid order.
-func orderJSON(t *testing.T, o order) []byte {
+func orderJSON(t *testing.T, o orderbook.Order) []byte {
 	t.Helper()
 	b, err := json.Marshal(o)
 	if err != nil {
@@ -185,7 +201,7 @@ func TestOrderbook(t *testing.T) {
 
 	db := fencedb.New()
 	ob := new(observer)
-	c, books := obCluster(t, ctx, db, ob)
+	c, _ := obCluster(t, ctx, db, ob)
 	hc := &http.Client{Transport: &http.Transport{}}
 	t.Cleanup(hc.CloseIdleConnections)
 
@@ -246,13 +262,13 @@ func TestOrderbook(t *testing.T) {
 			t.Fatal("the fence rejected no commit of the cut node")
 		case <-time.After(5 * time.Millisecond):
 		}
-		market := marketName(i % marketCount)
-		if _, err := c.Nodes[cut].Local(marketsSpace, market); err != nil {
+		market := orderbook.MarketName(i % orderbook.MarketCount)
+		if _, err := c.Nodes[cut].Local(orderbook.SpaceName, market); err != nil {
 			continue // n2 does not believe it owns the shard
 		}
 		id := fmt.Sprintf("x-%d", i)
-		a, err := postOrder(staleCtx, hc, c.URL(cut), orderJSON(t, order{ID: id, Market: market,
-			Side: []string{sideBuy, sideSell}[i%2], Price: 90 + int64(i%21), Qty: 1 + int64(i%10)}))
+		a, err := postOrder(staleCtx, hc, c.URL(cut), orderJSON(t, orderbook.Order{ID: id, Market: market,
+			Side: []string{orderbook.SideBuy, orderbook.SideSell}[i%2], Price: 90 + int64(i%21), Qty: 1 + int64(i%10)}))
 		if err != nil {
 			t.Fatalf("post %s to the cut node: %v", id, err)
 		}
@@ -296,9 +312,9 @@ func TestOrderbook(t *testing.T) {
 			}
 		}
 	}
-	for i := range marketCount {
-		if _, err := c.Nodes[drainedNode].Local(marketsSpace, marketName(i)); !errors.Is(err, tenure.ErrNotOwner) {
-			t.Errorf("Local(%s) on the drained node = %v, want ErrNotOwner", marketName(i), err)
+	for i := range orderbook.MarketCount {
+		if _, err := c.Nodes[drainedNode].Local(orderbook.SpaceName, orderbook.MarketName(i)); !errors.Is(err, tenure.ErrNotOwner) {
+			t.Errorf("Local(%s) on the drained node = %v, want ErrNotOwner", orderbook.MarketName(i), err)
 		}
 	}
 
@@ -318,15 +334,14 @@ func TestOrderbook(t *testing.T) {
 		lines   [][]byte
 		history []fencedb.Commit
 	}
-	shards := make([]shardState, marketShards)
+	shards := make([]shardState, orderbook.Shards)
 	for s := range shards {
-		if err := db.View(marketsSpace, s, func(tx *fencedb.Tx) error {
-			shards[s].lines = tx.Entries(journalLog)
-			return nil
-		}); err != nil {
+		lines, err := orderbook.NewDBJournal(db).Entries(ctx, s)
+		if err != nil {
 			t.Fatal(err)
 		}
-		shards[s].history = db.History(marketsSpace, s)
+		shards[s].lines = lines
+		shards[s].history = db.History(orderbook.SpaceName, s)
 	}
 
 	// Assertion 1: every shard's history is a single-owner history, and its journal replays to
@@ -338,7 +353,7 @@ func TestOrderbook(t *testing.T) {
 					st.history[i].Term, st.history[i-1].Term)
 			}
 		}
-		if err := newEngine(books[0], s, 0).replay(st.lines); err != nil {
+		if err := orderbook.Replay(st.lines); err != nil {
 			t.Errorf("shard %d: the journal does not replay: %v", s, err)
 		}
 		if len(st.lines) != len(st.history) {
@@ -350,11 +365,11 @@ func TestOrderbook(t *testing.T) {
 	// term below one that some node raised, failed with ErrStale, and is not in the history: the
 	// history holds exactly the attempts that succeeded.
 	stale := 0
-	committed := make(map[engineKey]int) // successful attempts per shard and term
+	committed := make(map[shardTerm]int) // successful attempts per shard and term
 	for _, a := range attempts {
 		switch {
 		case a.err == nil:
-			committed[engineKey{a.shard, a.term}]++
+			committed[shardTerm{a.shard, a.term}]++
 		case errors.Is(a.err, fencedb.ErrStale):
 			stale++
 			if !slices.ContainsFunc(raises, func(r raiseEvent) bool { return r.shard == a.shard && r.term > a.term }) {
@@ -368,10 +383,10 @@ func TestOrderbook(t *testing.T) {
 	if len(ob.staleFrom(cut)) == 0 {
 		t.Errorf("no commit of %s was rejected by the fence (%d rejected in all)", memberID(cut), stale)
 	}
-	inHistory := make(map[engineKey]int)
+	inHistory := make(map[shardTerm]int)
 	for s, st := range shards {
 		for _, cm := range st.history {
-			inHistory[engineKey{s, cm.Term}]++
+			inHistory[shardTerm{s, cm.Term}]++
 		}
 	}
 	if !mapsEqual(committed, inHistory) {
@@ -383,7 +398,7 @@ func TestOrderbook(t *testing.T) {
 	for s, st := range shards {
 		for _, en := range journalOf(t, st.lines) {
 			count[en.Order.ID]++
-			if got := core.KeyShard(en.Order.Market, marketShards); got != s {
+			if got := core.KeyShard(en.Order.Market, orderbook.Shards); got != s {
 				t.Errorf("order %s of %s is journaled in shard %d, not %d", en.Order.ID, en.Order.Market, s, got)
 			}
 		}
@@ -474,11 +489,11 @@ func TestOrderEntry(t *testing.T) {
 	}
 
 	const market = "mkt-07"
-	shard := core.KeyShard(market, marketShards)
+	shard := core.KeyShard(market, orderbook.Shards)
 	ownerIdx := -1
 	var sh *tenure.Shard
 	for i, n := range c.Nodes {
-		if s, err := n.Local(marketsSpace, market); err == nil {
+		if s, err := n.Local(orderbook.SpaceName, market); err == nil {
 			ownerIdx, sh = i, s
 		}
 	}
@@ -496,18 +511,18 @@ func TestOrderEntry(t *testing.T) {
 		}
 		return a
 	}
-	sell := order{ID: "s1", Market: market, Side: sideSell, Price: 100, Qty: 5}
-	buy := order{ID: "b1", Market: market, Side: sideBuy, Price: 101, Qty: 3}
+	sell := orderbook.Order{ID: "s1", Market: market, Side: orderbook.SideSell, Price: 100, Qty: 5}
+	buy := orderbook.Order{ID: "b1", Market: market, Side: orderbook.SideBuy, Price: 101, Qty: 3}
 
 	if a := post(owner, orderJSON(t, sell)); a.status != http.StatusOK || strings.Contains(string(a.body), `"maker"`) {
 		t.Fatalf("resting order: status %d, body %s; want 200 without fills", a.status, a.body)
 	}
 	a := post(owner, orderJSON(t, buy))
-	var res result
+	var res orderbook.Result
 	if err := json.Unmarshal(a.body, &res); err != nil || a.status != http.StatusOK {
 		t.Fatalf("crossing order: status %d, body %s, err %v", a.status, a.body, err)
 	}
-	if want := []fill{{Maker: "s1", Taker: "b1", Price: 100, Qty: 3}}; res.ID != "b1" || !slices.Equal(res.Fills, want) {
+	if want := []orderbook.Fill{{Maker: "s1", Taker: "b1", Price: 100, Qty: 3}}; res.ID != "b1" || !slices.Equal(res.Fills, want) {
 		t.Errorf("crossing order: answer %+v, want id b1 and fills %v", res, want)
 	}
 
@@ -528,14 +543,14 @@ func TestOrderEntry(t *testing.T) {
 			t.Errorf("%s: status %d, want 400", name, a.status)
 		}
 	}
-	if a := post(other, orderJSON(t, order{ID: "o1", Market: market, Side: sideBuy, Price: 1, Qty: 1})); a.status != http.StatusMisdirectedRequest ||
-		a.header.Get(routeHeader) != c.Addrs[ownerIdx] {
+	if a := post(other, orderJSON(t, orderbook.Order{ID: "o1", Market: market, Side: orderbook.SideBuy, Price: 1, Qty: 1})); a.status != http.StatusMisdirectedRequest ||
+		a.header.Get(routehttp.RouteHeader) != c.Addrs[ownerIdx] {
 		t.Errorf("order sent to a member that does not own the shard: status %d, %s %q; want 421 and %q",
-			a.status, routeHeader, a.header.Get(routeHeader), c.Addrs[ownerIdx])
+			a.status, routehttp.RouteHeader, a.header.Get(routehttp.RouteHeader), c.Addrs[ownerIdx])
 	}
 
 	// The same order through demo.Post lands on the owner.
-	if res, err := demo.Post(ctx, hc, other+"/orders", orderJSON(t, order{ID: "o2", Market: market, Side: sideBuy, Price: 1, Qty: 1})); err != nil ||
+	if res, err := demo.Post(ctx, hc, other+"/orders", orderJSON(t, orderbook.Order{ID: "o2", Market: market, Side: orderbook.SideBuy, Price: 1, Qty: 1})); err != nil ||
 		res.Status != http.StatusOK || res.Sends != 2 {
 		t.Errorf("Post through a member that does not own the shard: %+v, %v; want 200 in 2 sends", res, err)
 	}
@@ -554,23 +569,23 @@ func TestOrderEntry(t *testing.T) {
 	}
 
 	// An engine that refuses orders answers 503 with Retry-After, and journals nothing more.
-	e := books[ownerIdx].engine(sh.ID, sh.Term)
+	e := books[ownerIdx].Engine(sh.ID, sh.Term)
 	if e == nil {
 		t.Fatal("the owner has no engine")
 	}
-	e.close()
-	before := len(journal(t, db, sh.ID))
-	a = post(owner, orderJSON(t, order{ID: "r1", Market: market, Side: sideBuy, Price: 1, Qty: 1}))
+	e.Close()
+	before := len(journalOf(t, journalLines(t, db, sh.ID)))
+	a = post(owner, orderJSON(t, orderbook.Order{ID: "r1", Market: market, Side: orderbook.SideBuy, Price: 1, Qty: 1}))
 	if a.status != http.StatusServiceUnavailable || a.header.Get("Retry-After") != "1" {
 		t.Errorf("order to a refusing engine: status %d, Retry-After %q; want 503 and 1", a.status, a.header.Get("Retry-After"))
 	}
-	if after := len(journal(t, db, sh.ID)); after != before {
+	if after := len(journalOf(t, journalLines(t, db, sh.ID))); after != before {
 		t.Errorf("the journal grew from %d to %d entries on a refused order", before, after)
 	}
 }
 
 // mapsEqual reports whether two maps hold the same keys with the same counts.
-func mapsEqual(a, b map[engineKey]int) bool {
+func mapsEqual(a, b map[shardTerm]int) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -582,12 +597,22 @@ func mapsEqual(a, b map[engineKey]int) bool {
 	return true
 }
 
-// journalOf decodes journal lines.
-func journalOf(t *testing.T, lines [][]byte) []entry {
+// journalLines reads the committed journal lines of a shard.
+func journalLines(t *testing.T, db *fencedb.DB, shard int) [][]byte {
 	t.Helper()
-	out := make([]entry, 0, len(lines))
+	lines, err := orderbook.NewDBJournal(db).Entries(t.Context(), shard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lines
+}
+
+// journalOf decodes journal lines.
+func journalOf(t *testing.T, lines [][]byte) []orderbook.Entry {
+	t.Helper()
+	out := make([]orderbook.Entry, 0, len(lines))
 	for _, l := range lines {
-		var en entry
+		var en orderbook.Entry
 		if err := json.Unmarshal(l, &en); err != nil {
 			t.Fatalf("journal line %q: %v", l, err)
 		}
