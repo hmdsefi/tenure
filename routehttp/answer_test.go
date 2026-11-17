@@ -58,6 +58,7 @@ func TestRTR800Misdirected(t *testing.T) {
 // name, gets the 503 answer instead.
 func TestRTR800MisdirectedNoAddr(t *testing.T) {
 	w := httptest.NewRecorder()
+	w.Header().Set(routehttp.RouteHeader, "stale:1")
 	routehttp.Misdirected(w, tenure.Member{ID: "n2"})
 
 	res := w.Result()

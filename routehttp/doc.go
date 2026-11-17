@@ -26,23 +26,27 @@
 //
 //   - on a 421, sends the same request to the address in Tenure-Route, a bounded number of
 //     times, so that two members whose views disagree cannot bounce a request forever;
-//   - on a 503 with Tenure-Unprocessed, waits about Retry-After and sends it again;
+//   - on a 503 with Tenure-Unprocessed, waits up to Retry-After and sends it again;
 //   - on any other answer, is done.
 //
 // It sets Tenure-Hops on each send: the number of earlier sends of the same request that moved
 // it to another member, 0 on the first. A member that forwards requests itself can use the
 // count to stop a loop.
 //
-// A server uses the helpers in its handlers:
+// A server uses the helpers in its handlers. Errors that are not about ownership, such as an
+// unknown space, would fail again on every member, so they get a final answer instead:
 //
 //	sh, err := node.Local("orders", key)
-//	if err != nil {
-//		var notOwner *tenure.NotOwnerError
-//		if errors.As(err, &notOwner) && notOwner.Route.ID != self {
-//			routehttp.Misdirected(w, notOwner.Route)
-//			return
-//		}
+//	var notOwner *tenure.NotOwnerError
+//	switch {
+//	case err == nil:
+//		// Serve the request with sh.
+//	case errors.As(err, &notOwner) && notOwner.Route.ID != "" && notOwner.Route.ID != self:
+//		routehttp.Misdirected(w, notOwner.Route)
+//	case errors.As(err, &notOwner), errors.Is(err, tenure.ErrClosed):
+//		// No owner yet, this member is about to own the shard, or it is closing.
 //		routehttp.Unavailable(w, time.Second)
-//		return
+//	default:
+//		http.Error(w, err.Error(), http.StatusInternalServerError)
 //	}
 package routehttp
