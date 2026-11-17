@@ -22,11 +22,11 @@ import (
 // no Lease behind for good. The deletion carries the observed UID and resourceVersion as
 // preconditions, so a Lease written meanwhile stays; each deletion is logged at Info. It never
 // deletes the Adapter's own member Leases: the joined member's and those of its active
-// sessions. d = 0 turns the deletion off.
+// sessions. d = 0 turns the deletion off, and a watch-only Adapter (watchonly.go) never collects.
 
 // collectMembers runs member GC for one run of the informer, until ctx, the run's, ends.
 func (a *Adapter) collectMembers(ctx context.Context) {
-	if a.memberGC == 0 {
+	if a.memberGC == 0 || a.watchOnly {
 		return
 	}
 	tick := time.NewTicker(a.timing.RetryPeriod)

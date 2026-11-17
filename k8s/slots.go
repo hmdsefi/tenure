@@ -61,6 +61,9 @@ func (a *Adapter) ClaimSlot(ctx context.Context, holder string) (int, error) {
 	if a.err != nil {
 		return -1, a.err
 	}
+	if err := a.refuse("ClaimSlot"); err != nil {
+		return -1, err
+	}
 	if err := checkHolder(a.group, holder); err != nil {
 		return -1, fmt.Errorf("k8s: ClaimSlot: %w", err)
 	}
@@ -204,6 +207,9 @@ func (a *Adapter) ReleaseSlot(ctx context.Context, holder string, slot int) erro
 	if a.err != nil {
 		return a.err
 	}
+	if err := a.refuse("ReleaseSlot"); err != nil {
+		return err
+	}
 	if err := checkHolder(a.group, holder); err != nil {
 		return fmt.Errorf("k8s: ReleaseSlot: %w", err)
 	}
@@ -271,6 +277,9 @@ func (a *Adapter) SetSlots(ctx context.Context, count int) error {
 	}
 	if a.err != nil {
 		return a.err
+	}
+	if err := a.refuse("SetSlots"); err != nil {
+		return err
 	}
 	if count < 0 || count > maxSlots {
 		return fmt.Errorf("k8s: SetSlots: count %d: must be in [0, %d]", count, maxSlots)
