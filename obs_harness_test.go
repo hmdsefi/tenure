@@ -54,7 +54,9 @@ func newObsHarness(t *testing.T, listed ...string) *obsHarness {
 	members := make([]core.Member, len(listed))
 	h := &obsHarness{t: t, ms: memstore.New(nil), listed: make(map[string]bool, len(listed))}
 	for i, id := range listed {
+		// Listed as the node joins with its default space, so that its Join changes nothing.
 		members[i] = obsSelf(id)
+		members[i].Meta = map[string]string{"tenure.spaces": obsSpace + ":2"}
 		h.listed[id] = true
 	}
 	h.g = newGroup(t, members...)

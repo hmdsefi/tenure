@@ -19,12 +19,13 @@ type correction struct {
 // TTL (see WithCorrectionTTL), lookups of that shard return the member of the current snapshot's
 // view whose Addr is addr. Correct returns false, and records nothing, when no member of the
 // snapshot's view has addr, for a space the Router does not have, for a shard outside the space,
-// before the first view and after Close; the caller then follows the redirect for that request
+// for a space whose shard count a member disagrees with, before the first view and after Close;
+// the caller then follows the redirect for that request
 // only. A correction leaves lookups without allocation.
 func (r *Router) Correct(space string, shard int, addr string) bool {
 	h, ok := r.byName[space]
 	s := r.snap.Load()
-	if !ok || s.closed || s.view == nil || shard < 0 || shard >= h.shards {
+	if !ok || s.closed || s.view == nil || shard < 0 || shard >= h.shards || s.tables[h.index].mismatch != nil {
 		return false
 	}
 	for _, m := range s.view.Members {
@@ -44,7 +45,7 @@ func (r *Router) Correct(space string, shard int, addr string) bool {
 // snapshot's owner. Lookups call it only then, so that without corrections they read one
 // counter more than the snapshot lookup (RTR-410); with one, they read the clock as well.
 func (h *RouteSpace) corrected(s *routerSnapshot, shard int) (Member, error) {
-	if c := h.corrections[shard].Load(); c != nil && c.version == s.version &&
+	if c := h.corrections[shard].Load(); c != nil && c.version == s.version && s.tables[h.index].mismatch == nil &&
 		h.r.opts.now().Sub(c.at) < h.r.opts.correctionTTL {
 		return c.member, nil
 	}

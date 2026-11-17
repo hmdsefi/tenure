@@ -31,7 +31,10 @@ const DefaultSlotGrace = 60 * time.Second
 type Config struct {
 	// Self is this member. Its ID must be valid as core.Member.Validate says, and no key of its
 	// Meta may start with "tenure.", a prefix tenure reserves. Start ignores Slot and Draining:
-	// the member always joins with Slot -1 and Draining false.
+	// the member always joins with Slot -1 and Draining false. When the node has spaces, the
+	// member joins with Meta["tenure.spaces"] added: each space's name and shard count, sorted
+	// by name, as "markets:64,orders:8", which lets a Router check that it uses the same shard
+	// counts (a ',', ':' or '%' in a name is written as %2C, %3A or %25).
 	Self Member
 
 	// Membership tells the node which members its group has. It is required.
