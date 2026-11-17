@@ -18,6 +18,9 @@ import (
 // errWatchClosed is the error the watcher reports when a Watch channel closes before Leave.
 var errWatchClosed = errors.New("tenure: watch channel closed")
 
+// errSourceStale is the error of router.stale when the Router's Membership reports itself stale.
+var errSourceStale = errors.New("tenure: membership reports stale")
+
 // mergeView returns v with the slot data merged in (RUN-220): Slots is count, SlotHolders is
 // holders cut or padded with "" to count entries, and each member's Slot is the lowest slot whose
 // holder's member ID equals the member's ID, else -1. Version is v's. The members slice is a copy,

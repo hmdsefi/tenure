@@ -229,9 +229,10 @@ func TestATRTR15Relist(t *testing.T) {
 }
 
 // TestRTR720RouterStale checks on a cluster that a Router on a watch-only Adapter keeps its
-// table and reports stale while the Adapter's watch and lists are blocked, here in its client's
-// transport (the recorder's stall), for longer than LeaseDuration, and that it is fresh again,
-// with the same table, once they pass.
+// table, reports Stale and emits router.stale ("tenure: membership reports stale") while the
+// Adapter's watch and lists are blocked, here in its client's transport (the recorder's stall),
+// for longer than LeaseDuration, and that it is fresh again, with the same table and one
+// router.fresh, once they pass.
 func TestRTR720RouterStale(t *testing.T) {
 	c := newCluster(t)
 	t.Parallel()
@@ -243,7 +244,16 @@ func TestRTR720RouterStale(t *testing.T) {
 	mustJoin(t, a, member("m0"))
 	mustJoin(t, b, member("m1"))
 	wo, rec := watchOnlyAdapter(t, c, g, user)
-	r, err := tenure.NewRouter(wo, []tenure.Space{{Name: "orders", Shards: 8}})
+	events := make(chan tenure.RouterEvent, 64)
+	r, err := tenure.NewRouter(wo, []tenure.Space{{Name: "orders", Shards: 8}}, tenure.WithRouterTiming(T),
+		tenure.WithRouterEvents(func(e tenure.RouterEvent) {
+			if e.Kind == tenure.RouterEventStale || e.Kind == tenure.RouterEventFresh {
+				select {
+				case events <- e:
+				default: // never block delivery, which Close waits for
+				}
+			}
+		}))
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
 	}
@@ -279,6 +289,15 @@ func TestRTR720RouterStale(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	// The Router reports the Adapter's staleness as router.stale within RetryPeriod.
+	select {
+	case e := <-events:
+		if e.Kind != tenure.RouterEventStale || e.Err == nil || e.Err.Error() != "tenure: membership reports stale" {
+			t.Fatalf("event %s (%v) during the stall, want router.stale with \"tenure: membership reports stale\"", e.Kind, e.Err)
+		}
+	case <-time.After(T.RetryPeriod + 3*time.Second):
+		t.Fatal("no router.stale event during the stall")
+	}
 	time.Sleep(T.LeaseDuration + T.RetryPeriod)
 	if !r.Stale() || !wo.Stale() {
 		t.Errorf("Router stale %t, Adapter stale %t after LeaseDuration of the stall, want both", r.Stale(), wo.Stale())
@@ -297,6 +316,14 @@ func TestRTR720RouterStale(t *testing.T) {
 	}
 	if got := routes(); !slices.Equal(got, before) {
 		t.Errorf("routes %v after the stall, want %v", got, before)
+	}
+	select {
+	case e := <-events:
+		if e.Kind != tenure.RouterEventFresh {
+			t.Errorf("event %s (%v) after the stall, want one router.fresh", e.Kind, e.Err)
+		}
+	case <-time.After(T.RetryPeriod + 3*time.Second):
+		t.Error("no router.fresh event after the stall")
 	}
 }
 
