@@ -216,6 +216,10 @@ func serve(ctx context.Context, cfg config, client kubernetes.Interface, ln net.
 	case <-ctx.Done():
 	}
 
+	// Close each kept-alive connection after its next answer from now on, rather than all of
+	// them at the Shutdown below: a client that reuses an idle connection just as the server
+	// closes it loses its request's answer.
+	srv.SetKeepAlivesEnabled(false)
 	stopNode(n)
 	sd, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()

@@ -79,11 +79,14 @@ type Result struct {
 //     further order of its term.
 //   - 409: the order's ID is journaled already.
 //   - 200: the order was matched and journaled, and the body lists its fills.
+//   - 500: the journal failed without saying whether it holds the order (a remote journal's
+//     answer was lost). The order may be journaled, so the answer makes no promise.
 //
 // The 421 and every 503 carry Tenure-Unprocessed: 1, as routehttp.Misdirected and
 // routehttp.Unavailable write them, because none follows an effect: a 503 after a rejected
 // commit neither, since the fence rejects the whole commit and the engine keeps the order's match
-// only when the commit succeeded.
+// only when the commit succeeded, and a 503 while the engine cannot read its journal again after
+// a 500 comes before the order reached the journal.
 func (s *server) postOrder(w http.ResponseWriter, r *http.Request) {
 	o, err := decodeOrder(http.MaxBytesReader(w, r.Body, maxOrderBody))
 	if err != nil {

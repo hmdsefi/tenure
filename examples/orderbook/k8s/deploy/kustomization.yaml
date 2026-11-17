@@ -6,3 +6,5 @@ resources:
   - rbac.yaml
   - journalsvc.yaml
   - orderbook.yaml
+  - rbac-readonly.yaml
+  - client.yaml
