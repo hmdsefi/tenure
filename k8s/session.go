@@ -137,6 +137,9 @@ func (a *Adapter) KeepAlive(ctx context.Context, holder string, timing core.Timi
 	if a.err != nil {
 		return a.err
 	}
+	if err := a.refuse("KeepAlive"); err != nil {
+		return err
+	}
 	if err := checkHolder(a.group, holder); err != nil {
 		return fmt.Errorf("k8s: KeepAlive: %w", err)
 	}
@@ -332,6 +335,9 @@ func (a *Adapter) CloseSession(ctx context.Context, holder string) (err error) {
 	}
 	if a.err != nil {
 		return a.err
+	}
+	if err := a.refuse("CloseSession"); err != nil {
+		return err
 	}
 	if err := checkHolder(a.group, holder); err != nil {
 		return fmt.Errorf("k8s: CloseSession: %w", err)

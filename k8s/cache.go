@@ -176,6 +176,9 @@ func (a *Adapter) startCache() *leaseCache {
 	informer := a.leaseInformer(c)
 	deliver := func(old, obj any) {
 		l := asLease(obj)
+		if a.onEvent != nil {
+			a.onEvent(l)
+		}
 		c.observe(l)
 		a.delivered(c, l)
 		a.holderEvent(c, asLease(old), l, false, false)
@@ -185,6 +188,9 @@ func (a *Adapter) startCache() *leaseCache {
 		AddFunc:    func(obj any) { deliver(nil, obj) },
 		UpdateFunc: deliver,
 		DeleteFunc: func(obj any) {
+			if a.onEvent != nil {
+				a.onEvent(asLease(obj))
+			}
 			_, gap := obj.(cache.DeletedFinalStateUnknown)
 			c.forget(asLease(obj), gap)
 			a.holderEvent(c, nil, asLease(obj), true, gap)

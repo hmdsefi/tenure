@@ -66,6 +66,9 @@ func (a *Adapter) Acquire(ctx context.Context, holder, space string, shard int) 
 	if a.err != nil {
 		return 0, a.err
 	}
+	if err := a.refuse("Acquire"); err != nil {
+		return 0, err
+	}
 	name, err := a.checkRecordArgs("Acquire", holder, space, shard)
 	if err != nil {
 		return 0, err
@@ -347,6 +350,9 @@ func (a *Adapter) Release(ctx context.Context, holder, space string, shard int, 
 	if a.err != nil {
 		return a.err
 	}
+	if err := a.refuse("Release"); err != nil {
+		return err
+	}
 	name, err := a.checkTermArgs("Release", holder, space, shard, term)
 	if err != nil {
 		return err
@@ -495,6 +501,9 @@ func (a *Adapter) Confirm(ctx context.Context, holder, space string, shard int, 
 	}
 	if a.err != nil {
 		return tenure.Holding{}, a.err
+	}
+	if err := a.refuse("Confirm"); err != nil {
+		return tenure.Holding{}, err
 	}
 	name, err := a.checkTermArgs("Confirm", holder, space, shard, term)
 	if err != nil {
