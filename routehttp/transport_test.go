@@ -176,9 +176,15 @@ func transport(r *tenure.Router, s *sends) *routehttp.Transport {
 	return &routehttp.Transport{Router: r, Space: "orders", Key: headerKey, OnSend: s.on}
 }
 
-// request returns a request for key k1 to a host no test serves.
+// request returns a request for key k1 to a host no test serves. A ctx without a deadline gets
+// one of 10 s, so that a Transport that sends again and again fails the test instead of hanging.
 func request(t *testing.T, ctx context.Context, method string, body io.Reader) *http.Request {
 	t.Helper()
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		t.Cleanup(cancel)
+	}
 	req, err := http.NewRequestWithContext(ctx, method, "http://orders.invalid/orders", body)
 	if err != nil {
 		t.Fatal(err)
@@ -653,6 +659,30 @@ func TestATRTR18RetryUntilContext(t *testing.T) {
 	}
 }
 
+// TestTransportContextEndsDuringWait checks that a context that ends while the Transport waits to
+// send a request again ends the request at once, with no further send.
+func TestTransportContextEndsDuringWait(t *testing.T) {
+	var l jitterLog
+	l.use(t, func(n int64) int64 { return n - 1 }) // the whole Retry-After: 1 s
+	r, owner, _ := pair(t)
+	owner.set(unavailableFor(1<<30, "1"))
+	var s sends
+	tr := transport(r, &s)
+	tr.MaxRetryWait = 5 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := roundTripErr(t, tr, request(t, ctx, http.MethodGet, nil))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RoundTrip = %v, want the context's error", err)
+	}
+	if d := time.Since(start); d > 900*time.Millisecond {
+		t.Errorf("RoundTrip took %v: it waited past the context's end", d)
+	}
+	s.check(t, routehttp.SendInfo{Space: "orders", Addr: owner.addr, Status: 503})
+}
+
 // TestATRTR18NotReplayable checks that a body the Transport cannot replay, longer than
 // MaxBufferedBody and without GetBody, is sent once, whole, and that its 421, its 503 or its dial
 // error is what the caller gets (AT-RTR-18).
@@ -844,7 +874,8 @@ func TestTransportErrors(t *testing.T) {
 	closed := newRouter(t, tenure.Member{ID: "n1", Addr: owner.addr})
 	_ = closed.Close()
 	closedLater := newRouter(t, tenure.Member{ID: "n1", Addr: owner.addr})
-	later := &routehttp.Transport{Router: closedLater, Space: "orders", Key: headerKey}
+	// With a Fallback, so that a closed Router's error is seen not to go there.
+	later := &routehttp.Transport{Router: closedLater, Space: "orders", Key: headerKey, Fallback: owner.addr}
 	if res, err := later.RoundTrip(request(t, context.Background(), http.MethodGet, nil)); err != nil {
 		t.Fatalf("before Close: %v", err)
 	} else {
