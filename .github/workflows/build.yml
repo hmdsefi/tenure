@@ -337,6 +337,7 @@ jobs:
   examples-k8s:
     name: examples on kind
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       GOWORK: 'off'
     steps:
