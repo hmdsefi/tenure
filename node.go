@@ -94,8 +94,9 @@ type Node struct {
 	closed    bool          // Close has returned
 
 	resMu     sync.Mutex
-	resolvers []*Resolver // every open Resolver that Resolver returned
-	resClosed bool        // Close has closed the resolvers: Resolver returns closed ones
+	resolvers []*Resolver             // every open Resolver that Resolver returned
+	resClosed bool                    // Close has closed the resolvers: Resolver returns closed ones
+	watches   map[*viewWatch]struct{} // every open channel that Watch returned, guarded by resMu
 }
 
 // Start starts a node for cfg and returns it once the member has joined the group, the node
@@ -576,8 +577,8 @@ func (n *Node) writeSlots(ctx context.Context, ss SlotStore, count int) error {
 
 // Close drains the node as Drain does, leaves the group, and stops every goroutine of the node.
 // It returns nil once all of that is done. Later calls return ErrClosed, and so do Route, Local,
-// Drain, SetSlots and the lookups of every Resolver the node returned; a Shard the node handed to
-// Run keeps returning its stop error.
+// Drain, SetSlots, Watch and the lookups of every Resolver the node returned; a Shard the node
+// handed to Run keeps returning its stop error. Close closes every channel that Watch returned.
 //
 // When ctx ends before the drain completes, or is done already when Close is called, Close
 // neither closes the member's session nor leaves the group: the store expires the session, so no
@@ -616,6 +617,7 @@ func (n *Node) Close(ctx context.Context) error {
 	}
 	n.leave(ctx)
 	n.closeResolvers()
+	n.closeWatches()
 	n.cancel()
 	n.wait()
 	n.closeRoutes()
@@ -634,6 +636,7 @@ func (n *Node) forceClose(ctx context.Context) error {
 	detail := n.halt()
 	n.obs.closed(ctx, closedDeadline)
 	n.closeResolvers()
+	n.closeWatches()
 	n.cancel()
 	n.wg.Wait() // the loop, and with it every lane, has returned: no supervisor starts any more
 	n.waitIdleSupervisors()
@@ -780,4 +783,92 @@ func (n *Node) closeResolvers() {
 	for _, r := range rs {
 		_ = r.Close()
 	}
+}
+
+// viewWatch is one channel that Watch returned.
+type viewWatch struct {
+	ch   chan core.View // buffer 1
+	sent bool           // a view has been sent on ch
+	last uint64         // the Version of the latest view sent on ch
+	stop func() bool    // stops the context.AfterFunc that ends the watch with its ctx
+}
+
+// send puts v on w's channel, replacing a view not yet received, unless w has had v or a newer
+// view already. The caller holds n.resMu, under which alone views are sent, so it never blocks.
+func (w *viewWatch) send(v core.View) {
+	if w.sent && v.Version <= w.last {
+		return
+	}
+	select {
+	case <-w.ch:
+	default:
+	}
+	w.ch <- v
+	w.sent, w.last = true, v.Version
+}
+
+// Watch returns a channel of the node's published views: the views it follows and routes by,
+// with the slot data of its SlotStore merged in. The channel holds the current view at once
+// when the node has published one, and otherwise receives the first. It then receives each
+// later view; it holds one view, and a newer view replaces one not yet received. The channel is
+// closed when ctx is done and when the node closes.
+//
+// Watch returns ctx's error when ctx is done, and ErrClosed once Close has been called.
+func (n *Node) Watch(ctx context.Context) (<-chan core.View, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	n.mu.Lock()
+	closing := n.closing
+	n.mu.Unlock()
+	if closing {
+		return nil, ErrClosed
+	}
+	w := &viewWatch{ch: make(chan core.View, 1)}
+	n.resMu.Lock()
+	defer n.resMu.Unlock()
+	if n.resClosed {
+		return nil, ErrClosed
+	}
+	if v := n.view.Load(); v != nil {
+		w.send(*v)
+	}
+	if n.watches == nil {
+		n.watches = make(map[*viewWatch]struct{})
+	}
+	n.watches[w] = struct{}{}
+	w.stop = context.AfterFunc(ctx, func() { n.endWatch(w) })
+	return w.ch, nil
+}
+
+// endWatch closes w's channel when it is still open, for its ctx has ended.
+func (n *Node) endWatch(w *viewWatch) {
+	n.resMu.Lock()
+	defer n.resMu.Unlock()
+	if _, ok := n.watches[w]; ok {
+		delete(n.watches, w)
+		close(w.ch)
+	}
+}
+
+// feedWatches sends v, a view the node publishes, on every open channel of Watch.
+func (n *Node) feedWatches(v core.View) {
+	n.resMu.Lock()
+	defer n.resMu.Unlock()
+	for w := range n.watches {
+		w.send(v)
+	}
+}
+
+// closeWatches closes every open channel of Watch, which then returns ErrClosed, as
+// closeResolvers makes Resolver return closed ones.
+func (n *Node) closeWatches() {
+	n.resMu.Lock()
+	defer n.resMu.Unlock()
+	n.resClosed = true
+	for w := range n.watches {
+		w.stop()
+		close(w.ch)
+	}
+	n.watches = nil
 }

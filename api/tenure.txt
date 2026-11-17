@@ -456,9 +456,10 @@ func Start(ctx context.Context, cfg Config) (*Node, error)
 func (n *Node) Close(ctx context.Context) error
     Close drains the node as Drain does, leaves the group, and stops every
     goroutine of the node. It returns nil once all of that is done. Later calls
-    return ErrClosed, and so do Route, Local, Drain, SetSlots and the lookups
-    of every Resolver the node returned; a Shard the node handed to Run keeps
-    returning its stop error.
+    return ErrClosed, and so do Route, Local, Drain, SetSlots, Watch and the
+    lookups of every Resolver the node returned; a Shard the node handed to
+    Run keeps returning its stop error. Close closes every channel that Watch
+    returned.
 
     When ctx ends before the drain completes, or is done already when Close is
     called, Close neither closes the member's session nor leaves the group:
@@ -580,6 +581,17 @@ func (n *Node) Table() Table
     its session, its view and every shard of its spaces, which the node updates
     while it carries out each step. Table never waits for a step to be carried
     out. It may be called at any time, from Config.OnEvent too, and after Close.
+
+func (n *Node) Watch(ctx context.Context) (<-chan core.View, error)
+    Watch returns a channel of the node's published views: the views it
+    follows and routes by, with the slot data of its SlotStore merged in.
+    The channel holds the current view at once when the node has published one,
+    and otherwise receives the first. It then receives each later view; it holds
+    one view, and a newer view replaces one not yet received. The channel is
+    closed when ctx is done and when the node closes.
+
+    Watch returns ctx's error when ctx is done, and ErrClosed once Close has
+    been called.
 
 type NotOwnerError struct {
 	// Space and Shard name the shard.
