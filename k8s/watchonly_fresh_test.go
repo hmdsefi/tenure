@@ -12,12 +12,14 @@ import (
 	"testing"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/hmdsefi/tenure"
+	"github.com/hmdsefi/tenure/core"
 )
 
 // failingLists returns newFake's client whose Lease watches pass through gate, and whose Lease
@@ -290,4 +292,108 @@ func TestRTR720RouterStale(t *testing.T) {
 	if got := routes(); !slices.Equal(got, before) {
 		t.Errorf("routes %v after the stall, want %v", got, before)
 	}
+}
+
+// TestRTR720RelistEqualOnly checks what a relist after a quiet watch makes of the Leases it
+// lists, on a fake client in real time with timing T: a member Lease whose resourceVersion
+// differs from the one last observed counts as changed at the list, even when it is lower, as
+// resourceVersions are compared for equality only; a member Lease deleted during the gap leaves
+// at the list, not when its Lease would have expired; and an unchanged one keeps aging.
+func TestRTR720RelistEqualOnly(t *testing.T) {
+	ctx := t.Context()
+	gate := &watchGate{}
+	client := newFake()
+	gateWatches(client, gate)
+	leases := client.CoordinationV1().Leases("default")
+	for _, id := range []string{"m0", "m1", "m2"} {
+		if _, err := leases.Create(ctx, memberLease("g", id, encodeMember(member(id)), "", 3), metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	a := fakeAdapter(t, client, WithWatchOnly())
+	listed := time.Now()
+	w := watchView(t, ctx, a, "a")
+	if !listing("m0", "m1", "m2")(w.last) {
+		t.Fatalf("first view %s, want m0 to m2", fmtView(w.last))
+	}
+
+	// The watch stops delivering. m0's Lease gets a resourceVersion below the one observed, and
+	// m1's is deleted.
+	open := gate.shut()
+	t.Cleanup(open)
+	obj, err := client.Tracker().Get(leasesResource, "default", memberName("g", "m0"))
+	if err != nil {
+		t.Fatalf("get m0: %v", err)
+	}
+	l, _ := obj.(*coordinationv1.Lease)
+	l = l.DeepCopy()
+	l.ResourceVersion = "7"
+	if err := client.Tracker().Update(leasesResource, l, "default"); err != nil {
+		t.Fatalf("update m0: %v", err)
+	}
+	if err := leases.Delete(ctx, memberName("g", "m1"), metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete m1: %v", err)
+	}
+
+	// m1 leaves at the relist, RenewDeadline into the quiet, before its Lease would expire.
+	w.waitFor(T.RenewDeadline+time.Second, "m0 and m2 after the relist", listing("m0", "m2"))
+	if d := time.Since(listed); d > T.LeaseDuration-T.RetryPeriod {
+		t.Fatalf("m1 left %v after the first list, want at the relist, well before LeaseDuration %v", d, T.LeaseDuration)
+	}
+	if a.Stale() {
+		t.Error("Stale() = true after the relist, want false")
+	}
+	// m2, unchanged, expires LeaseDuration after the first list; m0, changed at the relist, stays.
+	w.waitFor(T.LeaseDuration, "m0 alone", listing("m0"))
+}
+
+// TestRTR720RelistBackoff checks the backoff between the failed lists of a relist, on a fake
+// client in real time with a short timing: from RetryPeriod, doubling, up to LeaseDuration and no
+// more. The Adapter stays stale and keeps its member meanwhile, and is fresh once a list
+// succeeds.
+func TestRTR720RelistBackoff(t *testing.T) {
+	ctx := t.Context()
+	tm := core.Timing{LeaseDuration: time.Second, RenewDeadline: 500 * time.Millisecond, RetryPeriod: 100 * time.Millisecond, SlotGrace: time.Second}
+	gate := &watchGate{}
+	var failLists atomic.Bool
+	failed := &attempts{}
+	client := failingLists(gate, &failLists, failed)
+	if _, err := client.CoordinationV1().Leases("default").Create(ctx, memberLease("g", "m0", encodeMember(member("m0")), "", 1), metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create m0: %v", err)
+	}
+	a := New(client, "default", "g", WithTiming(tm), WithWatchOnly())
+	t.Cleanup(func() { waitStopped(t, a) })
+	w := watchView(t, ctx, a, "a")
+
+	open := gate.shut()
+	t.Cleanup(open)
+	failLists.Store(true)
+	// 100, 200, 400, 800, 1000 and 1000 ms between the seven failed lists.
+	const n = 7
+	wait := 5 * time.Second
+	deadline := time.Now().Add(wait)
+	for len(failed.get()) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d failed lists after %v, want %d", len(failed.get()), wait, n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for {
+		if _, ok := w.next(0); !ok {
+			break
+		}
+	}
+	if !a.Stale() || !listing("m0")(w.last) {
+		t.Fatalf("stale %t, view %s while lists fail; want stale with m0", a.Stale(), fmtView(w.last))
+	}
+	at := failed.get()
+	for i := 1; i < n; i++ {
+		gap, want := at[i].Sub(at[i-1]), min(tm.RetryPeriod<<(i-1), tm.LeaseDuration)
+		if gap < want-30*time.Millisecond || gap > want+300*time.Millisecond {
+			t.Errorf("failed list %d came %v after the one before, want about %v", i, gap, want)
+		}
+	}
+
+	failLists.Store(false)
+	waitStale(t, a, false, tm.LeaseDuration+time.Second)
 }
