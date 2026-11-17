@@ -23,6 +23,10 @@ var DefaultTiming = Timing{
     60 s SlotGrace. It tolerates clock-rate error strictly below 20%. To change
     a field, copy DefaultTiming and change the copy.
 
+var ErrInvalidAssigner = errors.New("core: invalid assigner")
+    ErrInvalidAssigner is wrapped by the errors NewAssigner returns, except a
+    timing error, which wraps ErrInvalidTiming.
+
 var ErrInvalidMachineConfig = errors.New("core: invalid machine config")
     ErrInvalidMachineConfig is wrapped by the errors MachineConfig.Validate
     returns, except a timing error, which wraps ErrInvalidTiming.
@@ -140,6 +144,76 @@ type Action interface {
 	// Has unexported methods.
 }
     Action is one thing a Machine asks its driver to do.
+
+type Assigner struct {
+	// Has unexported fields.
+}
+    Assigner computes the assignment of a process that follows a group's views
+    without being a member that holds a slot, such as a router: for each space,
+    the placement key of every shard, as a Machine of the same group that holds
+    no slot and does not drain computes it.
+
+    The rules are the machine's. A view is ignored when it is not valid or its
+    version is older than the applied one; a view of the same version applies.
+    Eligibility is judged at the view's wall-clock time advanced by the readings
+    since the view was applied. A slot that the applied views have shown vacant
+    for Timing.SlotGrace, by the Assigner's readings, drops out of the placement
+    keys until a view shows it held. The assignment is recomputed when a view is
+    applied and when a slot's vacancy expires or ends, and at no other reading:
+    a member's JoinAt or LeaveAt that passes between two such readings takes
+    effect at the next one, as on a member.
+
+    An Assigner reads no clock and starts nothing: the caller feeds it views and
+    readings, which never go backwards. It is not safe for concurrent use.
+
+func NewAssigner(spaces []AssignerSpace, timing Timing) (*Assigner, error)
+    NewAssigner returns an Assigner for spaces, with no view applied, every
+    shard's key "" and its clock at reading 0. Every space has a non-empty,
+    distinct Name and at least one shard. The zero Timing means DefaultTiming.
+    NewAssigner returns an error wrapping ErrInvalidAssigner for a bad space,
+    and the error of Timing.Validate, unchanged, for a bad timing. It copies
+    spaces and does not modify it.
+
+func (a *Assigner) ApplyView(v View, reading time.Duration, wall time.Time) bool
+    ApplyView applies v, read at the monotonic reading reading and at the
+    wall-clock time wall, and reports whether the assignment of any space
+    changed. A view that is not valid, or whose version is older than the
+    applied one, changes nothing but the clock. ApplyView panics if reading is
+    before an earlier reading.
+
+func (a *Assigner) Assignment(space string) []string
+    Assignment returns the placement key of each shard of the named space,
+    indexed by shard number, or nil when the Assigner has no such space. The key
+    is "" for a shard with no key, so every key is "" before the first view.
+    Callers must not modify the result. A changed assignment is stored in a new
+    slice, so an earlier result never changes.
+
+func (a *Assigner) Keys() []string
+    Keys returns the placement keys of the current assignments, as PlacementKeys
+    returns them, or nil when there are none. Callers must not modify the
+    result. Changed keys are stored in a new slice, so an earlier result never
+    changes.
+
+func (a *Assigner) NextWake() (time.Duration, bool)
+    NextWake returns the earliest reading at which Tick can change an
+    assignment, and true, or 0 and false when no later reading can: the next
+    expiry of a slot's vacancy.
+
+func (a *Assigner) Tick(reading time.Duration) bool
+    Tick moves the clock to reading and reports whether the assignment of any
+    space changed: a slot's vacancy may have expired. Tick panics if reading is
+    before an earlier reading.
+
+type AssignerSpace struct {
+	// Name identifies the space. It is non-empty and distinct within an Assigner.
+	Name string
+
+	// Shards is the number of shards in the space, at least 1.
+	Shards int
+}
+    AssignerSpace names one space an Assigner places, with its shard count.
+
+    Write AssignerSpace values with keyed fields: later versions add fields.
 
 type Cause int
     Cause says how a session renewal failed.

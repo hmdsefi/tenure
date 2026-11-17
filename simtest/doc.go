@@ -10,6 +10,14 @@
 // time, that terms only grow, and that a fenced downstream never accepts a write of an owner
 // that was replaced.
 //
+// The TestATRTR13Router tests add routers to such worlds: each follows the store's views with a
+// lag of its own and routes requests to the members, correcting its table from their 421
+// answers, and the simulation checks after every event that a request reaches a member that
+// serves its shard within three sends and that a router whose view equals the members' sends
+// each request once. Run them alone with
+//
+//	go test -run Router ./...
+//
 // The package has no API: it is a set of tests, and nothing imports it. Run the short seed
 // counts with
 //

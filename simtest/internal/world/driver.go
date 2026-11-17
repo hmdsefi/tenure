@@ -145,6 +145,18 @@ type driver struct {
 	viewVersion uint64
 	slotFloor   uint64
 
+	// shown is the view of the latest ViewChanged stepped, under either rule, and showing
+	// reports that one was stepped. The routers read them (router.go): a member routes by the
+	// view it has, as Node.Route does.
+	shown   core.View
+	showing bool
+	// steps counts the steps of the machine. heldSlot is the slot the machine held after step
+	// heldStep, read only when a router asks (router.go), and heldRead reports that it was read.
+	steps    uint64
+	heldSlot int
+	heldStep uint64
+	heldRead bool
+
 	// records holds, by shard lane key, the filter state of each shard (records_version.go);
 	// looked up only.
 	records map[laneKey]*shardRecord
@@ -278,6 +290,10 @@ func (d *driver) stepOne(in core.Input, text, src string, extra ...kernel.Attr) 
 	}
 	d.stepping = true
 	acts := d.machine.Step(in)
+	d.steps++
+	if vc, ok := in.(core.ViewChanged); ok {
+		d.shown, d.showing = vc.View, true
+	}
 	typ, fields := inputFields(in)
 	if src != "" {
 		fields = append(fields, recAttr("src", src))

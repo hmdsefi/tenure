@@ -128,6 +128,25 @@ var rows = []row{
 		name: "TestFencedStoreOutage", sc: outageScenario(outageLengths()[0]),
 		seeds: 10, duration: 150 * time.Second, net: defaultNet, g2: true,
 	},
+	// The router rows (AT-RTR-13, router_test.go): TestSteady, TestSlotRollout and
+	// TestCrashRestart with two lagging routers and a fenced space, and the crashes with the
+	// routers cut off from the store's views for a minute.
+	{
+		name: "TestATRTR13RouterSteady", sc: routerScenario(world.Scenario{StopDelay: time.Second}),
+		seeds: 20, duration: 60 * time.Second, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestATRTR13RouterRollout", sc: routerScenario(world.Scenario{Slots: 5, Rollout: rolloutPlan}),
+		seeds: 20, duration: rolloutRun, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestATRTR13RouterChurn", sc: routerScenario(world.Scenario{Faults: churnFaults()}),
+		seeds: 50, duration: 150 * time.Second, net: defaultNet, g2: true,
+	},
+	{
+		name: "TestATRTR13RouterPartition", sc: routerScenario(world.Scenario{Faults: churnFaults(), RouterCut: routerCut}),
+		seeds: 50, duration: 150 * time.Second, net: defaultNet, g2: true,
+	},
 }
 
 // rowNamed returns the row of the table whose name is name, and fails t when there is none.
