@@ -21,6 +21,7 @@ const (
 	maxMembers = 64
 	maxSlots   = 10_000
 	maxRho     = 500_000 // the kernel's clocks run at half speed at least
+	maxRouters = 16
 )
 
 // setupPrefix starts the text of every setup error.
@@ -56,14 +57,17 @@ type setup struct {
 //   - Timing: "Timing: " and what core.Timing says about it;
 //   - Slots: "Slots -1 is outside [0, 10000]";
 //   - Rho: "Rho -1 is outside [0, 500000]";
-//   - Delta, WallSkew, WallSteps, StopDelay, EndAfter and SetSlotsAt, in this order:
-//     "Delta -1ns is negative";
+//   - Delta, WallSkew, WallSteps, StopDelay, EndAfter, SetSlotsAt and RouterLag, in this
+//     order: "Delta -1ns is negative";
 //   - SetSlotsTo: "SetSlotsTo -1 is outside [0, 10000]";
 //   - a slot count to set, or a rollout, in a world without slots: "SetSlotsAt without Slots",
 //     "Rollout without Slots";
 //   - Rollout: "Rollout.Gap 0s is not positive", the same for Surge, then
 //     "Rollout.Start -1ns is negative";
 //   - Outage: "Outage.For 0s is not positive", then "Outage.At -1ns is negative";
+//   - Routers: "Routers 17 is outside [0, 16]";
+//   - RouterCut: "RouterCut without Routers", "RouterCut.For 0s is not positive", then
+//     "RouterCut.At -1ns is negative";
 //   - Mutation: "unknown Mutation 9";
 //   - a clock-jump rule in Faults: "Faults: clock-jump rules are not supported: a jump would
 //     move the monotonic clock; use WallSteps";
@@ -194,6 +198,7 @@ func (sc Scenario) problem() string {
 		{"StopDelay", sc.StopDelay},
 		{"EndAfter", sc.EndAfter},
 		{"SetSlotsAt", sc.SetSlotsAt},
+		{"RouterLag", sc.RouterLag},
 	}
 	for _, f := range durations {
 		if f.d < 0 {
@@ -224,6 +229,19 @@ func (sc Scenario) problem() string {
 			return fmt.Sprintf("Outage.For %v is not positive", o.For)
 		case o.At < 0:
 			return fmt.Sprintf("Outage.At %v is negative", o.At)
+		}
+	}
+	if sc.Routers < 0 || sc.Routers > maxRouters {
+		return fmt.Sprintf("Routers %d is outside [0, %d]", sc.Routers, maxRouters)
+	}
+	if c := sc.RouterCut; c != nil {
+		switch {
+		case sc.Routers == 0:
+			return "RouterCut without Routers"
+		case c.For <= 0:
+			return fmt.Sprintf("RouterCut.For %v is not positive", c.For)
+		case c.At < 0:
+			return fmt.Sprintf("RouterCut.At %v is negative", c.At)
 		}
 	}
 	if sc.Mutation > ReadConfirm {

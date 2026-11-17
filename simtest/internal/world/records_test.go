@@ -47,6 +47,11 @@ func TestRecords(t *testing.T) {
 		w.emitAction(m, "", "KeepAlive")
 		w.emitReplyLate(m, "late", 41, "renewed")
 		w.emitRun(m, "", "stopped", "book", 3, 7)
+		r := &router{name: "r1", table: newRouterTable(w.Scenario().Spaces, w.Scenario().Timing)}
+		r.table.apply(view, 0)
+		w.emitRouterView(r, "tick")
+		w.emitRouterCut(r, true)
+		w.emitRoute(r, "book", 3, 2, "served", "m1 421 m2, m2 served")
 
 		store, fence, mn := w.Store().ID(), w.Fence().ID(), m.Node.ID()
 		want := []struct {
@@ -74,6 +79,9 @@ func TestRecords(t *testing.T) {
 			{kindAction, mn, "", []string{"type=KeepAlive"}},
 			{kindReplyLate, mn, "late", []string{"req=41", "type=renewed"}},
 			{kindRun, mn, "", []string{"op=stopped", "space=book", "shard=3", "term=7"}},
+			{kindRouteView, 0, "", []string{"router=r1", "snapshot=1", "version=4", "members=m1,m2", "slots=0", "cause=tick"}},
+			{kindRouteCut, 0, "", []string{"router=r1", "op=cut"}},
+			{kindRoute, 0, "m1 421 m2, m2 served", []string{"router=r1", "space=book", "shard=3", "sends=2", "result=served"}},
 		}
 		got := fw.Sim.Records()[before:]
 		if len(got) != len(want) {
