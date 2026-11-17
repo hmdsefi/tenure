@@ -24,6 +24,10 @@ import (
 // DefaultWait is the wait a Membership asks a Handler for when WithWait does not set one.
 const DefaultWait = 30 * time.Second
 
+// maxViewBytes bounds the body of a view a poll reads, after gzip decoding, so that an endpoint
+// cannot make the client hold an unbounded body in memory. A larger body is a failed poll.
+const maxViewBytes = 32 << 20
+
 // ClientOption configures a Membership that NewMembership returns.
 type ClientOption func(*clientConfig)
 
@@ -319,9 +323,12 @@ func (m *Membership) poll(ctx context.Context, u, tag string) (*core.View, strin
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, "", fmt.Errorf("viewhttp: GET %s: %s: %s", u, resp.Status, strings.TrimSpace(string(msg)))
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxViewBytes+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("viewhttp: GET %s: read body: %w", u, err)
+	}
+	if len(body) > maxViewBytes {
+		return nil, "", fmt.Errorf("viewhttp: GET %s: body over %d bytes", u, maxViewBytes)
 	}
 	v, err := decodeView(body)
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -507,4 +508,221 @@ func TestATRTR17WatchOnly(t *testing.T) {
 			},
 		}
 	})
+}
+
+// TestClientPollTimeout checks that a poll the endpoint does not answer is given up after the
+// wait plus RenewDeadline, with the hung request's context ended, and that the client then moves
+// to the other endpoint after the backoff, without the ETag of the endpoint it left.
+func TestClientPollTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srcs := map[string]*source{"a": newSource(new(viewOf(1, "m1"))), "b": newSource(new(viewOf(1, "m1")))}
+		var (
+			mu       sync.Mutex
+			tags     = make(map[string][]string) // If-None-Match of each request, by host
+			hungAt   time.Time
+			released bool
+		)
+		record := func(host string, h http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				tags[host] = append(tags[host], r.Header.Get("If-None-Match"))
+				mu.Unlock()
+				h.ServeHTTP(w, r)
+			})
+		}
+		n := newFakeNet()
+		n.serve("a", record("a", viewhttp.Handler(srcs["a"])))
+		n.serve("b", record("b", viewhttp.Handler(srcs["b"])))
+		m := newFakeMembership(t, n, "a", "b")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		start := time.Now()
+		ch, err := m.Watch(ctx)
+		if err != nil {
+			t.Fatalf("Watch() = %v, want nil", err)
+		}
+		recv(t, ch)
+		synctest.Wait()
+		cur := n.busy()[0]
+
+		// The current endpoint now accepts polls and never answers them. The poll it holds ends
+		// with 304 at 10s; the next, sent at 10s, hangs until the client gives up at 30s.
+		n.serve(cur, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			hungAt = time.Now()
+			mu.Unlock()
+			<-r.Context().Done()
+			mu.Lock()
+			released = true
+			mu.Unlock()
+		}))
+		srcs[other(cur)].set(viewOf(2, "m1", "m2"))
+		time.Sleep(31*time.Second - time.Millisecond)
+		synctest.Wait()
+		wantEmpty(t, ch, "before the hung poll's timeout and the backoff")
+		mu.Lock()
+		if d := hungAt.Sub(start); d != 10*time.Second {
+			t.Errorf("hung poll sent at %v, want 10s", d)
+		}
+		if !released {
+			t.Error("hung poll's request context still open after the poll timeout")
+		}
+		mu.Unlock()
+		time.Sleep(time.Millisecond)
+		synctest.Wait()
+		if v := recv(t, ch); v.Version != 2 || ids(v) != "m1,m2" {
+			t.Fatalf("view %d (%s) after the hung poll, want 2 (m1,m2) from %s", v.Version, ids(v), other(cur))
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if got := tags[other(cur)]; len(got) == 0 || got[0] != "" {
+			t.Errorf("If-None-Match of the polls of %s: %q, want none on the first", other(cur), got)
+		}
+	})
+}
+
+// TestClientBackoff checks the pauses after failed polls: the initial pause, doubling up to the
+// maximum, and back to the initial pause after a successful poll.
+func TestClientBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := viewhttp.Handler(newSource(new(viewOf(1, "m1"))))
+		script := []bool{false, false, false, false, true, false, false} // then true
+		var (
+			mu    sync.Mutex
+			times []time.Duration
+		)
+		start := time.Now()
+		n := newFakeNet()
+		n.serve("a", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			k := len(times)
+			times = append(times, time.Since(start))
+			mu.Unlock()
+			if k < len(script) && !script[k] {
+				http.Error(w, "down", http.StatusServiceUnavailable)
+				return
+			}
+			h.ServeHTTP(w, r)
+		}))
+		m := newFakeMembership(t, n, "a")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ch, err := m.Watch(ctx)
+		if err != nil {
+			t.Fatalf("Watch() = %v, want nil", err)
+		}
+		if v := recv(t, ch); v.Version != 1 {
+			t.Fatalf("first view %d, want 1", v.Version)
+		}
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		wantEmpty(t, ch, "after the second run of failures, with the same view")
+		s := time.Second
+		want := []time.Duration{0, s, 3 * s, 7 * s, 11 * s, 11 * s, 12 * s, 14 * s, 14 * s}
+		mu.Lock()
+		defer mu.Unlock()
+		if !slices.Equal(times, want) {
+			t.Errorf("polls sent at %v, want %v", times, want)
+		}
+	})
+}
+
+// TestClientRandomStart checks that clients start at a random endpoint.
+func TestClientRandomStart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		src := newSource(new(viewOf(1, "m1")))
+		n := newFakeNet()
+		n.serve("a", viewhttp.Handler(src))
+		n.serve("b", viewhttp.Handler(src))
+		for range 32 {
+			m := newFakeMembership(t, n, "a", "b")
+			ctx, cancel := context.WithCancel(context.Background())
+			if _, err := m.Watch(ctx); err != nil {
+				t.Fatalf("Watch() = %v, want nil", err)
+			}
+			cancel()
+			synctest.Wait()
+		}
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if a, b := n.hosts["a"].served, n.hosts["b"].served; a == 0 || b == 0 {
+			t.Errorf("32 clients sent %d polls to a and %d to b, want some to each", a, b)
+		}
+	})
+}
+
+// TestClientSlotChanges checks that a change of a member's slot alone, or of the slot holders
+// alone, delivers a new view, and a new server Version with the same content does not.
+func TestClientSlotChanges(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		v := viewOf(1, "m1")
+		v.Slots, v.SlotHolders = 2, []string{"h0", "h1"}
+		src := newSource(new(v))
+		n := newFakeNet()
+		n.serve("a", viewhttp.Handler(src))
+		m := newFakeMembership(t, n, "a")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ch, err := m.Watch(ctx)
+		if err != nil {
+			t.Fatalf("Watch() = %v, want nil", err)
+		}
+		recv(t, ch)
+		next := func(change func(*core.View)) core.View {
+			nv := viewOf(v.Version+1, "m1")
+			nv.Members[0].Slot, nv.Slots = v.Members[0].Slot, v.Slots
+			nv.SlotHolders = slices.Clone(v.SlotHolders)
+			change(&nv)
+			v = nv
+			return nv
+		}
+		src.set(next(func(v *core.View) { v.Members[0].Slot = 0 }))
+		synctest.Wait()
+		if got := recv(t, ch); got.Version != 2 || got.Members[0].Slot != 0 {
+			t.Fatalf("view %d with m1 at slot %d, want 2 with m1 at slot 0", got.Version, got.Members[0].Slot)
+		}
+		src.set(next(func(v *core.View) { v.SlotHolders[1] = "h2" }))
+		synctest.Wait()
+		if got := recv(t, ch); got.Version != 3 || !slices.Equal(got.SlotHolders, []string{"h0", "h2"}) {
+			t.Fatalf("view %d with holders %q, want 3 with [h0 h2]", got.Version, got.SlotHolders)
+		}
+		src.set(next(func(*core.View) {}))
+		synctest.Wait()
+		wantEmpty(t, ch, "after a new server Version with the same content")
+	})
+}
+
+// TestClientBodyLimit checks that the body of a view of up to 32 MiB is read, and a longer one
+// is a failed poll.
+func TestClientBodyLimit(t *testing.T) {
+	const limit = 32 << 20
+	view := `{"version":1,"members":[],"slots":0,"slot_holders":[]}`
+	for _, size := range []int{limit, limit + 1} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				body := []byte(view + strings.Repeat(" ", size-len(view)))
+				n := newFakeNet()
+				n.serve("a", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("ETag", `"x"`)
+					_, _ = w.Write(body)
+				}))
+				m := newFakeMembership(t, n, "a")
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				_, err := m.Watch(ctx)
+				if size == limit {
+					if err != nil {
+						t.Fatalf("Watch() = %v, want nil for a body of %d bytes", err, size)
+					}
+					cancel()
+					synctest.Wait()
+					return
+				}
+				if want := "viewhttp: GET http://a/view: body over 33554432 bytes"; err == nil ||
+					!strings.HasSuffix(err.Error(), want) {
+					t.Fatalf("Watch() = %v, want an error ending in %q", err, want)
+				}
+			})
+		})
+	}
 }
