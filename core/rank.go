@@ -19,6 +19,74 @@ func Rank(namespace, key string, members []Member, n int) []Member {
 	return rankScored(members, n, func(id string) uint64 { return Score(namespace, key, id) })
 }
 
+// AppendRank appends to dst the positions in members of Rank(namespace, key, members, n), best
+// first, and returns the extended slice: members[r[len(dst)+i]] is Rank's i-th member, position
+// included, so members with equal IDs keep Rank's order by position. It suits a lookup on every
+// message, such as finding the member that hosts a lockstep grain and the runner-up during a
+// handoff, where Rank's copies would allocate on each call.
+//
+// It returns dst unchanged when n <= 0 or members is empty. It never modifies members or the
+// elements of dst before len(dst), and it allocates nothing when cap(dst) - len(dst) is at least
+// min(n, len(members)), so a caller's array serves:
+//
+//	var buf [2]int
+//	r := core.AppendRank(buf[:0], kind, key, members, 2)
+//
+// AppendRank takes time O(len(members) · min(n, len(members))) and needs no sort; for n up to 16
+// it computes Score once per member.
+func AppendRank(dst []int, namespace, key string, members []Member, n int) []int {
+	if n <= 0 || len(members) == 0 {
+		return dst
+	}
+	k := min(n, len(members))
+	base := len(dst)
+	prefix := scorePrefix(namespace, key)
+
+	// scores[j] is the score of the j-th kept member while k fits it; beyond, kept scores are
+	// computed again when compared, which keeps the bound without allocating (COR-220, COR-230).
+	var small [16]uint64
+	scores := small[:0]
+	if k <= len(small) {
+		scores = small[:k]
+	}
+	keptScore := func(j int) uint64 {
+		if len(scores) > 0 {
+			return scores[j]
+		}
+		return scoreFrom(prefix, members[dst[base+j]].ID)
+	}
+	for i := range members {
+		s := scoreFrom(prefix, members[i].ID)
+		kept := len(dst) - base
+		// p is where i goes: after every kept member it does not beat. Members come in position
+		// order, so a kept member with the same score and ID stays ahead (COR-150, COR-210).
+		p := kept
+		for p > 0 {
+			ks := keptScore(p - 1)
+			if s < ks || s == ks && members[i].ID >= members[dst[base+p-1]].ID {
+				break
+			}
+			p--
+		}
+		if p >= k {
+			continue
+		}
+		last := kept
+		if kept < k {
+			dst = append(dst, 0)
+		} else {
+			last = k - 1
+		}
+		copy(dst[base+p+1:base+last+1], dst[base+p:base+last])
+		dst[base+p] = i
+		if len(scores) > 0 {
+			copy(scores[p+1:last+1], scores[p:last])
+			scores[p] = s
+		}
+	}
+	return dst
+}
+
 // scoredIndex is one member's score and its position in the members being ranked.
 type scoredIndex struct {
 	score uint64
