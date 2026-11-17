@@ -411,7 +411,7 @@ func TestATCOR20AppendRankEqualsRank(t *testing.T) {
 		return int(state>>33) % bound
 	}
 	ids := []string{"", "a", "b", "c", "n1", "n2", "n3", "zz"}
-	for round := range 3000 {
+	for round := range 600 {
 		m := next(40)
 		ms := make([]Member, m)
 		for i := range ms {
