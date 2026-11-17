@@ -45,11 +45,24 @@ type Router struct {
 	ready     chan struct{} // closed when the first view is applied
 	readyOnce sync.Once
 	closed    chan struct{} // closed by Close
+	closeOnce sync.Once
+
+	source Membership         // the Membership the builder watches
+	cancel context.CancelFunc // ends the builder's context
+	done   chan struct{}      // closed when the builder returns
+	stale  atomic.Bool        // the watch has ended or failed and no view has come since
 
 	// mu guards the build state: only one snapshot is built at a time.
 	mu       sync.Mutex
 	assigner *core.Assigner
-	view     *core.View // the applied view, nil before the first
+	view     *core.View       // the applied view, nil before the first
+	reading  time.Duration    // the latest reading fed to assigner
+	subs     []chan uint64    // every channel Subscribe returned, until Close
+	builds   routerBuildStats // what the builds have done, for tests and events
+
+	// testApplyHook, when set by a test, is called with each view the builder is about to apply,
+	// with mu held.
+	testApplyHook func(core.View)
 }
 
 // RouteSpace is a handle on one space of a Router. Its lookups skip the space lookup of
@@ -131,6 +144,14 @@ func WithClock(now func() time.Time) RouterOption {
 // A failure is returned as "tenure: NewRouter: " followed by the reason, such as
 // `tenure: NewRouter: Spaces[1].Name: duplicate name "orders"`.
 //
+// NewRouter calls m.Watch once and returns its error as "tenure: NewRouter: watch: " and the
+// error; it never calls Join, SetDraining or Leave. The Router's one goroutine then applies the
+// latest view of the channel, so a burst of views costs at most two builds, and lookups read the
+// previous snapshot while it builds. When the placement keys stay the same, as with slots while
+// the slot count does, it maps them to the new members without recomputing the assignment. When
+// the channel closes or a later Watch fails, the Router keeps its last table, reports Stale, and
+// calls Watch again the timing's RetryPeriod later, until Close or until Watch returns ErrClosed.
+//
 // Until the Router has applied its first view, lookups fail with an error that matches
 // ErrNoMembers and says "no view yet".
 func NewRouter(m Membership, spaces []Space, opts ...RouterOption) (*Router, error) {
@@ -179,6 +200,9 @@ func NewRouter(m Membership, spaces []Space, opts ...RouterOption) (*Router, err
 	}
 	r.assigner = a
 	r.snap.Store(r.firstSnapshot())
+	if err := r.start(m); err != nil {
+		return nil, err
+	}
 	return r, nil
 }
 
@@ -259,12 +283,12 @@ func (r *Router) Version() uint64 {
 	return r.snap.Load().version
 }
 
-// Ready waits until the Router has applied its first view. It returns nil then, ErrClosed if
-// the Router is closed first, or ctx.Err() if ctx is done first.
+// Ready waits until the Router has applied its first view. It returns nil then, ErrClosed once
+// the Router is closed, also after a view, or ctx.Err() if ctx is done first.
 func (r *Router) Ready(ctx context.Context) error {
 	select {
-	case <-r.ready:
-		return nil
+	case <-r.closed:
+		return ErrClosed
 	default:
 	}
 	select {
@@ -327,26 +351,54 @@ func (h *RouteSpace) RouteShard(shard int) (Member, error) {
 }
 
 // apply applies v, read at reading and wall-clock time wall, and publishes the new snapshot. A
-// view the Assigner ignores, being invalid or older than the applied one, changes nothing. It
-// reports whether it published a snapshot. The caller holds r.mu.
+// view the Assigner ignores, being invalid or older than the applied one, only moves the clock,
+// which may expire a slot's vacancy. It reports whether it applied v. A reading before the last
+// one counts as the last. The caller holds r.mu.
 func (r *Router) apply(v core.View, reading time.Duration, wall time.Time) bool {
 	if v.Validate() != nil || r.view != nil && v.Version < r.view.Version {
-		r.assigner.Tick(reading)
+		r.tick(reading)
 		return false
 	}
-	r.assigner.ApplyView(v, reading, wall)
+	keys := r.assigner.Keys()
+	r.reading = max(reading, r.reading)
+	r.assigner.ApplyView(v, r.reading, wall)
 	r.view = &v
-	r.publish()
+	r.publish(!sameSlice(keys, r.assigner.Keys()))
 	r.readyOnce.Do(func() { close(r.ready) })
 	return true
 }
 
-// publish builds a snapshot of the applied view and the Assigner's assignments and makes it the
-// one lookups read. The caller holds r.mu.
-func (r *Router) publish() {
+// tick moves the Assigner's clock to reading and publishes a new snapshot when that changed an
+// assignment. A reading before the last one counts as the last. The caller holds r.mu.
+func (r *Router) tick(reading time.Duration) {
+	r.reading = max(reading, r.reading)
+	keys := r.assigner.Keys()
+	if r.assigner.Tick(r.reading) && r.view != nil {
+		r.publish(!sameSlice(keys, r.assigner.Keys()))
+	}
+}
+
+// routerBuildStats counts what a Router's builds have done.
+type routerBuildStats struct {
+	snapshots uint64 // snapshots published
+	balanced  uint64 // of them, those whose placement keys changed, so Balanced ran
+}
+
+// publish builds a snapshot of the applied view and the Assigner's assignments, makes it the one
+// lookups read and sends its version to every subscriber. balanced reports that the placement
+// keys changed, so the Assigner ran Balanced. After Close it does nothing. The caller holds r.mu.
+func (r *Router) publish(balanced bool) {
 	prev := r.snap.Load()
 	if prev.closed {
 		return
 	}
-	r.snap.Store(r.buildSnapshot(prev.version + 1))
+	s := r.buildSnapshot(prev.version + 1)
+	r.snap.Store(s)
+	r.builds.snapshots++
+	if balanced {
+		r.builds.balanced++
+	}
+	for _, ch := range r.subs {
+		sendVersion(ch, s.version)
+	}
 }
