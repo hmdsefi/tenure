@@ -7,7 +7,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -281,6 +283,41 @@ func TestATRTR16Gzip(t *testing.T) {
 	b, _ := io.ReadAll(resp.Body)
 	if !resp.Uncompressed || !bytes.Equal(b, plain) {
 		t.Errorf("http.Get: Uncompressed %t, body %q, want true and the plain body", resp.Uncompressed, b)
+	}
+}
+
+// TestHandlerContentLength checks over a real server that a view too large for net/http to
+// measure by itself, even gzip-encoded, is sent with a Content-Length that is the body's, not
+// chunked, both plain and gzip-encoded.
+func TestHandlerContentLength(t *testing.T) {
+	ids := make([]string, 300)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("%x", sha256.Sum256([]byte{byte(i), byte(i >> 8)})) // hard to compress
+	}
+	srv := httptest.NewServer(viewhttp.Handler(newSource(new(viewOf(1, ids...)))))
+	defer srv.Close()
+	for _, accept := range []string{"identity", "gzip"} {
+		req, err := http.NewRequest(http.MethodGet, srv.URL+"/view", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Accept-Encoding", accept)
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("%s: GET: %v", accept, err)
+		}
+		b, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatalf("%s: read: %v", accept, err)
+		}
+		if len(b) <= 2048 {
+			t.Fatalf("%s: body of %d bytes, want more than net/http buffers before chunking", accept, len(b))
+		}
+		if resp.ContentLength != int64(len(b)) || len(resp.TransferEncoding) != 0 {
+			t.Errorf("%s: Content-Length %d, Transfer-Encoding %v, want %d and none",
+				accept, resp.ContentLength, resp.TransferEncoding, len(b))
+		}
 	}
 }
 
