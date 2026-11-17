@@ -481,6 +481,7 @@ var rootImportRules = []importRule{
 	{dir: "memstore", module: []string{"core", ""}},
 	{dir: "static", module: []string{"core", ""}},
 	{dir: "debughttp", module: []string{"core", ""}},
+	{dir: "viewhttp", module: []string{"core", ""}},
 	{dir: "storetest", testing: true, module: []string{"core", ""}},
 	{dir: "membershiptest", testing: true, module: []string{"core", ""}},
 	{dir: "internal/dettest"},
