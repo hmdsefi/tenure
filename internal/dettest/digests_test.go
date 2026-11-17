@@ -37,6 +37,7 @@ var digestCases = []digestCase{
 	{name: "tree", lines: treeLines},
 	{name: "balanced", lines: balancedLines},
 	{name: "machine", lines: machineLines},
+	{name: "assigner", lines: assignerLines},
 }
 
 // keyshardKeys returns the keys of the keyshard case: six fixed keys, then k0 … k9999.

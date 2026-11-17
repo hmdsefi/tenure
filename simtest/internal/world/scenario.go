@@ -7,7 +7,9 @@
 // A Scenario describes one world: how many members it has, the spaces and the timing, how far
 // the clocks and the network may stray, and the faults. From a Scenario alone, ComputeBound
 // gives the longest time a shard may stay without an owner once the faults have stopped, and
-// AssertsG2 says whether the timing still promises that no two members own a shard at once.
+// AssertsG2 says whether the timing still promises that no two members own a shard at once. A
+// Scenario may also add routers, which follow the store's views with a lag and route requests
+// to the members.
 //
 // The package is deterministic: it starts no goroutine, takes no lock, reads no wall clock and
 // takes every random choice from the seed of the run, so a scenario and a seed give one run.
@@ -105,6 +107,16 @@ type Outage struct {
 	For time.Duration
 }
 
+// RouterCut cuts every router off from the store's views once: the views the store makes from
+// At to At + For never reach a router, and at At + For each router reads the store's latest
+// view again, as a router whose watch failed calls Watch again.
+type RouterCut struct {
+	// At is when the cut starts.
+	At time.Duration
+	// For is how long the cut lasts.
+	For time.Duration
+}
+
 // The values that stand for a zero field of a Scenario.
 const (
 	defaultMembers = 5
@@ -168,6 +180,15 @@ type Scenario struct {
 	// IgnoreCheck makes the runs keep writing after the check they make before each write
 	// says that they must stop.
 	IgnoreCheck bool
+	// Routers is the number of routers, r1 to rN, that follow the store's views and route
+	// requests to the members (router.go). 0 means none.
+	Routers int
+	// RouterLag bounds the view delay of the routers: each router applies every view of the
+	// store a delay after the store made it, drawn once per router from [2·Delta, RouterLag].
+	// A RouterLag below 2·Delta counts as 2·Delta.
+	RouterLag time.Duration
+	// RouterCut, when it is not nil, cuts the routers off from the store's views once.
+	RouterCut *RouterCut
 	// Mutation is the bug that a build with planted bugs puts into the world.
 	Mutation Mutation
 }

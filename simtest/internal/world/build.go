@@ -155,6 +155,9 @@ type World struct {
 	// outage watches the scenario's store outage for tenure/outage (outage.go); nil without one.
 	outage *outageWatch
 
+	// routers holds the scenario's routers and their checks (router.go); nil without routers.
+	routers *routerWatch
+
 	// finalsOff turns the final checks into checks that pass. The tests of the parts of the world
 	// that disturb it by hand, after the recovery time, set it; the scenarios never do.
 	finalsOff bool
@@ -209,6 +212,14 @@ type World struct {
 // With a Rollout, the replacement mi-r is activated at Start + (i−1)·Gap, which starts its
 // first incarnation, and mi is told to drain Surge later.
 //
+// A scenario with Routers gets that many routers, r1 to rN, which are no nodes: each applies
+// the store's views its own delay after the store made them, sends a request every 50 ms, and
+// follows the members' 421 answers with corrections, at most three sends a request. Build
+// registers their invariants tenure/router/bound, tenure/router/converged and
+// tenure/router/owner (router.go). Routers change nothing the members do: a request is
+// answered from the members' state in the event that sends it, and the world of a scenario
+// without routers is the same as before they existed.
+//
 // A member whose session is lost starts a new incarnation, cause "recover", once its machine is
 // done and every run has returned, in the event of the last of them. A member told to drain
 // (Drain) exits once its machine is done, and never boots again.
@@ -240,6 +251,7 @@ func Build(w *faultline.World, sc Scenario) *World {
 	world.installRecovered()
 	world.planRollout()
 	world.installOutage()
+	world.installRouters()
 	world.emitBound()
 	return world
 }
