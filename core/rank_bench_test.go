@@ -46,3 +46,20 @@ func BenchmarkRendezvous(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkAppendRank(b *testing.B) {
+	for _, m := range []int{3, 200, 1000} {
+		ms := benchMembers(m)
+		for _, n := range []int{1, 2, 3} {
+			b.Run("m="+strconv.Itoa(m)+"/n="+strconv.Itoa(n), func(b *testing.B) {
+				var buf [3]int
+				b.ReportAllocs()
+				for b.Loop() {
+					if got := AppendRank(buf[:0], "account", "k1", ms, n); len(got) != n {
+						b.Fatalf("AppendRank returned %d positions, want %d", len(got), n)
+					}
+				}
+			})
+		}
+	}
+}

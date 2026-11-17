@@ -54,6 +54,39 @@ func TestATCOR10AllocsRank(t *testing.T) {
 	_ = sink
 }
 
+// TestATCOR21AllocsAppendRank checks that AppendRank allocates nothing when dst has room: for n
+// = 1, 2, 3 and 10 over n1 … n3 and n0 … n999, into a stack array and into a reused heap slice
+// (AT-COR-21).
+func TestATCOR21AllocsAppendRank(t *testing.T) {
+	large := make([]Member, 1000)
+	for i := range large {
+		large[i] = Member{ID: "n" + strconv.Itoa(i)}
+	}
+	small := members("n1", "n2", "n3")
+	heap := make([]int, 0, 10)
+	var sink int
+	for _, ms := range [][]Member{small, large} {
+		for _, n := range []int{1, 2, 3, 10} {
+			name := "AppendRank(n" + strconv.Itoa(len(ms)) + ", " + strconv.Itoa(n) + ")"
+			stack := func() {
+				var buf [10]int
+				sink += len(AppendRank(buf[:0], "account", "k1", ms, n))
+			}
+			reused := func() {
+				heap = AppendRank(heap[:0], "account", "k1", ms, n)
+				sink += len(heap)
+			}
+			if got := testing.AllocsPerRun(100, stack); got != 0 {
+				t.Errorf("%s into a stack array allocates %v times, want 0", name, got)
+			}
+			if got := testing.AllocsPerRun(100, reused); got != 0 {
+				t.Errorf("%s into a reused slice allocates %v times, want 0", name, got)
+			}
+		}
+	}
+	_ = sink
+}
+
 // Results go to package-level sinks so the compiler cannot drop the calls.
 var (
 	treeSinkBool bool
