@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/hmdsefi/tenure"
@@ -46,6 +47,11 @@ type Adapter struct {
 	memberGC          time.Duration
 	logger            *slog.Logger
 	watchLatency      time.Duration
+	// watchOnly is set by WithWatchOnly (watchonly.go).
+	watchOnly bool
+	// onEvent, set only by tests before the informer first starts, sees the Lease of every
+	// informer event.
+	onEvent func(l *coordinationv1.Lease)
 
 	// records limits the record operations in flight to recordConcurrency (records.go).
 	records *semaphore

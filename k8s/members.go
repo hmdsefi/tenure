@@ -112,6 +112,9 @@ func (a *Adapter) Join(ctx context.Context, self core.Member) error {
 	if a.err != nil {
 		return a.err
 	}
+	if err := a.refuse("Join"); err != nil {
+		return err
+	}
 	unlockOps, err := a.lockMembership(ctx)
 	if err != nil {
 		return err
@@ -168,6 +171,9 @@ func (a *Adapter) SetDraining(ctx context.Context, draining bool) error {
 	if a.err != nil {
 		return a.err
 	}
+	if err := a.refuse("SetDraining"); err != nil {
+		return err
+	}
 	unlockOps, err := a.lockMembership(ctx)
 	if err != nil {
 		return err
@@ -212,13 +218,17 @@ func (a *Adapter) SetDraining(ctx context.Context, draining bool) error {
 // without the member and is closed, and Join, SetDraining and Watch return tenure.ErrClosed.
 // Leave ends the membership also when its write fails, and returns that write's error; the
 // member Lease then expires. Leave before Join or again returns nil, with no request; it closes
-// the channels all the same.
+// the channels all the same. A watch-only Adapter (WithWatchOnly) refuses Leave with an error
+// wrapping ErrWatchOnly and closes nothing.
 func (a *Adapter) Leave(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if a.err != nil {
 		return a.err
+	}
+	if err := a.refuse("Leave"); err != nil {
+		return err
 	}
 	unlockOps, err := a.lockMembership(ctx)
 	if err != nil {

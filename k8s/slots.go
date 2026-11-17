@@ -61,6 +61,9 @@ func (a *Adapter) ClaimSlot(ctx context.Context, holder string) (int, error) {
 	if a.err != nil {
 		return -1, a.err
 	}
+	if err := a.refuse("ClaimSlot"); err != nil {
+		return -1, err
+	}
 	if err := checkHolder(a.group, holder); err != nil {
 		return -1, fmt.Errorf("k8s: ClaimSlot: %w", err)
 	}
@@ -204,6 +207,9 @@ func (a *Adapter) ReleaseSlot(ctx context.Context, holder string, slot int) erro
 	if a.err != nil {
 		return a.err
 	}
+	if err := a.refuse("ReleaseSlot"); err != nil {
+		return err
+	}
 	if err := checkHolder(a.group, holder); err != nil {
 		return fmt.Errorf("k8s: ReleaseSlot: %w", err)
 	}
@@ -272,6 +278,9 @@ func (a *Adapter) SetSlots(ctx context.Context, count int) error {
 	if a.err != nil {
 		return a.err
 	}
+	if err := a.refuse("SetSlots"); err != nil {
+		return err
+	}
 	if count < 0 || count > maxSlots {
 		return fmt.Errorf("k8s: SetSlots: count %d: must be in [0, %d]", count, maxSlots)
 	}
@@ -316,8 +325,8 @@ func (a *Adapter) SetSlots(ctx context.Context, count int) error {
 // while the Adapter has joined or holds a session, but the watch has not delivered one of its own
 // member Lease writes sent within the last RenewDeadline, the passing of time alone turns no
 // holder gone.
-// Otherwise Slots lists the group's Leases with one request, and a holder whose member Lease
-// names it counts as live. It returns an error when the count on the group's Lease is not a
+// Otherwise Slots lists the group's Leases with one request, only its member, slots and slot
+// Leases for a watch-only Adapter, and a holder whose member Lease names it counts as live. It returns an error when the count on the group's Lease is not a
 // number in [0, 10000]; a Lease at the count's name that lacks the group's labels counts as no
 // count.
 func (a *Adapter) Slots(ctx context.Context) (count int, holders []string, err error) {
@@ -331,7 +340,7 @@ func (a *Adapter) Slots(ctx context.Context) (count int, holders []string, err e
 	now := a.now()
 	obs, tombs, ok := a.snapshot()
 	if !ok {
-		list, err := a.leases().List(ctx, metav1.ListOptions{LabelSelector: labelGroup + "=" + a.group})
+		list, err := a.leases().List(ctx, metav1.ListOptions{LabelSelector: a.leaseSelector()})
 		if err != nil {
 			return 0, nil, fmt.Errorf("k8s: slots: list leases: %w", err)
 		}
