@@ -385,9 +385,9 @@ type nestedModule struct {
 	tagsOnly bool     // cmd/tenure: no replace directives and no placeholder versions (REP-040 item 5)
 }
 
-// anyInRepo is what simtest, examples, bench and cmd/tenure may require: the root, the adapters
-// and the metrics modules.
-var anyInRepo = []string{"", "k8s", "postgres", "etcd", "gossip", "metrics/prom", "metrics/otel"}
+// anyInRepo is what simtest, examples, bench and cmd/tenure may require: the root, the adapters,
+// grpcroute and the metrics modules.
+var anyInRepo = []string{"", "k8s", "postgres", "etcd", "gossip", "grpcroute", "metrics/prom", "metrics/otel"}
 
 // nestedModules is REP-030's table.
 var nestedModules = []nestedModule{
@@ -397,6 +397,7 @@ var nestedModules = []nestedModule{
 	{dir: "postgres", requires: []string{""}},
 	{dir: "etcd", requires: []string{""}},
 	{dir: "gossip", requires: []string{""}},
+	{dir: "grpcroute", requires: []string{""}},
 	{dir: "bench", requires: anyInRepo},
 	{dir: "cmd/tenure", requires: anyInRepo, tagsOnly: true},
 	{dir: "metrics/prom", requires: []string{""}},

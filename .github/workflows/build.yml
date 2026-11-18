@@ -36,6 +36,11 @@ jobs:
         with:
           version: v2.14.0
           working-directory: examples
+      - name: golangci-lint (grpcroute)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+          working-directory: grpcroute
       - name: golangci-lint (simtest)
         uses: golangci/golangci-lint-action@v9
         with:
@@ -246,6 +251,22 @@ jobs:
             fi
             echo "::endgroup::"
           done
+
+  grpcroute:
+    name: grpcroute
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: grpcroute/go.mod
+          cache-dependency-path: grpcroute/go.sum
+      - name: vet
+        run: go -C grpcroute vet ./...
+      - name: test the grpcroute module with -race
+        run: go -C grpcroute test -count=1 -race ./...
 
   simtest-short:
     name: simtest (-short)
