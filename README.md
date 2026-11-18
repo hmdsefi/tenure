@@ -58,8 +58,9 @@ node, err := tenure.Start(ctx, tenure.Config{
   fence point rejects a stale owner's writes. tenure provides the helper for Postgres.
 - **Clean handoffs.** On `SIGTERM`, a member stops its runs, releases its shards and its slot, and
   the next member starts at once instead of waiting for leases to expire.
-- **Routing.** tenure tells you which member owns a key (`node.Route`); you keep your own gRPC or
-  HTTP server and serialization.
+- **Routing.** tenure tells you which member owns a key, inside the group (`node.Route`) and in any
+  process that sends requests (`tenure.Router`); you keep your own gRPC or HTTP server and
+  serialization.
 - **A resolver** for keys that don't need strict ownership, and **partition trees** that split one
   hot key across members, the way Temporal's matching service splits task queues.
 
@@ -67,6 +68,29 @@ All decisions (assignment, placement, ownership state, timing) live in a pure, d
 package, `tenure/core`, with no dependencies outside the standard library. It is tested with
 deterministic simulation in [faultline](https://github.com/hmdsefi/faultline), and
 [lockstep](https://github.com/hmdsefi/lockstep) will use it for placing virtual actors.
+
+## Routing requests
+
+A process outside the group, such as a client, another service or a proxy you write, sends each
+request straight to its owner with a `tenure.Router`. The Router follows the group's views,
+computes the members' table, and answers a lookup with a hash and two array reads, without a lock
+or an allocation. Here it follows the Leases with a watch-only Adapter, and an HTTP client sends
+every request of the markets space to its owner through `routehttp.Transport`:
+
+```go
+kube := k8s.New(client, "trading", "orderbook", k8s.WithWatchOnly()) // reads Leases, writes none
+router, err := tenure.NewRouter(kube, spaces)                        // the members' own []tenure.Space
+if err != nil {
+	return err
+}
+markets := &http.Client{Transport: &routehttp.Transport{Router: router, Space: "markets", Key: marketOf}}
+```
+
+The Transport follows a member's `421` redirect when the Router's view lags, and `grpcroute` does
+the same for gRPC; `router.Route("markets", key)` names the owner for your own code. tenure
+ships these packages and no gateway or routing service. The [routing guide](docs/routing.md)
+says which pattern fits which service, how to serve views to many routers through a relay,
+and what lookups and rebuilds cost.
 
 ## What it doesn't do
 

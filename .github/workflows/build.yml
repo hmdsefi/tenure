@@ -341,7 +341,7 @@ jobs:
           TENURE_TEST_KUBECONFIG="$RUNNER_TEMP/kubeconfig" go -C k8s test -race -count=1 -v ./... 2>&1 | tee "$RUNNER_TEMP/k8s-test.log"
       - name: no k8s test skipped
         # The only skips allowed are the storetest cases that need Advance or SetWall, which a
-        # real cluster cannot offer, and, until Phase 2, membershiptest's Propagation/Estimate and
+        # real cluster cannot offer, and, until Phase 3, membershiptest's Propagation/Estimate and
         # WatchOnly/Fresh, which needs the watch-only Adapter's Stale.
         # go test -v names the test before each line it logs, so a skip message belongs to the
         # last test named.
