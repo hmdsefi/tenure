@@ -161,3 +161,49 @@ func BenchmarkPick(b *testing.B) {
 		})
 	}
 }
+
+// TestRTR920PickRoute checks that the attempt after a redirect gets the connection the redirect
+// names while it is ready, and the key's owner otherwise.
+func TestRTR920PickRoute(t *testing.T) {
+	space := testSpace(t)
+	p := pickerOver(space, "a1", "a2", "a3")
+	const key = "order-17"
+	owner, err := space.Route(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := "a1"
+	if owner.Addr == other {
+		other = "a2"
+	}
+	ctx := WithKey(context.Background(), key)
+	if got := picked(t, p, context.WithValue(ctx, routeCtx{}, other)); got != other {
+		t.Fatalf("Pick after a redirect to %s = %s", other, got)
+	}
+	if got := picked(t, p, context.WithValue(ctx, routeCtx{}, "a9")); got != owner.Addr {
+		t.Fatalf("Pick after a redirect to an address without a connection = %s, want the owner %s", got, owner.Addr)
+	}
+	info := balancer.PickInfo{FullMethodName: "/s/m", Ctx: context.WithValue(ctx, routeCtx{}, other)}
+	if n := testing.AllocsPerRun(1000, func() { _, _ = p.Pick(info) }); n != 0 {
+		t.Errorf("Pick after a redirect allocates %v times, want 0", n)
+	}
+}
+
+// TestSpaceOf checks which targets name a space.
+func TestSpaceOf(t *testing.T) {
+	for target, want := range map[string]string{
+		"tenure:///orders":    "orders",
+		"tenure:orders":       "orders",
+		"tenure://x/orders":   "orders",
+		"tenure:///":          "",
+		"dns:///orders":       "",
+		"passthrough:///a:80": "",
+		"127.0.0.1:80":        "",
+		"%":                   "",
+	} {
+		got, ok := spaceOf(target)
+		if got != want || ok != (want != "") {
+			t.Errorf("spaceOf(%q) = %q, %v; want %q", target, got, ok, want)
+		}
+	}
+}

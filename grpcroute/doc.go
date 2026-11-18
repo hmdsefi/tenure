@@ -3,8 +3,8 @@
 
 // Package grpcroute is the gRPC side of routing calls to the members of a tenure group: a
 // resolver that lists the members a tenure.Router sees, a load-balancing policy that sends each
-// call to the member that owns its key, and the answer a member gives to a call for a key it
-// does not own. It runs in the caller's and the members' own processes: no gateway
+// call to the member that owns its key, interceptors that follow a member's redirect, and the
+// answer a member gives to a call for a key it does not own. It runs in the caller's and the members' own processes: no gateway
 // or proxy stands between them.
 //
 // # The protocol
@@ -50,6 +50,8 @@
 //		grpc.WithTransportCredentials(insecure.NewCredentials()),
 //		grpc.WithResolvers(grpcroute.NewResolverBuilder(router)),
 //		grpc.WithDefaultServiceConfig(grpcroute.ServiceConfig),
+//		grpc.WithChainUnaryInterceptor(grpcroute.UnaryClientInterceptor(router)),
+//		grpc.WithChainStreamInterceptor(grpcroute.StreamClientInterceptor(router)),
 //	)
 //	...
 //	reply, err := client.Get(grpcroute.WithKey(ctx, req.Key), req)
@@ -58,6 +60,17 @@
 // ready, or whose key the Router has no member for, goes to any ready connection; a member that
 // does not own the key answers it with Misdirected. A pick reads the Router's snapshot without a
 // lock and allocates nothing.
+//
+// # Following redirects
+//
+// A Router's view can lag the members' own, for example while a member drains: the picker then
+// sends some calls to a member that no longer owns their key, which answers with Misdirected.
+// UnaryClientInterceptor and StreamClientInterceptor follow that answer: they record the
+// address with Router.Correct, so the next calls for the shard go there at once, and send the
+// call again to it. They follow at most DefaultMaxRedirects redirects per call, so a call takes
+// at most three attempts; WithMaxRedirects changes the bound. A stream is followed only until
+// its first message is received, and the messages sent until then are sent again. Put the
+// interceptors first in the chain, so that the interceptors after them see each attempt.
 //
 // The resolver sends no service config of its own, because gRPC would let it replace the
 // caller's whole default service config. A caller with a service config of its own adds the
