@@ -5,8 +5,6 @@ name: router bench
 # run in build.yml: the allocation tests with every test run, and the parallel-scaling check in
 # the Go build job.
 on:
-  push:
-    branches: [bench/2.5-01-router]
   workflow_dispatch:
     inputs:
       count:
