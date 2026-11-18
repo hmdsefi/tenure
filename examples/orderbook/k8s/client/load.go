@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -22,6 +23,10 @@ import (
 
 // maxErrors is how many error texts Stats keeps.
 const maxErrors = 5
+
+// latencySteps is how many latency buckets Stats has per factor e of latency: 20, so each bucket
+// is about 5% wide.
+const latencySteps = 20
 
 // Stats is what a load has done so far, as GET /stats answers it. The counts only grow, so the
 // difference of two Stats is what happened between them.
@@ -41,6 +46,11 @@ type Stats struct {
 	Sends map[int]int64 `json:"sends"`
 	Hops  map[int]int64 `json:"hops"`
 
+	// Latency counts the finished orders by how long each took, from its start to its end,
+	// resends included, in buckets about 5% wide, keyed by each bucket's upper bound in
+	// microseconds.
+	Latency map[int]int64 `json:"latency"`
+
 	// Resent409 counts the orders counted ok because a resend after a lost answer got a 409:
 	// the lost send had journaled them.
 	Resent409 int64 `json:"resent409"`
@@ -59,6 +69,20 @@ type Stats struct {
 	// them; the stats handler does.
 	Routes []string `json:"routes,omitempty"`
 	Stale  bool     `json:"stale,omitempty"`
+
+	// LookupNs is the mean time of one Router lookup, in nanoseconds, in the client's last
+	// measurement of a batch of them, 0 before the first. Run does not set it.
+	LookupNs float64 `json:"lookup_ns,omitempty"`
+}
+
+// latencyBound returns the upper bound, in microseconds, of the latency bucket that holds d.
+func latencyBound(d time.Duration) int {
+	us := float64(d) / float64(time.Microsecond)
+	if us <= 1 {
+		return 1
+	}
+	b := math.Floor(math.Log(us) * latencySteps)
+	return int(math.Ceil(math.Exp((b + 1) / latencySteps)))
 }
 
 // load sends orders at a fixed rate through a demo.Client and counts what happened to them. It
@@ -82,7 +106,10 @@ func newLoad(dc *demo.Client, url, pod string, rate float64) *load {
 	return &load{
 		dc: dc, url: url, pod: pod, rate: rate, orderTimeout: 20 * time.Second,
 		seed: uint64(time.Now().UnixNano()),
-		st:   Stats{Pod: pod, Failed: map[string]int64{}, Sends: map[int]int64{}, Hops: map[int]int64{}},
+		st: Stats{
+			Pod: pod, Failed: map[string]int64{}, Sends: map[int]int64{}, Hops: map[int]int64{},
+			Latency: map[int]int64{},
+		},
 	}
 }
 
@@ -102,6 +129,7 @@ func (l *load) stats() Stats {
 	defer l.mu.Unlock()
 	st := l.st
 	st.Failed, st.Sends, st.Hops = maps.Clone(st.Failed), maps.Clone(st.Sends), maps.Clone(st.Hops)
+	st.Latency = maps.Clone(st.Latency)
 	st.Errors = slices.Clone(st.Errors)
 	return st
 }
@@ -144,11 +172,12 @@ func (l *load) run(ctx context.Context) {
 // and answers a repeat with 409, which then means the lost send was journaled and counts as ok,
 // in Resent409.
 func (l *load) order(ctx context.Context, o orderbook.Order) {
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, l.orderTimeout)
 	defer cancel()
 	body, err := json.Marshal(o)
 	if err != nil {
-		l.finish(0, 0, 0, false, err)
+		l.finish(0, 0, 0, false, time.Since(start), err)
 		return
 	}
 	// hops counts the moves of the order across Posts: a Post sent again starts its own
@@ -172,7 +201,7 @@ func (l *load) order(ctx context.Context, o orderbook.Order) {
 				err = ctx.Err()
 			}
 		}
-		l.finish(sends, hops, res.Status, lost, err)
+		l.finish(sends, hops, res.Status, lost, time.Since(start), err)
 		return
 	}
 }
@@ -195,12 +224,13 @@ func (l *load) noteError(err error) {
 	l.st.Errors = append(l.st.Errors, err.Error())
 }
 
-// finish counts one finished order.
-func (l *load) finish(sends, hops, status int, lost bool, err error) {
+// finish counts one finished order, which took took.
+func (l *load) finish(sends, hops, status int, lost bool, took time.Duration, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.st.Sends[sends]++
 	l.st.Hops[hops]++
+	l.st.Latency[latencyBound(took)]++
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		l.st.Failed["timeout"]++
