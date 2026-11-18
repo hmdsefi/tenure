@@ -6,6 +6,8 @@ name: router load
 # server sends. The results table goes to the run's summary and to the artifact router-load, for
 # docs/routing.md.
 on:
+  push:
+    branches: [bench/2.5-02-load]
   workflow_dispatch:
 
 permissions:
