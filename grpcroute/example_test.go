@@ -18,19 +18,27 @@ import (
 	"github.com/hmdsefi/tenure/grpcroute"
 )
 
-// A client opens one channel to the members of a space through a Router.
+// A client opens one channel to the members of a space through a Router, and sends each call
+// to the owner of its key.
 func ExampleNewResolverBuilder() {
 	var router *tenure.Router // from tenure.NewRouter, on the group's membership
 
 	conn, err := grpc.NewClient("tenure:///orders",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithResolvers(grpcroute.NewResolverBuilder(router)),
+		grpc.WithDefaultServiceConfig(grpcroute.ServiceConfig),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer conn.Close()
-	_ = healthpb.NewHealthClient(conn)
+
+	// The call goes to the member that owns "order-17" in the Router's snapshot.
+	ctx := grpcroute.WithKey(context.Background(), "order-17")
+	_, err = healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{Service: "order-17"})
+	if err != nil {
+		log.Print(err)
+	}
 }
 
 // orderServer is a member's service. Its handlers check ownership before they act.
