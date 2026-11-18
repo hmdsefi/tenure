@@ -100,3 +100,53 @@ keeps the slot count only remaps.
 
 The ns/op of a lookup is published, not gated: hosted runners vary too much from one run to the
 next for a time budget to mean anything.
+
+### Many routers on kind
+
+A Router's lookups cost the same wherever it runs; what grows with the number of routers is the
+load on the membership source. The load test, `TestATRTR21LoadKubernetes` in
+[`examples/orderbook/k8s/load_test.go`](../examples/orderbook/k8s/load_test.go), measures it on
+kind. Five orderbook pods (M = 5, five slots) serve the markets space, and R = 2, 8 and 32 client
+pods each embed a Router and send 80 orders per second together through a
+`routehttp.Transport`. Each Router follows the group either with a watch-only Adapter of its own
+(direct) or through the view relay that the orderbook pods serve at `/tenure/view` (relay). After
+the clients have converged, the test reads the API server's `apiserver_watch_events_total` for
+Leases before and after a 60 s window, and the clients' counts of the orders in it.
+
+The [router load](../.github/workflows/router-load.yml) workflow runs the test when started by
+hand, on a cluster made from [`deploy-load`](../examples/orderbook/k8s/deploy-load), and attaches
+the table below to the run:
+
+| Run | Commit | Cluster | Hardware |
+|---|---|---|---|
+| CI | `1d84915`, 2026-11-18 | Kubernetes v1.37.0 on kind v0.33.0, one node; go1.26.0 | GitHub-hosted `ubuntu-latest` runner (ubuntu26 image 20261111.82.6): Intel Xeon 6975P-C, 4 cores, 15 GiB |
+
+With no client pod the API server sends 16.4 Lease watch events per second: the members' own
+watches and the cluster's. The columns below count what the clients add to that, and compare it
+with R×M/2, the estimate for a direct watch (each member renews its member Lease every 2 s):
+
+| Membership | R | Lease watch events/s | above the baseline | per router | R×M/2 | orders | p50 | p99 | sends per order | lookup |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| direct | 2 | 21.4 | 5.0 | 2.50 | 5 | 4,808 | 0.60 ms | 1.21 ms | 1.000 | 36 ns |
+| direct | 8 | 36.5 | 20.1 | 2.51 | 20 | 4,811 | 0.77 ms | 2.32 ms | 1.000 | 38 ns |
+| direct | 32 | 96.8 | 80.4 | 2.51 | 80 | 4,840 | 0.94 ms | 2.98 ms | 1.000 | 35 ns |
+| relay | 2 | 16.4 | 0.0 | 0 | | 4,811 | 0.99 ms | 1.90 ms | 1.000 | 33 ns |
+| relay | 8 | 16.4 | 0.0 | 0 | | 4,813 | 0.94 ms | 2.00 ms | 1.000 | 35 ns |
+| relay | 32 | 16.4 | 0.0 | 0 | | 4,840 | 1.04 ms | 2.70 ms | 1.000 | 35 ns |
+
+- With a direct watch each Router costs the API server M/2 = 2.5 events per second, as
+  estimated, so the load grows with R: 80 events per second for 32 routers on 5 members, 2,500
+  for 100 routers on 50.
+- With the relay the API server sends no more events than with no client at all, whatever R:
+  the relay's members already watch the Leases, and views change only when members, drains or
+  slots change, not on every renewal.
+- Every order took one send in every configuration: the Routers' tables matched the members',
+  and no order met a redirect.
+- Latency is that of an order from the client's start to its answer, journal write included;
+  p50 and p99 are the upper bounds of the 5%-wide buckets that hold them. The median rose from
+  0.60 ms to about 1 ms over the run. The configurations ran one after another, in the table's
+  order, on one cluster whose journal kept growing, so the test doesn't tell that trend apart
+  from R or the source; it shows that neither adds more than a fraction of a millisecond.
+- The lookup column is the mean of each client pod's timing of 100,000 `Router.Route` calls,
+  taken every 5 s while the load runs: the same 35 ns as the micro benchmarks, with 32 pods
+  sharing the node's 4 cores.
