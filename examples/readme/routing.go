@@ -36,7 +36,10 @@ func RoutedClient(client kubernetes.Interface, spaces []tenure.Space, marketOf f
 	if err != nil {
 		return err
 	}
-	markets := &http.Client{Transport: &routehttp.Transport{Router: router, Space: "markets", Key: marketOf}}
+	markets := &http.Client{Transport: &routehttp.Transport{
+		Router: router, Space: "markets", Key: marketOf,
+		Fallback: "orderbook.trading.svc:8080", // any member, until the Router has a view
+	}}
 	// README.md block 2 end
 	return use(markets)
 }
@@ -106,11 +109,12 @@ func OrdersClient(router *tenure.Router) error {
 	}
 	req.Header.Set("Order-Key", "o-17")
 	resp, err := orders.Do(req)
-	// docs/routing.md block 3 end
 	if err != nil {
 		return err
 	}
-	return resp.Body.Close()
+	defer resp.Body.Close()
+	// docs/routing.md block 3 end
+	return use(resp)
 }
 
 // ServeRelay serves a member's views next to its other handlers.
@@ -153,7 +157,8 @@ func GRPCClient(ctx context.Context, router *tenure.Router) error {
 		return err
 	}
 	defer conn.Close()
-	// Each call names its key in its context:
+	// Each call names its key in its context, for example with a generated client:
+	//   reply, err := pb.NewOrdersClient(conn).Get(grpcroute.WithKey(ctx, req.Key), req)
 	ctx = grpcroute.WithKey(ctx, "o-17")
 	// docs/routing.md block 4 end
 	return use(ctx)
@@ -165,6 +170,7 @@ func Proxy(router *tenure.Router) error {
 	// docs/routing.md block 7 begin
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetXForwarded()
 			r.Out.URL.Scheme = "http"
 			r.Out.URL.Host = "orders" // the Transport replaces it with the owner's address
 		},

@@ -83,7 +83,10 @@ router, err := tenure.NewRouter(kube, spaces)                        // the memb
 if err != nil {
 	return err
 }
-markets := &http.Client{Transport: &routehttp.Transport{Router: router, Space: "markets", Key: marketOf}}
+markets := &http.Client{Transport: &routehttp.Transport{
+	Router: router, Space: "markets", Key: marketOf,
+	Fallback: "orderbook.trading.svc:8080", // any member, until the Router has a view
+}}
 ```
 
 The Transport follows a member's `421` redirect when the Router's view lags, and `grpcroute` does
@@ -95,8 +98,9 @@ and what lookups and rebuilds cost.
 ## What it doesn't do
 
 tenure moves ownership, not data: it stores no user state, runs no consensus algorithm of its own,
-offers no cross-shard transactions and carries no requests. It makes no performance claims until
-published benchmarks back them.
+offers no cross-shard transactions and carries no requests. Beyond the routing measurements that
+the routing guide publishes with their method, it makes no performance claims until published
+benchmarks back them.
 
 ## Proof of work
 

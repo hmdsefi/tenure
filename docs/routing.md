@@ -40,7 +40,7 @@ requests: a client, another service, or a proxy you write.
 | A view relay (`viewhttp`) | members, or a relay Deployment, serve views to Routers | as above | an HTTP endpoint inside the cluster |
 
 **Inside the members.** A member that receives a request for a key it doesn't own can forward it
-to the owner (the signer example does) or redirect the caller with a `421` (the orderbook
+to the owner (the signer's Kubernetes program does) or redirect the caller with a `421` (the orderbook
 does). That keeps callers simple and costs the extra hop on most requests. Every member checks
 ownership with `Node.Local` before it acts on a request in any pattern: the routing packages make
 the first send right, the member's check and the fence keep it safe.
@@ -50,8 +50,10 @@ the owner up per request: a hash and two array reads, with no lock and no alloca
 directly, or through one of the transports.
 
 **The transports.** `routehttp.Transport` is an `http.RoundTripper` and `grpcroute` a resolver, a
-load-balancing policy and interceptors. Both send each request to its owner, follow a member's
-redirect when the Router's view lags, and report each send.
+load-balancing policy and interceptors. Both send each request to its owner and follow a member's
+redirect when the Router's view lags; `routehttp.Transport` also reports each send through
+`OnSend`. `grpcroute` is a module of its own, so that the root module stays free of gRPC:
+`go get github.com/hmdsefi/tenure/grpcroute`.
 
 **A relay.** Each Router watches the membership source on its own. With many routers, or callers
 that may not read Leases, the members relay their views over HTTP instead, and the store's load
@@ -80,7 +82,8 @@ if err != nil {
 // owner.ID and owner.Addr name the member that owns the key's shard.
 ```
 
-The Router never joins the group: it calls `Watch` once and builds its table on its own goroutine.
+The Router never joins the group: it only calls `Watch`, never `Join`, `SetDraining` or `Leave`,
+and builds its table on its own goroutine.
 `Route`, `RouteShard` and the handles of `Router.Space` read the latest snapshot. `Table` returns
 a copy of it for debugging, and `debughttp.RouterHandler` serves that as JSON.
 
@@ -123,10 +126,16 @@ if err != nil {
 }
 req.Header.Set("Order-Key", "o-17")
 resp, err := orders.Do(req)
+if err != nil {
+	return err
+}
+defer resp.Body.Close()
 ```
 
 A gRPC caller dials `tenure:///<space>` with `grpcroute`'s resolver, policy and interceptors, and
-puts each call's key in its context:
+puts each call's key in its context. A call whose owner's connection isn't ready, or whose key
+the Router has no member for, goes to any ready connection, whose member redirects it; a stream
+is redirected only until its first message:
 
 ```go
 conn, err := grpc.NewClient("tenure:///orders",
@@ -140,7 +149,8 @@ if err != nil {
 	return err
 }
 defer conn.Close()
-// Each call names its key in its context:
+// Each call names its key in its context, for example with a generated client:
+//   reply, err := pb.NewOrdersClient(conn).Get(grpcroute.WithKey(ctx, req.Key), req)
 ctx = grpcroute.WithKey(ctx, "o-17")
 ```
 
@@ -166,7 +176,8 @@ permissions.
 them. Views change only when members join or leave, drain, or slots change, not on renewals, so a
 relay sends almost nothing between changes, and the API server's load no longer depends on R.
 Each member serves the requests of R/S routers when S members sit behind the relay's Service,
-holding one idle long poll per router, and answers each once per view change:
+holding one idle long poll per router, and answers each once per view change, or with a
+`304 Not Modified` when the poll's wait (30 s by default) ends first:
 
 ```go
 mux := http.NewServeMux()
@@ -210,9 +221,11 @@ A member that doesn't own a request's key acts on nothing and answers in one of 
 
 The HTTP answers carry `Tenure-Unprocessed: 1`, a promise that the request had no effect, so a
 caller may send it again whatever its method; `FailedPrecondition` with the trailer makes the
-same promise. A member that has begun to act on a request, or can't tell, answers without the
-promise, and the caller doesn't send it again. `routehttp.Misdirected`, `routehttp.Unavailable`
-and `grpcroute.Misdirected` write these answers. Each send of `routehttp.Transport` carries
+same promise. A `421` always means the request was not taken. A member that has begun to act on a
+request, or can't tell, answers a `503` without the promise, and the caller doesn't send it
+again. On gRPC, `Unavailable` makes no promise and `grpcroute` doesn't resend it; gRPC's own
+retry policy can. `routehttp.Misdirected`, `routehttp.Unavailable` and `grpcroute.Misdirected`
+write these answers; a gRPC handler returns `status.Error(codes.Unavailable, …)` itself. Each send of `routehttp.Transport` carries
 `Tenure-Hops`, the number of earlier sends of the same request that moved it to another member,
 0 on the first, so a member that forwards requests itself can stop a loop.
 
@@ -225,36 +238,42 @@ makes the Router send that shard's requests to the named member until the next s
 the correction is older than `WithCorrectionTTL` (the `LeaseDuration`, 15 s, by default), and
 send the request again. A correction is kept only for a member of the Router's current snapshot.
 
-Each transport follows at most `MaxRedirects` redirects per request (2 by default), so a request
-takes at most 3 sends before it fails over to the caller's error handling, and two members whose
-views disagree can't bounce it forever. A wrong route costs a hop, never a wrong write: the
+Each transport follows at most 2 redirects per request by default
+(`routehttp.Transport.MaxRedirects`, `grpcroute.WithMaxRedirects`), so two members whose views
+disagree can't bounce a request forever: a gRPC call takes at most 3 attempts, and the HTTP
+Transport returns the last `421` as the response. The HTTP Transport also sends a request again
+after a `503` with `Tenure-Unprocessed`, until the request's context ends, and once to `Fallback`
+after its member refused the connection. A wrong route costs a hop, never a wrong write: the
 owner's `Node.Local` check and the fence stay the authority.
 
 When the Router's watch ends or fails, or the source reports itself stale (a watch-only Adapter
 whose watch has gone quiet, a relay client that has heard nothing for its wait plus
-`RenewDeadline`), the Router keeps routing with its last table, reports `Stale()` and the
-`router.stale` event, and watches again. An old table still sends most requests to their owner,
+`RenewDeadline`), the Router keeps routing with its last table and reports `Stale()` and the
+`router.stale` event. When its watch ended it calls `Watch` again every `RetryPeriod`; a source
+that reports itself stale recovers on its own. An old table still sends most requests to their owner,
 and corrections handle the rest. A caller that prefers to stop trusting a stale table reads
 `Stale()` or the events.
 
 ## Running many routers
 
 Routers are independent: any number of processes route without coordinating, and each holds its
-own table, about 4 bytes per shard per space plus the members. The cost to watch for is the
+own table, a few dozen bytes per shard per space plus the members. The cost to watch for is the
 membership source's.
 
 - Give each routing process one Router per group and share it among goroutines: lookups scale
   with cores.
 - Pick the source by the number of routers, as above. With a direct watch, every router pod runs
   under a ServiceAccount bound to the read-only Role.
-- Give the members a Service to serve as `Fallback`, so requests that a Router has no member for,
-  or whose member's address refuses connections, still reach a member that answers or redirects.
+- Give HTTP callers the members' Service as `Fallback`, so requests that a Router has no member
+  for, or whose member's address refuses connections, still reach a member that answers or
+  redirects. gRPC callers need none: such a call goes to any ready connection.
 - Count sends and hops with `routehttp.Transport.OnSend`; in steady state nearly every request
   takes one send.
 - Keep the Router's spaces equal to the members'. Members advertise their spaces' shard counts,
   and a Router whose count differs fails that space's lookups with `ErrSpaceMismatch` rather than
-  route every request wrong. `ShardOf` can't be compared: it must match the members' by
-  construction.
+  route every request wrong; with a `Fallback`, the HTTP Transport sends that space's requests
+  there, so watch for the `router.mismatch` event. Members of versions that advertise nothing
+  aren't checked, and `ShardOf` can't be compared: it must match the members' by construction.
 
 ## Building a proxy
 
@@ -264,6 +283,7 @@ builds it from an `httputil.ReverseProxy` whose `Transport` is a `routehttp.Tran
 ```go
 proxy := &httputil.ReverseProxy{
 	Rewrite: func(r *httputil.ProxyRequest) {
+		r.SetXForwarded()
 		r.Out.URL.Scheme = "http"
 		r.Out.URL.Host = "orders" // the Transport replaces it with the owner's address
 	},
@@ -277,7 +297,9 @@ proxy := &httputil.ReverseProxy{
 srv := &http.Server{Addr: ":8080", Handler: proxy, ReadHeaderTimeout: 10 * time.Second}
 ```
 
-The proxy is one more routing process: it embeds a Router like any other, needs a membership
+The Transport sends a request again after a redirect only when it can replay the body, which it
+buffers up to `MaxBufferedBody` (1 MiB by default); a larger body is sent once. The proxy is one
+more routing process: it embeds a Router like any other, needs a membership
 source like any other, and scales by running more replicas, each with its own Router. Its callers
 pay a hop to reach it, which a Router embedded in the callers saves.
 
