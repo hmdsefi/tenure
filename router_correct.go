@@ -45,25 +45,48 @@ func (r *Router) Correct(space string, shard int, addr string) bool {
 // space is set: a correction of the shard made in s and younger than the TTL, else the
 // snapshot's owner. Lookups call it only then, so that without corrections they read one
 // counter more than the snapshot lookup (RTR-410); with one, they read the clock as well.
+//
+// A lookup reads the counter before the snapshot, and publish stores a new snapshot before it
+// drops the old one's corrections, so a correction of s that a lookup misses was dropped after a
+// newer snapshot was stored (RTR-420). corrected then answers from the newest snapshot instead of
+// from s, whose owner the correction overrode.
 func (h *RouteSpace) corrected(s *routerSnapshot, shard int) (Member, error) {
-	if c := h.corrections[shard].Load(); c != nil && c.version == s.version && s.tables[h.index].mismatch == nil &&
-		h.r.opts.now().Sub(c.at) < h.r.opts.correctionTTL {
-		return c.member, nil
+	for {
+		if c := h.corrections[shard].Load(); c != nil && c.version == s.version && s.tables[h.index].mismatch == nil &&
+			h.r.opts.now().Sub(c.at) < h.r.opts.correctionTTL {
+			return c.member, nil
+		}
+		now := h.r.snap.Load()
+		if now == s {
+			return s.route(h.index, shard)
+		}
+		if now.closed {
+			return Member{}, ErrClosed
+		}
+		s = now
 	}
-	return s.route(h.index, shard)
 }
 
-// dropCorrections clears every correction, which a new snapshot ignores anyway (RTR-420), so that
-// lookups skip them again. A Correct racing with it may leave one of the old snapshot, which
-// lookups ignore. The caller holds r.mu.
-func (r *Router) dropCorrections() {
+// dropCorrections clears every correction not made in the snapshot of version, which lookups
+// ignore anyway (RTR-420), so that lookups skip them again. publish calls it after it stores that
+// snapshot: a lookup that still holds the old one then finds the newer one in corrected. It keeps
+// a correction a Correct made in the new snapshot meanwhile; a Correct racing with it may leave
+// one of an old snapshot, which lookups ignore. The caller holds r.mu.
+func (r *Router) dropCorrections(version uint64) {
 	for _, h := range r.spaces {
 		if h.live.Load() == 0 {
 			continue
 		}
 		for i := range h.corrections {
-			if h.corrections[i].Swap(nil) != nil {
-				h.live.Add(-1)
+			for {
+				c := h.corrections[i].Load()
+				if c == nil || c.version == version {
+					break
+				}
+				if h.corrections[i].CompareAndSwap(c, nil) {
+					h.live.Add(-1)
+					break
+				}
 			}
 		}
 	}
