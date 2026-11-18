@@ -36,6 +36,9 @@ spec:
               value: "40"
             - name: FALLBACK_URL
               value: http://orderbook:8080
+            # direct: a watch-only Adapter on the Leases; relay: the orderbook pods' view relay.
+            - name: MEMBERSHIP
+              value: direct
           readinessProbe:
             httpGet:
               path: /healthz

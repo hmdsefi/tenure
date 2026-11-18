@@ -28,7 +28,10 @@
 // The markets space has 16 shards and is fenced; POST /orders takes one order and answers as the
 // orderbook command's pods do: a pod that does not own the market's shard answers 421 with the
 // owner's address in Tenure-Route, so a client that follows it, or a Router, reaches the owner.
-// GET /healthz answers 200 once the node has started, which is the pods' readiness. On SIGTERM
+// GET /healthz answers 200 once the node has started, which is the pods' readiness. GET
+// /tenure/view relays the node's views with viewhttp.Handler, so that routers can follow the group
+// through the orderbook's Service instead of watching the Leases each; it is for clients inside
+// the cluster only, as is the whole Service. On SIGTERM
 // the program drains the node for up to 25 s and closes it for up to 3 s, so that its shards
 // move to the other pods before the pod ends, and exits 0. The program has no mode that runs
 // outside a cluster: its unit tests start it against a fake Kubernetes API, and the test of the
@@ -56,6 +59,7 @@ import (
 	"github.com/hmdsefi/tenure/examples/internal/orderbook"
 	"github.com/hmdsefi/tenure/k8s"
 	"github.com/hmdsefi/tenure/routehttp"
+	"github.com/hmdsefi/tenure/viewhttp"
 )
 
 const (
@@ -82,6 +86,9 @@ const (
 
 	// httpTimeout bounds one call to the journal service.
 	httpTimeout = 5 * time.Second
+
+	// viewPath is where the pod relays its views to routers.
+	viewPath = "/tenure/view"
 )
 
 func main() {
@@ -192,7 +199,10 @@ func serve(ctx context.Context, cfg config, client kubernetes.Interface, ln net.
 		_ = srv.Close()
 		return fmt.Errorf("start: %w", err)
 	}
-	h := orderbook.NewServer(n, ob, cfg.podName)
+	mux := http.NewServeMux()
+	mux.Handle(viewPath, viewhttp.Handler(n))
+	mux.Handle("/", orderbook.NewServer(n, ob, cfg.podName))
+	var h http.Handler = mux
 	node.Store(&h)
 
 	select {

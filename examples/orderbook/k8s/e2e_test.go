@@ -74,6 +74,8 @@ type stats struct {
 	Done       bool             `json:"done"`
 	Routes     []string         `json:"routes"`
 	Stale      bool             `json:"stale"`
+	Latency    map[int]int64    `json:"latency"`
+	LookupNs   float64          `json:"lookup_ns"`
 }
 
 // window is what several clients did between two readings of their stats.
@@ -239,12 +241,19 @@ func (e *e2e) holders(ctx context.Context) ([]string, []string, error) {
 }
 
 // converged waits until the deployment is quiet and the clients' routers agree with it, and
-// returns the client pods: there are clientReplicas Ready client pods, the Router of each routes
+// returns the client pods: there are clientReplicas Ready client pods, as convergedN says.
+func (e *e2e) converged(ctx context.Context) []string {
+	e.t.Helper()
+	return e.convergedN(ctx, clientReplicas)
+}
+
+// convergedN waits until the deployment is quiet and the clients' routers agree with it, and
+// returns the client pods: there are n Ready client pods, the Router of each routes
 // every shard to the holder of its Lease, and for quietFor neither a shard's term nor any
 // client's 503 retries have changed. The terms settle once the slots have placed the shards;
 // the 503 retries once no order is still waiting for a shard that a forming group has not
 // started yet.
-func (e *e2e) converged(ctx context.Context) []string {
+func (e *e2e) convergedN(ctx context.Context, n int) []string {
 	e.t.Helper()
 	var (
 		pods    []string
@@ -256,7 +265,7 @@ func (e *e2e) converged(ctx context.Context) []string {
 		if pods, err = e.clientPods(ctx); err != nil {
 			return err
 		}
-		if len(pods) != clientReplicas {
+		if len(pods) != n {
 			return fmt.Errorf("ready client pods %v", pods)
 		}
 		holders, terms, err := e.holders(ctx)
