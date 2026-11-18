@@ -202,3 +202,76 @@ func TestRouterCorrectConcurrent(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// TestRouterCorrectionOutlivesPublish checks that a lookup racing with a new snapshot never
+// returns the old snapshot's owner of a corrected shard: it returns the correction or the new
+// snapshot's owner. Each round applies a view, corrects a shard of n1 to n2, then applies a view
+// in which n1 drains, so that the new owner is not n1, while lookups of the shard run.
+func TestRouterCorrectionOutlivesPublish(t *testing.T) {
+	clk := &fakeClock{} // never moves, so no correction expires
+	r := newTestRouter(t, routerSpaces(), clk.option())
+	h, _ := r.Space("orders")
+	// round is odd from the shard's correction until the view after it has been applied; shard
+	// is the round's corrected shard, set before round turns odd.
+	var round atomic.Uint64
+	var shard atomic.Int64
+	var stale atomic.Int64
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				n := round.Load()
+				if n%2 == 0 {
+					continue
+				}
+				sh := int(shard.Load())
+				var m Member
+				var err error
+				switch (g + i) % 3 {
+				case 0:
+					m, err = h.RouteShard(sh)
+				case 1:
+					m, err = r.RouteShard("orders", sh)
+				default:
+					m, err = h.Route(keyOfShard(sh, h.Shards()))
+				}
+				if round.Load() == n && (err != nil || m.ID == "n1") {
+					stale.Add(1)
+				}
+			}
+		}()
+	}
+	defer func() {
+		close(stop)
+		wg.Wait()
+		if n := stale.Load(); n != 0 {
+			t.Errorf("%d lookups returned the old snapshot's owner of the corrected shard, or an error", n)
+		}
+	}()
+
+	for i := range 1000 {
+		d := time.Duration(i) * time.Millisecond
+		applyAt(r, plainView(uint64(2*i+1), "n1", "n2", "n3"), d)
+		sh := shardOwnedBy(t, r, "n1")
+		shard.Store(int64(sh))
+		if !r.Correct("orders", sh, "n2:80") {
+			t.Fatal("Correct = false")
+		}
+		round.Add(1)
+		v := plainView(uint64(2*i+2), "n1", "n2", "n3")
+		v.Members[0].Draining = true
+		applyAt(r, v, d)
+		if m, err := r.RouteShard("orders", sh); err != nil || m.ID == "n1" {
+			t.Fatalf("round %d: shard %d routes to %+v, %v once n1 drains", i, sh, m, err)
+		}
+		round.Add(1)
+	}
+}

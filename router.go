@@ -335,6 +335,7 @@ func (h *RouteSpace) Shard(key string) (int, error) {
 
 // Route returns the member that serves key in the space, as Router.Route does.
 func (h *RouteSpace) Route(key string) (Member, error) {
+	corrected := h.live.Load() > 0 // before the snapshot, as corrected requires
 	s := h.r.snap.Load()
 	if s.closed {
 		return Member{}, ErrClosed
@@ -343,7 +344,7 @@ func (h *RouteSpace) Route(key string) (Member, error) {
 	if err != nil {
 		return Member{}, err
 	}
-	if h.live.Load() > 0 {
+	if corrected {
 		return h.corrected(s, shard)
 	}
 	return s.route(h.index, shard)
@@ -351,6 +352,7 @@ func (h *RouteSpace) Route(key string) (Member, error) {
 
 // RouteShard returns the member that serves shard, as Router.RouteShard does.
 func (h *RouteSpace) RouteShard(shard int) (Member, error) {
+	corrected := h.live.Load() > 0 // before the snapshot, as corrected requires
 	s := h.r.snap.Load()
 	if s.closed {
 		return Member{}, ErrClosed
@@ -358,7 +360,7 @@ func (h *RouteSpace) RouteShard(shard int) (Member, error) {
 	if shard < 0 || shard >= h.shards {
 		return Member{}, h.errShard
 	}
-	if h.live.Load() > 0 {
+	if corrected {
 		return h.corrected(s, shard)
 	}
 	return s.route(h.index, shard)
@@ -410,8 +412,8 @@ func (r *Router) publish(balanced bool, start time.Time, viewed bool) {
 		return
 	}
 	s := r.buildSnapshot(prev.version + 1)
-	r.dropCorrections()
 	r.snap.Store(s)
+	r.dropCorrections(s.version)
 	took := r.opts.now().Sub(start)
 	r.builds.snapshots++
 	if balanced {
