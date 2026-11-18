@@ -50,6 +50,22 @@ func BenchmarkRouterRoute(b *testing.B) {
 	}
 }
 
+// BenchmarkRouterSpaceRoute measures RouteSpace.Route, which skips the space lookup of
+// Router.Route, with no correction set.
+func BenchmarkRouterSpaceRoute(b *testing.B) {
+	r := benchRouter(b)
+	sp, err := r.Space("markets")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		_, _ = sp.Route(benchRouterKeys[i&1023])
+		i++
+	}
+}
+
 // BenchmarkRouterRouteParallel measures Router.Route from GOMAXPROCS goroutines at once.
 func BenchmarkRouterRouteParallel(b *testing.B) {
 	benchRouteParallel(b, benchRouter(b))
