@@ -1,0 +1,22 @@
+# The load test's deployment, which the router-load workflow applies: the manifests of ../deploy
+# with five orderbook pods and five slots, one per pod, so that a rolling deploy still moves each
+# shard once. The load test scales the clients and sets how they follow the group itself.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../deploy
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: orderbook
+      spec:
+        replicas: 5
+        template:
+          spec:
+            containers:
+              - name: orderbook
+                env:
+                  - name: SLOTS
+                    value: "5"

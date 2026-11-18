@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -137,6 +138,27 @@ func TestServe(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	// The pod relays its view to routers.
+	resp, err := http.Get(base + viewPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var view struct {
+		Members []struct {
+			ID   string `json:"id"`
+			Addr string `json:"addr"`
+		} `json:"members"`
+		Slots int `json:"slots"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&view)
+	_ = resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK || resp.Header.Get("ETag") == "" {
+		t.Fatalf("GET %s: %d, ETag %q, %v", viewPath, resp.StatusCode, resp.Header.Get("ETag"), err)
+	}
+	if len(view.Members) != 1 || view.Members[0].ID != "orderbook-0" || view.Members[0].Addr != "127.0.0.1:8080" || view.Slots != 1 {
+		t.Errorf("GET %s = %+v, want orderbook-0 at 127.0.0.1:8080 with 1 slot", viewPath, view)
+	}
+
 	all, err := orderbook.NewHTTPJournal(svc.URL, nil).All(t.Context())
 	if err != nil {
 		t.Fatal(err)

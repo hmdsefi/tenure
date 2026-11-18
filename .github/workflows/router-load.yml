@@ -1,0 +1,78 @@
+name: router load
+
+# Run by hand: the load test of many routers on kind. It deploys the orderbook with five pods,
+# runs 2, 8 and 32 client pods that each embed a Router, once with a watch-only Adapter of their
+# own and once through the orderbook pods' view relay, and counts the Lease watch events the API
+# server sends. The results table goes to the run's summary and to the artifact router-load, for
+# docs/routing.md.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  router-load:
+    name: Router load on kind
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: examples/go.mod
+          cache-dependency-path: examples/go.sum
+      - name: install kind
+        run: go install sigs.k8s.io/kind@v0.33.0
+      - name: build the images
+        run: |
+          docker build -f examples/signer/k8s/Dockerfile --build-arg PKG=./orderbook/k8s -t tenure-orderbook:dev .
+          docker build -f examples/signer/k8s/Dockerfile --build-arg PKG=./orderbook/journalsvc -t tenure-journalsvc:dev .
+          docker build -f examples/signer/k8s/Dockerfile --build-arg PKG=./orderbook/k8s/client -t tenure-orderbook-client:dev .
+      - name: create the kind cluster
+        run: |
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+          kind create cluster --name tenure-load --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5 --kubeconfig "$RUNNER_TEMP/kubeconfig" --wait 120s
+      - name: deploy the orderbook with five pods, journalsvc and the clients
+        run: |
+          kind load docker-image tenure-orderbook:dev tenure-journalsvc:dev tenure-orderbook-client:dev --name tenure-load
+          kubectl apply -k examples/orderbook/k8s/deploy-load
+          kubectl -n tenure-orderbook rollout status deploy/journalsvc deploy/orderbook deploy/client --timeout 180s
+      - name: environment
+        run: |
+          mkdir -p "$RUNNER_TEMP/router-load"
+          {
+            echo "commit: $GITHUB_SHA"
+            go version
+            kind version
+            echo "runner: $RUNNER_NAME ($ImageOS $ImageVersion)"
+            echo "cpu: $(lscpu | sed -n 's/^Model name: *//p'), $(nproc) cores"
+            echo "memory: $(free -g | awk '/^Mem:/ { print $2 }') GiB"
+          } | tee "$RUNNER_TEMP/router-load/env.txt"
+      - name: the load test
+        env:
+          TENURE_TEST_EXTERNAL: '1'
+          TENURE_LOAD_RESULTS: ${{ runner.temp }}/router-load/results.md
+        run: |
+          set -o pipefail
+          TENURE_TEST_KUBECONFIG="$KUBECONFIG" go -C examples test -count=1 -v -timeout 60m -run '^TestATRTR21LoadKubernetes$' ./orderbook/k8s 2>&1 | tee "$RUNNER_TEMP/router-load/test.log"
+      - name: TestATRTR21LoadKubernetes not skipped
+        run: |
+          grep -q -e '^--- PASS: TestATRTR21LoadKubernetes ' "$RUNNER_TEMP/router-load/test.log"
+          { cat "$RUNNER_TEMP/router-load/env.txt"; echo; cat "$RUNNER_TEMP/router-load/results.md"; } >> "$GITHUB_STEP_SUMMARY"
+      - name: cluster state after a failure
+        if: failure()
+        run: |
+          kubectl -n tenure-orderbook get deploy,pods,leases -o wide || true
+          kubectl -n tenure-orderbook logs -l app=orderbook --all-containers --tail=100 --prefix || true
+          kubectl -n tenure-orderbook logs -l app=client --all-containers --tail=20 --prefix || true
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: router-load
+          path: ${{ runner.temp }}/router-load
