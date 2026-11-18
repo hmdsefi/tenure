@@ -193,8 +193,11 @@ A dedicated relay Deployment works too: it runs a watch-only Adapter and serves
 `viewhttp.Handler` over it, so the members serve nothing but their own requests.
 
 [Many routers on kind](#many-routers-on-kind) measures both sources with 2, 8 and 32 client pods
-on five members. Use a direct watch for a few routers whose pods may read Leases, and a relay
-for many routers, or for callers that shouldn't hold Lease permissions.
+on five members: with a direct watch each Router added 2.5 Lease watch events per second to the
+API server's load, exactly M/2, so 32 Routers added 80; with the relay the API server sent no more
+events than with no client at all, whatever the number of Routers. Every order took one send with
+either source. Use a direct watch for a few routers whose pods may read Leases, and a relay for
+many routers, or for callers that shouldn't hold Lease permissions.
 
 ## The protocol
 
