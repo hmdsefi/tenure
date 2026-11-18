@@ -3,7 +3,7 @@ module github.com/hmdsefi/tenure/grpcroute
 go 1.26.0
 
 require (
-	github.com/hmdsefi/tenure v0.0.0-00010101000000-000000000000
+	github.com/hmdsefi/tenure v0.2.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 )
