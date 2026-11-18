@@ -1,0 +1,72 @@
+name: router bench
+
+# Run by hand: measures the Router's lookups and rebuilds on a GitHub-hosted runner and summarizes
+# them with benchstat, for the Measurements section of docs/routing.md. The budgets that are gated
+# run in build.yml: the allocation tests with every test run, and the parallel-scaling check in
+# the Go build job.
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: runs of each benchmark
+        default: '10'
+      cpus:
+        description: GOMAXPROCS values for the parallel lookup benchmark
+        default: '1,2,4'
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  router-bench:
+    name: Router benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GOWORK: 'off'
+      COUNT: ${{ inputs.count || '10' }}
+      CPUS: ${{ inputs.cpus || '1,2,4' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: environment
+        run: |
+          mkdir -p "$RUNNER_TEMP/router-bench"
+          {
+            echo "commit: $GITHUB_SHA"
+            go version
+            echo "runner: $RUNNER_NAME ($ImageOS $ImageVersion)"
+            echo "cpu: $(lscpu | sed -n 's/^Model name: *//p'), $(nproc) cores"
+            echo "memory: $(free -g | awk '/^Mem:/ { print $2 }') GiB"
+          } | tee "$RUNNER_TEMP/router-bench/env.txt"
+      - name: lookups and rebuilds
+        run: |
+          set -o pipefail
+          go test -run '^$' -bench Router -benchmem -count "$COUNT" ./ | tee "$RUNNER_TEMP/router-bench/router.txt"
+      - name: parallel lookups by GOMAXPROCS
+        run: |
+          set -o pipefail
+          go test -run '^$' -bench '^BenchmarkRouterRoute(Parallel)?$' -benchmem -count "$COUNT" -cpu "$CPUS" ./ | tee "$RUNNER_TEMP/router-bench/parallel.txt"
+      - name: summarize with benchstat
+        run: |
+          cd "$RUNNER_TEMP/router-bench"
+          go run golang.org/x/perf/cmd/benchstat@v0.0.0-20261117185222-4febdb082b2c router.txt > router-summary.txt
+          go run golang.org/x/perf/cmd/benchstat@v0.0.0-20261117185222-4febdb082b2c parallel.txt > parallel-summary.txt
+          {
+            echo '```text'
+            cat env.txt
+            echo
+            cat router-summary.txt
+            echo
+            cat parallel-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: router-bench
+          path: ${{ runner.temp }}/router-bench
