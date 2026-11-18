@@ -37,8 +37,10 @@ func MemberID(addr resolver.Address) string {
 // first view, so calls wait for it. A target whose space r does not have fails to build. Once r
 // is closed, the resolvers report tenure.ErrClosed.
 //
-// Pass the builder to grpc.NewClient with grpc.WithResolvers. The builder follows r from its
-// first Build until r is closed, and serves any number of resolvers and targets.
+// Pass the builder to grpc.NewClient with grpc.WithResolvers, and select the tenure_key policy
+// with ServiceConfig so that calls go to their owners; the resolver sends no service config of
+// its own. The builder follows r from its first Build until r is closed, and serves any number
+// of resolvers and targets.
 func NewResolverBuilder(r *tenure.Router) resolver.Builder {
 	return &resolverBuilder{router: r}
 }
@@ -163,7 +165,7 @@ func (r *routeResolver) run() {
 			continue
 		}
 		last = addrs
-		_ = r.cc.UpdateState(resolver.State{Addresses: addrs})
+		_ = r.cc.UpdateState(resolver.State{Addresses: addrs, Attributes: attributes.New(routeSpaceKey{}, r.space)})
 	}
 }
 

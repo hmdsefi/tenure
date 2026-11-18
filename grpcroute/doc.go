@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 // Package grpcroute is the gRPC side of routing calls to the members of a tenure group: a
-// resolver that lists the members a tenure.Router sees, and the answer a member gives to a call
-// for a key it does not own. It runs in the caller's and the members' own processes: no gateway
+// resolver that lists the members a tenure.Router sees, a load-balancing policy that sends each
+// call to the member that owns its key, and the answer a member gives to a call for a key it
+// does not own. It runs in the caller's and the members' own processes: no gateway
 // or proxy stands between them.
 //
 // # The protocol
@@ -36,14 +37,31 @@
 //		...
 //	}
 //
-// # Finding the members
+// # Sending calls to their owners
 //
-// NewResolverBuilder returns a resolver for targets of the form "tenure:///<space>": it gives
-// gRPC the address of every member of the Router's latest snapshot and updates the list on
-// every snapshot that changes it, so the channel keeps a connection open to each member:
+// A caller with a tenure.Router sends each call straight to the member that owns its key with
+// two pieces. NewResolverBuilder returns a resolver for targets of the form "tenure:///<space>":
+// it gives gRPC the address of every member of the Router's latest snapshot and updates the list
+// on every snapshot that changes it, so the channel keeps a connection open to each member. The
+// tenure_key policy, which ServiceConfig selects, picks for each call the connection of the
+// member that owns the key that WithKey put in the call's context:
 //
 //	conn, err := grpc.NewClient("tenure:///orders",
 //		grpc.WithTransportCredentials(insecure.NewCredentials()),
 //		grpc.WithResolvers(grpcroute.NewResolverBuilder(router)),
+//		grpc.WithDefaultServiceConfig(grpcroute.ServiceConfig),
 //	)
+//	...
+//	reply, err := client.Get(grpcroute.WithKey(ctx, req.Key), req)
+//
+// A call without a key goes to the members in turn. A call whose owner's connection is not
+// ready, or whose key the Router has no member for, goes to any ready connection; a member that
+// does not own the key answers it with Misdirected. A pick reads the Router's snapshot without a
+// lock and allocates nothing.
+//
+// The resolver sends no service config of its own, because gRPC would let it replace the
+// caller's whole default service config. A caller with a service config of its own adds the
+// tenure_key policy to it:
+//
+//	{"loadBalancingConfig": [{"tenure_key": {}}], "methodConfig": [...]}
 package grpcroute
