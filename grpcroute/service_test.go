@@ -5,12 +5,17 @@ package grpcroute_test
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/hmdsefi/tenure"
@@ -19,11 +24,19 @@ import (
 
 // The tests' gRPC service, written by hand so that it needs no generated code. Who takes a key
 // and answers with the ID of the member that served it. Watch takes a key and streams the
-// member's ID three times.
+// member's ID three times. Collect takes a stream of keys, checks the first, and answers with
+// the ID and every key it received, as "<id>:<key>,<key>,…". Late takes a key, streams the
+// member's ID once, and only then checks the key.
 const (
-	whoMethod   = "/grpcroute.test.Members/Who"
-	watchMethod = "/grpcroute.test.Members/Watch"
+	whoMethod     = "/grpcroute.test.Members/Who"
+	watchMethod   = "/grpcroute.test.Members/Watch"
+	collectMethod = "/grpcroute.test.Members/Collect"
+	lateMethod    = "/grpcroute.test.Members/Late"
 )
+
+// handler checks one call of the test service for key on the member with id before the server
+// answers: nil lets it answer, an error is the call's answer.
+type handler func(ctx context.Context, id, key string) error
 
 // testServer is one member's server of the test service.
 type testServer struct {
@@ -31,8 +44,9 @@ type testServer struct {
 	addr string
 	srv  *grpc.Server
 
-	mu    sync.Mutex
-	calls []string // the key of each call received, Who's and Watch's
+	mu     sync.Mutex
+	handle handler
+	calls  []string // the key of each call received
 }
 
 // newServer starts a server of the test service for member id on a loopback port.
@@ -59,11 +73,25 @@ func (s *testServer) received() []string {
 	return append([]string(nil), s.calls...)
 }
 
-// answer records a call for key and answers it with the server's ID.
-func (s *testServer) answer(_ context.Context, key string) (string, error) {
+// set makes h check the server's calls.
+func (s *testServer) set(h handler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.handle = h
+}
+
+// answer records a call for key and answers it with the server's ID, unless its handler fails
+// the call.
+func (s *testServer) answer(ctx context.Context, key string) (string, error) {
+	s.mu.Lock()
 	s.calls = append(s.calls, key)
+	h := s.handle
+	s.mu.Unlock()
+	if h != nil {
+		if err := h(ctx, s.id, key); err != nil {
+			return "", err
+		}
+	}
 	return s.id, nil
 }
 
@@ -104,6 +132,47 @@ var testServiceDesc = grpc.ServiceDesc{
 				}
 			}
 			return nil
+		},
+	}, {
+		StreamName:    "Collect",
+		ClientStreams: true,
+		Handler: func(srv any, stream grpc.ServerStream) error {
+			var keys []string
+			for {
+				in := new(wrapperspb.StringValue)
+				err := stream.RecvMsg(in)
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					return err
+				}
+				keys = append(keys, in.GetValue())
+			}
+			if len(keys) == 0 {
+				return status.Error(codes.InvalidArgument, "no keys")
+			}
+			s, _ := srv.(*testServer)
+			id, err := s.answer(stream.Context(), keys[0])
+			if err != nil {
+				return err
+			}
+			return stream.SendMsg(wrapperspb.String(id + ":" + strings.Join(keys, ",")))
+		},
+	}, {
+		StreamName:    "Late",
+		ServerStreams: true,
+		Handler: func(srv any, stream grpc.ServerStream) error {
+			in := new(wrapperspb.StringValue)
+			if err := stream.RecvMsg(in); err != nil {
+				return err
+			}
+			s, _ := srv.(*testServer)
+			if err := stream.SendMsg(wrapperspb.String(s.id)); err != nil {
+				return err
+			}
+			_, err := s.answer(stream.Context(), in.GetValue())
+			return err
 		},
 	}},
 	Metadata: "grpcroute_test",

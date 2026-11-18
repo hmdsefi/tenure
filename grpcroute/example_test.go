@@ -18,8 +18,8 @@ import (
 	"github.com/hmdsefi/tenure/grpcroute"
 )
 
-// A client opens one channel to the members of a space through a Router, and sends each call
-// to the owner of its key.
+// A client opens one channel to the members of a space through a Router, sends each call to
+// the owner of its key, and follows the members' redirects.
 func ExampleNewResolverBuilder() {
 	var router *tenure.Router // from tenure.NewRouter, on the group's membership
 
@@ -27,6 +27,8 @@ func ExampleNewResolverBuilder() {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithResolvers(grpcroute.NewResolverBuilder(router)),
 		grpc.WithDefaultServiceConfig(grpcroute.ServiceConfig),
+		grpc.WithChainUnaryInterceptor(grpcroute.UnaryClientInterceptor(router)),
+		grpc.WithChainStreamInterceptor(grpcroute.StreamClientInterceptor(router)),
 	)
 	if err != nil {
 		log.Fatal(err)

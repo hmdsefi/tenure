@@ -122,8 +122,9 @@ func (pb *keyPickerBuilder) Build(info base.PickerBuildInfo) balancer.Picker {
 	return p
 }
 
-// keyPicker picks the connection of each call: the owner's for a call with a key, while it is
-// ready, and the next ready one in turn otherwise. Pick allocates nothing.
+// keyPicker picks the connection of each call: the one a followed redirect names, while it is
+// ready; else the owner's for a call with a key, while it is ready; else the next ready one in
+// turn. Pick allocates nothing.
 type keyPicker struct {
 	space  *tenure.RouteSpace // nil: round-robin only
 	byAddr map[string]balancer.SubConn
@@ -132,6 +133,11 @@ type keyPicker struct {
 }
 
 func (p *keyPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+	if addr, ok := routeFrom(info.Ctx); ok {
+		if sc, ok := p.byAddr[addr]; ok {
+			return balancer.PickResult{SubConn: sc}, nil
+		}
+	}
 	if p.space != nil {
 		if key, ok := keyFrom(info.Ctx); ok {
 			if m, err := p.space.Route(key); err == nil {
