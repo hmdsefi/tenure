@@ -216,8 +216,10 @@ jobs:
           for mod in $(git ls-files '*/go.mod' | xargs -r -n 1 dirname | sort); do
             for p in $(go -C "$mod" list ./... | grep -v -E '/internal(/|$)'); do go -C "$mod" doc -all "$p" >> "$out"; done
           done
-          if grep -nwE '(AT-)?(REP|DET|COR|ASG|MCH|PTR|RUN|STO|MEM|K8S|OBS|SIM|EXM|PGS|ETC|GSP|RCP|TMP|BEN|WLD|SPL|CLI|MET)-[0-9]{2,3}' "$out"; then
-            echo "public doc comments cite spec IDs; the specs are private, so describe the behavior instead"
+          # Every spec prefix, plus VAC, which the core spec cites from a sibling project.
+          ids='(AT-)?(REP|DET|COR|ASG|MCH|PTR|RUN|STO|MEM|K8S|OBS|SIM|EXM|RTR|PGS|ETC|GSP|RCP|TMP|BEN|WLD|SPL|CLI|MET|VAC)-[0-9]{2,3}'
+          if grep -nwE "$ids" "$out" $(git ls-files '*.md'); then
+            echo "public doc comments or Markdown docs cite spec IDs; the specs are private, so describe the behavior instead"
             exit 1
           fi
 
