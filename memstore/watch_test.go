@@ -577,7 +577,7 @@ func TestATSTO42DeleteDelivery(t *testing.T) {
 // and the goroutine count it started with (AT-STO-43; steps written from issue #36).
 func TestATSTO43Synctest(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		start := runtime.NumGoroutine()
+		start := bubbleGoroutines(t)
 		s := memstore.New(nil)
 		wctx, cancel := context.WithCancel(context.Background())
 		ch, err := s.WatchHolders(wctx)
@@ -617,8 +617,42 @@ func TestATSTO43Synctest(t *testing.T) {
 		if !slices.Equal(got, want) {
 			t.Errorf("values %+v, want %+v", got, want)
 		}
-		if n := runtime.NumGoroutine(); n != start {
+		if n := bubbleGoroutines(t); n != start {
 			t.Errorf("goroutines = %d, want the starting %d", n, start)
 		}
 	})
+}
+
+// bubbleGoroutines returns the number of goroutines in the synctest bubble of its caller.
+// runtime.NumGoroutine is no use for that: it counts the whole process, including goroutines
+// outside the bubble that come and go at any time, such as the runtime's finalizer and cleanup
+// goroutines while they run user code after a collection. The bubble of a goroutine is in its
+// header in runtime.Stack, "goroutine 7 [chan receive (durable), synctest bubble 1]:", and the
+// caller's own trace comes first. The root package's router tests have the same helper.
+func bubbleGoroutines(t *testing.T) int {
+	t.Helper()
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	traces := strings.Split(string(buf), "\n\n")
+	self, _, _ := strings.Cut(traces[0], "\n")
+	_, after, ok := strings.Cut(self, ", synctest bubble ")
+	id, _, _ := strings.Cut(after, "]")
+	if !ok || id == "" {
+		t.Fatalf("bubbleGoroutines outside a synctest bubble: %q", self)
+	}
+	tag := ", synctest bubble " + id + "]"
+	n := 0
+	for _, tr := range traces {
+		if header, _, _ := strings.Cut(tr, "\n"); strings.Contains(header, tag) {
+			n++
+		}
+	}
+	return n
 }
