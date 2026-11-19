@@ -8,6 +8,7 @@ import (
 	"errors"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -356,7 +357,7 @@ func TestATRTR08RouterStale(t *testing.T) {
 // (AT-RTR-12).
 func TestATRTR12RouterClose(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		start := runtime.NumGoroutine()
+		start := bubbleGoroutines(t)
 		src := &routerSource{}
 		r, err := NewRouter(src, routerSpaces())
 		if err != nil {
@@ -373,7 +374,7 @@ func TestATRTR12RouterClose(t *testing.T) {
 			t.Fatalf("Close = %v", err)
 		}
 		synctest.Wait() // the source's own context.AfterFunc closes its channel
-		if n := runtime.NumGoroutine(); n != start {
+		if n := bubbleGoroutines(t); n != start {
 			t.Fatalf("goroutines after Close = %d, want the starting %d", n, start)
 		}
 		for name, err := range map[string]error{
@@ -432,4 +433,38 @@ func TestRouterSubscribe(t *testing.T) {
 	if got := <-r.Subscribe(); got != 3 {
 		t.Fatalf("a new subscriber got %d, want 3", got)
 	}
+}
+
+// bubbleGoroutines returns the number of goroutines in the synctest bubble of its caller.
+// runtime.NumGoroutine is no use for that: it counts the whole process, including goroutines
+// outside the bubble that come and go at any time, such as the runtime's finalizer and cleanup
+// goroutines while they run user code after a collection. The bubble of a goroutine is in its
+// header in runtime.Stack, "goroutine 7 [chan receive (durable), synctest bubble 1]:", and the
+// caller's own trace comes first. memstore's watch tests have the same helper.
+func bubbleGoroutines(t *testing.T) int {
+	t.Helper()
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	traces := strings.Split(string(buf), "\n\n")
+	self, _, _ := strings.Cut(traces[0], "\n")
+	_, after, ok := strings.Cut(self, ", synctest bubble ")
+	id, _, _ := strings.Cut(after, "]")
+	if !ok || id == "" {
+		t.Fatalf("bubbleGoroutines outside a synctest bubble: %q", self)
+	}
+	tag := ", synctest bubble " + id + "]"
+	n := 0
+	for _, tr := range traces {
+		if header, _, _ := strings.Cut(tr, "\n"); strings.Contains(header, tag) {
+			n++
+		}
+	}
+	return n
 }
