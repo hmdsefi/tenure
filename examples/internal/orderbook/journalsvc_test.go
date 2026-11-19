@@ -248,13 +248,16 @@ func TestEngineUnsureAppend(t *testing.T) {
 // late is a Journal over a DBJournal whose Append, once hold is set, fails without appending,
 // as a remote journal's does when its client gives up first, and keeps the append to be applied
 // later, as the service does when the request reaches it after all. With inEntries the kept
-// append is applied right after the next Entries, before the engine's next Append.
+// append is applied right after the next Entries of its shard, before the engine's next Append.
+// The Entries of another shard leave it kept: a node starting its other shards reads their
+// journals at any time, and applying the append there would put it before the engine's read.
 type late struct {
 	*DBJournal
 	mu        sync.Mutex
 	hold      bool
 	inEntries bool
 	held      func() error
+	heldShard int
 	heldErr   error
 }
 
@@ -264,6 +267,7 @@ func (l *late) Append(ctx context.Context, shard int, term core.Term, at int, li
 	if l.hold {
 		l.hold = false
 		l.held = func() error { return l.DBJournal.Append(ctx, shard, term, at, line) }
+		l.heldShard = shard
 		return errLost
 	}
 	return l.DBJournal.Append(ctx, shard, term, at, line)
@@ -272,16 +276,16 @@ func (l *late) Append(ctx context.Context, shard int, term core.Term, at int, li
 func (l *late) Entries(ctx context.Context, shard int) ([][]byte, error) {
 	lines, err := l.DBJournal.Entries(ctx, shard)
 	if l.inEntries {
-		l.apply()
+		l.apply(shard)
 	}
 	return lines, err
 }
 
-// apply applies the kept append, once, and keeps its error.
-func (l *late) apply() {
+// apply applies the kept append, once, if it is for shard, and keeps its error.
+func (l *late) apply(shard int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.held != nil {
+	if l.held != nil && l.heldShard == shard {
 		l.heldErr, l.held = l.held(), nil
 	}
 }
@@ -324,7 +328,7 @@ func TestEngineLateAppend(t *testing.T) {
 				t.Fatalf("submit of b1 with a lost Append: %v", err)
 			}
 			_, err := e.submit(tc.next)
-			l.apply()
+			l.apply(shard)
 			if !errors.Is(err, tc.nextErr) || (tc.nextErr == nil && err != nil) {
 				t.Errorf("submit of %s: %v, want %v", tc.next.ID, err, tc.nextErr)
 			}
