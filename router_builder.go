@@ -226,7 +226,7 @@ func sendVersion(ch chan uint64, version uint64) {
 	ch <- version
 }
 
-// Close stops the Router (RTR-350): lookups return ErrClosed from then on, Ready returns
+// Close stops the Router: lookups return ErrClosed from then on, Ready returns
 // ErrClosed, the builder and its timers stop, and every channel of Subscribe is closed. Then it
 // emits router.closed, the last event, and waits until every event has been delivered. It
 // returns once every goroutine of the Router has returned, and returns nil; later calls do the
