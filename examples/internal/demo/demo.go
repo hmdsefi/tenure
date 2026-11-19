@@ -83,6 +83,7 @@ type Cluster struct {
 	timing    core.Timing
 	listeners []net.Listener
 	servers   []*http.Server
+	serving   sync.WaitGroup // the goroutines that run the servers
 
 	closeOnce sync.Once
 	closeErr  error
@@ -171,11 +172,11 @@ func Start(ctx context.Context, opts Options) (*Cluster, error) {
 		}
 		srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
 		c.servers = append(c.servers, srv)
-		go func() {
+		c.serving.Go(func() {
 			// Serve returns http.ErrServerClosed after Shutdown or Close; any other error
 			// means the listener broke, and the clients see the failure.
 			_ = srv.Serve(c.listeners[i])
-		}()
+		})
 	}
 	return c, nil
 }
@@ -216,6 +217,11 @@ func (c *Cluster) close(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+	// A Serve that starts after Shutdown returns at once and closes its listener on the way
+	// out. When that close is still running, ln.Close above returns net.ErrClosed without
+	// waiting for it, and the port would still accept connections after Close returned. Once
+	// every Serve has returned, every listener is closed.
+	c.serving.Wait()
 	for _, err := range errs {
 		if err != nil {
 			return err
